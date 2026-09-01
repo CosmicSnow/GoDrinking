@@ -1,9 +1,7 @@
-# Network: default bridge. NPM (Nginx Proxy Manager) proxies via the host port,
-# not the docker network. If you later want NPM on the docker network, add:
-#   networks:
-#     npm:
-#       external: true
-# and `networks: [npm]` on each service.
+networks:
+  npm:
+    external: true
+
 services:
   godrinking-rendezvous-dev:
     profiles: [dev]
@@ -13,7 +11,9 @@ services:
     env_file:
       - .env.dev
     ports:
-      - "${PORT:-8787}:${PORT:-8787}"
+      - "80:${PORT:-8787}"
+    networks:
+      - npm
 
   godrinking-rendezvous-prod:
     profiles: [prod]
@@ -23,4 +23,6 @@ services:
     env_file:
       - .env.production
     ports:
-      - "${PORT:-8787}:${PORT:-8787}"
+      - "80:${PORT:-8787}"
+    networks:
+      - npm
