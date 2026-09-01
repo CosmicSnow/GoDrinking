@@ -2194,6 +2194,11 @@ mod tests {
             system_audio: false,
             excluded_apps: Vec::new(),
             quality: super::super::types::TransmissionQuality::Low,
+            password: String::new(),
+            nickname: "Host".into(),
+            admission: false,
+            join_mode: super::super::types::JoinMode::Lan,
+            rendezvous_url: None,
         };
         let mut adapter = ScreenCaptureKitAdapter::new();
         let (capture_tx, _capture_rx) = sync_channel::<NativeFrame>(1);

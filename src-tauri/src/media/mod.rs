@@ -9,10 +9,15 @@
 mod access_unit;
 mod capabilities;
 mod engine;
+mod fanout;
 mod peer_transport;
 mod pipeline;
 mod process_tap;
+mod rendezvous;
+#[cfg(test)]
+mod stunar_integration_test;
 mod room;
+mod session_gate;
 mod screen_capture_kit;
 mod timestamp;
 mod transport;
@@ -28,8 +33,10 @@ pub use capabilities::MediaCapabilities;
 pub use engine::MediaEngine;
 #[allow(unused_imports)]
 pub use peer_transport::{PeerSignal, PeerSignalKind};
-pub use room::{discover_room, submit_answer as submit_room_answer};
+pub use room::{discover_direct, discover_room, submit_answer as submit_room_answer};
+#[allow(unused_imports)]
 pub use types::{
-    CreateMediaSessionRequest, MediaSessionSnapshot, NativeCaptureSource, NativeRunningApp,
-    PreviewFrameEvent, UpdateMediaSessionRequest,
+    CreateMediaSessionRequest, DirectAddress, JoinMode, MediaSessionSnapshot, NativeCaptureSource,
+    NativeRunningApp, PreviewFrameEvent, StunarState, UpdateCredentialsRequest,
+    UpdateMediaSessionRequest,
 };

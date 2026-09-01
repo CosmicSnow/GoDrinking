@@ -3,7 +3,7 @@
 use super::access_unit::AccessUnitReceiver;
 use super::pipeline::EncoderControl;
 use super::process_tap::EncodedAudioPacket;
-use super::types::PeerTransportState;
+use super::types::{JoinMode, PeerTransportState};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +17,7 @@ use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::ice::mdns::MulticastDnsMode;
+use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::media::Sample;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -45,6 +46,8 @@ pub struct PeerSignal {
     #[serde(rename = "type")]
     pub kind: PeerSignalKind,
     pub sdp: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -97,6 +100,7 @@ impl PeerTransport {
         audio_packets: Option<Receiver<EncodedAudioPacket>>,
         encoder_control: Arc<EncoderControl>,
         frame_duration: Duration,
+        join_mode: JoinMode,
     ) -> Result<Self, String> {
         let (command_tx, command_rx) = sync_channel(TRANSPORT_COMMAND_CAPACITY);
         let (ready_tx, ready_rx) = sync_channel(1);
@@ -138,6 +142,7 @@ impl PeerTransport {
                     audio_packets,
                     encoder_control,
                     frame_duration,
+                    join_mode,
                     ready_tx,
                     worker_status,
                     worker_shutdown,
@@ -304,6 +309,7 @@ async fn run_peer(
     audio_packets: Option<Receiver<EncodedAudioPacket>>,
     encoder_control: Arc<EncoderControl>,
     frame_duration: Duration,
+    join_mode: JoinMode,
     ready_tx: SyncSender<Result<(), String>>,
     status: Arc<Mutex<SharedStatus>>,
     shutdown: Arc<AtomicBool>,
@@ -343,10 +349,18 @@ async fn run_peer(
         .with_interceptor_registry(registry)
         .with_setting_engine(setting_engine)
         .build();
-    // Empty ICE servers intentionally restrict this transport to host/local
-    // candidates. No public STUN or TURN service is configured.
+    // LAN stays host/local-only (no internet needed). Direct and Stunar use
+    // the public STUN mirror so host candidates behind NAT can be discovered.
+    // No TURN is ever configured.
     let configuration = RTCConfiguration {
-        ice_servers: Vec::new(),
+        ice_servers: if join_mode == JoinMode::Lan {
+            Vec::new()
+        } else {
+            vec![RTCIceServer {
+                urls: vec!["stun:stun.l.google.com:19302".into()],
+                ..Default::default()
+            }]
+        },
         ..Default::default()
     };
     let peer = match run_signaling_operation(
@@ -782,6 +796,7 @@ async fn create_offer(peer: &Arc<RTCPeerConnection>) -> Result<PeerSignal, Strin
     Ok(PeerSignal {
         kind: PeerSignalKind::Offer,
         sdp: description.sdp,
+        id: None,
     })
 }
 
@@ -814,6 +829,7 @@ async fn accept_offer(
     Ok(PeerSignal {
         kind: PeerSignalKind::Answer,
         sdp: description.sdp,
+        id: None,
     })
 }
 
@@ -941,6 +957,7 @@ mod tests {
         let signal = PeerSignal {
             kind: PeerSignalKind::Offer,
             sdp: "v=0\r\n".into(),
+            id: None,
         };
         let encoded = serde_json::to_string(&signal).expect("signal serializes");
         assert_eq!(encoded, r#"{"type":"offer","sdp":"v=0\r\n"}"#);

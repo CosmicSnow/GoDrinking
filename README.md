@@ -60,4 +60,4 @@ Tauri 2, React 19, Rust. macOS only pra captura. Windows é um comentário sarc�
 
 ## licença
 
-Ainda não. Usa na LAN dos amigos e não finja que isso é um produto da Fortune 500.
+[PolyForm Noncommercial 1.0.0](LICENSE). Código visível. Uso pessoal, hobby e organizações não-comerciais: ok. Uso comercial: só com autorização explícita. Isto não é Open Source OSI.

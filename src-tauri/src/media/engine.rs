@@ -1,14 +1,18 @@
 use super::capabilities;
+use super::fanout::MediaFanout;
 use super::peer_transport::{PeerSignal, PeerTransport};
 use super::pipeline::{NativePipeline, PreviewState};
 use super::process_tap::{EncodedAudioPacket, ProcessTap};
-use super::room::LanRoom;
+use super::rendezvous::{StunarHost, StunarViewer};
+use super::room::{random_code, DirectRoom, LanRoom, OfferMint, ViewerCount};
+use super::session_gate::SessionGate;
 use super::types::{
-    CreateMediaSessionRequest, FrameRate, MediaLifecycleState, MediaSessionSnapshot,
-    NativeCaptureSource, NativeRunningApp, PeerTransportState, PreviewFrameEvent,
-    TransmissionQuality, UpdateMediaSessionRequest, VideoResolution,
+    CreateMediaSessionRequest, FrameRate, JoinMode, MediaLifecycleState, MediaSessionSnapshot,
+    NativeCaptureSource, NativeRunningApp, PeerTransportState, PreviewFrameEvent, RosterEntry,
+    TransmissionQuality, UpdateCredentialsRequest, UpdateMediaSessionRequest, VideoResolution,
 };
 use super::MediaCapabilities;
+use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -16,12 +20,20 @@ use std::thread;
 use std::time::Duration;
 
 const CONTROL_QUEUE_CAPACITY: usize = 32;
+const MAX_VIEWERS: usize = 8;
+
+struct ViewerLink {
+    id: String,
+    nickname: String,
+    peer: PeerTransport,
+}
 
 struct SessionRecord {
     id: String,
     generation: u64,
     request: CreateMediaSessionRequest,
-    peer: Option<PeerTransport>,
+    viewers: HashMap<String, ViewerLink>,
+    fanout: Option<MediaFanout>,
     // Kept alive with the session so capture and preview workers share the
     // bounded pipeline ownership boundary.
     _pipeline: NativePipeline,
@@ -31,6 +43,12 @@ struct SessionRecord {
     adapter: super::windows_capture::WindowsCaptureAdapter,
     native_capture_active: bool,
     room: Option<LanRoom>,
+    direct_room: Option<DirectRoom>,
+    // Stunar mode: the Host's Rendezvous connection (open + heartbeat + WS).
+    stunar: Option<Arc<StunarHost>>,
+    // Password/Admission/Ignore list for the Session. Shared with the room's
+    // TCP threads; connected Viewers are never touched by credential updates.
+    gate: Arc<SessionGate>,
     // The active process tap, if any. Dropped to silence system audio without
     // touching the peer; recreated against `audio_tx` when exclusions change.
     audio_tap: Option<ProcessTap>,
@@ -47,6 +65,8 @@ struct EngineState {
     next_session_id: u64,
     detail: String,
     preview: Arc<PreviewState>,
+    // Viewer-side Stunar WS, kept alive between ask and answer.
+    stunar_viewer: Option<StunarViewer>,
 }
 
 enum MediaCommand {
@@ -115,6 +135,7 @@ impl MediaEngine {
             session: None,
             next_session_id: 1,
             preview: Arc::new(PreviewState::new()),
+            stunar_viewer: None,
         }));
         let (control_tx, control_rx) = sync_channel(CONTROL_QUEUE_CAPACITY);
         let worker_state = Arc::clone(&state);
@@ -169,6 +190,7 @@ impl MediaEngine {
 
     pub fn snapshot(&self) -> MediaSessionSnapshot {
         self.apply_room_answer();
+        self.apply_stunar_accepts();
         self.state
             .lock()
             .map(|mut state| {
@@ -178,29 +200,201 @@ impl MediaEngine {
             .unwrap_or_else(|_| MediaSessionSnapshot::idle("Native media state is unavailable."))
     }
 
+    /// Stunar with Admission off accepts Viewers immediately on the
+    /// Rendezvous, so there is no pending step to trigger the mint. Polled
+    /// from `snapshot()`: any accepted Viewer without a ViewerLink gets an
+    /// offer minted and sent over the WS inbox.
+    fn apply_stunar_accepts(&self) {
+        let to_mint = self.state.lock().ok().and_then(|state| {
+            let session = state.session.as_ref()?;
+            let stunar = session.stunar.as_ref()?;
+            let accepted = stunar.accepted_roster();
+            Some(
+                accepted
+                    .into_iter()
+                    .filter(|(id, _)| !session.viewers.contains_key(id))
+                    .collect::<Vec<_>>(),
+            )
+        });
+        let Some(to_mint) = to_mint else {
+            return;
+        };
+        for (id, nickname) in to_mint {
+            let Ok(signal) = mint_viewer_offer(&self.state, &id, &nickname) else {
+                continue;
+            };
+            let stunar = self.state.lock().ok().and_then(|state| {
+                state
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.stunar.clone())
+            });
+            if let Some(stunar) = stunar {
+                let _ = stunar.send_signal(&id, &signal);
+            }
+        }
+    }
+
     fn apply_room_answer(&self) {
         let pending = self.state.lock().ok().and_then(|state| {
             let session = state.session.as_ref()?;
-            let answer = session.room.as_ref()?.take_answer()?;
-            Some((session.peer.as_ref()?.client(), answer))
+            session
+                .room
+                .as_ref()
+                .map(|room| room.take_answers())
+                .or_else(|| session.direct_room.as_ref().map(|room| room.take_answers()))
+                .or_else(|| session.stunar.as_ref().map(|stunar| stunar.take_answers()))
         });
-        if let Some((peer, answer)) = pending {
-            let _ = peer.set_answer(answer);
+        let Some(answers) = pending else {
+            return;
+        };
+        for answer in answers {
+            let client = self.state.lock().ok().and_then(|state| {
+                let session = state.session.as_ref()?;
+                let id = answer.id.as_deref()?;
+                Some(session.viewers.get(id)?.peer.client())
+            });
+            if let Some(client) = client {
+                let _ = client.set_answer(answer);
+            }
         }
+    }
+
+    pub fn kick_viewer(&self, id: &str) -> Result<MediaSessionSnapshot, MediaEngineError> {
+        let stunar = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| MediaEngineError::StatePoisoned)?;
+            state
+                .session
+                .as_ref()
+                .and_then(|session| session.stunar.clone())
+        };
+        if let Some(stunar) = stunar {
+            // Best-effort: the Viewer learns the kick via the Rendezvous WS.
+            let _ = stunar.kick(id);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MediaEngineError::StatePoisoned)?;
+        let session = state
+            .session
+            .as_mut()
+            .ok_or(MediaEngineError::NoActiveSession)?;
+        if let Some(viewer) = session.viewers.remove(id) {
+            if let Some(fanout) = session.fanout.as_ref() {
+                fanout.unsubscribe(id);
+            }
+            drop(viewer);
+        }
+        Ok(snapshot_from_state(&state))
+    }
+
+    /// Accepts a Pending Viewer. LAN/Direct wake the room's TCP thread via
+    /// the SessionGate; Stunar tells the Rendezvous, then mints the offer and
+    /// sends it over the WS inbox.
+    pub fn admit_viewer(&self, id: &str) -> Result<MediaSessionSnapshot, MediaEngineError> {
+        let stunar_path = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| MediaEngineError::StatePoisoned)?;
+            let session = state
+                .session
+                .as_ref()
+                .ok_or(MediaEngineError::NoActiveSession)?;
+            session.stunar.as_ref().map(|stunar| {
+                let nickname = stunar
+                    .pending_nickname(id)
+                    .unwrap_or_else(|| "Viewer".to_owned());
+                (stunar.clone(), nickname)
+            })
+        };
+        if let Some((stunar, nickname)) = stunar_path {
+            stunar
+                .decide(id, true)
+                .map_err(MediaEngineError::NativePeer)?;
+            let signal = mint_viewer_offer(&self.state, id, &nickname)
+                .map_err(MediaEngineError::NativePeer)?;
+            stunar
+                .send_signal(id, &signal)
+                .map_err(MediaEngineError::NativePeer)?;
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| MediaEngineError::StatePoisoned)?;
+            return Ok(snapshot_from_state(&state));
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| MediaEngineError::StatePoisoned)?;
+        let session = state
+            .session
+            .as_ref()
+            .ok_or(MediaEngineError::NoActiveSession)?;
+        session.gate.decide(id, true);
+        Ok(snapshot_from_state(&state))
+    }
+
+    /// Rejects a Pending Viewer. LAN/Direct send `REJECT` on the room TCP;
+    /// Stunar tells the Rendezvous (the Viewer's WS gets `rejected`).
+    pub fn reject_viewer(&self, id: &str) -> Result<MediaSessionSnapshot, MediaEngineError> {
+        let stunar = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| MediaEngineError::StatePoisoned)?;
+            state
+                .session
+                .as_ref()
+                .and_then(|session| session.stunar.clone())
+        };
+        if let Some(stunar) = stunar {
+            stunar
+                .decide(id, false)
+                .map_err(MediaEngineError::NativePeer)?;
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| MediaEngineError::StatePoisoned)?;
+            return Ok(snapshot_from_state(&state));
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| MediaEngineError::StatePoisoned)?;
+        let session = state
+            .session
+            .as_ref()
+            .ok_or(MediaEngineError::NoActiveSession)?;
+        session.gate.decide(id, false);
+        Ok(snapshot_from_state(&state))
+    }
+
+    /// Rotates Session credentials live (PRD-18) without touching Connected
+    /// Viewers, capture, the fanout, or the peers. Only new requests use the
+    /// new values:
+    /// - LAN: Room code rotates locally (UDP answers only the new code);
+    ///   Password updates the gate for new AUTH.
+    /// - Direct: no Room code; only Password/Admission apply.
+    /// - Stunar: code/password rotate on the Rendezvous (same room, same
+    ///   host_token, viewer tokens repointed); a code collision is an error
+    ///   and the old code stays. Admission is fixed at open there.
+    pub fn update_session_credentials(
+        &self,
+        request: UpdateCredentialsRequest,
+    ) -> Result<MediaSessionSnapshot, MediaEngineError> {
+        update_credentials_in_state(&self.state, request)
     }
 
     pub fn running_applications(&self) -> Result<Vec<NativeRunningApp>, MediaEngineError> {
         Ok(super::process_tap::running_applications())
     }
 
-    pub fn publish_peer_offer(&self, signal: PeerSignal) -> Result<(), MediaEngineError> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| MediaEngineError::StatePoisoned)?;
-        if let Some(room) = state.session.as_ref().and_then(|session| session.room.as_ref()) {
-            room.publish_offer(signal);
-        }
+    pub fn publish_peer_offer(&self, _signal: PeerSignal) -> Result<(), MediaEngineError> {
         Ok(())
     }
 
@@ -309,70 +503,104 @@ impl MediaEngine {
     }
 
     pub fn create_peer_offer(&self) -> Result<PeerSignal, MediaEngineError> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| MediaEngineError::StatePoisoned)?;
-        let peer = state
-            .session
-            .as_ref()
-            .and_then(|session| session.peer.as_ref())
-            .map(PeerTransport::client)
-            .ok_or_else(|| MediaEngineError::NativePeer("native peer is unavailable".into()))?;
-        drop(state);
-        let signal = peer.create_offer().map_err(MediaEngineError::NativePeer)?;
-        let _ = self.publish_peer_offer(signal.clone());
-        Ok(signal)
+        Err(MediaEngineError::NativePeer(
+            "offers are created when a viewer joins".into(),
+        ))
     }
 
-    pub fn accept_peer_offer(&self, offer: PeerSignal) -> Result<PeerSignal, MediaEngineError> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| MediaEngineError::StatePoisoned)?;
-        let peer = state
-            .session
-            .as_ref()
-            .and_then(|session| session.peer.as_ref())
-            .map(PeerTransport::client)
-            .ok_or_else(|| MediaEngineError::NativePeer("native peer is unavailable".into()))?;
-        drop(state);
-        peer.accept_offer(offer)
-            .map_err(MediaEngineError::NativePeer)
+    pub fn accept_peer_offer(&self, _offer: PeerSignal) -> Result<PeerSignal, MediaEngineError> {
+        Err(MediaEngineError::NativePeer(
+            "native accept_offer is unused; the viewer is browser WebRTC".into(),
+        ))
     }
 
     pub fn set_peer_answer(&self, answer: PeerSignal) -> Result<(), MediaEngineError> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| MediaEngineError::StatePoisoned)?;
-        let peer = state
-            .session
-            .as_ref()
-            .and_then(|session| session.peer.as_ref())
-            .map(PeerTransport::client)
-            .ok_or_else(|| MediaEngineError::NativePeer("native peer is unavailable".into()))?;
-        drop(state);
-        peer.set_answer(answer)
+        let client = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| MediaEngineError::StatePoisoned)?;
+            let session = state
+                .session
+                .as_ref()
+                .ok_or(MediaEngineError::NoActiveSession)?;
+            let id = answer
+                .id
+                .as_deref()
+                .ok_or_else(|| MediaEngineError::NativePeer("answer is missing viewer id".into()))?;
+            session
+                .viewers
+                .get(id)
+                .map(|viewer| viewer.peer.client())
+                .ok_or_else(|| MediaEngineError::NativePeer("unknown viewer".into()))?
+        };
+        client
+            .set_answer(answer)
             .map_err(MediaEngineError::NativePeer)
     }
 
     pub fn close_peer_transport(&self) -> Result<(), MediaEngineError> {
-        let state = self
+        let mut state = self
             .state
             .lock()
             .map_err(|_| MediaEngineError::StatePoisoned)?;
         let session = state
             .session
-            .as_ref()
+            .as_mut()
             .ok_or(MediaEngineError::NoActiveSession)?;
-        let peer = session
-            .peer
-            .as_ref()
-            .map(PeerTransport::client)
-            .ok_or_else(|| MediaEngineError::NativePeer("native peer is unavailable".into()))?;
-        drop(state);
-        peer.request_close().map_err(MediaEngineError::NativePeer)
+        let ids: Vec<String> = session.viewers.keys().cloned().collect();
+        for id in ids {
+            if let Some(fanout) = session.fanout.as_ref() {
+                fanout.unsubscribe(&id);
+            }
+            session.viewers.remove(&id);
+        }
+        Ok(())
+    }
+
+    /// Viewer-side Stunar: asks the Rendezvous and waits for the offer.
+    /// Returns the viewer_token (used as the "host" handle for the answer)
+    /// and keeps the WS open for `submit_stunar_answer`.
+    pub fn discover_stunar(
+        &self,
+        base: &str,
+        code: &str,
+        password: &str,
+        nickname: &str,
+    ) -> Result<(String, PeerSignal), MediaEngineError> {
+        let (token, offer, viewer) = super::rendezvous::discover_stunar_room(
+            base, code, password, nickname,
+        )
+        .map_err(MediaEngineError::NativePeer)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MediaEngineError::StatePoisoned)?;
+        state.stunar_viewer = Some(viewer);
+        Ok((token, offer))
+    }
+
+    /// Viewer-side Stunar: sends the answer signal over the stored WS.
+    pub fn submit_stunar_answer(&self, answer: PeerSignal) -> Result<(), MediaEngineError> {
+        let viewer = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| MediaEngineError::StatePoisoned)?;
+            state
+                .stunar_viewer
+                .take()
+                .ok_or_else(|| MediaEngineError::NativePeer("no stunar session".into()))?
+        };
+        super::rendezvous::submit_stunar_answer(viewer, &answer)
+            .map_err(MediaEngineError::NativePeer)
+    }
+
+    /// Viewer-side Stunar: drops the stored WS (disconnect).
+    pub fn close_stunar_viewer(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.stunar_viewer = None;
+        }
     }
 }
 
@@ -414,6 +642,27 @@ fn create_in_state(
         // existing session available for an explicit Stop/retry.
         stop_in_state(state)?;
     }
+    // Stunar opens the room on the Rendezvous before anything else starts,
+    // so a failure (missing URL, unreachable relay) aborts cleanly.
+    let stunar = match request.join_mode {
+        JoinMode::Stunar => {
+            let base = request.rendezvous_url.as_deref().ok_or_else(|| {
+                MediaEngineError::NativePeer("Set the Stunar URL in settings.".into())
+            })?;
+            let code = random_code();
+            Some(Arc::new(
+                StunarHost::start(
+                    base,
+                    &code,
+                    &request.password,
+                    &request.nickname,
+                    request.admission,
+                )
+                .map_err(MediaEngineError::NativePeer)?,
+            ))
+        }
+        JoinMode::Lan | JoinMode::Direct => None,
+    };
     let (capabilities, id, preview) = {
         let mut state = state.lock().map_err(|_| MediaEngineError::StatePoisoned)?;
         if !state.capabilities.supported {
@@ -450,28 +699,13 @@ fn create_in_state(
     } else {
         (None, None, None)
     };
-    let peer = if capabilities.native_peer_transport_implemented {
-        let frame_rate = match request.effective_frame_rate() {
-            super::types::FrameRate::Fps60 => 60,
-            super::types::FrameRate::Fps30 => 30,
-        };
-        let frame_duration = Duration::from_nanos(1_000_000_000 / frame_rate);
-        match PeerTransport::new(
+    let fanout = if capabilities.native_peer_transport_implemented {
+        Some(MediaFanout::start(
             pipeline.take_access_unit_receiver(),
             audio_rx,
-            Arc::clone(&pipeline.encoder_control),
-            frame_duration,
-        ) {
-            Ok(peer) => Some(peer),
-            Err(error) => {
-                if let Ok(mut state) = state.lock() {
-                    state.lifecycle = MediaLifecycleState::Idle;
-                    state.detail = format!("Native WebRTC peer start failed: {error}");
-                }
-                return Err(MediaEngineError::NativePeer(error));
-            }
-        }
+        ))
     } else {
+        let _ = audio_rx;
         None
     };
     #[cfg(target_os = "macos")]
@@ -512,7 +746,37 @@ fn create_in_state(
     }
     let native_capture_active = (cfg!(target_os = "macos") && capabilities.screen_capture_kit)
         || (cfg!(target_os = "windows") && capabilities.windows_graphics_capture);
-    let room = LanRoom::start().ok();
+    let gate = Arc::new(SessionGate::new(request.password.clone(), request.admission));
+    let mint_state = Arc::clone(&state);
+    let mint: OfferMint = Arc::new(move |id: &str, nickname: &str| {
+        mint_viewer_offer(&mint_state, id, nickname)
+    });
+    let count_state = Arc::clone(&state);
+    let viewer_count: ViewerCount = Arc::new(move || {
+        count_state
+            .lock()
+            .ok()
+            .and_then(|state| state.session.as_ref().map(|session| session.viewers.len()))
+            .unwrap_or(0)
+    });
+    let room = match request.join_mode {
+        JoinMode::Lan => {
+            LanRoom::start(
+                Arc::clone(&mint),
+                Arc::clone(&gate),
+                Arc::clone(&viewer_count),
+                request.nickname.clone(),
+            )
+            .ok()
+        }
+        JoinMode::Direct | JoinMode::Stunar => None,
+    };
+    let direct_room = match request.join_mode {
+        JoinMode::Direct => {
+            DirectRoom::start(mint, Arc::clone(&gate), viewer_count, request.nickname.clone()).ok()
+        }
+        JoinMode::Lan | JoinMode::Stunar => None,
+    };
     let mut state = state.lock().map_err(|_| MediaEngineError::StatePoisoned)?;
     let audio_note = if request.system_audio && audio_tap.is_none() {
         " System audio could not start; video is still sharing."
@@ -525,7 +789,8 @@ fn create_in_state(
         id,
         generation: pipeline.generation,
         request,
-        peer,
+        viewers: HashMap::new(),
+        fanout,
         _pipeline: pipeline,
         #[cfg(target_os = "macos")]
         adapter,
@@ -533,14 +798,21 @@ fn create_in_state(
         adapter,
         native_capture_active,
         room,
+        direct_room,
+        stunar,
+        gate,
         audio_tap,
         audio_tx,
     });
     state.lifecycle = MediaLifecycleState::Running;
     state.detail = if capabilities.native_capture_implemented {
-        format!(
-            "Native capture is running. Share the session code on your LAN.{audio_note}"
-        )
+        let share_note = match state.session.as_ref().expect("session was set").request.join_mode
+        {
+            JoinMode::Lan => "Share the session code on your LAN.",
+            JoinMode::Direct => "Share your address and port.",
+            JoinMode::Stunar => "Share the session code. Needs the relay.",
+        };
+        format!("Native capture is running. {share_note}{audio_note}")
     } else {
         "Control session is running; native capture is not implemented on this platform.".into()
     };
@@ -612,6 +884,65 @@ fn update_in_state(
     Ok(snapshot_from_state(&state))
 }
 
+/// Rotates Session credentials live (PRD-18) without touching Connected
+/// Viewers, capture, the fanout, or the peers. Only new requests use the
+/// new values:
+/// - LAN: Room code rotates locally (UDP answers only the new code);
+///   Password updates the gate for new AUTH.
+/// - Direct: no Room code; only Password/Admission apply.
+/// - Stunar: code/password rotate on the Rendezvous (same room, same
+///   host_token, viewer tokens repointed); a code collision is an error
+///   and the old code stays. Admission is fixed at open there.
+fn update_credentials_in_state(
+    state: &Arc<Mutex<EngineState>>,
+    request: UpdateCredentialsRequest,
+) -> Result<MediaSessionSnapshot, MediaEngineError> {
+    // Validate the code format before any network call.
+    if let Some(code) = request.code.as_deref() {
+        let normalized = code.trim().to_ascii_uppercase();
+        if normalized.len() != 6 || !normalized.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+            return Err(MediaEngineError::NativePeer(
+                "Room code must be 6 letters or numbers.".into(),
+            ));
+        }
+    }
+    let stunar = {
+        let state = state.lock().map_err(|_| MediaEngineError::StatePoisoned)?;
+        let session = state
+            .session
+            .as_ref()
+            .ok_or(MediaEngineError::NoActiveSession)?;
+        // LAN rotate is a local mutex update; safe under the state lock.
+        if let Some(room) = session.room.as_ref() {
+            if let Some(code) = request.code.as_deref() {
+                room.rotate_code(code).map_err(MediaEngineError::NativePeer)?;
+            }
+        }
+        session.stunar.clone()
+    };
+    // Stunar rotate is a network call; run it without the state lock.
+    if let Some(stunar) = stunar {
+        if request.code.is_some() || request.password.is_some() {
+            stunar
+                .rotate(request.code.as_deref(), request.password.as_deref())
+                .map_err(MediaEngineError::NativePeer)?;
+        }
+    }
+    // Local gate: new AUTH uses the new Password; Connected Viewers stay.
+    let state = state.lock().map_err(|_| MediaEngineError::StatePoisoned)?;
+    let session = state
+        .session
+        .as_ref()
+        .ok_or(MediaEngineError::NoActiveSession)?;
+    if let Some(password) = request.password.as_deref() {
+        session.gate.set_password(password.to_owned());
+    }
+    if let Some(admission) = request.admission {
+        session.gate.set_admission(admission);
+    }
+    Ok(snapshot_from_state(&state))
+}
+
 fn stop_in_state(
     state: &Arc<Mutex<EngineState>>,
 ) -> Result<MediaSessionSnapshot, MediaEngineError> {
@@ -623,6 +954,11 @@ fn stop_in_state(
         state.lifecycle = MediaLifecycleState::Stopping;
         state.session.take().expect("active session checked above")
     };
+    // Stunar: close the room on the Rendezvous (best-effort) and stop the
+    // heartbeat/WS worker before releasing the rest of the session.
+    if let Some(stunar) = session.stunar.as_ref() {
+        stunar.close();
+    }
     #[cfg(target_os = "macos")]
     if let Err(error) = session.adapter.stop_capture(session.generation) {
         if let Ok(mut state) = state.lock() {
@@ -701,15 +1037,54 @@ fn snapshot_from_state(state: &EngineState) -> MediaSessionSnapshot {
         .or_else(|| session.adapter.failure_detail());
     #[cfg(not(target_os = "macos"))]
     let native_failure_detail = session._pipeline.state.failure();
-    let peer_status = session.peer.as_ref().map(|peer| peer.status());
-    let peer_failed = peer_status
-        .as_ref()
-        .is_some_and(|status| status.state == PeerTransportState::Failed);
+    let mut roster: Vec<RosterEntry> = session
+        .viewers
+        .values()
+        .map(|viewer| {
+            let status = viewer.peer.status();
+            RosterEntry {
+                id: viewer.id.clone(),
+                nickname: viewer.nickname.clone(),
+                state: status.state,
+            }
+        })
+        .collect();
+    // Pending Viewers (Admission on) have no PeerTransport yet; they appear
+    // with the dedicated Pending state so the UI can offer Accept/Decline.
+    for (id, nickname) in session.gate.pending_roster() {
+        roster.push(RosterEntry {
+            id,
+            nickname,
+            state: PeerTransportState::Pending,
+        });
+    }
+    // Stunar pending Viewers live on the Rendezvous, not in the gate.
+    if let Some(stunar) = session.stunar.as_ref() {
+        for (id, nickname) in stunar.pending_roster() {
+            roster.push(RosterEntry {
+                id,
+                nickname,
+                state: PeerTransportState::Pending,
+            });
+        }
+    }
+    let peer_status = session
+        .viewers
+        .values()
+        .map(|viewer| viewer.peer.status())
+        .max_by_key(|status| match status.state {
+            PeerTransportState::Connected => 5,
+            PeerTransportState::Connecting => 4,
+            PeerTransportState::New | PeerTransportState::Starting => 3,
+            PeerTransportState::Failed => 2,
+            PeerTransportState::Disconnected | PeerTransportState::Closed => 1,
+            PeerTransportState::Pending | PeerTransportState::Disabled => 0,
+        });
     let preview_diagnostics = session._pipeline.preview_diagnostics();
     MediaSessionSnapshot {
         state: if native_cleanup_pending {
             MediaLifecycleState::CleanupPending
-        } else if native_failed || peer_failed {
+        } else if native_failed {
             MediaLifecycleState::Failed
         } else {
             state.lifecycle
@@ -742,27 +1117,56 @@ fn snapshot_from_state(state: &EngineState) -> MediaSessionSnapshot {
         peer_detail: peer_status
             .map(|status| status.detail)
             .unwrap_or_else(|| "Native peer transport is unavailable.".into()),
-        session_code: session.room.as_ref().map(|room| room.code.clone()),
+        session_code: session
+            .room
+            .as_ref()
+            .map(|room| room.code())
+            .or_else(|| session.stunar.as_ref().map(|stunar| stunar.code())),
         lan_addresses: session
             .room
             .as_ref()
             .map(|_| LanRoom::addresses())
             .unwrap_or_default(),
         lan_port: session.room.as_ref().map(|room| room.port),
+        roster,
+        password_set: session.gate.password_set(),
+        admission: session.gate.admission(),
+        join_mode: session.request.join_mode,
+        direct_listen_port: session.direct_room.as_ref().map(|room| room.port),
+        direct_addresses: session
+            .direct_room
+            .as_ref()
+            .map(|room| room.addresses())
+            .unwrap_or_default(),
+        direct_mapping: session
+            .direct_room
+            .as_ref()
+            .map(|room| room.mapping)
+            .unwrap_or(false),
+        stunar_state: session.stunar.as_ref().map(|stunar| stunar.state()),
     }
 }
 
 fn refresh_native_state(state: &mut EngineState) {
-    if let Some(session) = state.session.as_ref() {
+    if let Some(session) = state.session.as_mut() {
         if let Some(detail) = session._pipeline.state.failure() {
             state.lifecycle = MediaLifecycleState::Failed;
             state.detail = detail;
         }
-        if let Some(peer) = session.peer.as_ref() {
-            if peer.status().state == PeerTransportState::Failed {
-                state.lifecycle = MediaLifecycleState::Failed;
-                state.detail = peer.status().detail;
+        // A Viewer whose WebRTC peer failed is gone for good (the Viewer
+        // re-joins with a fresh connection). Drop it so the Roster and the
+        // fanout do not keep a dead entry.
+        let failed: Vec<String> = session
+            .viewers
+            .iter()
+            .filter(|(_, viewer)| viewer.peer.status().state == PeerTransportState::Failed)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in failed {
+            if let Some(fanout) = session.fanout.as_ref() {
+                fanout.unsubscribe(&id);
             }
+            session.viewers.remove(&id);
         }
     }
     #[cfg(target_os = "macos")]
@@ -783,6 +1187,65 @@ fn refresh_native_state(state: &mut EngineState) {
     }
 }
 
+fn mint_viewer_offer(
+    state: &Arc<Mutex<EngineState>>,
+    id: &str,
+    nickname: &str,
+) -> Result<PeerSignal, String> {
+    let (video_rx, audio_rx, encoder_control, frame_duration, join_mode) = {
+        let mut guard = state.lock().map_err(|_| "media state is unavailable".to_owned())?;
+        let session = guard
+            .session
+            .as_mut()
+            .ok_or_else(|| "no media session is active".to_owned())?;
+        if session.viewers.len() >= MAX_VIEWERS {
+            return Err("session is full".into());
+        }
+        let fanout = session
+            .fanout
+            .as_ref()
+            .ok_or_else(|| "peer transport is unavailable".to_owned())?;
+        let (video_rx, audio_rx) = fanout.subscribe(id);
+        let frame_rate = match session.request.effective_frame_rate() {
+            FrameRate::Fps60 => 60,
+            FrameRate::Fps30 => 30,
+        };
+        (
+            video_rx,
+            audio_rx,
+            Arc::clone(&session._pipeline.encoder_control),
+            Duration::from_nanos(1_000_000_000 / frame_rate),
+            session.request.join_mode,
+        )
+    };
+    let peer = PeerTransport::new(video_rx, audio_rx, encoder_control, frame_duration, join_mode)?;
+    let mut signal = peer
+        .client()
+        .create_offer()
+        .map_err(|error| error.to_string())?;
+    signal.id = Some(id.to_owned());
+    let mut guard = state.lock().map_err(|_| "media state is unavailable".to_owned())?;
+    let session = guard
+        .session
+        .as_mut()
+        .ok_or_else(|| "no media session is active".to_owned())?;
+    if session.viewers.len() >= MAX_VIEWERS {
+        if let Some(fanout) = session.fanout.as_ref() {
+            fanout.unsubscribe(id);
+        }
+        return Err("session is full".into());
+    }
+    session.viewers.insert(
+        id.to_owned(),
+        ViewerLink {
+            id: id.to_owned(),
+            nickname: nickname.to_owned(),
+            peer,
+        },
+    );
+    Ok(signal)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::capabilities::AppAudioExclusionSupport;
@@ -790,13 +1253,13 @@ mod tests {
     use super::super::pipeline::PreviewState;
     use super::super::types::MediaLifecycleState;
     use super::super::types::{
-        CaptureSource, FrameRate, PreviewFrameEvent, TransmissionQuality, UpdateMediaSessionRequest,
-        VideoResolution,
+        CaptureSource, FrameRate, JoinMode, PreviewFrameEvent, TransmissionQuality,
+        UpdateCredentialsRequest, UpdateMediaSessionRequest, VideoResolution,
     };
-    use super::{
-        create_in_state, refresh_native_state, snapshot_from_state, stop_in_state, update_in_state,
-        EngineState, MediaEngineError,
-    };
+use super::{
+    create_in_state, refresh_native_state, snapshot_from_state, stop_in_state,
+    update_credentials_in_state, update_in_state, EngineState, MediaEngineError,
+};
     use std::sync::{Arc, Mutex};
 
     fn test_state() -> Arc<Mutex<EngineState>> {
@@ -822,6 +1285,7 @@ mod tests {
             next_session_id: 1,
             detail: "idle".into(),
             preview: Arc::new(PreviewState::new()),
+            stunar_viewer: None,
         }))
     }
 
@@ -834,6 +1298,11 @@ mod tests {
             system_audio: false,
             excluded_apps: vec!["Discord".into()],
             quality: super::super::types::TransmissionQuality::High,
+            password: String::new(),
+            nickname: "Host".into(),
+            admission: false,
+            join_mode: JoinMode::Lan,
+            rendezvous_url: None,
         }
     }
 
@@ -863,6 +1332,24 @@ mod tests {
         assert_eq!(
             create_in_state(&state, request()),
             Err(MediaEngineError::UnsupportedPlatform)
+        );
+        assert_eq!(
+            state.lock().expect("test state").lifecycle,
+            MediaLifecycleState::Idle
+        );
+    }
+
+    #[test]
+    fn stunar_without_url_is_rejected_before_starting() {
+        let state = test_state();
+        let mut request = request();
+        request.join_mode = JoinMode::Stunar;
+        request.rendezvous_url = None;
+        assert_eq!(
+            create_in_state(&state, request),
+            Err(MediaEngineError::NativePeer(
+                "Set the Stunar URL in settings.".into()
+            ))
         );
         assert_eq!(
             state.lock().expect("test state").lifecycle,
@@ -1012,5 +1499,62 @@ mod tests {
             ),
             Err(MediaEngineError::NoActiveSession)
         );
+    }
+
+    #[test]
+    fn rotate_credentials_keeps_the_session_and_updates_the_code() {
+        let state = test_state();
+        create_in_state(&state, request()).expect("session should start");
+        let snapshot = update_credentials_in_state(
+            &state,
+            UpdateCredentialsRequest {
+                code: Some("xyz789".into()),
+                password: Some("nova".into()),
+                admission: None,
+            },
+        )
+        .expect("rotate should succeed");
+        assert_eq!(snapshot.state, MediaLifecycleState::Running);
+        assert_eq!(snapshot.session_code.as_deref(), Some("XYZ789"));
+        assert!(snapshot.password_set);
+        // The session (and its room) is still alive.
+        let stored = state.lock().expect("test state");
+        let session = stored.session.as_ref().expect("session should exist");
+        assert_eq!(session.room.as_ref().expect("lan room").code(), "XYZ789");
+        assert!(session.gate.password_set());
+    }
+
+    #[test]
+    fn rotate_credentials_rejects_invalid_codes_and_keeps_old_values() {
+        let state = test_state();
+        create_in_state(&state, request()).expect("session should start");
+        let original = state
+            .lock()
+            .expect("test state")
+            .session
+            .as_ref()
+            .expect("session")
+            .room
+            .as_ref()
+            .expect("lan room")
+            .code();
+        let result = update_credentials_in_state(
+            &state,
+            UpdateCredentialsRequest {
+                code: Some("ab".into()),
+                password: None,
+                admission: None,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(MediaEngineError::NativePeer(
+                "Room code must be 6 letters or numbers.".into()
+            ))
+        );
+        let stored = state.lock().expect("test state");
+        let session = stored.session.as_ref().expect("session should exist");
+        assert_eq!(session.room.as_ref().expect("lan room").code(), original);
+        assert_eq!(stored.lifecycle, MediaLifecycleState::Running);
     }
 }

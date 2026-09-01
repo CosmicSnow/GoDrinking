@@ -95,6 +95,33 @@ impl TransmissionQuality {
     }
 }
 
+fn default_host_nickname() -> String {
+    "Host".into()
+}
+
+/// How a Viewer finds the Host. LAN and Direct are implemented; Stunar needs
+/// the Rendezvous (Fatia 4/5).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JoinMode {
+    #[default]
+    Lan,
+    Direct,
+    Stunar,
+}
+
+/// Health of the Host's connection to the Rendezvous (Stunar mode only).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StunarState {
+    /// Opening the room / connecting the WS inbox.
+    Calling,
+    /// WS inbox connected and heartbeats succeeding.
+    Live,
+    /// Network failure; the room will expire if it lasts.
+    Unreachable,
+}
+
 /// Control input for a native capture session.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CreateMediaSessionRequest {
@@ -108,6 +135,22 @@ pub struct CreateMediaSessionRequest {
     pub excluded_apps: Vec<String>,
     #[serde(default)]
     pub quality: TransmissionQuality,
+    /// Optional Password for the Session. Empty means no Password.
+    #[serde(default)]
+    pub password: String,
+    /// Host Nickname shown in the Roster context. Not an account.
+    #[serde(default = "default_host_nickname")]
+    pub nickname: String,
+    /// Admission rule: when true, the Host must accept each Viewer before
+    /// signaling starts.
+    #[serde(default)]
+    pub admission: bool,
+    /// How Viewers find this Session.
+    #[serde(default)]
+    pub join_mode: JoinMode,
+    /// Rendezvous base URL, only used by Stunar (not in this fatia).
+    #[serde(default)]
+    pub rendezvous_url: Option<String>,
 }
 
 impl CreateMediaSessionRequest {
@@ -131,6 +174,20 @@ pub struct UpdateMediaSessionRequest {
     pub quality: TransmissionQuality,
     pub system_audio: bool,
     pub excluded_apps: Vec<String>,
+}
+
+/// Live credential rotation for an active Session (PRD-18). Connected
+/// Viewers are never dropped; only new requests use the new values.
+/// `None` keeps the current value; `Some("")` removes the Password;
+/// `Some("ABC123")` sets a new Room code (LAN/Stunar only).
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UpdateCredentialsRequest {
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub admission: Option<bool>,
 }
 
 /// Metadata only; no native source handles cross the command boundary.
@@ -198,6 +255,28 @@ pub enum PeerTransportState {
     Disconnected,
     Failed,
     Closed,
+    /// Waiting for the Host's Admission decision. Only used for Roster
+    /// entries; a real PeerTransport never reports this state.
+    Pending,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RosterEntry {
+    pub id: String,
+    pub nickname: String,
+    pub state: PeerTransportState,
+}
+
+/// One copyable address the Host can share for Direct joins.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DirectAddress {
+    pub ip: String,
+    pub port: u16,
+    pub version: u8,
+    /// `"lan"` | `"public"` | `"ipv6"`.
+    pub kind: String,
+    /// The exact string to copy: `ip:port` or `[ipv6]:port`.
+    pub copy: String,
 }
 
 /// Safe, small state returned to the WebView. Frame buffers and pipeline
@@ -223,6 +302,24 @@ pub struct MediaSessionSnapshot {
     pub session_code: Option<String>,
     pub lan_addresses: Vec<String>,
     pub lan_port: Option<u16>,
+    pub roster: Vec<RosterEntry>,
+    /// True when the Session has a Password. The Password itself never leaves
+    /// the native side.
+    pub password_set: bool,
+    /// Admission rule of the Session.
+    pub admission: bool,
+    /// Join mode of the Session.
+    pub join_mode: JoinMode,
+    /// Direct mode: the TCP Signaling port the Host listens on.
+    pub direct_listen_port: Option<u16>,
+    /// Direct mode: copyable addresses (lan/public/ipv6) for the Host to share.
+    pub direct_addresses: Vec<DirectAddress>,
+    /// Direct mode: true when a NAT port mapping was created. Always false in
+    /// this fatia (UPnP/NAT-PMP/PCP are stubbed).
+    pub direct_mapping: bool,
+    /// Stunar mode: health of the Host's Rendezvous connection. None for
+    /// LAN/Direct sessions.
+    pub stunar_state: Option<StunarState>,
 }
 
 impl MediaSessionSnapshot {
@@ -247,6 +344,14 @@ impl MediaSessionSnapshot {
             session_code: None,
             lan_addresses: Vec::new(),
             lan_port: None,
+            roster: Vec::new(),
+            password_set: false,
+            admission: false,
+            join_mode: JoinMode::Lan,
+            direct_listen_port: None,
+            direct_addresses: Vec::new(),
+            direct_mapping: false,
+            stunar_state: None,
         }
     }
 }

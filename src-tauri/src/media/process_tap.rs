@@ -29,6 +29,7 @@ use objc2::msg_send;
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSArray, NSNumber, NSString, NSUUID};
 
+#[derive(Clone)]
 pub(crate) struct EncodedAudioPacket {
     pub(crate) data: Vec<u8>,
     pub(crate) duration: Duration,

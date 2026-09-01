@@ -1,9 +1,11 @@
 mod media;
 
 use media::{
-    CreateMediaSessionRequest, MediaEngine, MediaSessionSnapshot, NativeCaptureSource,
-    NativeRunningApp, PeerSignal, PreviewFrameEvent, UpdateMediaSessionRequest,
+    CreateMediaSessionRequest, JoinMode, MediaEngine, MediaSessionSnapshot, NativeCaptureSource,
+    NativeRunningApp, PeerSignal, PreviewFrameEvent, UpdateCredentialsRequest,
+    UpdateMediaSessionRequest,
 };
+use std::net::IpAddr;
 use tauri::State;
 
 /// Returns the native media APIs known to be available on this platform.
@@ -119,6 +121,21 @@ fn close_media_peer_transport(engine: State<'_, MediaEngine>) -> Result<(), Stri
         .map_err(|error| error.to_string())
 }
 
+#[derive(serde::Deserialize)]
+struct KickViewerRequest {
+    id: String,
+}
+
+#[tauri::command]
+fn kick_media_viewer(
+    engine: State<'_, MediaEngine>,
+    request: KickViewerRequest,
+) -> Result<MediaSessionSnapshot, String> {
+    engine
+        .kick_viewer(&request.id)
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 fn get_media_running_apps(
     engine: State<'_, MediaEngine>,
@@ -130,28 +147,181 @@ fn get_media_running_apps(
 
 #[derive(serde::Deserialize)]
 struct JoinRoomRequest {
+    #[serde(default)]
     code: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    nickname: String,
+    #[serde(default)]
+    join_mode: JoinMode,
+    /// Direct mode: IP literal + porta tudo junto (ex. 192.168.1.40:41234 ou
+    /// [2001:db8::1]:41234). DNS rejeitado — o Viewer cola o que o Host mostrou.
+    #[serde(default)]
+    host: Option<String>,
+    /// Campo legado: alguns clientes antigos separavam host/porta. Mantido para
+    /// compatibilidade mas ignorado se `host` já contiver `:`.
+    #[serde(default)]
+    port: Option<u16>,
+    /// Stunar mode: the Rendezvous base URL.
+    #[serde(default)]
+    rendezvous_url: Option<String>,
+}
+
+/// Parses `1.2.3.4:41234`, `[2001:db8::1]:41234`, or a bare IPv6 with a
+/// trailing port. Only IP literals; anything else is `invalid_address`.
+fn parse_direct_host(input: &str) -> Result<std::net::SocketAddr, String> {
+    let invalid = || "Could not reach that address.".to_owned();
+    let input = input.trim();
+    if let Some(rest) = input.strip_prefix('[') {
+        let (ip, port) = rest.split_once(']').ok_or_else(invalid)?;
+        let port = port.strip_prefix(':').ok_or_else(invalid)?.parse::<u16>().map_err(|_| invalid())?;
+        let ip: IpAddr = ip.parse().map_err(|_| invalid())?;
+        Ok(std::net::SocketAddr::new(ip, port))
+    } else {
+        let (ip, port) = input.rsplit_once(':').ok_or_else(invalid)?;
+        let port = port.parse::<u16>().map_err(|_| invalid())?;
+        let ip: IpAddr = ip.parse().map_err(|_| invalid())?;
+        Ok(std::net::SocketAddr::new(ip, port))
+    }
 }
 
 #[tauri::command]
-fn discover_media_room(request: JoinRoomRequest) -> Result<(String, PeerSignal), String> {
-    let (host, offer) = media::discover_room(&request.code)?;
-    Ok((host.to_string(), offer))
+async fn discover_media_room(
+    engine: State<'_, MediaEngine>,
+    request: JoinRoomRequest,
+) -> Result<(String, PeerSignal, String), String> {
+    match request.join_mode {
+        JoinMode::Lan | JoinMode::Direct => {
+            tauri::async_runtime::spawn_blocking(move || match request.join_mode {
+                JoinMode::Lan => {
+                    let (host, offer, host_nickname) =
+                        media::discover_room(&request.code, &request.password, &request.nickname)?;
+                    Ok((host.to_string(), offer, host_nickname))
+                }
+                JoinMode::Direct => {
+                    let raw_host = request
+                        .host
+                        .as_deref()
+                        .ok_or_else(|| "Could not reach that address.".to_owned())?
+                        .trim();
+                    if raw_host.is_empty() {
+                        return Err("Could not reach that address.".to_owned());
+                    }
+                    // O Viewer agora manda IP:porta tudo junto em `host`
+                    // (ex. 192.168.1.10:41234 ou [2001:db8::1]:41234).
+                    // Mantemos compat com clientes antigos que separavam host/port.
+                    let addr = if let Ok(addr) = parse_direct_host(raw_host) {
+                        addr
+                    } else if let Some(port) = request.port {
+                        parse_direct_host(&format!("{raw_host}:{port}"))?
+                    } else {
+                        return Err("Could not reach that address.".to_owned());
+                    };
+                    let (offer, host_nickname) =
+                        media::discover_direct(addr, &request.password, &request.nickname)?;
+                    Ok((addr.to_string(), offer, host_nickname))
+                }
+                JoinMode::Stunar => unreachable!("stunar handled outside spawn_blocking"),
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        }
+        JoinMode::Stunar => {
+            let engine = engine.inner().clone();
+            let base = request
+                .rendezvous_url
+                .clone()
+                .ok_or_else(|| "Set the Stunar URL in settings.".to_owned())?;
+            tauri::async_runtime::spawn_blocking(move || {
+                engine
+                    .discover_stunar(&base, &request.code, &request.password, &request.nickname)
+                    .map(|(token, offer)| (token, offer, String::new()))
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
 struct SubmitAnswerRequest {
     host: String,
     answer: PeerSignal,
+    #[serde(default)]
+    join_mode: JoinMode,
 }
 
 #[tauri::command]
-fn submit_media_room_answer(request: SubmitAnswerRequest) -> Result<(), String> {
-    let host = request
-        .host
-        .parse()
-        .map_err(|_| "invalid room host address".to_owned())?;
-    media::submit_room_answer(host, &request.answer)
+async fn submit_media_room_answer(
+    engine: State<'_, MediaEngine>,
+    request: SubmitAnswerRequest,
+) -> Result<(), String> {
+    match request.join_mode {
+        JoinMode::Stunar => {
+            let engine = engine.inner().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                engine
+                    .submit_stunar_answer(request.answer)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        }
+        JoinMode::Lan | JoinMode::Direct => {
+            tauri::async_runtime::spawn_blocking(move || {
+                let host = request
+                    .host
+                    .parse()
+                    .map_err(|_| "invalid room host address".to_owned())?;
+                media::submit_room_answer(host, &request.answer)
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        }
+    }
+}
+
+/// Viewer-side Stunar cleanup: drops the stored WS (called on Disconnect).
+#[tauri::command]
+fn stunar_viewer_close(engine: State<'_, MediaEngine>) {
+    engine.close_stunar_viewer();
+}
+
+#[derive(serde::Deserialize)]
+struct ViewerDecisionRequest {
+    id: String,
+}
+
+#[tauri::command]
+fn admit_media_viewer(
+    engine: State<'_, MediaEngine>,
+    request: ViewerDecisionRequest,
+) -> Result<MediaSessionSnapshot, String> {
+    engine
+        .admit_viewer(&request.id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn reject_media_viewer(
+    engine: State<'_, MediaEngine>,
+    request: ViewerDecisionRequest,
+) -> Result<MediaSessionSnapshot, String> {
+    engine
+        .reject_viewer(&request.id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn update_media_session_credentials(
+    engine: State<'_, MediaEngine>,
+    request: UpdateCredentialsRequest,
+) -> Result<MediaSessionSnapshot, String> {
+    engine
+        .update_session_credentials(request)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -172,9 +342,14 @@ pub fn run() {
             accept_media_peer_offer,
             set_media_peer_answer,
             close_media_peer_transport,
+            kick_media_viewer,
+            admit_media_viewer,
+            reject_media_viewer,
+            update_media_session_credentials,
             get_media_running_apps,
             discover_media_room,
-            submit_media_room_answer
+            submit_media_room_answer,
+            stunar_viewer_close
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

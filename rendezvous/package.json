@@ -1,0 +1,17 @@
+{
+  "name": "godrinking-rendezvous",
+  "version": "0.1.0",
+  "private": true,
+  "description": "goDrinking Rendezvous: RAM-only signaling server for Stunar join mode. Presents Host and Viewer, never touches media.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node --watch server.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

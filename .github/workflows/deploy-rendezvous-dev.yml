@@ -1,0 +1,79 @@
+name: Deploy Rendezvous DEV
+
+on:
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    name: Build Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set image name
+        run: echo "IMAGE_NAME=${REGISTRY}/${GITHUB_REPOSITORY,,}/rendezvous" >> "$GITHUB_ENV"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push linux/arm64 image
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 60
+          max_attempts: 3
+          retry_wait_seconds: 30
+          command: |
+            docker buildx build \
+              --platform linux/arm64 \
+              --push \
+              -t "${IMAGE_NAME}:dev" \
+              -t "${IMAGE_NAME}:dev-${GITHUB_SHA}" \
+              ./rendezvous
+
+  deploy:
+    name: Deploy DEV
+    runs-on: ${{ vars.DEPLOY_RUNNER || 'oracion' }}
+    needs: build
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set image name
+        run: echo "IMAGE_NAME=${REGISTRY}/${GITHUB_REPOSITORY,,}/rendezvous" >> "$GITHUB_ENV"
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Write .env.dev from secret
+        working-directory: rendezvous
+        run: printf '%s\n' "${{ secrets.ENV_RENDEZVOUS_DEV }}" > .env.dev
+
+      - name: Pull and deploy
+        working-directory: rendezvous
+        run: |
+          docker compose -f docker-compose.app.yml --profile dev pull
+          docker compose -f docker-compose.app.yml --profile dev stop godrinking-rendezvous-dev || true
+          docker compose -f docker-compose.app.yml --profile dev up -d --force-recreate
+          docker image prune -f

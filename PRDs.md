@@ -2,6 +2,8 @@
 
 Independent, testable requirements. Implement in order. Do not skip PRD-8.
 
+Join modes (LAN / Direct / Stunar), Roster, Rendezvous e licença: **PRD-13 a PRD-20** em [`docs/connectivity/`](docs/connectivity/README.md). Não implementar isso a partir deste ficheiro.
+
 ## PRD-8 — Watch theater: fullscreen and video-only
 
 **Problem:** Fullscreen does nothing. Video only paints a black window.

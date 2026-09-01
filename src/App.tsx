@@ -29,8 +29,10 @@ function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
 type Source = { id: number; kind: "display" | "window"; title?: string; application_name?: string };
 type RunningApp = { name: string; bundle_id?: string | null; pid: number; emitting_audio?: boolean };
 type Capabilities = { supported: boolean; screen_capture_kit: boolean; source_enumeration_available: boolean; screen_recording_authorization: "granted" | "not_granted" | "unsupported"; app_audio_exclusion: "enhanced" | "best_effort" | "unsupported"; detail: string };
-type Snapshot = { state: string; session_id: string | null; source_id: number | null; native_capture_active: boolean; preview_callback_count: number; preview_frame_count: number; preview_dropped_count: number; preview_error: string | null; detail: string; peer_state: string; peer_detail: string; session_code: string | null; lan_addresses: string[]; lan_port: number | null };
-type Signal = { type: "offer" | "answer"; sdp: string };
+type RosterEntry = { id: string; nickname: string; state: string };
+type DirectAddress = { ip: string; port: number; version: number; kind: string; copy: string };
+type Snapshot = { state: string; session_id: string | null; source_id: number | null; native_capture_active: boolean; preview_callback_count: number; preview_frame_count: number; preview_dropped_count: number; preview_error: string | null; detail: string; peer_state: string; peer_detail: string; session_code: string | null; lan_addresses: string[]; lan_port: number | null; roster?: RosterEntry[]; password_set?: boolean; admission?: boolean; join_mode?: string; direct_listen_port?: number | null; direct_addresses?: DirectAddress[]; direct_mapping?: boolean; stunar_state?: string | null };
+type Signal = { type: "offer" | "answer"; sdp: string; id?: string };
 
 const invokeMedia = <T,>(command: string, args?: Record<string, unknown>) => invoke<T>(command, args);
 const diagnosticError = (error: unknown, fallback: string) => error instanceof Error ? error.message : typeof error === "string" ? error : fallback;
@@ -107,11 +109,23 @@ function App() {
   const [playingOnly, setPlayingOnly] = useState(false);
   const [session, setSession] = useState<Snapshot | null>(null);
   const [joinCode, setJoinCode] = useState("");
+  const [joinMode, setJoinMode] = useState<"lan" | "direct" | "stunar">(() => {
+    const saved = localStorage.getItem("godrinking.join_mode");
+    return saved === "direct" || saved === "stunar" ? saved : "lan";
+  });
+  const [directHost, setDirectHost] = useState(() => localStorage.getItem("godrinking.direct_host") ?? "");
+  const [rendezvousUrl, setRendezvousUrl] = useState(() => localStorage.getItem("godrinking.rendezvous_url") ?? "");
+  const [nickname, setNickname] = useState(() => localStorage.getItem("godrinking.nickname") ?? "");
+  const [hostPassword, setHostPassword] = useState("");
+  const [hostAdmission, setHostAdmission] = useState(false);
+  const [newCode, setNewCode] = useState("");
+  const [joinPassword, setJoinPassword] = useState("");
   const [notice, setNotice] = useState("");
   const [copied, setCopied] = useState(false);
   const [sessionAction, setSessionAction] = useState<"idle" | "starting" | "stopping" | "joining">("idle");
   const [watchIce, setWatchIce] = useState<"idle" | "connecting" | "connected" | "lost">("idle");
   const [watchCode, setWatchCode] = useState("");
+  const [watchHostName, setWatchHostName] = useState("");
   const [watchZoom, setWatchZoom] = useState(1);
   const [cinema, setCinema] = useState(false);
   const [windowFullscreen, setWindowFullscreen] = useState(false);
@@ -130,10 +144,34 @@ function App() {
   const connected = session?.peer_state === "connected";
   const watchConnected = watchIce === "connected";
   const watchStreamActive = watchConnected || watchIce === "connecting";
+  const watchLabel = joinMode === "direct" ? (watchHostName || "via Direct") : watchCode;
   const lanConnected = mode === "watch" ? watchConnected : connected;
   const canStart = Boolean(caps?.supported && caps.screen_recording_authorization === "granted");
   const audioExclusion = caps?.app_audio_exclusion === "enhanced";
   const roomLabel = session?.session_code ? `${session.session_code}${session.lan_addresses[0] ? ` · ${session.lan_addresses[0]}` : ""}` : "";
+  const nicknameValid = /^[A-Za-z0-9 _.-]+$/.test(nickname.trim()) && nickname.trim().length >= 2 && nickname.trim().length <= 24;
+  const roster = session?.roster ?? [];
+  const pendingRoster = roster.filter((entry) => entry.state === "pending");
+  const connectedRoster = roster.filter((entry) => entry.state !== "pending");
+  const directAddresses = session?.direct_addresses ?? [];
+  const joinModeHelp = {
+    lan: mode === "share" ? "Same network. They type your code." : "Code from the host on your network.",
+    direct: mode === "share" ? "They type your IP and port." : "IP and port the host sent you.",
+    stunar: mode === "share" ? "Internet. They type your code." : "Code from the host. Needs the relay."
+  }[joinMode];
+
+  useEffect(() => {
+    localStorage.setItem("godrinking.nickname", nickname);
+  }, [nickname]);
+  useEffect(() => {
+    localStorage.setItem("godrinking.join_mode", joinMode);
+  }, [joinMode]);
+  useEffect(() => {
+    localStorage.setItem("godrinking.rendezvous_url", rendezvousUrl);
+  }, [rendezvousUrl]);
+  useEffect(() => {
+    localStorage.setItem("godrinking.direct_host", directHost);
+  }, [directHost]);
 
   const refreshCapabilities = async () => {
     try {
@@ -316,6 +354,8 @@ function App() {
       const current = await refreshCapabilities();
       if (!current?.supported || current.screen_recording_authorization !== "granted") throw new Error("Grant Screen Recording access first.");
       if (sourceId === null && filteredSources.length > 0) throw new Error("Choose a display or window before starting.");
+      if (!nicknameValid) throw new Error("Enter a nickname (2–24 letters, numbers, spaces, _ - .).");
+      if (joinMode === "stunar" && !rendezvousUrl.trim()) throw new Error("Set the Stunar URL in settings.");
       const preset = qualityPresets[quality];
       const next = await invokeMedia<Snapshot>("create_media_session", {
         request: {
@@ -325,19 +365,16 @@ function App() {
           resolution: preset.resolution,
           frame_rate: preset.frame_rate,
           system_audio: systemAudio,
-          excluded_apps: excludedApps
+          excluded_apps: excludedApps,
+          password: hostPassword,
+          nickname: nickname.trim() || "Host",
+          admission: hostAdmission,
+          join_mode: joinMode,
+          rendezvous_url: joinMode === "stunar" ? rendezvousUrl.trim() : null
         }
       });
       setSession(next);
-      setNotice(next.detail);
-      try {
-        await invokeMedia<Signal>("create_media_peer_offer");
-        const refreshed = await invokeMedia<Snapshot>("get_media_session_state");
-        setSession(refreshed);
-        setNotice(refreshed.session_code ? `Session ${refreshed.session_code} is live. Share that code.` : refreshed.detail);
-      } catch (error) {
-        setNotice(`Capture is running, but the offer failed: ${diagnosticError(error, "unknown error")}`);
-      }
+      setNotice(next.session_code ? `Session ${next.session_code} is live. Share that code.` : next.detail);
     } catch (error) {
       const recovered = await invokeMedia<Snapshot>("get_media_session_state").catch(() => null);
       setSession(recovered && recovered.state !== "idle" ? recovered : null);
@@ -395,8 +432,10 @@ function App() {
     peerRef.current = null;
     remoteStreamRef.current = null;
     if (remoteRef.current) remoteRef.current.srcObject = null;
+    void invokeMedia("stunar_viewer_close").catch(() => undefined);
     setWatchIce("idle");
     setWatchCode("");
+    setWatchHostName("");
     setWatchZoom(1);
     leaveImmersive();
     setSessionAction("idle");
@@ -404,22 +443,52 @@ function App() {
   };
   const joinRoom = async () => {
     if (sessionAction !== "idle") return;
-    const code = joinCode.trim().toUpperCase();
-    if (code.length < 4) {
-      setNotice("Enter the 6-character session code.");
+    if (!nicknameValid) {
+      setNotice("Enter a nickname (2–24 letters, numbers, spaces, _ - .).");
       return;
     }
+    if (joinMode === "stunar") {
+      if (!rendezvousUrl.trim()) {
+        setNotice("Set the Stunar URL in settings.");
+        return;
+      }
+      const code = joinCode.trim().toUpperCase();
+      if (code.length < 4) {
+        setNotice("Enter the 6-character session code.");
+        return;
+      }
+    } else if (joinMode === "lan") {
+      const code = joinCode.trim().toUpperCase();
+      if (code.length < 4) {
+        setNotice("Enter the 6-character session code.");
+        return;
+      }
+    } else {
+      const host = directHost.trim();
+      if (!host || !host.includes(":")) {
+        setNotice("Enter the host address and port (e.g. 192.168.1.40:41234 or [2001:db8::1]:41234).");
+        return;
+      }
+    }
+    const targetLabel = joinMode === "lan" ? joinCode.trim().toUpperCase() : joinMode === "direct" ? directHost.trim() : joinCode.trim().toUpperCase();
     setSessionAction("joining");
-    setNotice("Looking for the host on your network…");
+    setNotice(joinMode === "lan" ? "Looking for the host on your network…" : joinMode === "direct" ? "Connecting to the host…" : "Waiting for approval…");
     const seq = ++joinSeqRef.current;
     try {
-      const [host, offer] = await invokeMedia<[string, Signal]>("discover_media_room", { request: { code } });
+      const request = joinMode === "lan"
+        ? { code: joinCode.trim().toUpperCase(), password: joinPassword, nickname: nickname.trim() }
+        : joinMode === "direct"
+          ? { join_mode: "direct", host: directHost.trim(), password: joinPassword, nickname: nickname.trim() }
+          : { join_mode: "stunar", code: joinCode.trim().toUpperCase(), password: joinPassword, nickname: nickname.trim(), rendezvous_url: rendezvousUrl.trim() };
+      const [host, offer, hostName] = await invokeMedia<[string, Signal, string]>("discover_media_room", { request });
       if (joinSeqRef.current !== seq) return;
-      const pc = new RTCPeerConnection({ iceServers: [] });
+      const displayLabel = joinMode === "direct" ? (hostName.trim() || "via Direct") : targetLabel;
+      const pc = new RTCPeerConnection({ iceServers: joinMode === "lan" ? [] : [{ urls: ["stun:stun.l.google.com:19302"] }] });
       peerRef.current?.close();
       peerRef.current = pc;
       setWatchIce("connecting");
-      setWatchCode(code);
+      setWatchCode(targetLabel);
+      setWatchHostName(hostName.trim() || "");
       pc.ontrack = (event) => {
         const stream = event.streams[0] ?? new MediaStream(event.track ? [event.track] : []);
         remoteStreamRef.current = stream;
@@ -436,7 +505,7 @@ function App() {
         const state = pc.iceConnectionState;
         if (state === "connected" || state === "completed") {
           setWatchIce("connected");
-          setNotice(`Connected to ${code}.`);
+          setNotice(`Connected to ${displayLabel}.`);
         } else if (state === "failed" || state === "disconnected" || state === "closed") {
           setWatchIce("lost");
           setNotice("Connection lost.");
@@ -446,24 +515,91 @@ function App() {
       };
       pc.oniceconnectionstatechange = handleIce;
       handleIce();
-      await invokeMedia("submit_media_room_answer", { request: { host, answer: { type: "answer", sdp: local.sdp } } });
+      await invokeMedia("submit_media_room_answer", { request: { host, answer: { type: "answer", sdp: local.sdp, id: offer.id }, join_mode: joinMode } });
       if (joinSeqRef.current !== seq || peerRef.current !== pc) return;
-      if (pc.iceConnectionState !== "connected" && pc.iceConnectionState !== "completed") setNotice(`Joined ${code}. Waiting for media…`);
+      if (pc.iceConnectionState !== "connected" && pc.iceConnectionState !== "completed") setNotice(`Joined ${displayLabel}. Waiting for media…`);
     } catch (error) {
       peerRef.current?.close();
       peerRef.current = null;
       if (joinSeqRef.current !== seq) return;
       setWatchIce("idle");
-      setNotice(diagnosticError(error, "Could not join the session."));
+      const message = diagnosticError(error, "Could not join.");
+      setNotice(message.includes("full") ? "This session is full." : message.includes("declined") ? "The host declined." : message.includes("banned") ? "Could not join." : message);
     } finally {
       setSessionAction("idle");
     }
   };
-  const copyCode = async () => {
-    if (!session?.session_code) return;
-    await navigator.clipboard?.writeText(session.session_code);
+  const copyText = async (text: string) => {
+    await navigator.clipboard?.writeText(text);
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1400);
+  };
+  const copyCode = async () => {
+    if (!session?.session_code) return;
+    await copyText(session.session_code);
+  };
+  const admitViewer = async (id: string) => {
+    try {
+      const next = await invokeMedia<Snapshot>("admit_media_viewer", { request: { id } });
+      setSession(next);
+    } catch (error) {
+      setNotice(diagnosticError(error, "Could not accept the viewer."));
+    }
+  };
+  const rejectViewer = async (id: string) => {
+    try {
+      const next = await invokeMedia<Snapshot>("reject_media_viewer", { request: { id } });
+      setSession(next);
+    } catch (error) {
+      setNotice(diagnosticError(error, "Could not decline the viewer."));
+    }
+  };
+  const kickViewer = async (id: string) => {
+    try {
+      const next = await invokeMedia<Snapshot>("kick_media_viewer", { request: { id } });
+      setSession(next);
+    } catch (error) {
+      setNotice(diagnosticError(error, "Could not disconnect the viewer."));
+    }
+  };
+  const applyCredentials = async () => {
+    try {
+      const next = await invokeMedia<Snapshot>("update_media_session_credentials", {
+        request: { password: hostPassword, admission: hostAdmission }
+      });
+      setSession(next);
+      setNotice(hostPassword ? "Password updated. Connected viewers stay." : "Password removed. Connected viewers stay.");
+    } catch (error) {
+      setNotice(diagnosticError(error, "Could not update the session credentials."));
+    }
+  };
+  const rotateCode = async () => {
+    const code = newCode.trim().toUpperCase();
+    if (!/^[A-Z0-9]{6}$/.test(code)) {
+      setNotice("Room code must be 6 letters or numbers.");
+      return;
+    }
+    try {
+      const next = await invokeMedia<Snapshot>("update_media_session_credentials", {
+        request: { code }
+      });
+      setSession(next);
+      setNewCode("");
+      setNotice(`Session code is now ${code}. Connected viewers stay.`);
+    } catch (error) {
+      setNotice(diagnosticError(error, "Could not change the session code."));
+    }
+  };
+  const toggleAdmission = async (next: boolean) => {
+    setHostAdmission(next);
+    try {
+      const updated = await invokeMedia<Snapshot>("update_media_session_credentials", {
+        request: { admission: next }
+      });
+      setSession(updated);
+    } catch (error) {
+      setNotice(diagnosticError(error, "Could not change the approval rule."));
+    }
   };
   const toggleExcludedApp = (token: string) => setExcludedApps((current) => current.includes(token) ? current.filter((item) => item !== token) : [...current, token]);
   const excludeQuery = appSearch.trim().toLowerCase();
@@ -508,17 +644,50 @@ function App() {
         <div className="page-heading">
           <div>
             <div className="eyebrow">{mode === "share" ? "Host a room" : "Watch a room"} <span>•</span> {mode === "share" ? "Native capture" : "Live stream"}</div>
-            <h1>{mode === "share" ? <>Share your screen,<br/><em>stay close.</em></> : watchConnected ? <>Watching <em>{watchCode}</em></> : <>Enter a code,<br/><em>watch live.</em></>}</h1>
+            <h1>{mode === "share" ? <>Share your screen,<br/><em>stay close.</em></> : watchConnected ? <>Watching <em>{watchLabel}</em></> : <>Enter a code,<br/><em>watch live.</em></>}</h1>
           </div>
         </div>
         {watchStreamActive || mode === "watch" ? (
           <div className={`${watchConnected ? "watch-live-grid" : "workspace-grid"}${mode === "share" ? " watch-background" : ""}`} aria-hidden={mode === "share" || undefined}>
             {!watchConnected && (
               <section className="panel controls-panel">
-                <div className="panel-title"><div><span className="section-kicker">01 / Join</span><h2>Session code</h2></div></div>
-                <input className="native-source" value={joinCode} onChange={(event) => setJoinCode(event.target.value.toUpperCase())} placeholder="ABC123" maxLength={8}/>
+                <div className="panel-title"><div><span className="section-kicker">01 / Join</span><h2>{joinMode === "direct" ? "Host address" : "Session code"}</h2></div></div>
+                <div className="join-mode-block">
+                  <span>Join mode</span>
+                  <div className="segmented">
+                    <button className={joinMode === "lan" ? "selected" : ""} disabled={active} onClick={() => setJoinMode("lan")}>LAN</button>
+                    <button className={joinMode === "direct" ? "selected" : ""} disabled={active} onClick={() => setJoinMode("direct")}>Direct</button>
+                    <button className={joinMode === "stunar" ? "selected" : ""} disabled={active} onClick={() => setJoinMode("stunar")}>Stunar</button>
+                  </div>
+                  <p className="quality-hint">{joinModeHelp}</p>
+                </div>
+                {joinMode === "lan" && (
+                  <>
+                    <label className="native-select-label" htmlFor="join-code">Session code</label>
+                    <input id="join-code" className="native-source" value={joinCode} onChange={(event) => setJoinCode(event.target.value.toUpperCase())} placeholder="ABC123" maxLength={8}/>
+                  </>
+                )}
+                {joinMode === "direct" && (
+                  <>
+                    <label className="native-select-label" htmlFor="join-host">Host (IP:port)</label>
+                    <input id="join-host" className="native-source" value={directHost} onChange={(event) => setDirectHost(event.target.value)} placeholder="192.168.1.40:41234 or [2001:db8::1]:41234"/>
+                    <p className="quality-hint">Cole o endereço completo que o Host mostrou (com porta, IPv6 entre [ ]). </p>
+                  </>
+                )}
+                {joinMode === "stunar" && (
+                  <>
+                    <label className="native-select-label" htmlFor="join-rendezvous">Stunar URL</label>
+                    <input id="join-rendezvous" className="native-source" value={rendezvousUrl} onChange={(event) => setRendezvousUrl(event.target.value)} placeholder="https://rendezvous.example.com"/>
+                    <label className="native-select-label" htmlFor="join-code">Session code</label>
+                    <input id="join-code" className="native-source" value={joinCode} onChange={(event) => setJoinCode(event.target.value.toUpperCase())} placeholder="ABC123" maxLength={8}/>
+                  </>
+                )}
+                <label className="native-select-label" htmlFor="join-nickname">Nickname</label>
+                <input id="join-nickname" className="native-source" value={nickname} onChange={(event) => setNickname(event.target.value)} placeholder="Your name" maxLength={24}/>
+                <label className="native-select-label" htmlFor="join-password">Password (optional)</label>
+                <input id="join-password" className="native-source" type="password" value={joinPassword} onChange={(event) => setJoinPassword(event.target.value)} placeholder="Only if the host set one" maxLength={64}/>
                 <p className="start-hint">{notice}</p>
-                <button className="primary-cta" disabled={sessionAction !== "idle"} onClick={() => void joinRoom()}>
+                <button className="primary-cta" disabled={sessionAction !== "idle" || !nicknameValid} onClick={() => void joinRoom()}>
                   {sessionAction === "joining" ? "Joining…" : "Join session"}
                 </button>
               </section>
@@ -533,7 +702,7 @@ function App() {
                 {watchConnected && (
                   <>
                     <div className="watch-hud">
-                      <span className="watch-chip watch-chip-code">{watchCode}</span>
+                      <span className="watch-chip watch-chip-code">{watchLabel}</span>
                       <span className="watch-chip">Connected</span>
                     </div>
                     {escHint && <div className="watch-esc-hint">Press Esc to exit</div>}
@@ -636,11 +805,28 @@ function App() {
                   <p className="exclude-hint">Viewers won't hear the apps you pick here. For example, pick Discord to mute it.</p>
                 </>
               )}
+              <label className="native-select-label" htmlFor="share-nickname">Nickname</label>
+              <input id="share-nickname" className="native-source" value={nickname} onChange={(event) => setNickname(event.target.value)} placeholder="Your name" maxLength={24}/>
+              <div className="join-mode-block">
+                <span>Join mode</span>
+                <div className="segmented">
+                  <button className={joinMode === "lan" ? "selected" : ""} disabled={active} onClick={() => setJoinMode("lan")}>LAN</button>
+                  <button className={joinMode === "direct" ? "selected" : ""} disabled={active} onClick={() => setJoinMode("direct")}>Direct</button>
+                  <button className={joinMode === "stunar" ? "selected" : ""} disabled={active} onClick={() => setJoinMode("stunar")}>Stunar</button>
+                </div>
+                <p className="quality-hint">{joinModeHelp}</p>
+              </div>
+              {joinMode === "stunar" && (
+                <>
+                  <label className="native-select-label" htmlFor="share-rendezvous">Stunar URL</label>
+                  <input id="share-rendezvous" className="native-source" value={rendezvousUrl} onChange={(event) => setRendezvousUrl(event.target.value)} placeholder="https://rendezvous.example.com"/>
+                </>
+              )}
               <p className="start-hint">{notice}</p>
               {active ? (
                 <button className="primary-cta" disabled={sessionAction !== "idle"} onClick={() => void stopSharing()}>{sessionAction === "stopping" ? "Stopping…" : "Stop native session"}</button>
               ) : (
-                <button className="primary-cta" disabled={!canStart || sessionAction !== "idle"} onClick={() => void startSharing()}>{sessionAction === "starting" ? "Starting…" : "Start native session"}</button>
+                <button className="primary-cta" disabled={!canStart || !nicknameValid || sessionAction !== "idle"} onClick={() => void startSharing()}>{sessionAction === "starting" ? "Starting…" : "Start native session"}</button>
               )}
             </section>
             <div className="right-column">
@@ -653,13 +839,98 @@ function App() {
                 </div>
               </section>
               <section className="panel connect-panel">
-                <div className="panel-title"><div><span className="section-kicker">02 / Connect</span><h2>Pass this code</h2></div><Icon name="wifi" size={19}/></div>
-                <div className="signal-block">
-                  <label>Session code</label>
-                  <input className="signal-input" readOnly value={roomLabel} placeholder="Start a session to create a code"/>
-                  <button className="copy-button" onClick={() => void copyCode()} disabled={!session?.session_code}><Icon name="copy" size={15}/>{copied ? "Copied" : "Copy"}</button>
-                </div>
-                <p className="signaling-status">{session?.peer_detail || "The other person opens Watch and enters this code on the same network."}</p>
+                <div className="panel-title"><div><span className="section-kicker">02 / Connect</span><h2>{joinMode === "direct" ? "Share this address" : "Pass this code"}</h2></div><Icon name="wifi" size={19}/></div>
+                {joinMode === "lan" && (
+                  <div className="signal-block">
+                    <label>Session code</label>
+                    <input className="signal-input" readOnly value={roomLabel} placeholder="Start a session to create a code"/>
+                    <button className="copy-button" onClick={() => void copyCode()} disabled={!session?.session_code}><Icon name="copy" size={15}/>{copied ? "Copied" : "Copy"}</button>
+                  </div>
+                )}
+                {joinMode === "direct" && (
+                  <div className="direct-address-list">
+                    <label>Addresses</label>
+                    {!active && <p className="roster-empty">Start a session to create addresses.</p>}
+                    {active && directAddresses.length === 0 && <p className="roster-empty">Collecting addresses…</p>}
+                    {directAddresses.map((entry) => (
+                      <div className="direct-address-row" key={`${entry.kind}-${entry.ip}`}>
+                        <span className="direct-address-kind">{entry.kind === "lan" ? "LAN" : entry.kind === "public" ? "Public" : "IPv6"}</span>
+                        <code className="direct-address-copy">{entry.copy}</code>
+                        <button className="copy-button" onClick={() => void copyText(entry.copy)}><Icon name="copy" size={15}/>{copied ? "Copied" : "Copy"}</button>
+                      </div>
+                    ))}
+                    {!directAddresses.some((entry) => entry.kind === "public") && active && (
+                      <p className="signaling-status">No public IPv4. Direct over the internet may fail.</p>
+                    )}
+                    {session?.direct_mapping === false && directAddresses.some((entry) => entry.kind === "public") && (
+                      <p className="signaling-status">Port mapping failed. Viewers on other networks need this port open.</p>
+                    )}
+                  </div>
+                )}
+                {joinMode === "stunar" && (
+                  <>
+                    <div className="signal-block">
+                      <label>Session code</label>
+                      <input className="signal-input" readOnly value={session?.session_code ?? ""} placeholder="Start a session to create a code"/>
+                      <button className="copy-button" onClick={() => void copyCode()} disabled={!session?.session_code}><Icon name="copy" size={15}/>{copied ? "Copied" : "Copy"}</button>
+                    </div>
+                    <span className={`stunar-chip ${session?.stunar_state === "live" ? "is-live" : session?.stunar_state === "unreachable" ? "is-down" : ""}`}>
+                      <i/>{session?.stunar_state === "live" ? "Live" : session?.stunar_state === "unreachable" ? "Relay unreachable" : "Calling…"}
+                    </span>
+                  </>
+                )}
+                {active && (joinMode === "lan" || joinMode === "stunar") && (
+                  <div className="signal-block">
+                    <label>New code</label>
+                    <input className="signal-input" value={newCode} onChange={(event) => setNewCode(event.target.value.toUpperCase())} placeholder="ABC123" maxLength={6}/>
+                    <button className="copy-button" onClick={() => void rotateCode()} disabled={sessionAction !== "idle" || newCode.trim().length !== 6}>New code</button>
+                  </div>
+                )}
+                {active && (
+                  <>
+                    <div className="signal-block">
+                      <label>Password (optional)</label>
+                      <input className="signal-input" type="password" value={hostPassword} onChange={(event) => setHostPassword(event.target.value)} placeholder={session?.password_set ? "Change password" : "Set a password"} maxLength={64}/>
+                      <button className="copy-button" onClick={() => void applyCredentials()} disabled={sessionAction !== "idle"}>{session?.password_set ? "Update" : "Set password"}</button>
+                    </div>
+                    <label className={`unsupported-option ${active ? "" : "is-disabled"}`}>
+                      <div><strong>Require approval</strong><small>Approve each viewer before they see your screen</small></div>
+                      <input type="checkbox" checked={hostAdmission} onChange={(event) => void toggleAdmission(event.target.checked)}/>
+                    </label>
+                    <div className="roster-block">
+                      <label>People</label>
+                      {pendingRoster.length > 0 && (
+                        <div className="roster-group">
+                          {pendingRoster.map((entry) => (
+                            <div className="roster-row" key={`pending-${entry.id}`}>
+                              <span className="roster-name">{entry.nickname}<small>Waiting for approval</small></span>
+                              <span className="roster-actions">
+                                <button onClick={() => void admitViewer(entry.id)}>Accept</button>
+                                <button onClick={() => void rejectViewer(entry.id)}>Decline</button>
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {connectedRoster.length > 0 && (
+                        <div className="roster-group">
+                          {connectedRoster.map((entry) => (
+                            <div className="roster-row" key={`connected-${entry.id}`}>
+                              <span className="roster-name">{entry.nickname}<small>{entry.state === "connected" ? "Connected" : "Connecting…"}</small></span>
+                              <span className="roster-actions">
+                                <button onClick={() => void kickViewer(entry.id)}>Disconnect</button>
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {pendingRoster.length === 0 && connectedRoster.length === 0 && (
+                        <p className="roster-empty">{joinMode === "direct" ? "No one here yet. Share the address." : "No one here yet. Share the code."}</p>
+                      )}
+                    </div>
+                  </>
+                )}
+                <p className="signaling-status">{session?.peer_detail || (joinMode === "direct" ? "The other person opens Watch, picks Direct, and enters this address." : joinMode === "stunar" ? "The other person opens Watch, picks Stunar, and enters this code." : "The other person opens Watch and enters this code on the same network.")}</p>
               </section>
             </div>
           </div>
