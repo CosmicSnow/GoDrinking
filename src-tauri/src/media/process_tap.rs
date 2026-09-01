@@ -1,9 +1,13 @@
 //! macOS 14.2+ system-audio capture with per-app exclusion.
 
+#[cfg(target_os = "macos")]
 use std::ffi::c_void;
+#[cfg(target_os = "macos")]
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+#[cfg(target_os = "macos")]
+use std::sync::mpsc::{sync_channel, Receiver};
+use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -35,6 +39,8 @@ pub(crate) struct ProcessTap {
     _capture: Option<JoinHandle<()>>,
     #[cfg(target_os = "macos")]
     _native: Option<NativeTap>,
+    #[cfg(target_os = "windows")]
+    _native: Option<WindowsAudioTap>,
 }
 
 #[cfg(target_os = "macos")]
@@ -47,6 +53,18 @@ struct NativeTap {
 #[cfg(target_os = "macos")]
 unsafe impl Send for NativeTap {}
 
+/// Owns the WASAPI loopback client and its Opus worker thread. The thread
+/// closure owns the COM-backed client objects; the wrapper exists only to make
+/// the non-`Send` COM handles movable into the thread (WASAPI clients are
+/// thread-affine only during initialization, which happens before the move).
+#[cfg(target_os = "windows")]
+struct WindowsAudioTap {
+    thread: Option<JoinHandle<()>>,
+}
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for WindowsAudioTap {}
+
 impl ProcessTap {
     /// Starts a process tap that writes encoded packets into `audio_tx`.
     /// The engine owns the Opus channel so a tap can be recreated against the
@@ -55,7 +73,11 @@ impl ProcessTap {
         excluded_bundle_ids: &[String],
         audio_tx: SyncSender<EncodedAudioPacket>,
     ) -> Result<Self, String> {
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            start_windows(excluded_bundle_ids, audio_tx)
+        }
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
         {
             let _ = (excluded_bundle_ids, audio_tx);
             return Err("process taps are unavailable on this platform".into());
@@ -70,6 +92,12 @@ impl ProcessTap {
 impl Drop for ProcessTap {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        #[cfg(target_os = "windows")]
+        if let Some(native) = self._native.take() {
+            if let Some(thread) = native.thread {
+                let _ = thread.join();
+            }
+        }
         #[cfg(target_os = "macos")]
         if let Some(native) = self._native.take() {
             unsafe {
@@ -158,6 +186,148 @@ fn start_macos(
             proc_id,
         }),
     })
+}
+
+#[cfg(target_os = "windows")]
+fn start_windows(
+    excluded_apps: &[String],
+    opus_tx: SyncSender<EncodedAudioPacket>,
+) -> Result<ProcessTap, String> {
+    if !excluded_apps.is_empty() {
+        eprintln!(
+            "[goDrinking] Windows system audio is a full device loopback; app exclusions are ignored (no mix-minus tap)."
+        );
+    }
+    let _ = wasapi::initialize_mta();
+    let enumerator = wasapi::DeviceEnumerator::new()
+        .map_err(|error| format!("WASAPI device enumerator failed: {error}"))?;
+    let device = enumerator
+        .get_default_device(&wasapi::Direction::Render)
+        .map_err(|error| format!("no default render device for loopback: {error}"))?;
+    let mut client = device
+        .get_iaudioclient()
+        .map_err(|error| format!("WASAPI audio client failed: {error}"))?;
+    // Request 48 kHz stereo float; autoconvert lets the audio engine resample
+    // any device mix format into this shape.
+    let desired = wasapi::WaveFormat::new(32, 32, &wasapi::SampleType::Float, 48_000, 2, None);
+    let mode = wasapi::StreamMode::EventsShared {
+        autoconvert: true,
+        buffer_duration_hns: 200_000,
+    };
+    client
+        .initialize_client(&desired, &wasapi::Direction::Capture, &mode)
+        .map_err(|error| format!("WASAPI loopback client init failed: {error}"))?;
+    let event = client
+        .set_get_eventhandle()
+        .map_err(|error| format!("WASAPI event handle failed: {error}"))?;
+    let capture = client
+        .get_audiocaptureclient()
+        .map_err(|error| format!("WASAPI capture client failed: {error}"))?;
+    client
+        .start_stream()
+        .map_err(|error| format!("WASAPI stream start failed: {error}"))?;
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let worker_shutdown = Arc::clone(&shutdown);
+    // Construct the Send wrapper before the move so the thread closure captures
+    // the wrapper (which is Send) rather than the raw non-Send COM handles.
+    let loopback = WasapiLoopback {
+        client,
+        capture,
+        event,
+    };
+    let thread = thread::Builder::new()
+        .name("godrinking-audio-opus".into())
+        .spawn(move || {
+            let _ = wasapi_loop(loopback, opus_tx, worker_shutdown);
+        })
+        .map_err(|error| error.to_string())?;
+
+    Ok(ProcessTap {
+        shutdown,
+        _capture: None,
+        _native: Some(WindowsAudioTap {
+            thread: Some(thread),
+        }),
+    })
+}
+
+/// WASAPI loopback client moved into the Opus worker thread. COM interfaces
+/// are not `Send` by default; initialization completed on the caller thread
+/// before the move, so this is safe.
+#[cfg(target_os = "windows")]
+struct WasapiLoopback {
+    client: wasapi::AudioClient,
+    capture: wasapi::AudioCaptureClient,
+    event: wasapi::Handle,
+}
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for WasapiLoopback {}
+
+#[cfg(target_os = "windows")]
+fn wasapi_loop(
+    loopback: WasapiLoopback,
+    opus_tx: SyncSender<EncodedAudioPacket>,
+    shutdown: Arc<AtomicBool>,
+) {
+    // Voip application mode keeps latency low for 20 ms stereo 48 kHz frames.
+    // An init failure must not fail the session: the worker simply exits and
+    // the tap keeps running without encoded output.
+    let Ok(mut encoder) = opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Voip)
+    else {
+        eprintln!("[goDrinking] Opus encoder init failed; system audio continues without encoding");
+        return;
+    };
+    let mut pcm = Vec::<f32>::new();
+    let mut bytes = std::collections::VecDeque::<u8>::new();
+    while !shutdown.load(Ordering::Acquire) {
+        if loopback.event.wait_for_event(100).is_err() {
+            continue;
+        }
+        loop {
+            let Ok(Some(frames)) = loopback.capture.get_next_packet_size() else {
+                break;
+            };
+            if frames == 0 {
+                break;
+            }
+            let Ok(info) = loopback.capture.read_from_device_to_deque(&mut bytes) else {
+                break;
+            };
+            if info.flags.silent {
+                continue;
+            }
+            // 48 kHz stereo float: 8 bytes per frame (2 x f32).
+            while bytes.len() >= 8 {
+                let mut frame = [0_u8; 8];
+                for byte in frame.iter_mut() {
+                    *byte = bytes.pop_front().expect("length checked above");
+                }
+                pcm.push(f32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]));
+                pcm.push(f32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]));
+            }
+            while pcm.len() >= 960 * 2 {
+                let frame: Vec<f32> = pcm.drain(..960 * 2).collect();
+                let mut output = vec![0_u8; 4000];
+                match encoder.encode_float(&frame, &mut output) {
+                    Ok(size) if size > 0 => {
+                        output.truncate(size);
+                        if opus_tx
+                            .try_send(EncodedAudioPacket {
+                                data: output,
+                                duration: Duration::from_millis(20),
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -471,9 +641,16 @@ fn audio_get<T>(object: u32, selector: u32, value: &mut T) -> Result<(), String>
 }
 
 pub fn running_applications() -> Vec<super::types::NativeRunningApp> {
-    super::screen_capture_kit::ScreenCaptureKitAdapter::new()
-        .enumerate_running_apps()
-        .unwrap_or_default()
+    #[cfg(target_os = "windows")]
+    {
+        super::windows_capture::WindowsCaptureAdapter::enumerate_running_apps().unwrap_or_default()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        super::screen_capture_kit::ScreenCaptureKitAdapter::new()
+            .enumerate_running_apps()
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(target_os = "macos")]

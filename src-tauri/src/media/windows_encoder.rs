@@ -1,0 +1,274 @@
+//! OpenH264 H.264 encoder wrapper for Windows native capture.
+//!
+//! The encoder is created lazily from the first `NativeFrame` dimensions and
+//! re-initialized automatically by OpenH264 when the resolution changes. BGRA8
+//! frames are converted to I420 with the crate's SIMD helpers, encoded to
+//! Annex-B, normalized (SPS/PPS cached and injected before IDR), and pushed
+//! into the same `AccessUnitQueue` the VideoToolbox path uses. A single encode
+//! error is logged and a keyframe requested rather than failing the session.
+
+use super::access_unit::{AccessUnitPushResult, AccessUnitQueue, EncodedAccessUnit};
+use super::pipeline::{EncoderControl, NativeFrame, PipelineState};
+use openh264::encoder::{
+    BitRate, Complexity, Encoder, EncoderConfig, FrameRate as OpenH264FrameRate, FrameType, Profile,
+    RateControlMode, UsageType, VuiConfig,
+};
+use openh264::formats::{BgraSliceU8, YUVBuffer};
+use openh264::OpenH264API;
+use openh264::Timestamp;
+use openh264_sys2::ENCODER_OPTION_BITRATE;
+use std::borrow::Cow;
+use std::sync::Arc;
+
+const ANNEX_B_START_CODE: &[u8] = &[0, 0, 0, 1];
+
+pub(crate) struct OpenH264Encoder {
+    encoder: Encoder,
+    converter: AnnexBConverter,
+    output: AccessUnitQueue,
+    control: Arc<EncoderControl>,
+}
+
+impl OpenH264Encoder {
+    pub(crate) fn new(
+        _width: u32,
+        _height: u32,
+        bitrate: u32,
+        fps: u32,
+        output: AccessUnitQueue,
+        _state: Arc<PipelineState>,
+        control: Arc<EncoderControl>,
+    ) -> Result<Self, String> {
+        let config = EncoderConfig::new()
+            .bitrate(BitRate::from_bps(bitrate))
+            .max_frame_rate(OpenH264FrameRate::from_hz(fps as f32))
+            .usage_type(UsageType::ScreenContentRealTime)
+            .rate_control_mode(RateControlMode::Bitrate)
+            .profile(Profile::Baseline)
+            .complexity(Complexity::Low)
+            .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(fps * 2))
+            .vui(VuiConfig::bt709_full());
+        let encoder = Encoder::with_api_config(OpenH264API::from_source(), config)
+            .map_err(|error| format!("OpenH264 initialization failed: {error}"))?;
+        Ok(Self {
+            encoder,
+            converter: AnnexBConverter::default(),
+            output,
+            control,
+        })
+    }
+
+    pub(crate) fn encode(&mut self, frame: &NativeFrame) -> Result<(), String> {
+        let width = frame.width;
+        let height = frame.height;
+        if width < 2 || height < 2 {
+            return Ok(());
+        }
+        // OpenH264 requires even dimensions. WGC frames are normally even; when
+        // they are not, crop the last row/column into a temporary buffer.
+        let (bgra, enc_width, enc_height): (Cow<[u8]>, u32, u32) =
+            if width % 2 == 0 && height % 2 == 0 {
+                (Cow::Borrowed(frame.storage.as_ref()), width, height)
+            } else {
+                let even_width = width & !1;
+                let even_height = height & !1;
+                let mut cropped = Vec::with_capacity((even_width * even_height * 4) as usize);
+                for y in 0..even_height {
+                    let row_start = (y * width * 4) as usize;
+                    cropped.extend_from_slice(
+                        &frame.storage[row_start..row_start + (even_width * 4) as usize],
+                    );
+                }
+                (Cow::Owned(cropped), even_width, even_height)
+            };
+        let bgra = BgraSliceU8::new(&bgra, (enc_width as usize, enc_height as usize));
+        let yuv = YUVBuffer::from_bgra8_source(bgra);
+        let timestamp_ms = frame.timestamp_micros / 1000;
+        let bitstream = self
+            .encoder
+            .encode_at(&yuv, Timestamp::from_millis(timestamp_ms))
+            .map_err(|error| format!("OpenH264 encode failed: {error}"))?;
+        let keyframe = bitstream.frame_type() == FrameType::IDR;
+        let timestamp_90khz = frame.timestamp_micros.saturating_mul(9) / 100;
+        let bytes = bitstream.to_vec();
+        let Some(unit) = self.converter.convert(&bytes, timestamp_90khz, keyframe) else {
+            return Ok(());
+        };
+        match self.output.try_push(unit) {
+            AccessUnitPushResult::Enqueued => {}
+            AccessUnitPushResult::DroppedUntilKeyframe => {
+                self.control.request_keyframe();
+            }
+            AccessUnitPushResult::Closed => {}
+        }
+        Ok(())
+    }
+
+    pub(crate) fn force_keyframe(&mut self) {
+        self.encoder.force_intra_frame();
+    }
+
+    pub(crate) fn set_bitrate(&mut self, bitrate: u32) -> Result<(), String> {
+        unsafe {
+            self.encoder
+                .raw_api()
+                .set_option(ENCODER_OPTION_BITRATE, (&bitrate as *const u32).cast_mut().cast());
+        }
+        Ok(())
+    }
+}
+
+/// Normalizes OpenH264's Annex-B output: caches SPS/PPS and injects them before
+/// every IDR so the access-unit queue always starts a decodable GOP. Mirrors
+/// the `AvccAnnexBConverter` behavior used by the VideoToolbox path.
+#[derive(Default)]
+struct AnnexBConverter {
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
+}
+
+impl AnnexBConverter {
+    fn convert(
+        &mut self,
+        data: &[u8],
+        timestamp_90khz: u64,
+        keyframe: bool,
+    ) -> Option<EncodedAccessUnit> {
+        let nals = annex_b_nals(data);
+        if nals.is_empty() {
+            return None;
+        }
+        for nal in &nals {
+            if nal.is_empty() {
+                continue;
+            }
+            match nal[0] & 0x1f {
+                7 => self.sps = Some(nal.to_vec()),
+                8 => self.pps = Some(nal.to_vec()),
+                _ => {}
+            }
+        }
+        let contains_idr = nals
+            .iter()
+            .any(|nal| !nal.is_empty() && nal[0] & 0x1f == 5);
+        let is_keyframe = keyframe || contains_idr;
+        let profile_level_id = self.sps.as_deref().and_then(sps_profile_level_id);
+        let mut out = Vec::with_capacity(data.len() + 64);
+        if is_keyframe {
+            if let Some(sps) = &self.sps {
+                out.extend_from_slice(ANNEX_B_START_CODE);
+                out.extend_from_slice(sps);
+            }
+            if let Some(pps) = &self.pps {
+                out.extend_from_slice(ANNEX_B_START_CODE);
+                out.extend_from_slice(pps);
+            }
+        }
+        for nal in nals {
+            if nal.is_empty() {
+                continue;
+            }
+            if is_keyframe && matches!(nal[0] & 0x1f, 7 | 8) {
+                continue;
+            }
+            out.extend_from_slice(ANNEX_B_START_CODE);
+            out.extend_from_slice(nal);
+        }
+        Some(EncodedAccessUnit {
+            data: out,
+            timestamp_90khz,
+            keyframe: is_keyframe,
+            profile_level_id,
+        })
+    }
+}
+
+fn sps_profile_level_id(sps: &[u8]) -> Option<String> {
+    (sps.len() >= 4).then(|| format!("{:02x}{:02x}{:02x}", sps[1], sps[2], sps[3]))
+}
+
+/// Splits an Annex-B byte stream into NAL units, handling both 3- and 4-byte
+/// start codes.
+fn annex_b_nals(data: &[u8]) -> Vec<&[u8]> {
+    let mut nals = Vec::new();
+    let len = data.len();
+    let mut pos = 0;
+    while let Some((start, code_len)) = next_start_code(data, pos) {
+        let nal_start = start + code_len;
+        let end = next_start_code(data, nal_start)
+            .map(|(next_start, _)| next_start)
+            .unwrap_or(len);
+        if end > nal_start {
+            nals.push(&data[nal_start..end]);
+        }
+        pos = end;
+    }
+    nals
+}
+
+/// Finds the next Annex-B start code at or after `from`, returning its byte
+/// offset and length (3 for `00 00 01`, 4 for `00 00 00 01`).
+fn next_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
+    let len = data.len();
+    let mut i = from;
+    while i + 3 <= len {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            if i >= 1 && data[i - 1] == 0 {
+                return Some((i - 1, 4));
+            }
+            return Some((i, 3));
+        }
+        i += 1;
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{annex_b_nals, AnnexBConverter};
+
+    #[test]
+    fn splits_annex_b_with_three_and_four_byte_start_codes() {
+        let data = [
+            0, 0, 0, 1, 0x67, 1, 2, 0, 0, 0, 1, 0x68, 3, 0, 0, 1, 0x65, 4,
+        ];
+        let nals = annex_b_nals(&data);
+        assert_eq!(nals.len(), 3);
+        assert_eq!(nals[0], &[0x67, 1, 2]);
+        assert_eq!(nals[1], &[0x68, 3]);
+        assert_eq!(nals[2], &[0x65, 4]);
+    }
+
+    #[test]
+    fn injects_cached_sps_pps_before_an_idr() {
+        let mut converter = AnnexBConverter::default();
+        let sps_pps = [0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x2a, 1, 0, 0, 0, 1, 0x68, 2];
+        converter
+            .convert(&sps_pps, 0, false)
+            .expect("parameter sets should convert");
+        let unit = converter
+            .convert(&[0, 0, 0, 1, 0x65, 3], 3_000, true)
+            .expect("IDR should convert");
+        assert!(unit.keyframe);
+        assert_eq!(
+            unit.data,
+            vec![
+                0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x2a, 1, 0, 0, 0, 1, 0x68, 2, 0, 0, 0, 1, 0x65, 3,
+            ]
+        );
+        assert_eq!(unit.profile_level_id.as_deref(), Some("42e02a"));
+    }
+
+    #[test]
+    fn non_keyframes_do_not_repeat_parameter_sets() {
+        let mut converter = AnnexBConverter::default();
+        converter
+            .convert(&[0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x2a, 1, 0, 0, 0, 1, 0x68, 2], 0, false)
+            .expect("parameter sets");
+        let unit = converter
+            .convert(&[0, 0, 0, 1, 0x41, 9], 3_000, false)
+            .expect("P frame should convert");
+        assert!(!unit.keyframe);
+        assert_eq!(unit.data, vec![0, 0, 0, 1, 0x41, 9]);
+    }
+}

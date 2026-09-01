@@ -19,6 +19,10 @@ mod transport;
 mod types;
 #[cfg(target_os = "macos")]
 mod video_toolbox;
+#[cfg(target_os = "windows")]
+mod windows_capture;
+#[cfg(target_os = "windows")]
+mod windows_encoder;
 
 pub use capabilities::MediaCapabilities;
 pub use engine::MediaEngine;

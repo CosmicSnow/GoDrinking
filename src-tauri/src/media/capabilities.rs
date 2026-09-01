@@ -64,18 +64,18 @@ pub fn detect() -> MediaCapabilities {
     {
         return MediaCapabilities {
             platform: "windows".into(),
-            supported: false,
+            supported: true,
             screen_capture_kit: false,
             screen_recording_authorization: ScreenRecordingAuthorization::Unsupported,
-            source_enumeration_available: false,
-            windows_graphics_capture: false,
-            wasapi: false,
+            source_enumeration_available: true,
+            windows_graphics_capture: true,
+            wasapi: true,
             process_loopback: false,
             app_audio_exclusion: AppAudioExclusionSupport::Unsupported,
-            native_capture_implemented: false,
-            native_encoder_implemented: false,
-            native_peer_transport_implemented: false,
-            detail: "Windows native capture, WASAPI, and process-loopback adapters are unimplemented; the WebView path remains active.".into(),
+            native_capture_implemented: true,
+            native_encoder_implemented: true,
+            native_peer_transport_implemented: true,
+            detail: "Windows Graphics Capture and OpenH264 native capture are available. System audio is a full device loopback; per-app audio exclusion is unsupported (no mix-minus tap).".into(),
         };
     }
 
@@ -138,16 +138,20 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_reports_native_media_as_unimplemented() {
+    fn windows_reports_native_media_as_implemented() {
         let capabilities = detect();
-        assert!(!capabilities.supported);
-        assert!(!capabilities.windows_graphics_capture);
-        assert!(!capabilities.wasapi);
-        assert!(!capabilities.process_loopback);
+        assert!(capabilities.supported);
+        assert!(capabilities.windows_graphics_capture);
+        assert!(capabilities.wasapi);
+        assert!(capabilities.native_capture_implemented);
+        assert!(capabilities.native_encoder_implemented);
+        assert!(capabilities.native_peer_transport_implemented);
+        assert!(capabilities.source_enumeration_available);
         assert_eq!(
             capabilities.app_audio_exclusion,
             AppAudioExclusionSupport::Unsupported
         );
+        assert!(!capabilities.detail.is_empty());
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]

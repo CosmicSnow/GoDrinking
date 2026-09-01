@@ -398,7 +398,7 @@ impl Drop for NativePipeline {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn encoder_bitrate(width: u32, height: u32, quality: TransmissionQuality) -> u32 {
     // Start from the quality preset and scale by the actual pixel count
     // relative to the preset's capture cap, clamped so the preset is the
@@ -526,7 +526,101 @@ fn encoder_worker_loop(
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn encoder_worker_loop(
+    receiver: Receiver<EncoderCommand>,
+    output: AccessUnitQueue,
+    _width: u32,
+    _height: u32,
+    fps: u32,
+    quality: TransmissionQuality,
+    generation: u64,
+    state: Arc<PipelineState>,
+    shutdown: Arc<AtomicBool>,
+    control: Arc<EncoderControl>,
+) {
+    let mut encoder: Option<super::windows_encoder::OpenH264Encoder> = None;
+    let mut pending_output = Some(output);
+    loop {
+        if control.stop_requested() {
+            return;
+        }
+        if let Some(bitrate) = control.take_bitrate() {
+            if let Some(encoder) = encoder.as_mut() {
+                let _ = encoder.set_bitrate(bitrate);
+            }
+        }
+        if control.take_keyframe() {
+            if let Some(encoder) = encoder.as_mut() {
+                encoder.force_keyframe();
+            }
+        }
+        if state.is_failed() {
+            break;
+        }
+        let command = match receiver.recv_timeout(Duration::from_millis(10)) {
+            Ok(command) => command,
+            Err(RecvTimeoutError::Timeout) => {
+                if shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        match command {
+            EncoderCommand::Video(frame) => {
+                if frame.generation != generation {
+                    continue;
+                }
+                if encoder.is_none() {
+                    let Some(output) = pending_output.take() else {
+                        continue;
+                    };
+                    let width = frame.width.max(2) & !1;
+                    let height = frame.height.max(2) & !1;
+                    match super::windows_encoder::OpenH264Encoder::new(
+                        width,
+                        height,
+                        encoder_bitrate(width, height, quality),
+                        fps,
+                        output,
+                        Arc::clone(&state),
+                        Arc::clone(&control),
+                    ) {
+                        Ok(next) => {
+                            encoder = Some(next);
+                            control.request_keyframe();
+                        }
+                        Err(error) => {
+                            state.fail(format!("OpenH264 initialization failed: {error}"));
+                            return;
+                        }
+                    }
+                }
+                let Some(active) = encoder.as_mut() else {
+                    continue;
+                };
+                if let Err(error) = active.encode(&frame) {
+                    eprintln!("[goDrinking] OpenH264 encode skipped: {error}");
+                    control.request_keyframe();
+                }
+            }
+            EncoderCommand::Flush => {}
+            EncoderCommand::ForceKeyframe => {
+                control.request_keyframe();
+            }
+            EncoderCommand::SetBitrate(bitrate) => {
+                control.set_bitrate(bitrate);
+            }
+            EncoderCommand::Stop => {
+                control.request_stop();
+            }
+        }
+    }
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 fn encoder_worker_loop(
     receiver: Receiver<EncoderCommand>,
     _output: AccessUnitQueue,

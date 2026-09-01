@@ -1,0 +1,74 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Which installer to build
+        required: true
+        default: windows
+        type: choice
+        options:
+          - macos
+          - windows
+          - both
+      tag:
+        description: Release tag (default v + package.json version)
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    if: ${{ inputs.platform == 'macos' || inputs.platform == 'both' }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - run: npm exec tauri build -- --bundles app,dmg --ci
+      - name: Zip .app
+        run: |
+          version=$(node -p "require('./package.json').version")
+          ditto -c -k --keepParent src-tauri/target/release/bundle/macos/goDrinking.app \
+            "src-tauri/target/release/bundle/goDrinking-${version}-macos-arm64.zip"
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(node -p "require('./package.json').version")
+          tag="${{ inputs.tag }}"
+          [ -n "$tag" ] || tag="v${version}"
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "goDrinking $tag" --notes "goDrinking $tag"
+          zip="src-tauri/target/release/bundle/goDrinking-${version}-macos-arm64.zip"
+          dmg=$(ls src-tauri/target/release/bundle/dmg/*.dmg | head -1)
+          gh release upload "$tag" "$zip" "$dmg" --clobber
+
+  windows:
+    if: ${{ inputs.platform == 'windows' || inputs.platform == 'both' }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - run: npm exec tauri build -- --bundles nsis,msi --ci
+      - name: Upload to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(node -p "require('./package.json').version")
+          tag="${{ inputs.tag }}"
+          [ -n "$tag" ] || tag="v${version}"
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "goDrinking $tag" --notes "goDrinking $tag"
+          nsis=$(ls src-tauri/target/release/bundle/nsis/*.exe | head -1)
+          msi=$(ls src-tauri/target/release/bundle/msi/*.msi | head -1)
+          gh release upload "$tag" "$nsis" "$msi" --clobber

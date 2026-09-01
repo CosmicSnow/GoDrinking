@@ -26,6 +26,13 @@ webrtc = "0.14.0"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "time", "net", "io-util", "macros"] }
 rand = "0.8"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-capture = "2.0.1"
+openh264 = "0.9.8"
+openh264-sys2 = "0.9.8"
+wasapi = "0.24.0"
+opus = "0.3"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = { version = "=0.6.2", default-features = false, features = ["alloc"] }
 dispatch2 = { version = "=0.3.1", default-features = false, features = ["alloc", "objc2"] }

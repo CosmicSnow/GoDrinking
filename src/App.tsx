@@ -3,6 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import "./index.css";
 import "./App.css";
+import logo from "./assets/logo.png";
 
 type IconName = "grid" | "monitor" | "window" | "game" | "settings" | "help" | "plus" | "copy" | "wifi" | "chevron" | "expand" | "minimize" | "volume" | "volume-off";
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
@@ -56,6 +57,41 @@ const qualityPresets = {
   medium: { resolution: "1080p", frame_rate: "30_fps" },
   high: { resolution: "1080p", frame_rate: "60_fps" }
 } as const;
+const taglines = [
+  "Rage against the machine",
+  "The cake is a lie",
+  "War. War never changes.",
+  "Fight the power",
+  "Information wants to be free",
+  "No gods, no masters",
+  "Wake up, Neo",
+  "Nothing is true, everything is permitted",
+  "The revolution will not be televised",
+  "Speak, even if your voice shakes",
+  "I never asked for this",
+  "Censorship is a dead end",
+  "Think for yourself",
+  "Be water, my friend",
+  "The internet interprets censorship as damage",
+  "Would you kindly",
+  "Do you feel like a hero yet?",
+  "Be realistic, demand the impossible",
+  "Sous les pavés, la plage",
+  "It is forbidden to forbid",
+  "If I can't dance, it's not my revolution",
+  "When injustice becomes law, resistance becomes duty",
+  "Who controls the past controls the future",
+  "Question authority",
+  "Silence is consent",
+  "Speak truth to power",
+  "You can't evict an idea",
+  "Another world is possible",
+  "No pasarán",
+  "A luta continua",
+  "Independência ou morte",
+  "Liberdade ainda que tardia",
+  "Quem cala consente"
+];
 
 function App() {
   const [mode, setMode] = useState<"share" | "watch">("share");
@@ -83,14 +119,17 @@ function App() {
   const [watchVolume, setWatchVolume] = useState(80);
   const [watchMuted, setWatchMuted] = useState(false);
   const [escHint, setEscHint] = useState(false);
+  const [tagline, setTagline] = useState(() => taglines[Math.floor(Math.random() * taglines.length)]);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const remoteRef = useRef<HTMLVideoElement>(null);
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const remoteStreamRef = useRef<MediaStream | null>(null);
   const liveSettingsApplied = useRef(false);
+  const joinSeqRef = useRef(0);
   const active = session?.state === "running" || Boolean(session?.native_capture_active);
   const connected = session?.peer_state === "connected";
   const watchConnected = watchIce === "connected";
+  const watchStreamActive = watchConnected || watchIce === "connecting";
   const lanConnected = mode === "watch" ? watchConnected : connected;
   const canStart = Boolean(caps?.supported && caps.screen_recording_authorization === "granted");
   const audioExclusion = caps?.app_audio_exclusion === "enhanced";
@@ -176,6 +215,21 @@ function App() {
   useEffect(() => {
     if (mode !== "watch") setCinema(false);
   }, [mode]);
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "=") return;
+      const target = event.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT" || target.isContentEditable)) return;
+      event.preventDefault();
+      setTagline((current) => {
+        let next = current;
+        while (next === current) next = taglines[Math.floor(Math.random() * taglines.length)];
+        return next;
+      });
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
   useEffect(() => {
     const el = remoteRef.current;
     const stream = remoteStreamRef.current;
@@ -335,6 +389,19 @@ function App() {
       return win.setFullscreen(false).catch(() => undefined);
     }).catch(() => undefined);
   };
+  const disconnectWatch = () => {
+    joinSeqRef.current += 1;
+    peerRef.current?.close();
+    peerRef.current = null;
+    remoteStreamRef.current = null;
+    if (remoteRef.current) remoteRef.current.srcObject = null;
+    setWatchIce("idle");
+    setWatchCode("");
+    setWatchZoom(1);
+    leaveImmersive();
+    setSessionAction("idle");
+    setNotice("Disconnected.");
+  };
   const joinRoom = async () => {
     if (sessionAction !== "idle") return;
     const code = joinCode.trim().toUpperCase();
@@ -344,8 +411,10 @@ function App() {
     }
     setSessionAction("joining");
     setNotice("Looking for the host on your network…");
+    const seq = ++joinSeqRef.current;
     try {
       const [host, offer] = await invokeMedia<[string, Signal]>("discover_media_room", { request: { code } });
+      if (joinSeqRef.current !== seq) return;
       const pc = new RTCPeerConnection({ iceServers: [] });
       peerRef.current?.close();
       peerRef.current = pc;
@@ -378,10 +447,12 @@ function App() {
       pc.oniceconnectionstatechange = handleIce;
       handleIce();
       await invokeMedia("submit_media_room_answer", { request: { host, answer: { type: "answer", sdp: local.sdp } } });
+      if (joinSeqRef.current !== seq || peerRef.current !== pc) return;
       if (pc.iceConnectionState !== "connected" && pc.iceConnectionState !== "completed") setNotice(`Joined ${code}. Waiting for media…`);
     } catch (error) {
       peerRef.current?.close();
       peerRef.current = null;
+      if (joinSeqRef.current !== seq) return;
       setWatchIce("idle");
       setNotice(diagnosticError(error, "Could not join the session."));
     } finally {
@@ -407,11 +478,17 @@ function App() {
   return (
     <div className={`app-shell${cinema ? " cinema" : ""}`}>
       <aside className="sidebar">
-        <div className="brand"><span className="brand-mark"><i/><i/><i/></span><span>goDrinking</span></div>
+        <div className="brand">
+          <img className="brand-logo" src={logo} alt=""/>
+          <div className="brand-stack">
+            <span>goDrinking</span>
+            <span className="brand-tagline" title={tagline}>{tagline}</span>
+          </div>
+        </div>
         <div className="nav-label">Workspace</div>
         <nav aria-label="Main navigation">
           <button className={`nav-item ${mode === "share" ? "active" : ""}`} onClick={() => setMode("share")}><Icon name="grid"/> Share screen</button>
-          <button className={`nav-item ${mode === "watch" ? "active" : ""}`} onClick={() => setMode("watch")}><Icon name="monitor"/> Watch</button>
+          <button className={`nav-item ${mode === "watch" ? "active" : ""}`} onClick={() => setMode("watch")}><Icon name="monitor"/> Watch{watchStreamActive ? <span className="nav-live"><i/>Live</span> : null}</button>
         </nav>
         <div className="sidebar-spacer"/>
         <div className={`local-card ${lanConnected ? "is-connected" : ""}`}>
@@ -434,8 +511,8 @@ function App() {
             <h1>{mode === "share" ? <>Share your screen,<br/><em>stay close.</em></> : watchConnected ? <>Watching <em>{watchCode}</em></> : <>Enter a code,<br/><em>watch live.</em></>}</h1>
           </div>
         </div>
-        {mode === "watch" ? (
-          <div className={watchConnected ? "watch-live-grid" : "workspace-grid"}>
+        {watchStreamActive || mode === "watch" ? (
+          <div className={`${watchConnected ? "watch-live-grid" : "workspace-grid"}${mode === "share" ? " watch-background" : ""}`} aria-hidden={mode === "share" || undefined}>
             {!watchConnected && (
               <section className="panel controls-panel">
                 <div className="panel-title"><div><span className="section-kicker">01 / Join</span><h2>Session code</h2></div></div>
@@ -480,10 +557,16 @@ function App() {
                   </>
                 )}
               </div>
-              {watchConnected && <p className="watch-status-line">{notice}</p>}
+              {(watchConnected || watchIce === "connecting") && (
+                <div className="watch-status-row">
+                  {watchConnected && <p className="watch-status-line">{notice}</p>}
+                  <button className="watch-disconnect" onClick={disconnectWatch}>Disconnect</button>
+                </div>
+              )}
             </section>
           </div>
-        ) : (
+        ) : null}
+        {mode === "share" && (
           <div className="workspace-grid">
             <section className="panel controls-panel">
               <div className="panel-title"><div><span className="section-kicker">01 / Source</span><h2>What do you want to share?</h2></div></div>

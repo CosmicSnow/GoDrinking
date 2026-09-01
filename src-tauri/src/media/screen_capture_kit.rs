@@ -1911,6 +1911,7 @@ fn screen_recording_is_granted() -> bool {
     objc2_core_graphics::CGPreflightScreenCaptureAccess() || foreign_window_titles_visible()
 }
 
+#[cfg(target_os = "macos")]
 fn foreign_window_titles_visible() -> bool {
     use core_foundation::array::CFArray;
     use core_foundation::base::{CFType, TCFType};
@@ -2066,6 +2067,7 @@ fn dedupe_apps_by_pid(
     result
 }
 
+#[cfg(target_os = "macos")]
 fn detect_availability() -> ScreenCaptureKitAvailability {
     let authorization = if screen_recording_is_granted() {
         ScreenRecordingAuthorization::Granted

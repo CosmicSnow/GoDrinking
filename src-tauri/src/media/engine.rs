@@ -27,6 +27,8 @@ struct SessionRecord {
     _pipeline: NativePipeline,
     #[cfg(target_os = "macos")]
     adapter: super::screen_capture_kit::ScreenCaptureKitAdapter,
+    #[cfg(target_os = "windows")]
+    adapter: super::windows_capture::WindowsCaptureAdapter,
     native_capture_active: bool,
     room: Option<LanRoom>,
     // The active process tap, if any. Dropped to silence system audio without
@@ -149,9 +151,20 @@ impl MediaEngine {
         &self,
         app: &tauri::AppHandle,
     ) -> MediaCapabilities {
-        let mut adapter = super::screen_capture_kit::ScreenCaptureKitAdapter::new();
-        let availability = adapter.probe_permission(app);
-        self.update_capabilities(availability)
+        #[cfg(target_os = "windows")]
+        {
+            // Windows has no pre-flight permission probe: WGC fails at capture
+            // start if display capture is blocked. Report the static
+            // capabilities as granted.
+            let _ = app;
+            self.capabilities()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut adapter = super::screen_capture_kit::ScreenCaptureKitAdapter::new();
+            let availability = adapter.probe_permission(app);
+            self.update_capabilities(availability)
+        }
     }
 
     pub fn snapshot(&self) -> MediaSessionSnapshot {
@@ -203,18 +216,37 @@ impl MediaEngine {
     }
 
     pub fn enumerate_sources(&self) -> Result<Vec<NativeCaptureSource>, MediaEngineError> {
-        let adapter = super::screen_capture_kit::ScreenCaptureKitAdapter::new();
-        adapter
-            .enumerate_sources()
-            .map_err(|error| MediaEngineError::NativeCapture(error.to_string()))
+        #[cfg(target_os = "windows")]
+        {
+            super::windows_capture::WindowsCaptureAdapter::enumerate_sources()
+                .map_err(MediaEngineError::NativeCapture)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let adapter = super::screen_capture_kit::ScreenCaptureKitAdapter::new();
+            adapter
+                .enumerate_sources()
+                .map_err(|error| MediaEngineError::NativeCapture(error.to_string()))
+        }
     }
 
     pub fn request_screen_recording_permission(&self, app: &tauri::AppHandle) -> MediaCapabilities {
-        let mut adapter = super::screen_capture_kit::ScreenCaptureKitAdapter::new();
-        let availability = adapter.request_permission(app);
-        self.update_capabilities(availability)
+        #[cfg(target_os = "windows")]
+        {
+            // No-op granted: WGC will fail at capture start if display capture
+            // is blocked in Windows privacy settings.
+            let _ = app;
+            self.capabilities()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut adapter = super::screen_capture_kit::ScreenCaptureKitAdapter::new();
+            let availability = adapter.request_permission(app);
+            self.update_capabilities(availability)
+        }
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn update_capabilities(
         &self,
         availability: super::screen_capture_kit::ScreenCaptureKitAvailability,
@@ -460,7 +492,26 @@ fn create_in_state(
             return Err(MediaEngineError::NativeCapture(error.to_string()));
         }
     }
-    let native_capture_active = cfg!(target_os = "macos") && capabilities.screen_capture_kit;
+    #[cfg(target_os = "windows")]
+    let mut adapter = super::windows_capture::WindowsCaptureAdapter::new();
+    #[cfg(target_os = "windows")]
+    if capabilities.windows_graphics_capture {
+        if let Err(error) = adapter.start_capture(
+            &request,
+            pipeline.capture_tx.clone(),
+            pipeline.encoder_tx.clone(),
+            pipeline.preview_diagnostics(),
+            pipeline.generation,
+        ) {
+            if let Ok(mut state) = state.lock() {
+                state.lifecycle = MediaLifecycleState::Idle;
+                state.detail = format!("Native capture start failed and is retryable: {error}");
+            }
+            return Err(MediaEngineError::NativeCapture(error));
+        }
+    }
+    let native_capture_active = (cfg!(target_os = "macos") && capabilities.screen_capture_kit)
+        || (cfg!(target_os = "windows") && capabilities.windows_graphics_capture);
     let room = LanRoom::start().ok();
     let mut state = state.lock().map_err(|_| MediaEngineError::StatePoisoned)?;
     let audio_note = if request.system_audio && audio_tap.is_none() {
@@ -477,6 +528,8 @@ fn create_in_state(
         peer,
         _pipeline: pipeline,
         #[cfg(target_os = "macos")]
+        adapter,
+        #[cfg(target_os = "windows")]
         adapter,
         native_capture_active,
         room,
@@ -597,6 +650,16 @@ fn stop_in_state(
                 .unwrap_or_else(|| format!("Native capture stop failed and is retryable: {error}"));
         }
         return Err(MediaEngineError::NativeCapture(error.to_string()));
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Err(error) = session.adapter.stop_capture() {
+        if let Ok(mut state) = state.lock() {
+            state.session = Some(session);
+            state.lifecycle = MediaLifecycleState::Running;
+            state.detail = format!("Native capture stop failed and is retryable: {error}");
+        }
+        return Err(MediaEngineError::NativeCapture(error));
     }
 
     let mut state = state.lock().map_err(|_| MediaEngineError::StatePoisoned)?;
