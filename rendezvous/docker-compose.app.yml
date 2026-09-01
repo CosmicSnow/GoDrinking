@@ -10,8 +10,8 @@ services:
     restart: unless-stopped
     env_file:
       - .env.dev
-    ports:
-      - "80:${PORT:-8787}"
+    expose:
+      - "${PORT:-8787}"
     networks:
       - npm
 
@@ -22,7 +22,7 @@ services:
     restart: unless-stopped
     env_file:
       - .env.production
-    ports:
-      - "80:${PORT:-8787}"
+    expose:
+      - "${PORT:-8787}"
     networks:
       - npm
