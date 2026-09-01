@@ -1,5 +1,5 @@
 networks:
-  npm:
+  main-npm:
     external: true
 
 services:
@@ -13,7 +13,7 @@ services:
     expose:
       - "${PORT:-8787}"
     networks:
-      - npm
+      - main-npm
 
   godrinking-rendezvous-prod:
     profiles: [prod]
@@ -25,4 +25,4 @@ services:
     expose:
       - "${PORT:-8787}"
     networks:
-      - npm
+      - main-npm
