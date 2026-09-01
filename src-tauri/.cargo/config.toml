@@ -1,0 +1,4 @@
+# ScreenCaptureKit was introduced for public use in macOS 12.3.
+# Keep the deployment target aligned with the APIs linked by the native media core.
+[env]
+MACOSX_DEPLOYMENT_TARGET = { value = "12.3", force = true }

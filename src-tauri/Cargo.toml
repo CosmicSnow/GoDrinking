@@ -1,0 +1,40 @@
+[package]
+name = "godrinking"
+version = "0.1.0"
+description = "goDrinking"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "tauri_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+webrtc = "0.14.0"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "time", "net", "io-util", "macros"] }
+rand = "0.8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = { version = "=0.6.2", default-features = false, features = ["alloc"] }
+dispatch2 = { version = "=0.3.1", default-features = false, features = ["alloc", "objc2"] }
+objc2 = { version = "=0.6.4", default-features = false, features = ["std"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["std", "NSArray", "NSError", "NSObject", "NSString", "NSProcessInfo", "NSUUID", "NSValue"] }
+opus = "0.3"
+core-foundation = "0.10"
+objc2-core-media = { version = "=0.3.2", default-features = false, features = ["std", "CMSampleBuffer", "CMTime", "objc2", "objc2-core-video"] }
+objc2-core-video = { version = "=0.3.2", default-features = false, features = ["CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn", "objc2"] }
+objc2-screen-capture-kit = "=0.3.2"
+objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["CGWindow"] }
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "libc", "NSWorkspace", "NSRunningApplication"] }
