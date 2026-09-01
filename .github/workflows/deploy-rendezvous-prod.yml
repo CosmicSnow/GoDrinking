@@ -73,6 +73,7 @@ jobs:
       - name: Pull and deploy
         working-directory: rendezvous
         run: |
+          docker network inspect npm >/dev/null 2>&1 || docker network create npm || true
           docker compose -f docker-compose.app.yml --profile prod pull
           docker compose -f docker-compose.app.yml --profile prod stop godrinking-rendezvous-prod || true
           docker compose -f docker-compose.app.yml --profile prod up -d --force-recreate
