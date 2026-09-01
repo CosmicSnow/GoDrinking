@@ -73,8 +73,8 @@ enum Outgoing {
 /// The Host's Stunar connection: open + heartbeat + WS inbox.
 pub(crate) struct StunarHost {
     base: String,
-    /// Current Room code. Mutable so the Host can rotate it live (PRD-18);
-    /// the Rendezvous repoints the same room (same host_token, same viewers).
+    /// Room code assigned by the Rendezvous at open. Server-owned: the Host
+    /// never chooses or rotates it; it lives until the room dies.
     code: Mutex<String>,
     host_token: String,
     state: Arc<Mutex<StunarState>>,
@@ -95,16 +95,18 @@ struct RosterViewer {
 
 impl StunarHost {
     /// Opens the room on the Rendezvous and starts the heartbeat + WS worker.
+    /// The Rendezvous generates the Room code and returns it with the
+    /// host_token; the caller reads it back via `code()`.
     pub(crate) fn start(
         base: &str,
-        code: &str,
         password: &str,
         nickname: &str,
         admission: bool,
     ) -> Result<Self, String> {
         let runtime = current_thread_runtime()?;
         let client = http_client()?;
-        let host_token = runtime.block_on(host_open(&client, base, code, password, nickname, admission))?;
+        let (host_token, code) =
+            runtime.block_on(host_open(&client, base, password, nickname, admission))?;
         let state = Arc::new(Mutex::new(StunarState::Calling));
         let roster = Arc::new(Mutex::new(HashMap::new()));
         let answers = Arc::new(Mutex::new(Vec::new()));
@@ -135,7 +137,7 @@ impl StunarHost {
             .map_err(|error| error.to_string())?;
         Ok(Self {
             base: base.to_owned(),
-            code: Mutex::new(code.to_owned()),
+            code: Mutex::new(code),
             host_token,
             state,
             roster,
@@ -231,24 +233,13 @@ impl StunarHost {
         runtime.block_on(post_decide(&client, &self.base, &self.host_token, id, "kick"))
     }
 
-    /// Rotates the Room code and/or Password on the Rendezvous. `None` keeps
-    /// the current value; `Some("")` removes the Password. A code collision
-    /// is an error and the old code stays. Connected Viewers keep their
-    /// tokens (the server repoints them); the WS is not touched.
-    pub(crate) fn rotate(
-        &self,
-        code: Option<&str>,
-        password: Option<&str>,
-    ) -> Result<(), String> {
+    /// Rotates the Password on the Rendezvous. `None` keeps the current
+    /// value. The Room code is server-owned and never rotates. Connected
+    /// Viewers keep their tokens; the WS is not touched.
+    pub(crate) fn rotate(&self, password: Option<&str>) -> Result<(), String> {
         let runtime = current_thread_runtime()?;
         let client = http_client()?;
-        runtime.block_on(post_rotate(&client, &self.base, &self.host_token, code, password))?;
-        if let Some(code) = code {
-            if let Ok(mut current) = self.code.lock() {
-                *current = code.to_owned();
-            }
-        }
-        Ok(())
+        runtime.block_on(post_rotate(&client, &self.base, &self.host_token, password))
     }
 
     /// Sends an offer signal to an accepted Viewer over the WS.
@@ -284,15 +275,12 @@ impl Drop for StunarHost {
 async fn host_open(
     client: &reqwest::Client,
     base: &str,
-    code: &str,
     password: &str,
     nickname: &str,
     admission: bool,
-) -> Result<String, String> {
-    let mut body = json!({ "code": code, "nickname": nickname, "admission": admission });
-    if !password.is_empty() {
-        body["password"] = json!(password);
-    }
+) -> Result<(String, String), String> {
+    // The server generates the Room code; the Host never sends one.
+    let body = json!({ "password": password, "nickname": nickname, "admission": admission });
     let response = client
         .post(format!("{base}/v1/host/open"))
         .json(&body)
@@ -305,10 +293,15 @@ async fn host_open(
         .await
         .map_err(|_| "Stunar is unreachable.".to_owned())?;
     if status.is_success() && json["ok"] == true {
-        json["host_token"]
+        let host_token = json["host_token"]
             .as_str()
             .map(|token| token.to_owned())
-            .ok_or_else(|| "Stunar is unreachable.".to_owned())
+            .ok_or_else(|| "Stunar is unreachable.".to_owned())?;
+        let code = json["code"]
+            .as_str()
+            .map(|code| code.to_owned())
+            .ok_or_else(|| "Stunar is unreachable.".to_owned())?;
+        Ok((host_token, code))
     } else {
         Err("Stunar is unreachable.".into())
     }
@@ -356,13 +349,10 @@ async fn post_rotate(
     client: &reqwest::Client,
     base: &str,
     host_token: &str,
-    code: Option<&str>,
     password: Option<&str>,
 ) -> Result<(), String> {
+    // The code is server-owned; rotate only changes the Password.
     let mut body = json!({ "host_token": host_token });
-    if let Some(code) = code {
-        body["code"] = json!(code);
-    }
     if let Some(password) = password {
         body["password"] = json!(password);
     }
@@ -372,13 +362,8 @@ async fn post_rotate(
         .send()
         .await
         .map_err(|_| "Stunar is unreachable.".to_owned())?;
-    let status = response.status();
-    if status.is_success() {
+    if response.status().is_success() {
         return Ok(());
-    }
-    if status == reqwest::StatusCode::NOT_FOUND {
-        // 404 denied: the new code is already alive on another Host.
-        return Err("That code is already in use.".into());
     }
     Err("Stunar is unreachable.".into())
 }
@@ -592,10 +577,8 @@ pub(crate) fn discover_stunar_room(
     let runtime = current_thread_runtime()?;
     let result: Result<(String, PeerSignal, WsStream), String> = runtime.block_on(async {
         let client = http_client()?;
-        let mut body = json!({ "code": code, "nickname": nickname });
-        if !password.is_empty() {
-            body["password"] = json!(password);
-        }
+        // Stunar rooms always have a Password; the ask always carries it.
+        let body = json!({ "code": code, "password": password, "nickname": nickname });
         let response = client
             .post(format!("{base}/v1/viewer/ask"))
             .json(&body)

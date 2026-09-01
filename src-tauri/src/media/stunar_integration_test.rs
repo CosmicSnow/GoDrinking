@@ -27,10 +27,9 @@ mod stunar_integration {
                 if !health {
                     return false;
                 }
-                let code = format!("P{:05}", rand::random::<u16>() % 10000);
                 let response = client
                     .post(format!("{base}/v1/host/open"))
-                    .json(&serde_json::json!({ "code": code, "nickname": "Probe" }))
+                    .json(&serde_json::json!({ "password": "probe", "nickname": "Probe" }))
                     .send()
                     .await
                     .ok();
@@ -72,14 +71,15 @@ mod stunar_integration {
             eprintln!("SKIP: rendezvous not running on {base}");
             return;
         }
-        let code = format!("T{:05}", rand::random::<u16>() % 10000);
-        let host = StunarHost::start(base, &code, "", "Ana", true).expect("open");
-        assert_eq!(host.code(), code);
+        let host = StunarHost::start(base, "senha", "Ana", true).expect("open");
+        let code = host.code();
+        assert_eq!(code.len(), 6);
+        assert!(code.chars().all(|ch| ch.is_ascii_alphanumeric()));
 
         let viewer_base = base.to_owned();
         let viewer_code = code.clone();
         let viewer = std::thread::spawn(move || {
-            discover_stunar_room(&viewer_base, &viewer_code, "", "Joao")
+            discover_stunar_room(&viewer_base, &viewer_code, "senha", "Joao")
         });
 
         // Host sees the pending viewer.
@@ -129,7 +129,7 @@ mod stunar_integration {
         let denied = runtime.block_on(async {
             let response = reqwest::Client::new()
                 .post(format!("{base}/v1/viewer/ask"))
-                .json(&serde_json::json!({ "code": code, "nickname": "Outro" }))
+                .json(&serde_json::json!({ "code": code, "password": "senha", "nickname": "Outro" }))
                 .send()
                 .await
                 .unwrap();
@@ -145,14 +145,14 @@ mod stunar_integration {
             eprintln!("SKIP: rendezvous not running on {base}");
             return;
         }
-        let code = format!("U{:05}", rand::random::<u16>() % 10000);
-        let host = StunarHost::start(base, &code, "", "Ana", false).expect("open");
+        let host = StunarHost::start(base, "senha", "Ana", false).expect("open");
+        let code = host.code();
 
         // Viewer asks; admission off => accepted immediately, no pending step.
         let viewer_base = base.to_owned();
         let viewer_code = code.clone();
         let viewer = std::thread::spawn(move || {
-            discover_stunar_room(&viewer_base, &viewer_code, "", "Joao")
+            discover_stunar_room(&viewer_base, &viewer_code, "senha", "Joao")
         });
 
         // The host learns the accepted viewer from the roster message.
@@ -177,25 +177,27 @@ mod stunar_integration {
     }
 
     #[test]
-    fn stunar_rotate_code_and_password_live() {
+    fn stunar_rotate_password_live() {
         let base = "http://127.0.0.1:8787";
         if !rendezvous_up(base) {
             eprintln!("SKIP: rendezvous not running on {base}");
             return;
         }
-        let code = format!("R{:05}", rand::random::<u16>() % 10000);
-        let host = StunarHost::start(base, &code, "", "Ana", false).expect("open");
+        let host = StunarHost::start(base, "senha", "Ana", false).expect("open");
+        let code = host.code();
+        assert_eq!(code.len(), 6);
 
-        // Rotate code + password; the same room (host_token) keeps serving.
-        host.rotate(Some("XYZ789"), Some("nova")).expect("rotate");
-        assert_eq!(host.code(), "XYZ789");
+        // Rotate the password; the same room (host_token) keeps serving and
+        // the server-owned code never changes.
+        host.rotate(Some("nova")).expect("rotate");
+        assert_eq!(host.code(), code, "code is server-owned and never rotates");
 
-        // Old code no longer resolves; new code + new password works.
+        // Old password rejected; new password works.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        let ask = |code: &str, password: &str| {
+        let ask = |password: &str| {
             runtime.block_on(async {
                 let response = reqwest::Client::new()
                     .post(format!("{base}/v1/viewer/ask"))
@@ -211,15 +213,8 @@ mod stunar_integration {
                 json["ok"] == true
             })
         };
-        assert!(!ask(&code, ""), "old code must stop resolving");
-        assert!(!ask("XYZ789", ""), "old password must be rejected");
-        assert!(ask("XYZ789", "nova"), "new code + new password must work");
-
-        // Collision: another host takes the old code, rotate back is denied.
-        let other = StunarHost::start(base, &code, "", "Bia", false).expect("open other");
-        assert!(host.rotate(Some(&code), None).is_err(), "collision must fail");
-        assert_eq!(host.code(), "XYZ789", "old code kept on collision");
-        other.close();
+        assert!(!ask("senha"), "old password must be rejected");
+        assert!(ask("nova"), "new password must work");
         host.close();
     }
 }

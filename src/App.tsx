@@ -118,7 +118,6 @@ function App() {
   const [nickname, setNickname] = useState(() => localStorage.getItem("godrinking.nickname") ?? "");
   const [hostPassword, setHostPassword] = useState("");
   const [hostAdmission, setHostAdmission] = useState(false);
-  const [newCode, setNewCode] = useState("");
   const [joinPassword, setJoinPassword] = useState("");
   const [notice, setNotice] = useState("");
   const [copied, setCopied] = useState(false);
@@ -150,6 +149,9 @@ function App() {
   const audioExclusion = caps?.app_audio_exclusion === "enhanced";
   const roomLabel = session?.session_code ? `${session.session_code}${session.lan_addresses[0] ? ` · ${session.lan_addresses[0]}` : ""}` : "";
   const nicknameValid = /^[A-Za-z0-9 _.-]+$/.test(nickname.trim()) && nickname.trim().length >= 2 && nickname.trim().length <= 24;
+  const passwordValid = (password: string) => password.length >= 4 && password.length <= 64;
+  const stunarHostPasswordValid = joinMode !== "stunar" || passwordValid(hostPassword);
+  const stunarJoinPasswordValid = joinMode !== "stunar" || passwordValid(joinPassword);
   const roster = session?.roster ?? [];
   const pendingRoster = roster.filter((entry) => entry.state === "pending");
   const connectedRoster = roster.filter((entry) => entry.state !== "pending");
@@ -356,6 +358,7 @@ function App() {
       if (sourceId === null && filteredSources.length > 0) throw new Error("Choose a display or window before starting.");
       if (!nicknameValid) throw new Error("Enter a nickname (2–24 letters, numbers, spaces, _ - .).");
       if (joinMode === "stunar" && !rendezvousUrl.trim()) throw new Error("Set the Stunar URL in settings.");
+      if (joinMode === "stunar" && !passwordValid(hostPassword)) throw new Error("Stunar requires a password (4–64 characters).");
       const preset = qualityPresets[quality];
       const next = await invokeMedia<Snapshot>("create_media_session", {
         request: {
@@ -450,6 +453,10 @@ function App() {
     if (joinMode === "stunar") {
       if (!rendezvousUrl.trim()) {
         setNotice("Set the Stunar URL in settings.");
+        return;
+      }
+      if (!passwordValid(joinPassword)) {
+        setNotice("Stunar requires a password (4–64 characters).");
         return;
       }
       const code = joinCode.trim().toUpperCase();
@@ -563,6 +570,10 @@ function App() {
     }
   };
   const applyCredentials = async () => {
+    if (joinMode === "stunar" && !passwordValid(hostPassword)) {
+      setNotice("Stunar requires a password (4–64 characters).");
+      return;
+    }
     try {
       const next = await invokeMedia<Snapshot>("update_media_session_credentials", {
         request: { password: hostPassword, admission: hostAdmission }
@@ -571,23 +582,6 @@ function App() {
       setNotice(hostPassword ? "Password updated. Connected viewers stay." : "Password removed. Connected viewers stay.");
     } catch (error) {
       setNotice(diagnosticError(error, "Could not update the session credentials."));
-    }
-  };
-  const rotateCode = async () => {
-    const code = newCode.trim().toUpperCase();
-    if (!/^[A-Z0-9]{6}$/.test(code)) {
-      setNotice("Room code must be 6 letters or numbers.");
-      return;
-    }
-    try {
-      const next = await invokeMedia<Snapshot>("update_media_session_credentials", {
-        request: { code }
-      });
-      setSession(next);
-      setNewCode("");
-      setNotice(`Session code is now ${code}. Connected viewers stay.`);
-    } catch (error) {
-      setNotice(diagnosticError(error, "Could not change the session code."));
     }
   };
   const toggleAdmission = async (next: boolean) => {
@@ -684,10 +678,10 @@ function App() {
                 )}
                 <label className="native-select-label" htmlFor="join-nickname">Nickname</label>
                 <input id="join-nickname" className="native-source" value={nickname} onChange={(event) => setNickname(event.target.value)} placeholder="Your name" maxLength={24}/>
-                <label className="native-select-label" htmlFor="join-password">Password (optional)</label>
-                <input id="join-password" className="native-source" type="password" value={joinPassword} onChange={(event) => setJoinPassword(event.target.value)} placeholder="Only if the host set one" maxLength={64}/>
+                <label className="native-select-label" htmlFor="join-password">Password {joinMode === "stunar" ? "(required)" : "(optional)"}</label>
+                <input id="join-password" className="native-source" type="password" value={joinPassword} onChange={(event) => setJoinPassword(event.target.value)} placeholder={joinMode === "stunar" ? "Required" : "Only if the host set one"} maxLength={64}/>
                 <p className="start-hint">{notice}</p>
-                <button className="primary-cta" disabled={sessionAction !== "idle" || !nicknameValid} onClick={() => void joinRoom()}>
+                <button className="primary-cta" disabled={sessionAction !== "idle" || !nicknameValid || !stunarJoinPasswordValid} onClick={() => void joinRoom()}>
                   {sessionAction === "joining" ? "Joining…" : "Join session"}
                 </button>
               </section>
@@ -820,13 +814,15 @@ function App() {
                 <>
                   <label className="native-select-label" htmlFor="share-rendezvous">Stunar URL</label>
                   <input id="share-rendezvous" className="native-source" value={rendezvousUrl} onChange={(event) => setRendezvousUrl(event.target.value)} placeholder="https://rendezvous.example.com"/>
+                  <label className="native-select-label" htmlFor="share-password">Password (required)</label>
+                  <input id="share-password" className="native-source" type="password" value={hostPassword} onChange={(event) => setHostPassword(event.target.value)} placeholder="4–64 characters" maxLength={64}/>
                 </>
               )}
               <p className="start-hint">{notice}</p>
               {active ? (
                 <button className="primary-cta" disabled={sessionAction !== "idle"} onClick={() => void stopSharing()}>{sessionAction === "stopping" ? "Stopping…" : "Stop native session"}</button>
               ) : (
-                <button className="primary-cta" disabled={!canStart || !nicknameValid || sessionAction !== "idle"} onClick={() => void startSharing()}>{sessionAction === "starting" ? "Starting…" : "Start native session"}</button>
+                <button className="primary-cta" disabled={!canStart || !nicknameValid || sessionAction !== "idle" || !stunarHostPasswordValid} onClick={() => void startSharing()}>{sessionAction === "starting" ? "Starting…" : "Start native session"}</button>
               )}
             </section>
             <div className="right-column">
@@ -879,19 +875,12 @@ function App() {
                     </span>
                   </>
                 )}
-                {active && (joinMode === "lan" || joinMode === "stunar") && (
-                  <div className="signal-block">
-                    <label>New code</label>
-                    <input className="signal-input" value={newCode} onChange={(event) => setNewCode(event.target.value.toUpperCase())} placeholder="ABC123" maxLength={6}/>
-                    <button className="copy-button" onClick={() => void rotateCode()} disabled={sessionAction !== "idle" || newCode.trim().length !== 6}>New code</button>
-                  </div>
-                )}
                 {active && (
                   <>
                     <div className="signal-block">
-                      <label>Password (optional)</label>
+                      <label>Password {joinMode === "stunar" ? "(required)" : "(optional)"}</label>
                       <input className="signal-input" type="password" value={hostPassword} onChange={(event) => setHostPassword(event.target.value)} placeholder={session?.password_set ? "Change password" : "Set a password"} maxLength={64}/>
-                      <button className="copy-button" onClick={() => void applyCredentials()} disabled={sessionAction !== "idle"}>{session?.password_set ? "Update" : "Set password"}</button>
+                      <button className="copy-button" onClick={() => void applyCredentials()} disabled={sessionAction !== "idle" || (joinMode === "stunar" && !passwordValid(hostPassword))}>{session?.password_set ? "Update" : "Set password"}</button>
                     </div>
                     <label className={`unsupported-option ${active ? "" : "is-disabled"}`}>
                       <div><strong>Require approval</strong><small>Approve each viewer before they see your screen</small></div>

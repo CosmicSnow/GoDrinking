@@ -34,9 +34,12 @@ const SALT_LEN = 16;
 const RATE_WINDOW_MS = 60 * 1000;
 const RATE_LIMITS = { "host/open": 5, "host/heartbeat": 6, "viewer/ask": 10, ws: 20, rest: 60 };
 const IGNORE_WINDOW_MS = 10 * 60 * 1000;
-const IGNORE_LIMIT = 5;
-const IGNORE_FOR_MS = 15 * 60 * 1000;
-const CODE_RE = /^[A-Z0-9]{6}$/;
+// Escalating ignore: 5,10,15,20 fails in the window -> 15min,1h,6h,24h.
+const IGNORE_PENALTIES = [15 * 60 * 1000, 60 * 60 * 1000, 6 * 60 * 60 * 1000, 24 * 60 * 60 * 1000];
+const FAKE_TOKENS_MAX = 100;
+const FAKE_TOKEN_TTL_MS = 2 * 60 * 1000;
+const FAKE_TOKEN_GC_MS = 30 * 1000;
+const TARPIT_SOCKET_MS = 60 * 1000;
 const NICK_RE = /^[A-Za-z0-9 _\-.]+$/;
 const ROUTES = new Set([
   "/v1/host/open",
@@ -55,8 +58,10 @@ const rooms = new Map();
 const tokens = new Map();
 /** @type {Map<string, Map<string, number[]>>} ip -> route -> hit timestamps */
 const rate = new Map();
-/** @type {Map<string, {fails: number[], until: number}>} ip -> ignore entry */
+/** @type {Map<string, {fails: number[], until: number, level: number}>} ip -> ignore entry */
 const ignore = new Map();
+/** @type {Map<string, number>} fake viewer_token -> createdAt (tarpit) */
+const fakeTokens = new Map();
 
 // Room = { code, passwordHash, passwordSalt, admission, hostNickname,
 //          hostToken, heartbeatAt, hostWs, viewers: Map<id, Viewer> }
@@ -91,6 +96,12 @@ function randomViewerId() {
   return randomBytes(4).toString("hex");
 }
 
+function randomCode() {
+  // 4 random bytes -> 6 base36 chars (A-Z0-9). Mask to 31 bits so the
+  // base36 form never exceeds 6 chars.
+  return (randomBytes(4).readUInt32BE(0) & 0x7fffffff).toString(36).toUpperCase().padStart(6, "0");
+}
+
 function scryptAsync(password, salt) {
   return new Promise((resolve, reject) => {
     scrypt(password, salt, SCRYPT_KEYLEN, { N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P }, (err, key) => {
@@ -114,7 +125,7 @@ function validNickname(nickname) {
 function validPassword(password) {
   if (typeof password !== "string") return false;
   const len = [...password].length;
-  return len === 0 || (len >= 4 && len <= 64);
+  return len >= 4 && len <= 64;
 }
 
 function sendJson(res, status, obj) {
@@ -176,19 +187,42 @@ function isIgnored(ip) {
   return false;
 }
 
+// Tarpit: penalized IPs (level >= 1) get fake `pending` answers instead of
+// `denied`, so scanners cannot tell a live room from a dead one.
+function isTarpitted(ip) {
+  const entry = ignore.get(ip);
+  return !!entry && entry.level >= 1 && Date.now() < entry.until;
+}
+
 function noteAuthFailure(ip) {
   const now = Date.now();
   let entry = ignore.get(ip);
   if (!entry) {
-    entry = { fails: [], until: 0 };
+    entry = { fails: [], until: 0, level: 0 };
     ignore.set(ip, entry);
   }
   entry.fails = entry.fails.filter((t) => now - t < IGNORE_WINDOW_MS);
   entry.fails.push(now);
-  if (entry.fails.length >= IGNORE_LIMIT) {
-    entry.until = now + IGNORE_FOR_MS;
+  const fails = entry.fails.length;
+  const nextLevel = fails >= 20 ? 4 : fails >= 15 ? 3 : fails >= 10 ? 2 : fails >= 5 ? 1 : 0;
+  if (nextLevel > entry.level) {
+    // Escalate: 5,10,15,20 fails in the window -> 15min,1h,6h,24h.
+    entry.level = nextLevel;
+    entry.until = now + IGNORE_PENALTIES[nextLevel - 1];
+    entry.fails = [];
+  } else if (nextLevel === entry.level && entry.level > 0) {
+    // Penalty expired and the IP is still failing: re-apply, count restarts.
+    entry.until = now + IGNORE_PENALTIES[entry.level - 1];
     entry.fails = [];
   }
+}
+
+function storeFakeToken(token) {
+  if (fakeTokens.size >= FAKE_TOKENS_MAX) {
+    const oldest = fakeTokens.keys().next().value;
+    if (oldest !== undefined) fakeTokens.delete(oldest);
+  }
+  fakeTokens.set(token, Date.now());
 }
 
 // --- Room lifecycle --------------------------------------------------------
@@ -220,21 +254,25 @@ function destroyRoom(room) {
 // --- REST handlers ---------------------------------------------------------
 
 async function handleOpen(ip, json, res) {
-  const code = normalizeCode(json.code);
-  if (!CODE_RE.test(code)) return invalid(res);
   if (!validNickname(json.nickname)) return invalid(res);
   const password = typeof json.password === "string" ? json.password : "";
   if (!validPassword(password)) return invalid(res);
   if (rooms.size >= MAX_ROOMS) return busy(res);
-  if (rooms.has(code)) return deny(res); // no stealing a live code
+
+  // The server picks the code; a client-supplied one is ignored (compat).
+  let code = null;
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const candidate = randomCode();
+    if (!rooms.has(candidate)) {
+      code = candidate;
+      break;
+    }
+  }
+  if (!code) return busy(res); // 10 collisions: no free code
 
   const hostToken = randomToken();
-  let passwordHash = null;
-  let passwordSalt = null;
-  if (password) {
-    passwordSalt = randomBytes(SALT_LEN);
-    passwordHash = await scryptAsync(password, passwordSalt);
-  }
+  const passwordSalt = randomBytes(SALT_LEN);
+  const passwordHash = await scryptAsync(password, passwordSalt);
   const room = {
     code,
     passwordHash,
@@ -249,7 +287,7 @@ async function handleOpen(ip, json, res) {
   rooms.set(code, room);
   tokens.set(hostToken, { role: "host", code });
   log("info", ip, "open", code);
-  ok(res, { ok: true, host_token: hostToken });
+  ok(res, { ok: true, host_token: hostToken, code });
 }
 
 function handleHeartbeat(ip, json, res) {
@@ -269,32 +307,11 @@ async function handleRotate(ip, json, res) {
   const room = rooms.get(entry.code);
   if (!room || room.hostToken !== token) return deny(res);
 
-  if (json.code !== undefined) {
-    const code = normalizeCode(json.code);
-    if (!CODE_RE.test(code)) return invalid(res);
-    if (code !== room.code && rooms.has(code)) return deny(res); // collision: keep old
-    if (code !== room.code) {
-      rooms.delete(room.code);
-      rooms.set(code, room);
-      room.code = code;
-      entry.code = code;
-      // Accepted viewer tokens survive a code rotate; point them at the new code.
-      for (const viewer of room.viewers.values()) {
-        const viewerEntry = tokens.get(viewer.token);
-        if (viewerEntry) viewerEntry.code = code;
-      }
-    }
-  }
-  if (json.password !== undefined) {
-    if (!validPassword(json.password)) return invalid(res);
-    if (json.password === "") {
-      room.passwordHash = null;
-      room.passwordSalt = null;
-    } else {
-      room.passwordSalt = randomBytes(SALT_LEN);
-      room.passwordHash = await scryptAsync(json.password, room.passwordSalt);
-    }
-  }
+  // The code is server-owned; rotate only changes the mandatory Password.
+  const password = typeof json.password === "string" ? json.password : "";
+  if (!validPassword(password)) return invalid(res);
+  room.passwordSalt = randomBytes(SALT_LEN);
+  room.passwordHash = await scryptAsync(password, room.passwordSalt);
   room.heartbeatAt = Date.now();
   log("info", ip, "rotate", room.code);
   ok(res, { ok: true });
@@ -312,6 +329,16 @@ function handleClose(ip, json, res) {
 }
 
 async function handleAsk(ip, json, res) {
+  if (isTarpitted(ip)) {
+    // Tarpit: burn CPU and answer with a fake `pending` so the scanner
+    // cannot tell a live room from a dead one. The token is dead on arrival.
+    await scryptAsync("", randomBytes(SALT_LEN)); // equalize timing with the hash path
+    await delay(50 + Math.random() * 30);
+    const viewerToken = randomToken();
+    storeFakeToken(viewerToken);
+    log("warn", ip, "ask", "-", "-", "tarpit");
+    return ok(res, { ok: true, status: "pending", viewer_token: viewerToken });
+  }
   const code = normalizeCode(json.code);
   const password = typeof json.password === "string" ? json.password : "";
   const nickname = typeof json.nickname === "string" ? json.nickname : "";
@@ -327,14 +354,12 @@ async function handleAsk(ip, json, res) {
     return deny(res);
   }
   if (!validNickname(nickname)) return invalid(res);
-  if (room.passwordHash) {
-    const hash = await scryptAsync(password, room.passwordSalt);
-    if (!timingSafeEqual(hash, room.passwordHash)) {
-      await delay(50 + Math.random() * 30);
-      noteAuthFailure(ip);
-      log("warn", ip, "ask", code, "-", "denied");
-      return deny(res);
-    }
+  const hash = await scryptAsync(password, room.passwordSalt);
+  if (!timingSafeEqual(hash, room.passwordHash)) {
+    await delay(50 + Math.random() * 30);
+    noteAuthFailure(ip);
+    log("warn", ip, "ask", code, "-", "denied");
+    return deny(res);
   }
 
   // Sync section: no await between the full check and the insert.
@@ -442,6 +467,19 @@ const wss = new WebSocketServer({ noServer: true, maxPayload: BODY_LIMIT });
 
 wss.on("connection", (ws, req, meta) => {
   const ip = ipOf(req);
+  if (meta.role === "tarpit") {
+    // Tarpit socket: looks alive, carries nothing, dies at 60s.
+    ws.isAlive = true;
+    ws.on("pong", () => {
+      ws.isAlive = true;
+    });
+    ws.on("error", () => {});
+    send(ws, { t: "roster", entries: [] });
+    ws.on("message", () => {}); // swallow everything
+    setTimeout(() => ws.close(4000, "tarpit"), TARPIT_SOCKET_MS);
+    log("warn", ip, "ws", "-", "-", "tarpit");
+    return;
+  }
   const room = rooms.get(meta.code);
   if (!room) {
     ws.close(4000, "gone");
@@ -519,7 +557,9 @@ const server = http.createServer(async (req, res) => {
     return deny(res);
   }
   if (!ROUTES.has(path)) return deny(res);
-  if (isIgnored(ip)) {
+  // Tarpitted IPs are not denied on ask: handleAsk answers with a fake
+  // `pending` instead, so scanners cannot tell a live room from a dead one.
+  if (isIgnored(ip) && !(path === "/v1/viewer/ask" && isTarpitted(ip))) {
     log("warn", ip, "ignored", path.slice(4));
     return deny(res);
   }
@@ -575,7 +615,7 @@ server.on("clientError", (_err, socket) => socket.destroy());
 
 server.on("upgrade", (req, socket, head) => {
   const ip = ipOf(req);
-  if (isIgnored(ip)) {
+  if (isIgnored(ip) && !isTarpitted(ip)) {
     socket.destroy();
     return;
   }
@@ -587,14 +627,21 @@ server.on("upgrade", (req, socket, head) => {
   const url = new URL(req.url, "http://localhost");
   const role = url.searchParams.get("role");
   const token = url.searchParams.get("token");
-  const entry = tokens.get(token);
-  if (!entry || entry.role !== role) {
-    socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+  if (wss.clients.size >= MAX_WS) {
+    socket.write("HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n");
     socket.destroy();
     return;
   }
-  if (wss.clients.size >= MAX_WS) {
-    socket.write("HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n");
+  if (fakeTokens.has(token)) {
+    // Tarpit token: accept the socket, it carries nothing and dies at 60s.
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req, { role: "tarpit", token });
+    });
+    return;
+  }
+  const entry = tokens.get(token);
+  if (!entry || entry.role !== role) {
+    socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
     socket.destroy();
     return;
   }
@@ -637,6 +684,14 @@ setInterval(() => {
     if (now >= entry.until && !entry.fails.length) ignore.delete(ip);
   }
 }, GC_INTERVAL_MS);
+
+// Tarpit tokens are short-lived: 2 min TTL, swept every 30s.
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, createdAt] of fakeTokens) {
+    if (now - createdAt > FAKE_TOKEN_TTL_MS) fakeTokens.delete(token);
+  }
+}, FAKE_TOKEN_GC_MS);
 
 server.listen(PORT, BIND, () => {
   log("info", "-", "listen", `${BIND}:${PORT}`);

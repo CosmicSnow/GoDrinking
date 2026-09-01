@@ -12,8 +12,11 @@ Mesmo comprometido, só tem Signaling. DTLS-SRTP do WebRTC continua a cifrar Med
 
 Não há `HEAD`, não há timing óbvio no scrypt (correr delay mesmo sem hash).
 
+Acima de 10 falhas em 10 min do mesmo IP, `ask` deixa de responder `denied` e responde `pending` falso (tarpit) — o scanner não sabe se a sala existe, se a Password está errada ou se está a ser enganado. Mesmo timing do `denied`.
+
 ## 3. Password
 
+- **Obrigatória (4–64) em toda sala Stunar.** `open` sem Password → `invalid`; `rotate` com `""` → `invalid`. LAN/Direct continuam a permitir vazia.
 - Nunca em logs, SDP, snapshot Tauri, query string, nome de ficheiro.
 - Snapshot: `password_set: bool`.
 - Rendezvous: scrypt, salt por sala.
@@ -32,13 +35,15 @@ Não há `HEAD`, não há timing óbvio no scrypt (correr delay mesmo sem hash).
 | | Valor |
 |---|---|
 | Janela de falhas | 10 minutos |
-| Limiar | 5 `AUTH`/`ask` falhados |
-| Duração | 15 minutos |
+| Limiar | 5 falhas → 15 min; 10 → 1 h; 15 → 6 h; 20+ → 24 h |
+| Duração | escala com o nível (acima) |
 | Chave | IP do socket (ou XFF se `TRUST_PROXY=1`) |
 | O que conta | Password errada, sala inexistente (no Rendezvous, para não dar oráculo), PROTO lixo no TCP |
 | O que não conta | Reject, Kick, FULL, Timeout Pending |
 
 No Host Direct: IP ignorado → `ERR BANNED` e close, **antes** de ler NICK. No Rendezvous: `denied` (mesmo body).
+
+**Tarpit (Rendezvous):** depois de 10 falhas em 10 min, `ask` responde `pending` falso com `viewer_token` dummy — o WS desse token manda `roster` vazio, ignora mensagens e fecha aos 60s. Tokens falsos: máx 100, TTL 2 min. O IP continua a escalar a Ignore list normalmente.
 
 IPv6: /128 no v1 (não agregamos /64). Documentar que um atacante com prefixo grande contorna; v1 aceita.
 
@@ -113,3 +118,6 @@ Não meter segredos no repo (URL default pode ser público). `host_token` não v
 - [ ] Heartbeat 5 min mata a sala
 - [ ] LAN sem STUN
 - [ ] Direct não fala com o Rendezvous
+- [ ] Código é gerado no servidor; `rotate` não aceita `code`
+- [ ] Password obrigatória (4–64) em toda sala Stunar; `open`/`rotate` recusam vazia
+- [ ] Tarpit: tokens falsos ≤ 100, TTL 2 min, WS fecha aos 60s, timing igual ao `denied`

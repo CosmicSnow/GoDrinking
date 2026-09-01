@@ -31,7 +31,7 @@ MediaEngine
 
 ```
 join_mode: "lan" | "direct" | "stunar"
-password: string          // "" = sem Password
+password: string          // "" = sem Password (LAN/Direct); Stunar obrigatória 4–64
 nickname: string
 admission: bool
 rendezvous_url?: string   // só stunar
@@ -83,7 +83,7 @@ Rust (Host) e/ou JS (Viewer) falam HTTPS com o Rendezvous. Preferência: **Rust 
 
 Fluxo Host:
 
-1. `open` → `host_token`
+1. `open` → `host_token` + `code` (gerado pelo servidor, 6 chars `A-Z0-9`; o Host não escolhe)
 2. thread Heartbeat 30s
 3. long-poll / WebSocket `inbox` → pending, accepted, signal, gone
 4. por cada Accept: cria `PeerTransport`, manda offer no mailbox daquele Viewer
@@ -101,7 +101,7 @@ Fluxo Viewer:
 roster: [
   { id, nickname, state: "pending" | "connected", since_unix_ms }
 ]
-session_code?: string          // lan + stunar
+session_code?: string          // lan + stunar; no Stunar vem do `open` (servidor)
 password_set: bool             // nunca a Password em claro
 admission: bool
 join_mode: "lan" | "direct" | "stunar"
@@ -111,12 +111,12 @@ Comandos novos: `admit_viewer`, `reject_viewer`, `kick_viewer`, `update_session_
 
 ## 8. Rodar credenciais
 
-`update_session_credentials { code?, password? }`:
+`update_session_credentials { password? }`:
 
 - Atualiza o que a SessionGate usa para AUTH novo.
-- Stunar: `POST /v1/host/rotate` com `host_token`.
+- Stunar: `POST /v1/host/rotate` com `host_token` (só Password; o código é do servidor e não roda).
 - Não toca em `ViewerLink` Connected.
-- Room code vazio na chamada = manter. Password `null` = manter. Password `""` = remover Password.
+- Password `null` = manter. Password `""` = remover Password (só LAN/Direct; no Stunar a Password é obrigatória e `rotate` recusa remover).
 
 ## 9. Limites
 
@@ -125,11 +125,12 @@ Comandos novos: `admit_viewer`, `reject_viewer`, `kick_viewer`, `update_session_
 | Viewers Connected | 8 |
 | Pending | 8 |
 | Nickname | 2–24 |
-| Password | 0 ou 4–64 |
-| Room code | 6 A–Z0–9 (igual hoje) |
+| Password | 4–64 (Stunar obrigatória; LAN/Direct 0 ou 4–64) |
+| Room code | 6 A–Z0–9, gerado pelo servidor no Stunar |
 | SDP | 64 KiB |
 | Heartbeat | 30s envio / 5 min expirar |
-| Ignore list | 5 falhas / 10 min → 15 min ignore |
+| Ignore list | 5→15 min, 10→1 h, 15→6 h, 20+→24 h (janela 10 min) |
+| Tarpit | 10 falhas/10 min → pending falso; ≤ 100 tokens, TTL 2 min, WS 60s |
 | ICE gather | 5s (como hoje) |
 
 ## 10. Fora de âmbito

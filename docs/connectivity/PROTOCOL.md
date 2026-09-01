@@ -122,8 +122,7 @@ Nunca `unknown_room`, `bad_password`, `expired`. Quem implementa não “melhora
 
 ```json
 {
-  "code": "ABC123",
-  "password": "opcional ou omitido",
+  "password": "obrigatória",
   "nickname": "Ana",
   "admission": false
 }
@@ -132,10 +131,10 @@ Nunca `unknown_room`, `bad_password`, `expired`. Quem implementa não “melhora
 Resposta:
 
 ```json
-{ "ok": true, "host_token": "<32 bytes hex>" }
+{ "ok": true, "host_token": "<32 bytes hex>", "code": "ABC123" }
 ```
 
-Se o código já estiver vivo noutro Host: `denied`. Não há “steal”.
+O código é gerado pelo servidor: 6 chars `A-Z0-9` via `randomBytes` base36, com retry até 10 se colidir com sala viva; se mesmo assim não houver código livre, `busy`. O Host não escolhe nem envia código. Password obrigatória (4–64) em toda sala Stunar; `open` sem Password → `invalid`.
 
 **`POST /v1/host/heartbeat`**
 
@@ -150,10 +149,10 @@ Se o código já estiver vivo noutro Host: `denied`. Não há “steal”.
 **`POST /v1/host/rotate`**
 
 ```json
-{ "host_token": "...", "code": "XYZ789", "password": "nova ou \"\" para tirar" }
+{ "host_token": "...", "password": "nova" }
 ```
 
-Omitir `code` ou `password` = não mexer nesse campo. Código novo: se colidir com outra sala, `denied` e **mantém** o antigo.
+Só Password (e `admission`, se o Host a mudar ao vivo). Sem rotação de código: o código é do servidor e vive até a sala morrer. Omitir `password` = não mexer. Password `""` (remover) → `invalid`: no Stunar a Password é obrigatória.
 
 **`POST /v1/host/close`**
 
@@ -168,7 +167,7 @@ Apaga a sala. Viewers ligados no Rendezvous recebem `gone` no WS.
 ```json
 {
   "code": "ABC123",
-  "password": "opcional ou omitido",
+  "password": "obrigatória",
   "nickname": "Joao"
 }
 ```
@@ -184,7 +183,9 @@ Resposta possível:
 
 `accepted` imediato só se Admission estiver desligada e AUTH ok.
 
-Password: se a sala tem Password e o campo vem vazio ou errado → `denied`. Se a sala **não** tem Password, ignorar o campo.
+Password errada ou em falta → `denied` (toda sala Stunar tem Password).
+
+**Tarpit:** depois de 10 falhas em 10 min do mesmo IP, `ask` responde `{ "ok": true, "status": "pending", "viewer_token": "<dummy>" }` — um pending falso, com o mesmo timing do `denied` (scrypt dummy + 50–80 ms). O WS desse token é um tarpit: manda `roster` vazio, ignora mensagens e fecha aos 60s. Tokens falsos: máx 100, TTL 2 min.
 
 **`POST /v1/host/decide`**
 
@@ -222,6 +223,8 @@ Mensagens **cliente → servidor**:
 ```
 
 O servidor só reencaminha `signal` se o Token estiver **accepted**. Pending não manda nem recebe SDP. Host manda `signal` com `viewer_id`. Viewer não manda `viewer_id` (está no Token).
+
+Token de tarpit (dummy do `ask`): o WS aceita, manda `roster` vazio, ignora tudo o que o cliente mandar e fecha aos 60s. Nunca `pending`/`accepted`/`signal` reais.
 
 Heartbeat do Host é REST, não WS ping. WS ping/pong do protocolo WebSocket a 30s para não morrer o proxy — não substitui o Heartbeat da sala.
 

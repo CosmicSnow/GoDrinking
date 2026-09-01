@@ -135,7 +135,9 @@ pub struct CreateMediaSessionRequest {
     pub excluded_apps: Vec<String>,
     #[serde(default)]
     pub quality: TransmissionQuality,
-    /// Optional Password for the Session. Empty means no Password.
+    /// Password for the Session. Empty means no Password on LAN/Direct;
+    /// Stunar rooms require one (4-64 chars) and the server rejects open
+    /// without it.
     #[serde(default)]
     pub password: String,
     /// Host Nickname shown in the Roster context. Not an account.
@@ -178,12 +180,12 @@ pub struct UpdateMediaSessionRequest {
 
 /// Live credential rotation for an active Session (PRD-18). Connected
 /// Viewers are never dropped; only new requests use the new values.
-/// `None` keeps the current value; `Some("")` removes the Password;
-/// `Some("ABC123")` sets a new Room code (LAN/Stunar only).
+/// `None` keeps the current value; `Some("")` removes the Password
+/// (LAN/Direct only — Stunar rooms always have one).
+/// The Room code is server-owned (Stunar) or fixed for the Session
+/// (LAN/Direct): it never rotates.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct UpdateCredentialsRequest {
-    #[serde(default)]
-    pub code: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
     #[serde(default)]

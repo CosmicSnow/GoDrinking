@@ -4,7 +4,7 @@ use super::peer_transport::{PeerSignal, PeerTransport};
 use super::pipeline::{NativePipeline, PreviewState};
 use super::process_tap::{EncodedAudioPacket, ProcessTap};
 use super::rendezvous::{StunarHost, StunarViewer};
-use super::room::{random_code, DirectRoom, LanRoom, OfferMint, ViewerCount};
+use super::room::{DirectRoom, LanRoom, OfferMint, ViewerCount};
 use super::session_gate::SessionGate;
 use super::types::{
     CreateMediaSessionRequest, FrameRate, JoinMode, MediaLifecycleState, MediaSessionSnapshot,
@@ -377,12 +377,12 @@ impl MediaEngine {
     /// Rotates Session credentials live (PRD-18) without touching Connected
     /// Viewers, capture, the fanout, or the peers. Only new requests use the
     /// new values:
-    /// - LAN: Room code rotates locally (UDP answers only the new code);
-    ///   Password updates the gate for new AUTH.
-    /// - Direct: no Room code; only Password/Admission apply.
-    /// - Stunar: code/password rotate on the Rendezvous (same room, same
-    ///   host_token, viewer tokens repointed); a code collision is an error
-    ///   and the old code stays. Admission is fixed at open there.
+    /// - LAN/Direct: Password updates the gate for new AUTH; Admission toggles
+    ///   live. No Room code rotation: the code is server-owned on Stunar and
+    ///   fixed for the Session lifetime everywhere.
+    /// - Stunar: Password rotates on the Rendezvous (same room, same
+    ///   host_token, viewer tokens repointed) and is mandatory (4-64).
+    ///   Admission is fixed at open there.
     pub fn update_session_credentials(
         &self,
         request: UpdateCredentialsRequest,
@@ -626,6 +626,13 @@ fn worker_loop(receiver: Receiver<MediaCommand>, state: Arc<Mutex<EngineState>>)
     }
 }
 
+/// Stunar rooms always carry a Password (4-64 chars, counted like the
+/// Rendezvous does: Unicode code points). LAN/Direct keep optional.
+fn valid_password(password: &str) -> bool {
+    let len = password.chars().count();
+    (4..=64).contains(&len)
+}
+
 fn create_in_state(
     state: &Arc<Mutex<EngineState>>,
     request: CreateMediaSessionRequest,
@@ -643,22 +650,23 @@ fn create_in_state(
         stop_in_state(state)?;
     }
     // Stunar opens the room on the Rendezvous before anything else starts,
-    // so a failure (missing URL, unreachable relay) aborts cleanly.
+    // so a failure (missing URL, unreachable relay) aborts cleanly. The
+    // Rendezvous generates the Room code; the Host never sends one.
     let stunar = match request.join_mode {
         JoinMode::Stunar => {
             let base = request.rendezvous_url.as_deref().ok_or_else(|| {
                 MediaEngineError::NativePeer("Set the Stunar URL in settings.".into())
             })?;
-            let code = random_code();
+            // Password is mandatory (4-64) on every Stunar room; the server
+            // rejects open without it, so fail fast with a clear message.
+            if !valid_password(&request.password) {
+                return Err(MediaEngineError::NativePeer(
+                    "Stunar requires a password (4-64 characters).".into(),
+                ));
+            }
             Some(Arc::new(
-                StunarHost::start(
-                    base,
-                    &code,
-                    &request.password,
-                    &request.nickname,
-                    request.admission,
-                )
-                .map_err(MediaEngineError::NativePeer)?,
+                StunarHost::start(base, &request.password, &request.nickname, request.admission)
+                    .map_err(MediaEngineError::NativePeer)?,
             ))
         }
         JoinMode::Lan | JoinMode::Direct => None,
@@ -887,44 +895,35 @@ fn update_in_state(
 /// Rotates Session credentials live (PRD-18) without touching Connected
 /// Viewers, capture, the fanout, or the peers. Only new requests use the
 /// new values:
-/// - LAN: Room code rotates locally (UDP answers only the new code);
-///   Password updates the gate for new AUTH.
-/// - Direct: no Room code; only Password/Admission apply.
-/// - Stunar: code/password rotate on the Rendezvous (same room, same
-///   host_token, viewer tokens repointed); a code collision is an error
-///   and the old code stays. Admission is fixed at open there.
+/// - LAN/Direct: Password updates the gate for new AUTH; Admission toggles
+///   live. No Room code rotation.
+/// - Stunar: Password rotates on the Rendezvous (same room, same host_token,
+///   viewer tokens repointed) and is mandatory (4-64). Admission is fixed at
+///   open there.
 fn update_credentials_in_state(
     state: &Arc<Mutex<EngineState>>,
     request: UpdateCredentialsRequest,
 ) -> Result<MediaSessionSnapshot, MediaEngineError> {
-    // Validate the code format before any network call.
-    if let Some(code) = request.code.as_deref() {
-        let normalized = code.trim().to_ascii_uppercase();
-        if normalized.len() != 6 || !normalized.chars().all(|ch| ch.is_ascii_alphanumeric()) {
-            return Err(MediaEngineError::NativePeer(
-                "Room code must be 6 letters or numbers.".into(),
-            ));
-        }
-    }
     let stunar = {
         let state = state.lock().map_err(|_| MediaEngineError::StatePoisoned)?;
         let session = state
             .session
             .as_ref()
             .ok_or(MediaEngineError::NoActiveSession)?;
-        // LAN rotate is a local mutex update; safe under the state lock.
-        if let Some(room) = session.room.as_ref() {
-            if let Some(code) = request.code.as_deref() {
-                room.rotate_code(code).map_err(MediaEngineError::NativePeer)?;
-            }
-        }
         session.stunar.clone()
     };
     // Stunar rotate is a network call; run it without the state lock.
     if let Some(stunar) = stunar {
-        if request.code.is_some() || request.password.is_some() {
+        if let Some(password) = request.password.as_deref() {
+            // Stunar rooms always have a Password; the server rejects empty
+            // or short ones, so fail fast with a clear message.
+            if !valid_password(password) {
+                return Err(MediaEngineError::NativePeer(
+                    "Stunar requires a password (4-64 characters).".into(),
+                ));
+            }
             stunar
-                .rotate(request.code.as_deref(), request.password.as_deref())
+                .rotate(Some(password))
                 .map_err(MediaEngineError::NativePeer)?;
         }
     }
@@ -1502,59 +1501,49 @@ use super::{
     }
 
     #[test]
-    fn rotate_credentials_keeps_the_session_and_updates_the_code() {
+    fn rotate_credentials_keeps_the_session_and_updates_the_password() {
         let state = test_state();
         create_in_state(&state, request()).expect("session should start");
         let snapshot = update_credentials_in_state(
             &state,
             UpdateCredentialsRequest {
-                code: Some("xyz789".into()),
                 password: Some("nova".into()),
                 admission: None,
             },
         )
         .expect("rotate should succeed");
         assert_eq!(snapshot.state, MediaLifecycleState::Running);
-        assert_eq!(snapshot.session_code.as_deref(), Some("XYZ789"));
         assert!(snapshot.password_set);
         // The session (and its room) is still alive.
         let stored = state.lock().expect("test state");
         let session = stored.session.as_ref().expect("session should exist");
-        assert_eq!(session.room.as_ref().expect("lan room").code(), "XYZ789");
         assert!(session.gate.password_set());
     }
 
     #[test]
-    fn rotate_credentials_rejects_invalid_codes_and_keeps_old_values() {
+    fn stunar_requires_a_password_before_starting() {
         let state = test_state();
-        create_in_state(&state, request()).expect("session should start");
-        let original = state
-            .lock()
-            .expect("test state")
-            .session
-            .as_ref()
-            .expect("session")
-            .room
-            .as_ref()
-            .expect("lan room")
-            .code();
-        let result = update_credentials_in_state(
-            &state,
-            UpdateCredentialsRequest {
-                code: Some("ab".into()),
-                password: None,
-                admission: None,
-            },
-        );
+        let mut request = request();
+        request.join_mode = JoinMode::Stunar;
+        request.rendezvous_url = Some("http://127.0.0.1:8787".into());
+        // Empty and too-short passwords are rejected before any network call.
+        request.password = String::new();
         assert_eq!(
-            result,
+            create_in_state(&state, request.clone()),
             Err(MediaEngineError::NativePeer(
-                "Room code must be 6 letters or numbers.".into()
+                "Stunar requires a password (4-64 characters).".into()
             ))
         );
-        let stored = state.lock().expect("test state");
-        let session = stored.session.as_ref().expect("session should exist");
-        assert_eq!(session.room.as_ref().expect("lan room").code(), original);
-        assert_eq!(stored.lifecycle, MediaLifecycleState::Running);
+        request.password = "abc".into();
+        assert_eq!(
+            create_in_state(&state, request),
+            Err(MediaEngineError::NativePeer(
+                "Stunar requires a password (4-64 characters).".into()
+            ))
+        );
+        assert_eq!(
+            state.lock().expect("test state").lifecycle,
+            MediaLifecycleState::Idle
+        );
     }
 }

@@ -50,14 +50,14 @@ Implementar na ordem dos PRDs. Não saltar PRD-20: o Roster precisa de mais do q
 
 **Regras:**
 
-- Password é **opcional**. Vazia = qualquer um que saiba o endereço (Direct) ou o Room code (LAN/Stunar) pode pedir para entrar.
+- Password é **opcional** (LAN/Direct). Vazia = qualquer um que saiba o endereço (Direct) ou o Room code (LAN) pode pedir para entrar. **Stunar: obrigatória** (4–64) — o Rendezvous recusa `open` sem Password.
 - Se preenchida: 4–64 caracteres. Nunca logada. Nunca no SDP.
 - Signaling Direct/LAN **não** envia offer antes de AUTH ok.
-- Ignore list no processo do Host: após **5** AUTH falhados do mesmo IP em 10 minutos, ignorar esse IP durante **15 minutos**. Ligação TCP fecha na hora. Sem mensagem rica (`ERR BANNED` chega).
+- Ignore list no processo do Host: falhas do mesmo IP em 10 minutos escalam a duração — **5** → 15 min, **10** → 1 h, **15** → 6 h, **20+** → 24 h. Ligação TCP fecha na hora. Sem mensagem rica (`ERR BANNED` chega).
 - Falhas de Admission (Host recusou) **não** contam para a Ignore list.
 - A Ignore list é memória do processo. Morre com o Stop.
 
-**Done when:** Password errada nunca recebe SDP. O quinto erro do mesmo IP fica 15 min de fora. Password certa de outro IP entra.
+**Done when:** Password errada nunca recebe SDP. Falhas do mesmo IP escalam a Ignore list (5→15 min, 10→1 h, 15→6 h, 20+→24 h). Password certa de outro IP entra.
 
 ---
 
@@ -68,14 +68,14 @@ Implementar na ordem dos PRDs. Não saltar PRD-20: o Roster precisa de mais do q
 **Regras:**
 
 - URL HTTPS do Rendezvous é configuração do app (default documentado, editável). Sem URL, Stunar recusa Start/Join com erro claro.
-- Host em Stunar: Nickname + Room code (gerado, 6 chars como hoje) + Password opcional + Admission. “Telefona” `open` e depois Heartbeat.
+- Host em Stunar: Nickname + Password (**obrigatória**, 4–64) + Admission. O Room code é **gerado pelo servidor** no `open` (6 chars A–Z0–9) e devolvido na resposta com o `host_token`; o Host não o escolhe. “Telefona” `open` e depois Heartbeat.
 - Heartbeat a cada **30s**. Sem Heartbeat **5 minutos** → a sala deixa de existir. Pedidos a essa sala = `denied` genérico.
-- Viewer: mesmo Room code, Password se existir, Nickname.
+- Viewer: mesmo Room code, Password, Nickname.
 - O Rendezvous **não** devolve IP, SDP, Roster nem existência da sala a quem falhe Password.
 - Depois de aceite: reencaminha Signaling (offer/answer) entre aquele Host e aquele Viewer. Zero Media.
 - Sem listagem de salas. Sem pesquisa. Sem contas.
 
-**Done when:** Host e Viewer em redes diferentes, com o Rendezvous no meio, trocam SDP e a Media corre P2P. Matar o Heartbeat 5+ min faz o Join falhar. tcpdump no Rendezvous não mostra RTP.
+**Done when:** Host e Viewer em redes diferentes, com o Rendezvous no meio, trocam SDP e a Media corre P2P. O código que o Viewer escreve é o que o servidor devolveu no `open`. Matar o Heartbeat 5+ min faz o Join falhar. tcpdump no Rendezvous não mostra RTP.
 
 ---
 
@@ -103,10 +103,10 @@ Implementar na ordem dos PRDs. Não saltar PRD-20: o Roster precisa de mais do q
 
 **Regras:**
 
-- Host pode editar Password (os três modos) e Room code (LAN e Stunar) com a Session a correr.
+- Host pode editar Password (os três modos) com a Session a correr. Room code: só LAN — no Stunar o código é do servidor e não roda.
 - Quem **já está Connected** permanece. Tokens e PeerConnections atuais continuam válidos.
 - Pedidos **novos** usam só os valores novos.
-- No Stunar, o Rendezvous atualiza o mapa: o código antigo deixa de resolver; o novo passa a resolver para a mesma Session.
+- No Stunar, `rotate` só aceita Password nova (e Admission); o código não muda.
 - No LAN, o broadcast passa a responder só ao código novo.
 - Direct não tem Room code; só a Password nova vale para AUTH novo.
 
