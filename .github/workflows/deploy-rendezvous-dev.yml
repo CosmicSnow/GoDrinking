@@ -50,7 +50,7 @@ jobs:
 
   deploy:
     name: Deploy DEV
-    runs-on: ${{ vars.DEPLOY_RUNNER || 'oracion' }}
+    runs-on: ${{ vars.DEPLOY_RUNNER || 'godrinking' }}
     needs: build
     permissions:
       contents: read
