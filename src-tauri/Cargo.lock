@@ -1779,7 +1779,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "golive-local"
+name = "godrinking"
 version = "0.1.0"
 dependencies = [
  "block2",

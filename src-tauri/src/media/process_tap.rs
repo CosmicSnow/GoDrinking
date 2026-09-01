@@ -382,6 +382,43 @@ fn audio_process_objects() -> Vec<(u32, i32)> {
         .collect()
 }
 
+/// Best-effort check of whether a pid is currently running audio output.
+///
+/// Reads `kAudioProcessPropertyIsRunningOutput` (`'piro'`, UInt32, non-zero =
+/// output running) from the pid's Core Audio process object(s). The pid is
+/// translated with `id2p` first; the process-object list is scanned as a
+/// fallback so a pid that owns several objects reports true if any of them is
+/// running output. Never requires live audio to be present.
+pub(crate) fn pid_is_emitting_output(pid: i32) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if pid <= 0 {
+            return false;
+        }
+        let mut objects = Vec::new();
+        if let Ok(object) = translate_pid(pid) {
+            objects.push(object);
+        }
+        objects.extend(
+            audio_process_objects()
+                .into_iter()
+                .filter(|(_, object_pid)| *object_pid == pid)
+                .map(|(object, _)| object),
+        );
+        objects.sort_unstable();
+        objects.dedup();
+        objects.into_iter().any(|object| {
+            let mut running = 0_u32;
+            audio_get(object, fourcc(b"piro"), &mut running).is_ok() && running != 0
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn translate_pid(pid: i32) -> Result<u32, String> {
     // kAudioHardwarePropertyTranslatePIDToProcessObject = 'id2p'
@@ -700,6 +737,21 @@ mod tests {
         assert_eq!(super::fourcc(b"id2p"), u32::from_be_bytes(*b"id2p"));
         super::translate_pid(std::process::id() as i32)
             .expect("current process should map to a Core Audio process object via id2p");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn piro_is_k_audio_process_property_is_running_output() {
+        // kAudioProcessPropertyIsRunningOutput = 'piro' (UInt32, non-zero = running).
+        assert_eq!(super::fourcc(b"piro"), u32::from_be_bytes(*b"piro"));
+        assert_ne!(super::fourcc(b"piro"), super::fourcc(b"ppid"));
+        assert_ne!(super::fourcc(b"piro"), super::fourcc(b"prs#"));
+        // Invalid pids never report output without touching Core Audio.
+        assert!(!super::pid_is_emitting_output(-1));
+        assert!(!super::pid_is_emitting_output(0));
+        // The test binary never plays audio, so its own pid must not report
+        // running output. No live audio is required for this assertion.
+        assert!(!super::pid_is_emitting_output(std::process::id() as i32));
     }
 
     #[cfg(target_os = "macos")]

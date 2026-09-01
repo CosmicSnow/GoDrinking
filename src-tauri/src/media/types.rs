@@ -146,6 +146,11 @@ pub struct NativeRunningApp {
     pub name: String,
     pub bundle_id: Option<String>,
     pub pid: i32,
+    /// True when Core Audio reports the app's process object running output
+    /// (`kAudioProcessPropertyIsRunningOutput`). Best-effort; false when the
+    /// property cannot be read.
+    #[serde(default)]
+    pub emitting_audio: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

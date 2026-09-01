@@ -26,7 +26,7 @@ function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
 }
 
 type Source = { id: number; kind: "display" | "window"; title?: string; application_name?: string };
-type RunningApp = { name: string; bundle_id?: string | null; pid: number };
+type RunningApp = { name: string; bundle_id?: string | null; pid: number; emitting_audio?: boolean };
 type Capabilities = { supported: boolean; screen_capture_kit: boolean; source_enumeration_available: boolean; screen_recording_authorization: "granted" | "not_granted" | "unsupported"; app_audio_exclusion: "enhanced" | "best_effort" | "unsupported"; detail: string };
 type Snapshot = { state: string; session_id: string | null; source_id: number | null; native_capture_active: boolean; preview_callback_count: number; preview_frame_count: number; preview_dropped_count: number; preview_error: string | null; detail: string; peer_state: string; peer_detail: string; session_code: string | null; lan_addresses: string[]; lan_port: number | null };
 type Signal = { type: "offer" | "answer"; sdp: string };
@@ -67,6 +67,8 @@ function App() {
   const [quality, setQuality] = useState<"low" | "medium" | "high">("high");
   const [systemAudio, setSystemAudio] = useState(false);
   const [excludedApps, setExcludedApps] = useState<string[]>([]);
+  const [appSearch, setAppSearch] = useState("");
+  const [playingOnly, setPlayingOnly] = useState(false);
   const [session, setSession] = useState<Snapshot | null>(null);
   const [joinCode, setJoinCode] = useState("");
   const [notice, setNotice] = useState("");
@@ -119,9 +121,7 @@ function App() {
     try {
       const next = await invokeMedia<RunningApp[]>("get_media_running_apps");
       setApps(next);
-    } catch {
-      setApps([]);
-    }
+    } catch { /* keep the last list; polled */ }
   };
 
   useEffect(() => { void refreshCapabilities(); }, []);
@@ -130,6 +130,12 @@ function App() {
     void loadSources();
     void loadApps();
   }, [caps?.source_enumeration_available]);
+  useEffect(() => {
+    if (mode !== "share" || !systemAudio || !audioExclusion) return undefined;
+    void loadApps();
+    const timer = window.setInterval(() => void loadApps(), 1000);
+    return () => window.clearInterval(timer);
+  }, [mode, systemAudio, audioExclusion]);
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     void getCurrentWindow().onFocusChanged(({ payload }) => {
@@ -388,6 +394,13 @@ function App() {
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1400);
   };
+  const toggleExcludedApp = (token: string) => setExcludedApps((current) => current.includes(token) ? current.filter((item) => item !== token) : [...current, token]);
+  const excludeQuery = appSearch.trim().toLowerCase();
+  const visibleApps = apps.filter((app) => {
+    if (playingOnly && app.emitting_audio !== true) return false;
+    if (excludeQuery && !app.name.toLowerCase().includes(excludeQuery)) return false;
+    return true;
+  });
   const filteredSources = sources.filter((item) => item.kind === sourceKind);
   const permissionLabel = caps === null ? "Checking Screen Recording access…" : caps.screen_recording_authorization === "granted" ? "Screen Recording ready" : caps.screen_recording_authorization === "not_granted" ? "Screen Recording permission needed" : "Native capture unavailable";
 
@@ -505,15 +518,25 @@ function App() {
               </label>
               {systemAudio && audioExclusion && (
                 <>
-                  <label className="native-select-label" htmlFor="exclude-apps">Don't share audio from</label>
-                  <select id="exclude-apps" className="native-source" value="" onChange={(event) => {
-                    const token = event.target.value;
-                    event.target.value = "";
-                    if (token) setExcludedApps((current) => current.includes(token) ? current : [...current, token]);
-                  }}>
-                    <option value="">Choose an app</option>
-                    {apps.map((app) => <option key={`${app.pid}-${app.bundle_id ?? app.name}`} value={app.bundle_id || app.name}>{app.name}</option>)}
-                  </select>
+                  <p className="native-select-label">Don't share audio from</p>
+                  <div className="exclude-tools">
+                    <input className="native-source exclude-search" type="text" value={appSearch} onChange={(event) => setAppSearch(event.target.value)} placeholder="Search apps" aria-label="Search apps"/>
+                    <button className={`exclude-filter ${playingOnly ? "on" : ""}`} onClick={() => setPlayingOnly((value) => !value)} aria-pressed={playingOnly} title="Only apps playing sound">Playing only</button>
+                  </div>
+                  <div className="exclude-list" role="group" aria-label="Running apps">
+                    {visibleApps.length === 0 ? (
+                      <p className="exclude-empty">{playingOnly ? "No apps playing sound" : "No apps found"}</p>
+                    ) : visibleApps.map((app) => {
+                      const token = app.bundle_id || app.name;
+                      const selected = excludedApps.includes(token);
+                      return (
+                        <button key={`${app.pid}-${app.bundle_id ?? app.name}`} type="button" className={`exclude-row ${selected ? "selected" : ""}`} aria-pressed={selected} onClick={() => toggleExcludedApp(token)}>
+                          <span className="exclude-row-name">{app.name}</span>
+                          {app.emitting_audio === true && <span className="exclude-audio" title="Playing sound" aria-label="Playing sound"><i/><i/><i/></span>}
+                        </button>
+                      );
+                    })}
+                  </div>
                   {excludedApps.length > 0 && (
                     <div className="exclude-chips">
                       {excludedApps.map((token) => {

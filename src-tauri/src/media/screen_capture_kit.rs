@@ -1982,10 +1982,10 @@ fn running_apps_from_workspace() -> Vec<crate::media::types::NativeRunningApp> {
             name,
             bundle_id,
             pid,
+            emitting_audio: super::process_tap::pid_is_emitting_output(pid),
         });
     }
-    result.sort_by(|left, right| left.name.to_ascii_lowercase().cmp(&right.name.to_ascii_lowercase()));
-    result
+    dedupe_apps_by_pid(result)
 }
 
 #[cfg(target_os = "macos")]
@@ -1995,7 +1995,6 @@ fn running_apps_from_window_list() -> Vec<crate::media::types::NativeRunningApp>
     use core_foundation::dictionary::CFDictionary;
     use core_foundation::number::CFNumber;
     use core_foundation::string::CFString;
-    use std::collections::BTreeSet;
 
     const ON_SCREEN_ONLY: u32 = 1;
     #[link(name = "CoreGraphics", kind = "framework")]
@@ -2014,7 +2013,6 @@ fn running_apps_from_window_list() -> Vec<crate::media::types::NativeRunningApp>
         unsafe { CFArray::wrap_under_create_rule(raw) };
     let owner_key = CFString::new("kCGWindowOwnerName");
     let pid_key = CFString::new("kCGWindowOwnerPID");
-    let mut seen = BTreeSet::new();
     let mut apps = Vec::new();
     for window in &windows {
         let pid = window
@@ -2022,7 +2020,7 @@ fn running_apps_from_window_list() -> Vec<crate::media::types::NativeRunningApp>
             .and_then(|value| value.downcast::<CFNumber>())
             .and_then(|number| number.to_i64())
             .unwrap_or(0);
-        if pid <= 0 || !seen.insert(pid) {
+        if pid <= 0 {
             continue;
         }
         let name = window
@@ -2035,10 +2033,37 @@ fn running_apps_from_window_list() -> Vec<crate::media::types::NativeRunningApp>
             name,
             bundle_id: None,
             pid: pid as i32,
+            emitting_audio: super::process_tap::pid_is_emitting_output(pid as i32),
         });
     }
-    apps.sort_by(|left, right| left.name.to_ascii_lowercase().cmp(&right.name.to_ascii_lowercase()));
-    apps
+    dedupe_apps_by_pid(apps)
+}
+
+/// Merges duplicate pids, preferring `emitting_audio = true` when any entry
+/// for the pid reports running output, and keeping the first non-empty bundle
+/// id. Sorted by name for stable UI ordering.
+#[cfg(target_os = "macos")]
+fn dedupe_apps_by_pid(
+    apps: Vec<crate::media::types::NativeRunningApp>,
+) -> Vec<crate::media::types::NativeRunningApp> {
+    use std::collections::HashMap;
+    let mut by_pid: HashMap<i32, crate::media::types::NativeRunningApp> = HashMap::new();
+    for app in apps {
+        match by_pid.get_mut(&app.pid) {
+            Some(existing) => {
+                existing.emitting_audio = existing.emitting_audio || app.emitting_audio;
+                if existing.bundle_id.is_none() {
+                    existing.bundle_id = app.bundle_id;
+                }
+            }
+            None => {
+                by_pid.insert(app.pid, app);
+            }
+        }
+    }
+    let mut result: Vec<_> = by_pid.into_values().collect();
+    result.sort_by(|left, right| left.name.to_ascii_lowercase().cmp(&right.name.to_ascii_lowercase()));
+    result
 }
 
 fn detect_availability() -> ScreenCaptureKitAvailability {
