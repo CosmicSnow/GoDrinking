@@ -27,6 +27,7 @@ use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use webrtc::rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate;
+use webrtc::rtcp::receiver_report::ReceiverReport;
 use webrtc::rtp_transceiver::rtp_codec::{
     RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
 };
@@ -625,6 +626,12 @@ async fn run_peer(
                 {
                     rtcp_encoder_control.request_keyframe();
                 }
+                if let Some(rr) = packet.as_any().downcast_ref::<ReceiverReport>() {
+                    let worst = rr.reports.iter().map(|report| report.fraction_lost).max();
+                    if let Some(fraction) = worst {
+                        rtcp_encoder_control.note_loss(fraction);
+                    }
+                }
                 if let Some(remb) = packet
                     .as_any()
                     .downcast_ref::<ReceiverEstimatedMaximumBitrate>()
@@ -651,6 +658,26 @@ async fn run_peer(
                         }
                     }
                 }
+            }
+        }
+    });
+
+    // Sender-side probing: once per second, step back toward the target
+    // while the path looks clean (no recent decrease, no recent loss).
+    // REMB decreases still win immediately inside set_congestion_bitrate.
+    let probe_control = Arc::clone(&encoder_control);
+    let probe_shutdown = Arc::clone(&shutdown);
+    let _probe_worker = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            ticker.tick().await;
+            if probe_shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            if let Some(bitrate) =
+                probe_control.probe_candidate(std::time::Instant::now())
+            {
+                probe_control.apply_probe(bitrate);
             }
         }
     });

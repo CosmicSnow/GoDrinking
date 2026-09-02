@@ -13,7 +13,7 @@ use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::access_unit::{AccessUnitQueue, AccessUnitReceiver};
 use super::types::PreviewFrameEvent;
@@ -23,6 +23,13 @@ use super::types::{FrameRate, TransmissionQuality, VideoResolution};
 use objc2::rc::Retained;
 #[cfg(target_os = "macos")]
 use objc2_core_video::CVPixelBuffer;
+
+/// Pause after a real rate decrease before probing upward again.
+const PROBE_QUIET: Duration = Duration::from_secs(3);
+/// Recent RTCP loss freezes probing (REMB decreases still apply).
+const LOSS_WINDOW: Duration = Duration::from_secs(5);
+/// fraction-lost (0-255) above ~2% counts as real congestion for probing.
+const LOSS_FREEZE_FRACTION: u8 = 5;
 
 const CAPTURE_QUEUE_CAPACITY: usize = 3;
 const ENCODER_QUEUE_CAPACITY: usize = 8;
@@ -174,9 +181,18 @@ pub(crate) struct EncoderControl {
     target: Mutex<u32>,
     /// Congestion floor: REMB is never followed below this.
     floor: Mutex<u32>,
-    /// Last bitrate imposed by congestion feedback (None = no signal yet,
-    /// encoder follows the target). Surfaced for diagnostics.
+    /// Last bitrate imposed by the adaptation loop (REMB or probe).
+    /// None = no signal yet, encoder follows the target. Surfaced for
+    /// diagnostics.
     congestion: Mutex<Option<u32>>,
+    /// Last rate queued to the encoder (target, REMB or probe).
+    applied: Mutex<u32>,
+    /// When the adaptation loop last *lowered* the rate. Probing pauses
+    /// briefly after a real decrease so it never fights fresh feedback.
+    last_decrease_at: Mutex<Option<Instant>>,
+    /// Worst fraction-lost (0-255) seen in RTCP Receiver Reports + when.
+    /// Any recent loss freezes probing; REMB decreases still apply.
+    last_loss: Mutex<(u8, Option<Instant>)>,
     stop_requested: AtomicBool,
 }
 
@@ -188,6 +204,9 @@ impl EncoderControl {
             target: Mutex::new(target),
             floor: Mutex::new(floor.min(target)),
             congestion: Mutex::new(None),
+            applied: Mutex::new(target),
+            last_decrease_at: Mutex::new(None),
+            last_loss: Mutex::new((0, None)),
             stop_requested: AtomicBool::new(false),
         })
     }
@@ -208,6 +227,9 @@ impl EncoderControl {
         if let Ok(mut congestion) = self.congestion.lock() {
             *congestion = None;
         }
+        if let Ok(mut applied) = self.applied.lock() {
+            *applied = bitrate;
+        }
         if let Ok(mut pending) = self.bitrate.lock() {
             *pending = Some(bitrate);
         }
@@ -226,6 +248,9 @@ impl EncoderControl {
             *slot = floor;
         }
         let reassert = current.unwrap_or(target).clamp(floor, target);
+        if let Ok(mut applied) = self.applied.lock() {
+            *applied = reassert;
+        }
         if let Ok(mut pending) = self.bitrate.lock() {
             *pending = Some(reassert);
         }
@@ -237,8 +262,17 @@ impl EncoderControl {
         let ceiling = self.target().max(250_000);
         let floor = self.floor().min(ceiling);
         let bitrate = bitrate.clamp(floor, ceiling);
+        let decreased = bitrate < self.applied();
         if let Ok(mut congestion) = self.congestion.lock() {
             *congestion = Some(bitrate);
+        }
+        if let Ok(mut applied) = self.applied.lock() {
+            *applied = bitrate;
+        }
+        if decreased {
+            if let Ok(mut at) = self.last_decrease_at.lock() {
+                *at = Some(Instant::now());
+            }
         }
         if let Ok(mut pending) = self.bitrate.lock() {
             *pending = Some(bitrate);
@@ -259,6 +293,75 @@ impl EncoderControl {
 
     pub(crate) fn floor(&self) -> u32 {
         self.floor.lock().ok().map(|floor| *floor).unwrap_or(250_000)
+    }
+
+    pub(crate) fn applied(&self) -> u32 {
+        self.applied.lock().ok().map(|applied| *applied).unwrap_or(0)
+    }
+
+    /// Records the rate actually programmed into a fresh encoder (e.g. the
+    /// pixel-scaled bitrate at the first frame) so probing starts from the
+    /// real base instead of the unscaled target.
+    pub(crate) fn note_applied(&self, bitrate: u32) {
+        if let Ok(mut applied) = self.applied.lock() {
+            *applied = bitrate;
+        }
+    }
+
+    /// Records RTCP Receiver Report loss (fraction-lost 0-255).
+    pub(crate) fn note_loss(&self, fraction_lost: u8) {
+        if let Ok(mut last) = self.last_loss.lock() {
+            let now = Instant::now();
+            match last.1 {
+                Some(at) if now.duration_since(at) < LOSS_WINDOW => {
+                    last.0 = last.0.max(fraction_lost);
+                }
+                _ => *last = (fraction_lost, Some(now)),
+            }
+        }
+    }
+
+    /// Sender-side probe: when the path looks clean (no recent decrease,
+    /// no recent loss) and we sit below the target, suggest the next step
+    /// up (+25%, min +200 kbps). REMB decreases still win immediately.
+    /// `now` is a parameter so unit tests can time-travel.
+    pub(crate) fn probe_candidate(&self, now: Instant) -> Option<u32> {
+        if let Ok(decrease) = self.last_decrease_at.lock() {
+            if let Some(at) = *decrease {
+                if now.duration_since(at) < PROBE_QUIET {
+                    return None;
+                }
+            }
+        }
+        if let Ok(loss) = self.last_loss.lock() {
+            if loss.0 > LOSS_FREEZE_FRACTION {
+                if let Some(at) = loss.1 {
+                    if now.duration_since(at) < LOSS_WINDOW {
+                        return None;
+                    }
+                }
+            }
+        }
+        let applied = self.applied();
+        let target = self.target();
+        if applied >= target {
+            return None;
+        }
+        let step = (applied / 4).max(200_000);
+        Some(applied.saturating_add(step).min(target))
+    }
+
+    /// Queues a probe step without moving the target or floor.
+    pub(crate) fn apply_probe(&self, bitrate: u32) {
+        if let Ok(mut congestion) = self.congestion.lock() {
+            *congestion = Some(bitrate);
+        }
+        if let Ok(mut applied) = self.applied.lock() {
+            *applied = bitrate;
+        }
+        if let Ok(mut pending) = self.bitrate.lock() {
+            *pending = Some(bitrate);
+        }
     }
 
     pub(crate) fn congestion_bitrate(&self) -> Option<u32> {
@@ -591,6 +694,7 @@ fn encoder_worker_loop(
                     let size = pixel_buffer_size(&frame.pixel_buffer);
                     let initial = encoder_bitrate(size.0, size.1, quality, bitrate_bps);
                     control.set_target(initial);
+                    control.note_applied(initial);
                     match super::video_toolbox::VideoToolboxEncoder::new(
                         size.0,
                         size.1,
@@ -696,6 +800,7 @@ fn encoder_worker_loop(
                     let height = frame.height.max(2) & !1;
                     let initial = encoder_bitrate(width, height, quality, bitrate_bps);
                     control.set_target(initial);
+                    control.note_applied(initial);
                     match super::windows_encoder::OpenH264Encoder::new(
                         width,
                         height,
@@ -759,6 +864,51 @@ mod tests {
     use super::super::types::{FrameRate, TransmissionQuality, VideoResolution};
     use super::{EncoderCommand, EncoderControl, NativeFrame, NativePipeline, PreviewState};
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn probing_climbs_toward_target_when_path_is_clean() {
+        let control = EncoderControl::new(20_000_000, 1_000_000);
+        control.set_congestion_bitrate(4_000_000);
+        assert_eq!(control.applied(), 4_000_000);
+        // Fresh decrease: quiet period holds.
+        assert_eq!(control.probe_candidate(Instant::now()), None);
+        // After quiet: +25% steps toward the target.
+        let later = Instant::now() + Duration::from_secs(10);
+        assert_eq!(control.probe_candidate(later), Some(5_000_000));
+        control.apply_probe(5_000_000);
+        assert_eq!(control.probe_candidate(later), Some(6_250_000));
+    }
+
+    #[test]
+    fn probing_freezes_on_recent_loss_and_caps_at_target() {
+        let control = EncoderControl::new(8_000_000, 1_000_000);
+        control.set_congestion_bitrate(4_000_000);
+        control.note_loss(20);
+        let later = Instant::now() + Duration::from_secs(4);
+        // Quiet (3s) passed but loss window (5s) still holds.
+        assert_eq!(control.probe_candidate(later), None);
+        // Loss expired: probing resumes.
+        let much_later = Instant::now() + Duration::from_secs(30);
+        assert_eq!(control.probe_candidate(much_later), Some(5_000_000));
+        // Never above the target.
+        control.set_congestion_bitrate(7_900_000);
+        control.note_loss(0);
+        assert_eq!(control.probe_candidate(much_later), Some(8_000_000));
+        control.apply_probe(8_000_000);
+        assert_eq!(control.probe_candidate(much_later), None);
+    }
+
+    #[test]
+    fn congestion_respects_floor_and_floor_raise_reasserts() {
+        let control = EncoderControl::new(20_000_000, 1_000_000);
+        control.set_congestion_bitrate(100_000);
+        assert_eq!(control.applied(), 1_000_000);
+        assert_eq!(control.congestion_bitrate(), Some(1_000_000));
+        control.set_floor(5_000_000);
+        assert_eq!(control.floor(), 5_000_000);
+        assert_eq!(control.take_bitrate(), Some(5_000_000));
+    }
 
     #[test]
     fn pipeline_uses_bounded_channels_and_shared_frame_storage() {

@@ -1073,7 +1073,7 @@ function App() {
                   <div><span>Capture preview</span><code>{hostPreviewFps !== null ? hostPreviewFps + " fps" : "—"}{session ? " · " + session.preview_frame_count + " frames" : ""}{session && session.preview_dropped_count > 0 ? " · " + session.preview_dropped_count + " dropped" : ""}</code></div>
                   <div><span>Peer detail</span><code title={session?.peer_detail ?? ""}>{session?.peer_detail || "—"}</code></div>
                   <div><span>Preview error</span><code className={session?.preview_error ? "is-error" : ""}>{session?.preview_error || "—"}</code></div>
-                  <div><span>Efetivo (REMB)</span><code className={congestionMbps !== null && session?.bitrate_bps ? (congestionMbps < session.bitrate_bps / 1e6 / 2 ? "is-warn" : "") : ""}>{congestionMbps !== null ? `${congestionMbps} Mbps impostos pelo viewer` : "sem sinal — usando o alvo"}{floorAppliedMbps !== null ? ` · piso ${floorAppliedMbps}` : ""}</code></div>
+                  <div><span>Efetivo (adaptação)</span><code className={congestionMbps !== null && session?.bitrate_bps ? (congestionMbps < session.bitrate_bps / 1e6 / 2 ? "is-warn" : "") : ""}>{congestionMbps !== null ? `${congestionMbps} Mbps (REMB/sondagem)` : "sem sinal — usando o alvo"}{floorAppliedMbps !== null ? ` · piso ${floorAppliedMbps}` : ""}</code></div>
                 </div>
                 <div className="stats-links">
                   <span className="stats-links-title">Viewers · ms da conexão</span>
