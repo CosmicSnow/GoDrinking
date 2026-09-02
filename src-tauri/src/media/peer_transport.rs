@@ -30,6 +30,7 @@ use webrtc::rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::Receive
 use webrtc::rtp_transceiver::rtp_codec::{
     RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
 };
+use webrtc::stats::StatsReportType;
 use webrtc::rtp_transceiver::RTCPFeedback;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
@@ -77,6 +78,7 @@ enum PeerCommand {
     CreateOffer(SyncSender<Result<PeerSignal, String>>),
     AcceptOffer(PeerSignal, SyncSender<Result<PeerSignal, String>>),
     SetAnswer(PeerSignal, SyncSender<Result<(), String>>),
+    GetRtt(SyncSender<Option<f64>>),
     Close,
 }
 
@@ -228,6 +230,16 @@ impl PeerTransportClient {
             .try_send(PeerCommand::SetAnswer(answer, response_tx))
             .map_err(|error| format!("WebRTC set-answer request rejected: {error}"))?;
         receive_response(response_rx, "WebRTC set-answer request")
+    }
+
+    /// Current round-trip time in milliseconds, measured via get_stats().
+    /// None while unmeasured (pre-first STUN response / no RTCP yet).
+    pub(crate) fn rtt_ms(&self) -> Option<f64> {
+        let (response_tx, response_rx) = sync_channel(1);
+        self.command_tx
+            .try_send(PeerCommand::GetRtt(response_tx))
+            .ok()?;
+        response_rx.recv_timeout(Duration::from_secs(2)).ok().flatten()
     }
 
     pub(crate) fn request_close(&self) -> Result<(), String> {
@@ -600,6 +612,10 @@ async fn run_peer(
 
     let rtcp_encoder_control = Arc::clone(&encoder_control);
     let rtcp_worker = tokio::spawn(async move {
+        // Throttled REMB trace for the session logs: first signal, then only
+        // on significant moves (>25%) or every 30s, so the story is visible
+        // without spamming (browsers send REMB ~1/s).
+        let mut last_logged: Option<(std::time::Instant, u32)> = None;
         loop {
             let result = sender.read_rtcp().await;
             let Ok((packets, _)) = result else { break };
@@ -615,7 +631,24 @@ async fn run_peer(
                 {
                     if remb.bitrate.is_finite() && remb.bitrate > 0.0 {
                         let bitrate = (remb.bitrate as u32).clamp(250_000, 50_000_000);
-                        rtcp_encoder_control.set_bitrate(bitrate);
+                        rtcp_encoder_control.set_congestion_bitrate(bitrate);
+                        let now = std::time::Instant::now();
+                        let significant = last_logged.map(|(at, prev)| {
+                            now.duration_since(at).as_secs() >= 30
+                                || (bitrate as i64 - prev as i64).abs() * 4 > prev as i64
+                        });
+                        if significant != Some(false) {
+                            last_logged = Some((now, bitrate));
+                            super::logger::log(
+                                "INFO",
+                                "remb",
+                                &format!(
+                                    "receiver estimate {} kbps (target {} kbps)",
+                                    bitrate / 1000,
+                                    rtcp_encoder_control.target() / 1000
+                                ),
+                            );
+                        }
                     }
                 }
             }
@@ -650,6 +683,10 @@ async fn run_peer(
                 )
                 .await;
                 let _ = response.send(result);
+            }
+            PeerCommand::GetRtt(response) => {
+                let rtt = peer_rtt_ms(&peer).await;
+                let _ = response.send(rtt);
             }
             PeerCommand::Close => break,
         }
@@ -884,6 +921,40 @@ async fn wait_for_ice(mut gather: tokio::sync::mpsc::Receiver<()>) -> Result<(),
         .await
         .map(|_| ())
         .map_err(|_| "ICE gathering timed out".to_owned())
+}
+
+/// Round-trip time in ms for the selected ICE pair (STUN-based, same as
+/// the browser `candidate-pair/currentRoundTripTime`), falling back to the
+/// RTCP-level measurement when the pair has no sample yet.
+async fn peer_rtt_ms(peer: &Arc<RTCPeerConnection>) -> Option<f64> {
+    let report = peer.get_stats().await;
+    let mut any_pair: Option<f64> = None;
+    for stats in report.reports.values() {
+        if let StatsReportType::CandidatePair(pair) = stats {
+            if pair.current_round_trip_time > 0.0 {
+                let ms = pair.current_round_trip_time * 1000.0;
+                if pair.nominated {
+                    return Some(ms);
+                }
+                any_pair = Some(ms);
+            }
+        }
+    }
+    if any_pair.is_some() {
+        return any_pair;
+    }
+    for stats in report.reports.values() {
+        if let StatsReportType::RemoteInboundRTP(inbound) = stats {
+            // NOTE: the interceptor records this from `rtt_ms`, so it is
+            // already in milliseconds (unlike the ICE pair stats above).
+            if let Some(rtt) = inbound.round_trip_time {
+                if rtt > 0.0 {
+                    return Some(rtt);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn timestamp_from_90khz(timestamp: u64) -> Option<SystemTime> {

@@ -2194,6 +2194,8 @@ mod tests {
             system_audio: false,
             excluded_apps: Vec::new(),
             quality: super::super::types::TransmissionQuality::Low,
+            bitrate_bps: None,
+            min_bitrate_bps: None,
             password: String::new(),
             nickname: "Host".into(),
             admission: false,

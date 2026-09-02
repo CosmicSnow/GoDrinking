@@ -4,7 +4,7 @@ use media::logger;
 use media::{
     CreateMediaSessionRequest, JoinMode, MediaEngine, MediaSessionSnapshot, NativeCaptureSource,
     NativeRunningApp, PeerSignal, PreviewFrameEvent, UpdateCredentialsRequest,
-    UpdateMediaSessionRequest,
+    UpdateMediaSessionRequest, MediaSessionStats,
 };
 use std::net::IpAddr;
 use tauri::State;
@@ -67,6 +67,17 @@ fn update_media_session(
 #[tauri::command]
 fn get_media_session_state(engine: State<'_, MediaEngine>) -> MediaSessionSnapshot {
     engine.snapshot()
+}
+
+/// Session-wide encoder + per-viewer link diagnostics for the Host popup.
+#[tauri::command]
+async fn get_media_session_stats(
+    engine: State<'_, MediaEngine>,
+) -> Result<MediaSessionStats, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.viewer_link_stats())
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Enumerates display and window metadata without exposing native handles or
@@ -368,6 +379,7 @@ pub fn run() {
             update_media_session,
             stop_media_session,
             get_media_session_state,
+            get_media_session_stats,
             get_media_capture_sources,
             request_media_screen_recording_permission,
             get_media_preview,

@@ -65,6 +65,39 @@ impl Default for TransmissionQuality {
     }
 }
 
+/// Bounds for a user-supplied encoder bitrate override (bps).
+/// The floor matches the congestion-control floor so a custom value can
+/// never starve the encoder below what REMB may already apply.
+pub(crate) const MIN_BITRATE_BPS: u32 = 250_000;
+pub(crate) const MAX_BITRATE_BPS: u32 = 100_000_000;
+
+pub(crate) fn clamp_bitrate_bps(bps: u32) -> u32 {
+    bps.clamp(MIN_BITRATE_BPS, MAX_BITRATE_BPS)
+}
+
+/// Effective encoder target: an explicit override wins over the preset.
+pub(crate) fn resolve_bitrate(quality: TransmissionQuality, override_bps: Option<u32>) -> u32 {
+    override_bps
+        .filter(|bps| *bps > 0)
+        .map(clamp_bitrate_bps)
+        .unwrap_or_else(|| quality.bitrate())
+}
+
+/// Default congestion floor: the encoder never follows REMB below this,
+/// so a hunting estimator (300–900 kbps sawtooth on healthy links) cannot
+/// collapse a 1080p picture. 1 Mbps is watchable; real congestion still
+/// shows as loss/jitter and still caps the ceiling via the target.
+pub(crate) const DEFAULT_FLOOR_BPS: u32 = 1_000_000;
+
+/// Effective congestion floor, always within [250 kbps, target].
+pub(crate) fn resolve_floor(target_bps: u32, floor_override_bps: Option<u32>) -> u32 {
+    let floor = floor_override_bps
+        .filter(|bps| *bps > 0)
+        .map(clamp_bitrate_bps)
+        .unwrap_or(DEFAULT_FLOOR_BPS);
+    floor.min(target_bps.max(MIN_BITRATE_BPS))
+}
+
 impl TransmissionQuality {
     /// Maximum capture dimensions for the preset. The encoder still follows
     /// the actual CVPixelBuffer size; this is only the cap used to fit the
@@ -135,6 +168,16 @@ pub struct CreateMediaSessionRequest {
     pub excluded_apps: Vec<String>,
     #[serde(default)]
     pub quality: TransmissionQuality,
+    /// Optional encoder bitrate override in bps. When set (> 0), it wins
+    /// over the quality preset for the encoder target (resolution/fps still
+    /// follow the preset). Clamped to 250 kbps – 100 Mbps.
+    #[serde(default)]
+    pub bitrate_bps: Option<u32>,
+    /// Optional congestion floor in bps: REMB is never followed below this
+    /// (None = 1 Mbps auto, always capped by the target). Raises the worst
+    /// case on hunting estimators without disabling adaptation.
+    #[serde(default)]
+    pub min_bitrate_bps: Option<u32>,
     /// Password for the Session. Empty means no Password on LAN/Direct;
     /// Stunar rooms require one (4-64 chars) and the server rejects open
     /// without it.
@@ -174,6 +217,12 @@ impl CreateMediaSessionRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct UpdateMediaSessionRequest {
     pub quality: TransmissionQuality,
+    /// Live encoder bitrate override in bps (None = follow the preset).
+    #[serde(default)]
+    pub bitrate_bps: Option<u32>,
+    /// Live congestion floor in bps (None = 1 Mbps auto).
+    #[serde(default)]
+    pub min_bitrate_bps: Option<u32>,
     pub system_audio: bool,
     pub excluded_apps: Vec<String>,
 }
@@ -262,6 +311,28 @@ pub enum PeerTransportState {
     Pending,
 }
 
+/// Session-wide encoder + per-viewer diagnostics for the Host popup.
+#[derive(Clone, Debug, Serialize)]
+pub struct MediaSessionStats {
+    pub links: Vec<ViewerLinkStats>,
+    /// Encoder target (preset or user override) in bps.
+    pub target_bps: u32,
+    /// Last congestion-imposed bitrate in bps (None = no REMB signal yet).
+    pub congestion_bps: Option<u32>,
+    /// Current congestion floor in bps.
+    pub floor_bps: u32,
+}
+
+/// Per-viewer link diagnostics for the Host status popup (RTT in ms).
+#[derive(Clone, Debug, Serialize)]
+pub struct ViewerLinkStats {
+    pub id: String,
+    pub nickname: String,
+    pub state: PeerTransportState,
+    /// Last measured round-trip time in ms. None = not measured yet.
+    pub rtt_ms: Option<f64>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RosterEntry {
     pub id: String,
@@ -291,6 +362,9 @@ pub struct MediaSessionSnapshot {
     pub source_id: Option<u64>,
     pub resolution: Option<VideoResolution>,
     pub frame_rate: Option<FrameRate>,
+    /// Effective encoder bitrate target in bps (preset or user override).
+    /// 0 when no session is active.
+    pub bitrate_bps: u32,
     pub system_audio: bool,
     pub excluded_apps: Vec<String>,
     pub native_capture_active: bool,
@@ -333,6 +407,7 @@ impl MediaSessionSnapshot {
             source_id: None,
             resolution: None,
             frame_rate: None,
+            bitrate_bps: 0,
             system_audio: false,
             excluded_apps: Vec::new(),
             native_capture_active: false,

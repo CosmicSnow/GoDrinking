@@ -142,6 +142,13 @@ private final class GoLiveEncoder {
 
     func setBitrate(_ bitrate: Int32) throws {
         try setProperty(kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: bitrate))
+        // Keep the burst cap in sync: otherwise a live raise (preset change,
+        // custom slider, REMB recovery) stays choked by the creation-time
+        // limit and the picture blocks up despite the higher average.
+        try setProperty(
+            kVTCompressionPropertyKey_DataRateLimits,
+            value: NSArray(objects: NSNumber(value: bitrate / 8), NSNumber(value: 1))
+        )
     }
 
     func flush() throws {

@@ -1,7 +1,7 @@
 use super::capabilities;
 use super::fanout::MediaFanout;
 use super::logger;
-use super::peer_transport::{PeerSignal, PeerTransport};
+use super::peer_transport::{PeerSignal, PeerTransport, PeerTransportClient};
 use super::pipeline::{NativePipeline, PreviewState};
 use super::process_tap::{EncodedAudioPacket, ProcessTap};
 use super::rendezvous::{StunarHost, StunarViewer};
@@ -11,6 +11,7 @@ use super::types::{
     CreateMediaSessionRequest, FrameRate, JoinMode, MediaLifecycleState, MediaSessionSnapshot,
     NativeCaptureSource, NativeRunningApp, PeerTransportState, PreviewFrameEvent, RosterEntry,
     TransmissionQuality, UpdateCredentialsRequest, UpdateMediaSessionRequest, VideoResolution,
+    MediaSessionStats, ViewerLinkStats,
 };
 use super::MediaCapabilities;
 use std::collections::HashMap;
@@ -392,6 +393,60 @@ impl MediaEngine {
         update_credentials_in_state(&self.state, request)
     }
 
+    /// Session-wide encoder diagnostics + per-viewer link diagnostics
+    /// (state + RTT in ms) for the Host status popup. Peer status is read
+    /// under the lock; RTT queries run after it is released so snapshot
+    /// polling never blocks on stats collection.
+    pub fn viewer_link_stats(&self) -> MediaSessionStats {
+        let collected: (Vec<(String, String, PeerTransportState, PeerTransportClient)>, u32, Option<u32>, u32) = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| {
+                state.session.as_ref().map(|session| {
+                    let links = session
+                        .viewers
+                        .iter()
+                        .map(|(id, viewer)| {
+                            let status = viewer.peer.status();
+                            (
+                                id.clone(),
+                                viewer.nickname.clone(),
+                                status.state,
+                                viewer.peer.client(),
+                            )
+                        })
+                        .collect();
+                    (
+                        links,
+                        session._pipeline.bitrate_target(),
+                        session._pipeline.bitrate_congestion(),
+                        session._pipeline.bitrate_floor(),
+                    )
+                })
+            })
+            .unwrap_or_default();
+        let (links, target_bps, congestion_bps, floor_bps) = collected;
+        let links = links
+            .into_iter()
+            .map(|(id, nickname, state, client)| {
+                let rtt_ms = client.rtt_ms().map(|rtt| (rtt * 10.0).round() / 10.0);
+                ViewerLinkStats {
+                    id,
+                    nickname,
+                    state,
+                    rtt_ms,
+                }
+            })
+            .collect();
+        MediaSessionStats {
+            links,
+            target_bps,
+            congestion_bps,
+            floor_bps,
+        }
+    }
+
     pub fn running_applications(&self) -> Result<Vec<NativeRunningApp>, MediaEngineError> {
         Ok(super::process_tap::running_applications())
     }
@@ -721,6 +776,8 @@ fn create_in_state(
         request.resolution,
         request.frame_rate,
         request.quality,
+        request.bitrate_bps,
+        request.min_bitrate_bps,
     );
     // The engine owns the Opus channel for the session lifetime. The peer
     // keeps the receiver even if the first tap fails, so a later update can
@@ -870,13 +927,19 @@ fn update_in_state(
         return Err(MediaEngineError::NoActiveSession);
     };
 
-    // 1. Quality: live bitrate + keyframe. The stored request (and its
-    // derived resolution/frame_rate) follow the preset so snapshots reflect
-    // the effective settings.
-    if session.request.quality != request.quality {
-        let _ = session._pipeline.set_bitrate(request.quality.bitrate());
+    // 1. Quality/bitrate: live bitrate + keyframe. The stored request (and
+    // its derived resolution/frame_rate) follow the preset so snapshots
+    // reflect the effective settings. An explicit bitrate override wins
+    // over the preset for the encoder target.
+    let target_changed = session.request.quality != request.quality
+        || session.request.bitrate_bps != request.bitrate_bps;
+    let target = super::types::resolve_bitrate(request.quality, request.bitrate_bps);
+    let floor = super::types::resolve_floor(target, request.min_bitrate_bps);
+    if target_changed {
+        let _ = session._pipeline.set_bitrate(target);
         let _ = session._pipeline.force_keyframe();
         session.request.quality = request.quality;
+        session.request.bitrate_bps = request.bitrate_bps;
         session.request.resolution = match request.quality {
             TransmissionQuality::Low => VideoResolution::P720,
             TransmissionQuality::Medium | TransmissionQuality::High => VideoResolution::P1080,
@@ -885,6 +948,12 @@ fn update_in_state(
             TransmissionQuality::High => FrameRate::Fps60,
             TransmissionQuality::Low | TransmissionQuality::Medium => FrameRate::Fps30,
         };
+    }
+    if session.request.min_bitrate_bps != request.min_bitrate_bps {
+        // A raised floor re-asserts the encoder immediately so a collapsed
+        // stream recovers without waiting for the next REMB.
+        let _ = session._pipeline.set_floor(floor);
+        session.request.min_bitrate_bps = request.min_bitrate_bps;
     }
 
     // 2. Audio: recreate only the process tap. The peer keeps its original
@@ -1127,6 +1196,7 @@ fn snapshot_from_state(state: &EngineState) -> MediaSessionSnapshot {
         source_id: session.request.source_id,
         resolution: Some(session.request.resolution),
         frame_rate: Some(session.request.frame_rate),
+        bitrate_bps: session._pipeline.bitrate_target(),
         system_audio: session.request.system_audio,
         excluded_apps: session.request.excluded_apps.clone(),
         native_capture_active,
@@ -1334,6 +1404,8 @@ use super::{
             system_audio: false,
             excluded_apps: vec!["Discord".into()],
             quality: super::super::types::TransmissionQuality::High,
+            bitrate_bps: None,
+            min_bitrate_bps: None,
             password: String::new(),
             nickname: "Host".into(),
             admission: false,
@@ -1470,6 +1542,8 @@ use super::{
             &state,
             UpdateMediaSessionRequest {
                 quality: TransmissionQuality::Low,
+                bitrate_bps: None,
+                min_bitrate_bps: None,
                 system_audio: false,
                 excluded_apps: vec!["Discord".into(), "com.hnc.Discord".into()],
             },
@@ -1509,6 +1583,8 @@ use super::{
             &state,
             UpdateMediaSessionRequest {
                 quality: TransmissionQuality::Medium,
+                bitrate_bps: None,
+                min_bitrate_bps: None,
                 system_audio: true,
                 excluded_apps: Vec::new(),
             },
@@ -1529,6 +1605,8 @@ use super::{
                 &state,
                 UpdateMediaSessionRequest {
                     quality: TransmissionQuality::High,
+                    bitrate_bps: None,
+                    min_bitrate_bps: None,
                     system_audio: false,
                     excluded_apps: Vec::new(),
                 },

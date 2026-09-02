@@ -12,6 +12,7 @@ use super::types::JoinMode;
 use std::process::Command;
 
 /// Se o join mode precisa de inbound TCP (firewall).
+#[cfg(target_os = "windows")]
 pub fn needs_firewall(join_mode: JoinMode) -> bool {
     matches!(join_mode, JoinMode::Direct | JoinMode::Lan)
 }

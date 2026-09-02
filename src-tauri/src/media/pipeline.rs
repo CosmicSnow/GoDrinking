@@ -170,14 +170,24 @@ pub(crate) enum EncoderCommand {
 pub(crate) struct EncoderControl {
     keyframe_requested: AtomicBool,
     bitrate: Mutex<Option<u32>>,
+    /// User/preset intent: the ceiling congestion control may not exceed.
+    target: Mutex<u32>,
+    /// Congestion floor: REMB is never followed below this.
+    floor: Mutex<u32>,
+    /// Last bitrate imposed by congestion feedback (None = no signal yet,
+    /// encoder follows the target). Surfaced for diagnostics.
+    congestion: Mutex<Option<u32>>,
     stop_requested: AtomicBool,
 }
 
 impl EncoderControl {
-    pub(crate) fn new() -> Arc<Self> {
+    pub(crate) fn new(target: u32, floor: u32) -> Arc<Self> {
         Arc::new(Self {
             keyframe_requested: AtomicBool::new(false),
             bitrate: Mutex::new(None),
+            target: Mutex::new(target),
+            floor: Mutex::new(floor.min(target)),
+            congestion: Mutex::new(None),
             stop_requested: AtomicBool::new(false),
         })
     }
@@ -186,10 +196,73 @@ impl EncoderControl {
         self.keyframe_requested.store(true, Ordering::Release);
     }
 
+    /// Explicit intent (preset change or user override): moves the target
+    /// ceiling and applies it to the encoder.
     pub(crate) fn set_bitrate(&self, bitrate: u32) {
+        if let Ok(mut target) = self.target.lock() {
+            *target = bitrate;
+        }
+        if let Ok(mut floor) = self.floor.lock() {
+            *floor = (*floor).min(bitrate);
+        }
+        if let Ok(mut congestion) = self.congestion.lock() {
+            *congestion = None;
+        }
         if let Ok(mut pending) = self.bitrate.lock() {
             *pending = Some(bitrate);
         }
+    }
+
+    /// Live floor update: re-asserts the encoder at the raised floor so a
+    /// previously collapsed stream recovers without waiting for REMB.
+    pub(crate) fn set_floor(&self, floor: u32) {
+        let (floor, target, current) = (
+            floor,
+            self.target(),
+            self.congestion_bitrate(),
+        );
+        let floor = floor.min(target);
+        if let Ok(mut slot) = self.floor.lock() {
+            *slot = floor;
+        }
+        let reassert = current.unwrap_or(target).clamp(floor, target);
+        if let Ok(mut pending) = self.bitrate.lock() {
+            *pending = Some(reassert);
+        }
+    }
+
+    /// Congestion feedback (REMB): may lower the encoder below the target
+    /// but never raise it above what the user/preset asked for.
+    pub(crate) fn set_congestion_bitrate(&self, bitrate: u32) {
+        let ceiling = self.target().max(250_000);
+        let floor = self.floor().min(ceiling);
+        let bitrate = bitrate.clamp(floor, ceiling);
+        if let Ok(mut congestion) = self.congestion.lock() {
+            *congestion = Some(bitrate);
+        }
+        if let Ok(mut pending) = self.bitrate.lock() {
+            *pending = Some(bitrate);
+        }
+    }
+
+    /// Records the actual encoder target (e.g. after the first frame fixes
+    /// the pixel-scaled bitrate) without queueing a redundant update.
+    pub(crate) fn set_target(&self, bitrate: u32) {
+        if let Ok(mut target) = self.target.lock() {
+            *target = bitrate;
+        }
+    }
+
+    pub(crate) fn target(&self) -> u32 {
+        self.target.lock().ok().map(|target| *target).unwrap_or(0)
+    }
+
+    pub(crate) fn floor(&self) -> u32 {
+        self.floor.lock().ok().map(|floor| *floor).unwrap_or(250_000)
+    }
+
+    pub(crate) fn congestion_bitrate(&self) -> Option<u32> {
+        self.congestion.lock().ok().and_then(|congestion| *congestion)
     }
 
     pub(crate) fn request_stop(&self) {
@@ -234,13 +307,19 @@ impl NativePipeline {
         resolution: VideoResolution,
         _frame_rate: FrameRate,
         quality: TransmissionQuality,
+        bitrate_bps: Option<u32>,
+        min_bitrate_bps: Option<u32>,
     ) -> Self {
         let generation = preview.generation.load(Ordering::Acquire);
         let (capture_tx, capture_rx) = sync_channel::<NativeFrame>(CAPTURE_QUEUE_CAPACITY);
         let (encoder_tx, encoder_rx) = sync_channel(ENCODER_QUEUE_CAPACITY);
         let (access_unit_tx, access_unit_rx) = AccessUnitQueue::bounded(ACCESS_UNIT_QUEUE_CAPACITY);
         let pipeline_state = PipelineState::new();
-        let encoder_control = EncoderControl::new();
+        let initial_target = super::types::resolve_bitrate(quality, bitrate_bps);
+        let encoder_control = EncoderControl::new(
+            initial_target,
+            super::types::resolve_floor(initial_target, min_bitrate_bps),
+        );
         let shutdown = Arc::new(AtomicBool::new(false));
         let preview_completion = Arc::new(WorkerCompletion {
             done: Mutex::new(false),
@@ -276,6 +355,7 @@ impl NativePipeline {
                     height,
                     fps,
                     quality,
+                    bitrate_bps,
                     generation,
                     worker_state,
                     worker_shutdown,
@@ -349,6 +429,27 @@ impl NativePipeline {
         Ok(())
     }
 
+    /// Current encoder bitrate target (preset or user override, as applied
+    /// to the actual frame size). Surfaced in session snapshots.
+    pub(crate) fn bitrate_target(&self) -> u32 {
+        self.encoder_control.target()
+    }
+
+    /// Last congestion-imposed bitrate, if any REMB signal arrived.
+    pub(crate) fn bitrate_congestion(&self) -> Option<u32> {
+        self.encoder_control.congestion_bitrate()
+    }
+
+    pub(crate) fn set_floor(&self, floor: u32) -> Result<(), String> {
+        self.encoder_control.set_floor(floor);
+        Ok(())
+    }
+
+    /// Current congestion floor.
+    pub(crate) fn bitrate_floor(&self) -> u32 {
+        self.encoder_control.floor()
+    }
+
     pub(crate) fn preview_diagnostics(&self) -> Arc<PreviewDiagnostics> {
         Arc::clone(&self.preview_diagnostics)
     }
@@ -399,7 +500,17 @@ impl Drop for NativePipeline {
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-fn encoder_bitrate(width: u32, height: u32, quality: TransmissionQuality) -> u32 {
+fn encoder_bitrate(
+    width: u32,
+    height: u32,
+    quality: TransmissionQuality,
+    override_bps: Option<u32>,
+) -> u32 {
+    // An explicit user value is used as-is (clamped): it expresses intent
+    // for the whole frame, so pixel scaling must not shrink it.
+    if let Some(bps) = override_bps.filter(|bps| *bps > 0) {
+        return super::types::clamp_bitrate_bps(bps);
+    }
     // Start from the quality preset and scale by the actual pixel count
     // relative to the preset's capture cap, clamped so the preset is the
     // ceiling and small sources never starve the encoder.
@@ -427,6 +538,7 @@ fn encoder_worker_loop(
     _height: u32,
     fps: u32,
     quality: TransmissionQuality,
+    bitrate_bps: Option<u32>,
     generation: u64,
     state: Arc<PipelineState>,
     shutdown: Arc<AtomicBool>,
@@ -477,10 +589,12 @@ fn encoder_worker_loop(
                         continue;
                     };
                     let size = pixel_buffer_size(&frame.pixel_buffer);
+                    let initial = encoder_bitrate(size.0, size.1, quality, bitrate_bps);
+                    control.set_target(initial);
                     match super::video_toolbox::VideoToolboxEncoder::new(
                         size.0,
                         size.1,
-                        encoder_bitrate(size.0, size.1, quality),
+                        initial,
                         fps,
                         output,
                         Arc::clone(&state),
@@ -534,6 +648,7 @@ fn encoder_worker_loop(
     _height: u32,
     fps: u32,
     quality: TransmissionQuality,
+    bitrate_bps: Option<u32>,
     generation: u64,
     state: Arc<PipelineState>,
     shutdown: Arc<AtomicBool>,
@@ -579,10 +694,12 @@ fn encoder_worker_loop(
                     };
                     let width = frame.width.max(2) & !1;
                     let height = frame.height.max(2) & !1;
+                    let initial = encoder_bitrate(width, height, quality, bitrate_bps);
+                    control.set_target(initial);
                     match super::windows_encoder::OpenH264Encoder::new(
                         width,
                         height,
-                        encoder_bitrate(width, height, quality),
+                        initial,
                         fps,
                         output,
                         Arc::clone(&state),
@@ -628,6 +745,7 @@ fn encoder_worker_loop(
     _height: u32,
     _fps: u32,
     _quality: TransmissionQuality,
+    _bitrate_bps: Option<u32>,
     _generation: u64,
     _state: Arc<PipelineState>,
     _shutdown: Arc<AtomicBool>,
@@ -651,6 +769,8 @@ mod tests {
             VideoResolution::P1080,
             FrameRate::Fps60,
             TransmissionQuality::High,
+            None,
+            None,
         );
         let storage: Arc<[u8]> = Arc::from([1_u8, 2, 3]);
         let frame = NativeFrame {
@@ -683,6 +803,8 @@ mod tests {
             VideoResolution::P1080,
             FrameRate::Fps60,
             TransmissionQuality::High,
+            None,
+            None,
         );
         pipeline
             .capture_tx
@@ -717,6 +839,8 @@ mod tests {
             VideoResolution::P1080,
             FrameRate::Fps60,
             TransmissionQuality::High,
+            None,
+            None,
         );
         preview.begin_session();
         pipeline
@@ -744,13 +868,15 @@ mod tests {
             VideoResolution::P720,
             FrameRate::Fps30,
             TransmissionQuality::Low,
+            None,
+            None,
         );
         drop(pipeline);
     }
 
     #[test]
     fn encoder_control_coalesces_feedback_bursts_without_saturation() {
-        let control = EncoderControl::new();
+        let control = EncoderControl::new(8_000_000, 1_000_000);
         for bitrate in 250_000..260_000 {
             control.request_keyframe();
             control.set_bitrate(bitrate);

@@ -4,8 +4,9 @@ import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 
 import "./index.css";
 import "./App.css";
 import logo from "./assets/logo.png";
+import { AUTO_FLOOR_MBPS, BITRATE_MAX_MBPS, BITRATE_MIN_MBPS, FLOOR_MAX_MBPS, FLOOR_MIN_MBPS, collectViewerStats, qualityTargetLabel, qualityTargetMbps, type ViewerStats, type ViewerStatsPrev } from "./sessionStats";
 
-type IconName = "grid" | "monitor" | "window" | "game" | "settings" | "help" | "plus" | "copy" | "wifi" | "chevron" | "expand" | "minimize" | "volume" | "volume-off" | "terminal";
+type IconName = "grid" | "monitor" | "window" | "game" | "settings" | "help" | "plus" | "copy" | "wifi" | "chevron" | "expand" | "minimize" | "volume" | "volume-off" | "terminal" | "activity";
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
   const paths: Record<IconName, ReactNode> = {
     grid: <><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></>,
@@ -22,7 +23,8 @@ function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
     minimize: <path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/>,
     volume: <><path d="M11 5 6 9H2v6h4l5 4V5Z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.8 5.8a9 9 0 0 1 0 12.4"/></>,
     "volume-off": <><path d="M11 5 6 9H2v6h4l5 4V5Z"/><path d="m22 9-6 6"/><path d="m16 9 6 6"/></>,
-    terminal: <><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></>
+    terminal: <><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></>,
+    activity: <><path d="M3 12h4l3 8 4-16 3 8h4"/></>
   };
   return <svg className="icon" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
 }
@@ -32,9 +34,11 @@ type RunningApp = { name: string; bundle_id?: string | null; pid: number; emitti
 type Capabilities = { supported: boolean; screen_capture_kit: boolean; source_enumeration_available: boolean; screen_recording_authorization: "granted" | "not_granted" | "unsupported"; app_audio_exclusion: "enhanced" | "best_effort" | "unsupported"; detail: string };
 type RosterEntry = { id: string; nickname: string; state: string };
 type DirectAddress = { ip: string; port: number; version: number; kind: string; copy: string };
-type Snapshot = { state: string; session_id: string | null; source_id: number | null; native_capture_active: boolean; preview_callback_count: number; preview_frame_count: number; preview_dropped_count: number; preview_error: string | null; detail: string; peer_state: string; peer_detail: string; session_code: string | null; lan_addresses: string[]; lan_port: number | null; roster?: RosterEntry[]; password_set?: boolean; admission?: boolean; join_mode?: string; direct_listen_port?: number | null; direct_addresses?: DirectAddress[]; direct_mapping?: boolean; stunar_state?: string | null };
+type Snapshot = { state: string; session_id: string | null; source_id: number | null; bitrate_bps: number | null; native_capture_active: boolean; preview_callback_count: number; preview_frame_count: number; preview_dropped_count: number; preview_error: string | null; detail: string; peer_state: string; peer_detail: string; session_code: string | null; lan_addresses: string[]; lan_port: number | null; roster?: RosterEntry[]; password_set?: boolean; admission?: boolean; join_mode?: string; direct_listen_port?: number | null; direct_addresses?: DirectAddress[]; direct_mapping?: boolean; stunar_state?: string | null };
 type Signal = { type: "offer" | "answer"; sdp: string; id?: string };
 type LogSession = { session: string; timestamp: string; lines: string[] };
+type ViewerLinkStats = { id: string; nickname: string; state: string; rtt_ms: number | null };
+type SessionLinkStats = { links: ViewerLinkStats[]; target_bps: number; congestion_bps: number | null; floor_bps: number };
 
 const invokeMedia = <T,>(command: string, args?: Record<string, unknown>) => invoke<T>(command, args);
 const diagnosticError = (error: unknown, fallback: string) => error instanceof Error ? error.message : typeof error === "string" ? error : fallback;
@@ -105,6 +109,12 @@ function App() {
   const [sourceKind, setSourceKind] = useState<"display" | "window">("display");
   const [sourceId, setSourceId] = useState<number | null>(null);
   const [quality, setQuality] = useState<"low" | "medium" | "high">("high");
+  // Limite custom do encoder em Mbps. null = seguir o preset de qualidade.
+  const [bitrateMbps, setBitrateMbps] = useState<number | null>(null);
+  const effectiveMbps = bitrateMbps ?? qualityTargetMbps[quality];
+  // Piso custom anti-colapso REMB em Mbps. null = 1 Mbps automático.
+  const [minBitrateMbps, setMinBitrateMbps] = useState<number | null>(null);
+  const effectiveFloorMbps = Math.min(minBitrateMbps ?? AUTO_FLOOR_MBPS, effectiveMbps);
   const [systemAudio, setSystemAudio] = useState(false);
   const [excludedApps, setExcludedApps] = useState<string[]>([]);
   const [appSearch, setAppSearch] = useState("");
@@ -135,6 +145,15 @@ function App() {
   const [watchMuted, setWatchMuted] = useState(false);
   const [escHint, setEscHint] = useState(false);
   const [tagline, setTagline] = useState(() => taglines[Math.floor(Math.random() * taglines.length)]);
+  const [statsOpen, setStatsOpen] = useState(false);
+  const [viewerStats, setViewerStats] = useState<ViewerStats | null>(null);
+  const [hostStats, setHostStats] = useState<SessionLinkStats | null>(null);
+  const hostLinks = hostStats?.links ?? null;
+  const congestionMbps = hostStats?.congestion_bps != null ? Math.round(hostStats.congestion_bps / 1e5) / 10 : null;
+  const floorAppliedMbps = hostStats ? Math.round(hostStats.floor_bps / 1e5) / 10 : null;
+  const [hostPreviewFps, setHostPreviewFps] = useState<number | null>(null);
+  const statsPrevRef = useRef<ViewerStatsPrev>(null);
+  const hostPreviewPrevRef = useRef<{ frames: number; t: number } | null>(null);
   const [logsOpen, setLogsOpen] = useState(false);
   const [logs, setLogs] = useState<LogSession[]>([]);
   const [activeLog, setActiveLog] = useState(0);
@@ -261,6 +280,42 @@ function App() {
   useEffect(() => {
     if (mode !== "watch") setCinema(false);
   }, [mode]);
+  // Session status popup: poll live stats 1x/sec while open.
+  // Watch mode measures the real received stream via getStats();
+  // Share mode shows encoder targets + capture health from the snapshot.
+  useEffect(() => {
+    if (!statsOpen) return undefined;
+    const tick = async () => {
+      if (mode === "watch") {
+        const pc = peerRef.current;
+        if (!pc) { setViewerStats(null); return; }
+        const { stats, prev } = await collectViewerStats(pc, remoteRef.current, statsPrevRef.current);
+        statsPrevRef.current = prev;
+        setViewerStats(stats);
+      } else {
+        const frames = session?.preview_frame_count;
+        const now = Date.now();
+        const prev = hostPreviewPrevRef.current;
+        if (typeof frames === "number" && prev) {
+          const dt = (now - prev.t) / 1000;
+          if (dt > 0.5) {
+            setHostPreviewFps(Math.round(((frames - prev.frames) / dt) * 10) / 10);
+            hostPreviewPrevRef.current = { frames, t: now };
+          }
+        } else if (typeof frames === "number") {
+          hostPreviewPrevRef.current = { frames, t: now };
+          setHostPreviewFps(null);
+        }
+        try {
+          const stats = await invokeMedia<SessionLinkStats>("get_media_session_stats");
+          setHostStats(stats);
+        } catch { /* mantém a última leitura */ }
+      }
+    };
+    void tick();
+    const timer = window.setInterval(() => void tick(), 1000);
+    return () => window.clearInterval(timer);
+  }, [statsOpen, mode, session?.preview_frame_count]);
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "=") return;
@@ -332,10 +387,10 @@ function App() {
     if (!active) { liveSettingsApplied.current = false; return; }
     if (sessionAction !== "idle") return;
     if (!liveSettingsApplied.current) { liveSettingsApplied.current = true; return; }
-    void invokeMedia<Snapshot | null>("update_media_session", { request: { quality, system_audio: systemAudio, excluded_apps: excludedApps } })
+    void invokeMedia<Snapshot | null>("update_media_session", { request: { quality, bitrate_bps: bitrateMbps !== null ? Math.round(bitrateMbps * 1_000_000) : null, min_bitrate_bps: minBitrateMbps !== null ? Math.round(minBitrateMbps * 1_000_000) : null, system_audio: systemAudio, excluded_apps: excludedApps } })
       .then((next) => { if (next) setSession(next); })
       .catch((error) => setNotice(`Could not apply the change: ${diagnosticError(error, "unknown error")}`));
-  }, [quality, systemAudio, excludedApps, active, sessionAction]);
+  }, [quality, bitrateMbps, minBitrateMbps, systemAudio, excludedApps, active, sessionAction]);
   useEffect(() => () => {
     peerRef.current?.close();
     void invokeMedia("close_media_peer_transport").catch(() => undefined).then(() => invokeMedia("stop_media_session").catch(() => undefined));
@@ -371,6 +426,8 @@ function App() {
           source: sourceKind === "display" ? "screen" : "window",
           source_id: sourceId,
           quality,
+          bitrate_bps: bitrateMbps !== null ? Math.round(bitrateMbps * 1_000_000) : null,
+          min_bitrate_bps: minBitrateMbps !== null ? Math.round(minBitrateMbps * 1_000_000) : null,
           resolution: preset.resolution,
           frame_rate: preset.frame_rate,
           system_audio: systemAudio,
@@ -734,7 +791,10 @@ function App() {
             <section className={`panel preview-panel ${watchConnected ? "watch-preview" : ""}`}>
               <div className="panel-title">
                 <div><span className="section-kicker">Preview</span><h2>Incoming stream</h2></div>
-                <span className={`live-badge ${watchConnected ? "is-live" : ""}`}><i/>{watchConnected ? " Live" : watchIce === "connecting" ? " Waiting" : " Standby"}</span>
+                <span className="panel-title-actions">
+                  <button className="status-button" onClick={() => setStatsOpen(true)} title="Session status: bitrate, resolution, fps, delay"><Icon name="activity" size={13}/> Status</button>
+                  <span className={`live-badge ${watchConnected ? "is-live" : ""}`}><i/>{watchConnected ? " Live" : watchIce === "connecting" ? " Waiting" : " Standby"}</span>
+                </span>
               </div>
               <div className={`preview-screen ${watchConnected ? "watch-stage" : ""}`} style={watchConnected ? ({ "--watch-zoom": watchZoom } as CSSProperties) : undefined}>
                 <video ref={remoteRef} className="remote-preview visible" autoPlay playsInline />
@@ -796,11 +856,33 @@ function App() {
                 <div>
                   <span>Quality</span>
                   <div className="segmented">
-                    <button className={quality === "low" ? "selected" : ""} onClick={() => setQuality("low")}>Low</button>
-                    <button className={quality === "medium" ? "selected" : ""} onClick={() => setQuality("medium")}>Medium</button>
-                    <button className={quality === "high" ? "selected" : ""} onClick={() => setQuality("high")}>High</button>
+                    <button className={quality === "low" ? "selected" : ""} onClick={() => { setQuality("low"); setBitrateMbps(null); setMinBitrateMbps(null); }}>Low</button>
+                    <button className={quality === "medium" ? "selected" : ""} onClick={() => { setQuality("medium"); setBitrateMbps(null); setMinBitrateMbps(null); }}>Medium</button>
+                    <button className={quality === "high" ? "selected" : ""} onClick={() => { setQuality("high"); setBitrateMbps(null); setMinBitrateMbps(null); }}>High</button>
                   </div>
                   <p className="quality-hint">Low 720p 30 · Medium 1080p 30 · High 1080p 60</p>
+                  <div className="bitrate-block">
+                    <div className="bitrate-label-row">
+                      <span>Bitrate limite</span>
+                      {bitrateMbps !== null && <button className="bitrate-auto" onClick={() => setBitrateMbps(null)} title="Voltar ao valor do preset">auto</button>}
+                    </div>
+                    <div className="bitrate-row">
+                      <input type="range" min={BITRATE_MIN_MBPS} max={BITRATE_MAX_MBPS} step={0.5} value={Math.min(BITRATE_MAX_MBPS, Math.max(BITRATE_MIN_MBPS, effectiveMbps))} onChange={(event) => setBitrateMbps(Number(event.target.value))} aria-label="Bitrate limite em Mbps"/>
+                      <code>{effectiveMbps} Mbps{bitrateMbps === null ? " · preset" : " · custom"}</code>
+                    </div>
+                    <p className="quality-hint">Teto do encoder — aplica na hora, mesmo com sessão ativa. A rede pode baixar temporariamente.</p>
+                  </div>
+                  <div className="bitrate-block">
+                    <div className="bitrate-label-row">
+                      <span>Bitrate mínimo (piso)</span>
+                      {minBitrateMbps !== null && <button className="bitrate-auto" onClick={() => setMinBitrateMbps(null)} title="Voltar ao piso automático de 1 Mbps">auto</button>}
+                    </div>
+                    <div className="bitrate-row">
+                      <input type="range" min={FLOOR_MIN_MBPS} max={FLOOR_MAX_MBPS} step={0.25} value={Math.min(FLOOR_MAX_MBPS, Math.max(FLOOR_MIN_MBPS, effectiveFloorMbps))} onChange={(event) => setMinBitrateMbps(Number(event.target.value))} aria-label="Bitrate mínimo em Mbps"/>
+                      <code>{effectiveFloorMbps} Mbps{minBitrateMbps === null ? " · auto" : " · custom"}</code>
+                    </div>
+                    <p className="quality-hint">O REMB nunca derruba abaixo disso. Protege contra estimador caçando para baixo.</p>
+                  </div>
                 </div>
               </div>
               <label className={`unsupported-option ${audioExclusion ? "" : "is-disabled"}`}>
@@ -872,7 +954,7 @@ function App() {
             </section>
             <div className="right-column">
               <section className="panel preview-panel">
-                <div className="panel-title"><div><span className="section-kicker">Preview</span><h2>What your peer will see</h2></div><span className="live-badge"><i/>{connected ? " Live" : active ? " Capturing" : " Standby"}</span></div>
+                <div className="panel-title"><div><span className="section-kicker">Preview</span><h2>What your peer will see</h2></div><span className="panel-title-actions"><button className="status-button" onClick={() => setStatsOpen(true)} title="Session status: bitrate, resolution, fps, delay"><Icon name="activity" size={13}/> Status</button><span className="live-badge"><i/>{connected ? " Live" : active ? " Capturing" : " Standby"}</span></span></div>
                 <div className="preview-screen">
                   <div className="preview-grid"/>
                   <canvas ref={canvasRef} className={`native-preview ${active ? "visible" : ""}`} aria-label="Native capture preview"/>
@@ -970,6 +1052,64 @@ function App() {
           </div>
         )}
       </main>
+      {statsOpen && (
+        <div className="logs-overlay" onClick={() => setStatsOpen(false)}>
+          <div className="logs-modal stats-modal" role="dialog" aria-modal="true" aria-label="Session status" onClick={(event) => event.stopPropagation()}>
+            <div className="logs-header">
+              <div>
+                <span className="section-kicker">Diagnostics · live · 1s</span>
+                <h2>{mode === "share" ? "Session status · Host" : "Session status · Viewer"}</h2>
+              </div>
+              <button className="logs-close" onClick={() => setStatsOpen(false)} aria-label="Close status" title="Close">&times;</button>
+            </div>
+            {mode === "share" ? (
+              <>
+                <div className="stats-grid">
+                  <div><span>Encoder target</span><code>{session?.bitrate_bps ? `${Math.round(session.bitrate_bps / 1e5) / 10} Mbps aplicados` : `${qualityTargetMbps[quality]} Mbps (preset)`} · {qualityTargetLabel[quality]}{bitrateMbps !== null ? " · custom" : ""}</code></div>
+                  <div><span>Session / peer</span><code>{session?.state ?? "idle"} / {session?.peer_state ?? "—"}</code></div>
+                  <div><span>Viewers connected</span><code>{connectedRoster.length}{pendingRoster.length > 0 ? " (+" + pendingRoster.length + " waiting)" : ""}</code></div>
+                  <div><span>Join mode</span><code>{joinMode}{session?.session_code ? " · " + session.session_code : ""}</code></div>
+                  <div><span>Capture active</span><code>{session?.native_capture_active ? "yes" : active ? "starting…" : "no"}</code></div>
+                  <div><span>Capture preview</span><code>{hostPreviewFps !== null ? hostPreviewFps + " fps" : "—"}{session ? " · " + session.preview_frame_count + " frames" : ""}{session && session.preview_dropped_count > 0 ? " · " + session.preview_dropped_count + " dropped" : ""}</code></div>
+                  <div><span>Peer detail</span><code title={session?.peer_detail ?? ""}>{session?.peer_detail || "—"}</code></div>
+                  <div><span>Preview error</span><code className={session?.preview_error ? "is-error" : ""}>{session?.preview_error || "—"}</code></div>
+                  <div><span>Efetivo (REMB)</span><code className={congestionMbps !== null && session?.bitrate_bps ? (congestionMbps < session.bitrate_bps / 1e6 / 2 ? "is-warn" : "") : ""}>{congestionMbps !== null ? `${congestionMbps} Mbps impostos pelo viewer` : "sem sinal — usando o alvo"}{floorAppliedMbps !== null ? ` · piso ${floorAppliedMbps}` : ""}</code></div>
+                </div>
+                <div className="stats-links">
+                  <span className="stats-links-title">Viewers · ms da conexão</span>
+                  {!hostLinks || hostLinks.length === 0 ? (
+                    <code className="stats-links-empty">{active ? "Nenhum viewer com transporte ativo — o ms aparece aqui quando alguém conectar." : "Inicie uma sessão para medir."}</code>
+                  ) : hostLinks.map((link) => (
+                    <div className="stats-link-row" key={link.id}>
+                      <span className="stats-link-name">{link.nickname}<small>{link.state}</small></span>
+                      <code className={link.rtt_ms !== null && link.rtt_ms > 150 ? "is-warn" : ""}>{link.rtt_ms !== null ? `${link.rtt_ms} ms` : "medindo…"}</code>
+                    </div>
+                  ))}
+                </div>
+                <p className="stats-hint">Alvo do encoder no Host. O bitrate <em>recebido</em> aparece no Status do Viewer — se estiver bem abaixo do alvo, é congestionamento (o encoder baixa via REMB) ou limite da rede, não a configuração.</p>
+              </>
+            ) : (
+              <>
+                <div className="stats-grid">
+                  <div><span>Bitrate recebido</span><code className={viewerStats?.bitrateMbps !== null && viewerStats?.bitrateMbps !== undefined && viewerStats.bitrateMbps < 1 ? "is-warn" : ""}>{viewerStats?.bitrateMbps !== null && viewerStats?.bitrateMbps !== undefined ? viewerStats.bitrateMbps + " Mbps" : "—"}</code></div>
+                  <div><span>Resolução</span><code>{viewerStats?.resolution ?? "—"}</code></div>
+                  <div><span>FPS</span><code>{viewerStats?.fps !== null && viewerStats?.fps !== undefined ? String(viewerStats.fps) : "—"}</code></div>
+                  <div><span>Codec</span><code>{viewerStats?.codec ?? "—"}</code></div>
+                  <div><span>RTT (delay rede)</span><code>{viewerStats?.rttMs !== null && viewerStats?.rttMs !== undefined ? viewerStats.rttMs + " ms" : "—"}</code></div>
+                  <div><span>Jitter</span><code>{viewerStats?.jitterMs !== null && viewerStats?.jitterMs !== undefined ? viewerStats.jitterMs + " ms" : "—"}</code></div>
+                  <div><span>Pacotes (perda)</span><code>{viewerStats?.packetsLost !== null && viewerStats?.packetsLost !== undefined ? viewerStats.packetsLost + " perdidos" + (viewerStats.lossPercent !== null && viewerStats.lossPercent !== undefined ? " · " + viewerStats.lossPercent + "%" : "") : "—"}</code></div>
+                  <div><span>Frames (descarte)</span><code>{viewerStats?.framesDecoded !== null && viewerStats?.framesDecoded !== undefined ? viewerStats.framesDecoded + " dec." + (viewerStats.dropPercent !== null && viewerStats.dropPercent !== undefined ? " · " + viewerStats.dropPercent + "% drop" : "") : "—"}</code></div>
+                  <div><span>Atraso do player</span><code>{viewerStats?.liveDelaySec !== null && viewerStats?.liveDelaySec !== undefined ? viewerStats.liveDelaySec + " s" : "—"}</code></div>
+                  <div><span>Conexão / ICE</span><code>{viewerStats?.connectionState ?? watchIce}{viewerStats?.iceState ? " / " + viewerStats.iceState : ""}</code></div>
+                </div>
+                {!watchConnected && <p className="stats-hint">Sem mídia ainda — os números aparecem após conectar.</p>}
+                {watchConnected && (viewerStats?.bitrateMbps === null || viewerStats?.bitrateMbps === undefined) && <p className="stats-hint">Coletando amostras… aguarde 1–2s.</p>}
+                <p className="stats-hint">Bitrate &lt; 1 Mbps com imagem quadriculada = rede forçando o encoder para baixo. Compare com o alvo do Host ({qualityTargetLabel[quality]}).</p>
+              </>
+            )}
+          </div>
+        </div>
+      )}
       {logsOpen && (
         <div className="logs-overlay" onClick={closeLogs}>
           <div className="logs-modal" role="dialog" aria-modal="true" aria-label="Session logs" onClick={(event) => event.stopPropagation()}>
