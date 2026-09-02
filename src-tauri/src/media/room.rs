@@ -194,7 +194,21 @@ impl Drop for DirectRoom {
 /// port for IPv4 and IPv6); falls back to `0.0.0.0:0` when the OS binds
 /// `[::]` v6-only (Windows) or the bind fails. Returns whether IPv6 is
 /// reachable on the chosen listener.
+///
+/// On Windows `[::]:0` is v6-only by default (IPV6_V6ONLY=1). We try to
+/// create a true dual-stack socket via `socket2` with `only_v6(false)` so
+/// one port serves both families and the advertised `[ipv6]:port` is
+/// actually reachable. Probe + fallback keeps the old behaviour when that
+/// fails.
 fn bind_direct_listener() -> Result<(TcpListener, bool), String> {
+    // Try a true dual-stack socket first (especially on Windows).
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(listener) = bind_dual_stack() {
+            // Dual-stack succeeded: one port for v4 and v6.
+            return Ok((listener, true));
+        }
+    }
     if let Ok(listener) = TcpListener::bind("[::]:0") {
         let port = listener.local_addr().map_err(|error| error.to_string())?.port();
         // Probe: can IPv4 reach this listener? On Windows `[::]` is v6-only
@@ -205,11 +219,50 @@ fn bind_direct_listener() -> Result<(TcpListener, bool), String> {
         )
         .is_ok();
         if ipv4_reachable {
+            logger::log(
+                "INFO",
+                "direct listen",
+                &format!("dual-stack [::]:{port} (v4 reachable)"),
+            );
             return Ok((listener, true));
         }
+        logger::log(
+            "INFO",
+            "direct listen",
+            &format!("[::]:{port} v6-only, falling back to 0.0.0.0"),
+        );
+        // Fall through to IPv4-only; the v6-only listener is dropped.
     }
     let listener = TcpListener::bind("0.0.0.0:0").map_err(|error| error.to_string())?;
+    logger::log(
+        "INFO",
+        "direct listen",
+        &format!("ipv4-only {}", listener.local_addr().map_err(|e| e.to_string())?),
+    );
     Ok((listener, false))
+}
+
+#[cfg(target_os = "windows")]
+fn bind_dual_stack() -> Result<TcpListener, String> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))
+        .map_err(|e| e.to_string())?;
+    socket
+        .set_only_v6(false)
+        .map_err(|e| e.to_string())?;
+    socket
+        .set_nonblocking(false)
+        .map_err(|e| e.to_string())?;
+    let addr: SocketAddr = "[::]:0".parse().map_err(|e: std::net::AddrParseError| e.to_string())?;
+    socket
+        .bind(&addr.into())
+        .map_err(|e| e.to_string())?;
+    socket.listen(128).map_err(|e| e.to_string())?;
+    let std_listener: std::net::TcpListener = socket.into();
+    std_listener
+        .set_nonblocking(false)
+        .map_err(|e| e.to_string())?;
+    Ok(std_listener)
 }
 
 /// Collects the copyable Direct addresses on a worker thread so Start never

@@ -29,6 +29,10 @@ mod video_toolbox;
 mod windows_capture;
 #[cfg(target_os = "windows")]
 mod windows_encoder;
+#[cfg(target_os = "windows")]
+pub(crate) mod firewall;
+#[cfg(not(target_os = "windows"))]
+pub(crate) mod firewall;
 
 pub use capabilities::MediaCapabilities;
 pub use engine::MediaEngine;

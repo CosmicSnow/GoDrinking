@@ -312,6 +312,16 @@ fn clear_app_logs() {
     media::clear();
 }
 
+#[tauri::command]
+fn reset_firewall_rules() -> Result<String, String> {
+    crate::media::firewall::reset_firewall_rules()
+}
+
+#[tauri::command]
+fn get_firewall_status() -> String {
+    crate::media::firewall::check_firewall_status()
+}
+
 #[derive(serde::Deserialize)]
 struct ViewerDecisionRequest {
     id: String,
@@ -374,7 +384,9 @@ pub fn run() {
             submit_media_room_answer,
             stunar_viewer_close,
             get_app_logs,
-            clear_app_logs
+            clear_app_logs,
+            reset_firewall_rules,
+            get_firewall_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

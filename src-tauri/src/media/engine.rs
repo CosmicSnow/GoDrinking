@@ -657,6 +657,8 @@ fn create_in_state(
             request.admission,
         ),
     );
+    // Firewall: só Direct/LAN precisam inbound TCP; Stunar é só outbound.
+    crate::media::firewall::ensure_firewall_for_host(request.join_mode);
     let has_active_session = state
         .lock()
         .map_err(|_| MediaEngineError::StatePoisoned)?

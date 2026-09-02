@@ -37,8 +37,12 @@ fn http_client() -> Result<reqwest::Client, String> {
         .map_err(|error| error.to_string())
 }
 
+fn normalize_base(base: &str) -> String {
+    base.trim().trim_end_matches('/').to_owned()
+}
+
 fn ws_url(base: &str, role: &str, token: &str) -> Result<String, String> {
-    let base = base.trim_end_matches('/');
+    let base = normalize_base(base);
     let (scheme, rest) = if let Some(rest) = base.strip_prefix("https://") {
         ("wss", rest)
     } else if let Some(rest) = base.strip_prefix("http://") {
@@ -290,6 +294,7 @@ async fn host_open(
     nickname: &str,
     admission: bool,
 ) -> Result<(String, String), String> {
+    let base = normalize_base(base);
     // The server generates the Room code; the Host never sends one.
     let body = json!({ "password": password, "nickname": nickname, "admission": admission });
     let response = client
@@ -334,6 +339,7 @@ async fn post_heartbeat(
     base: &str,
     host_token: &str,
 ) -> Result<(), String> {
+    let base = normalize_base(base);
     let response = client
         .post(format!("{base}/v1/host/heartbeat"))
         .json(&json!({ "host_token": host_token }))
@@ -359,6 +365,7 @@ async fn post_decide(
     viewer_id: &str,
     action: &str,
 ) -> Result<(), String> {
+    let base = normalize_base(base);
     let response = client
         .post(format!("{base}/v1/host/decide"))
         .json(&json!({ "host_token": host_token, "viewer_id": viewer_id, "action": action }))
@@ -378,6 +385,7 @@ async fn post_rotate(
     host_token: &str,
     password: Option<&str>,
 ) -> Result<(), String> {
+    let base = normalize_base(base);
     // The code is server-owned; rotate only changes the Password.
     let mut body = json!({ "host_token": host_token });
     if let Some(password) = password {
@@ -396,6 +404,7 @@ async fn post_rotate(
 }
 
 async fn post_close(client: &reqwest::Client, base: &str, host_token: &str) -> Result<(), String> {
+    let base = normalize_base(base);
     let response = client
         .post(format!("{base}/v1/host/close"))
         .json(&json!({ "host_token": host_token }))
@@ -623,6 +632,7 @@ pub(crate) fn discover_stunar_room(
     password: &str,
     nickname: &str,
 ) -> Result<(String, PeerSignal, StunarViewer), String> {
+    let base = normalize_base(base);
     logger::begin_session("viewer", "stunar");
     logger::log(
         "INFO",
@@ -680,7 +690,7 @@ pub(crate) fn discover_stunar_room(
             .as_str()
             .ok_or_else(|| "Could not join.".to_owned())?
             .to_owned();
-        let ws_url = ws_url(base, "viewer", &token)?;
+        let ws_url = ws_url(&base, "viewer", &token)?;
         let mut ws = connect_ws(&ws_url).await.map_err(|error| {
             logger::log("ERROR", "stunar ws", &format!("connect failed: {error}"));
             "Stunar is unreachable.".to_owned()
