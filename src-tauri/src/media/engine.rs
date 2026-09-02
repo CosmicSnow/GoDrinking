@@ -1,5 +1,6 @@
 use super::capabilities;
 use super::fanout::MediaFanout;
+use super::logger;
 use super::peer_transport::{PeerSignal, PeerTransport};
 use super::pipeline::{NativePipeline, PreviewState};
 use super::process_tap::{EncodedAudioPacket, ProcessTap};
@@ -261,6 +262,7 @@ impl MediaEngine {
     }
 
     pub fn kick_viewer(&self, id: &str) -> Result<MediaSessionSnapshot, MediaEngineError> {
+        logger::log("INFO", "kick", &format!("viewer={id}"));
         let stunar = {
             let state = self
                 .state
@@ -637,6 +639,24 @@ fn create_in_state(
     state: &Arc<Mutex<EngineState>>,
     request: CreateMediaSessionRequest,
 ) -> Result<MediaSessionSnapshot, MediaEngineError> {
+    logger::begin_session(
+        "host",
+        match request.join_mode {
+            JoinMode::Lan => "lan",
+            JoinMode::Direct => "direct",
+            JoinMode::Stunar => "stunar",
+        },
+    );
+    logger::log(
+        "INFO",
+        "create session",
+        &format!(
+            "join_mode={:?} rendezvous_url={} admission={}",
+            request.join_mode,
+            request.rendezvous_url.as_deref().unwrap_or("none"),
+            request.admission,
+        ),
+    );
     let has_active_session = state
         .lock()
         .map_err(|_| MediaEngineError::StatePoisoned)?
@@ -660,13 +680,21 @@ fn create_in_state(
             // Password is mandatory (4-64) on every Stunar room; the server
             // rejects open without it, so fail fast with a clear message.
             if !valid_password(&request.password) {
+                logger::log(
+                    "ERROR",
+                    "create session",
+                    "stunar password rejected locally (4-64 characters)",
+                );
                 return Err(MediaEngineError::NativePeer(
                     "Stunar requires a password (4-64 characters).".into(),
                 ));
             }
             Some(Arc::new(
                 StunarHost::start(base, &request.password, &request.nickname, request.admission)
-                    .map_err(MediaEngineError::NativePeer)?,
+                    .map_err(|error| {
+                        logger::log("ERROR", "stunar open", &error);
+                        MediaEngineError::NativePeer(error)
+                    })?,
             ))
         }
         JoinMode::Lan | JoinMode::Direct => None,
@@ -925,6 +953,7 @@ fn update_credentials_in_state(
             stunar
                 .rotate(Some(password))
                 .map_err(MediaEngineError::NativePeer)?;
+            logger::log("INFO", "rotate", "stunar password rotated");
         }
     }
     // Local gate: new AUTH uses the new Password; Connected Viewers stay.
@@ -935,9 +964,11 @@ fn update_credentials_in_state(
         .ok_or(MediaEngineError::NoActiveSession)?;
     if let Some(password) = request.password.as_deref() {
         session.gate.set_password(password.to_owned());
+        logger::log("INFO", "credentials", "password updated (lan/direct)");
     }
     if let Some(admission) = request.admission {
         session.gate.set_admission(admission);
+        logger::log("INFO", "credentials", &format!("admission={admission}"));
     }
     Ok(snapshot_from_state(&state))
 }
@@ -945,6 +976,7 @@ fn update_credentials_in_state(
 fn stop_in_state(
     state: &Arc<Mutex<EngineState>>,
 ) -> Result<MediaSessionSnapshot, MediaEngineError> {
+    logger::log("INFO", "session", "stop");
     let mut session = {
         let mut state = state.lock().map_err(|_| MediaEngineError::StatePoisoned)?;
         if state.session.is_none() {
@@ -1191,6 +1223,7 @@ fn mint_viewer_offer(
     id: &str,
     nickname: &str,
 ) -> Result<PeerSignal, String> {
+    logger::log("INFO", "mint offer", &format!("viewer={id} nickname={nickname}"));
     let (video_rx, audio_rx, encoder_control, frame_duration, join_mode) = {
         let mut guard = state.lock().map_err(|_| "media state is unavailable".to_owned())?;
         let session = guard
@@ -1198,6 +1231,7 @@ fn mint_viewer_offer(
             .as_mut()
             .ok_or_else(|| "no media session is active".to_owned())?;
         if session.viewers.len() >= MAX_VIEWERS {
+            logger::log("WARN", "mint offer", "session is full (8 viewers)");
             return Err("session is full".into());
         }
         let fanout = session
@@ -1232,6 +1266,7 @@ fn mint_viewer_offer(
         if let Some(fanout) = session.fanout.as_ref() {
             fanout.unsubscribe(id);
         }
+        logger::log("WARN", "mint offer", "session is full (8 viewers)");
         return Err("session is full".into());
     }
     session.viewers.insert(

@@ -1,5 +1,6 @@
 mod media;
 
+use media::logger;
 use media::{
     CreateMediaSessionRequest, JoinMode, MediaEngine, MediaSessionSnapshot, NativeCaptureSource,
     NativeRunningApp, PeerSignal, PreviewFrameEvent, UpdateCredentialsRequest,
@@ -31,13 +32,17 @@ async fn create_media_session(
     request: CreateMediaSessionRequest,
 ) -> Result<MediaSessionSnapshot, String> {
     let engine = engine.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         engine
             .create_session(request)
             .map_err(|error| error.to_string())
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())?;
+    result.map_err(|error| {
+        logger::log("ERROR", "create session failed", &error);
+        error
+    })
 }
 
 /// Stops the active session and releases its native pipeline and stream handles.
@@ -191,7 +196,7 @@ async fn discover_media_room(
     engine: State<'_, MediaEngine>,
     request: JoinRoomRequest,
 ) -> Result<(String, PeerSignal, String), String> {
-    match request.join_mode {
+    let result: Result<(String, PeerSignal, String), String> = match request.join_mode {
         JoinMode::Lan | JoinMode::Direct => {
             tauri::async_runtime::spawn_blocking(move || match request.join_mode {
                 JoinMode::Lan => {
@@ -242,7 +247,11 @@ async fn discover_media_room(
             .await
             .map_err(|error| error.to_string())?
         }
-    }
+    };
+    result.map_err(|error| {
+        logger::log("ERROR", "join failed", &error);
+        error
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -287,6 +296,20 @@ async fn submit_media_room_answer(
 #[tauri::command]
 fn stunar_viewer_close(engine: State<'_, MediaEngine>) {
     engine.close_stunar_viewer();
+}
+
+/// Returns the last 5 session log files (newest first) for the View logs UI.
+#[tauri::command]
+async fn get_app_logs() -> Vec<media::LogSession> {
+    tauri::async_runtime::spawn_blocking(media::read_sessions)
+        .await
+        .unwrap_or_default()
+}
+
+/// Deletes every session log file.
+#[tauri::command]
+fn clear_app_logs() {
+    media::clear();
 }
 
 #[derive(serde::Deserialize)]
@@ -349,7 +372,9 @@ pub fn run() {
             get_media_running_apps,
             discover_media_room,
             submit_media_room_answer,
-            stunar_viewer_close
+            stunar_viewer_close,
+            get_app_logs,
+            clear_app_logs
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

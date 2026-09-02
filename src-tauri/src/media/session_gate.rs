@@ -1,5 +1,6 @@
 //! Password, Admission, Ignore list, and pending Viewer decisions for LAN/Direct.
 
+use super::logger;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,6 +70,7 @@ impl SessionGate {
         };
         if let Some(until) = ignore.until.get(&ip).copied() {
             if Instant::now() < until {
+                logger::log("WARN", "ignore list", &format!("{ip} refused (on ignore list)"));
                 return true;
             }
             ignore.until.remove(&ip);
@@ -87,6 +89,11 @@ impl SessionGate {
         if fails.len() >= FAIL_LIMIT {
             fails.clear();
             ignore.until.insert(ip, now + IGNORE_FOR);
+            logger::log(
+                "WARN",
+                "ignore list",
+                &format!("{ip} ignored for 15 minutes after 5 auth failures"),
+            );
         }
     }
 

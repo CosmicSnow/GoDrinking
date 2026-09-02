@@ -5,7 +5,7 @@ import "./index.css";
 import "./App.css";
 import logo from "./assets/logo.png";
 
-type IconName = "grid" | "monitor" | "window" | "game" | "settings" | "help" | "plus" | "copy" | "wifi" | "chevron" | "expand" | "minimize" | "volume" | "volume-off";
+type IconName = "grid" | "monitor" | "window" | "game" | "settings" | "help" | "plus" | "copy" | "wifi" | "chevron" | "expand" | "minimize" | "volume" | "volume-off" | "terminal";
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
   const paths: Record<IconName, ReactNode> = {
     grid: <><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></>,
@@ -21,7 +21,8 @@ function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
     expand: <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>,
     minimize: <path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/>,
     volume: <><path d="M11 5 6 9H2v6h4l5 4V5Z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.8 5.8a9 9 0 0 1 0 12.4"/></>,
-    "volume-off": <><path d="M11 5 6 9H2v6h4l5 4V5Z"/><path d="m22 9-6 6"/><path d="m16 9 6 6"/></>
+    "volume-off": <><path d="M11 5 6 9H2v6h4l5 4V5Z"/><path d="m22 9-6 6"/><path d="m16 9 6 6"/></>,
+    terminal: <><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></>
   };
   return <svg className="icon" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
 }
@@ -33,6 +34,7 @@ type RosterEntry = { id: string; nickname: string; state: string };
 type DirectAddress = { ip: string; port: number; version: number; kind: string; copy: string };
 type Snapshot = { state: string; session_id: string | null; source_id: number | null; native_capture_active: boolean; preview_callback_count: number; preview_frame_count: number; preview_dropped_count: number; preview_error: string | null; detail: string; peer_state: string; peer_detail: string; session_code: string | null; lan_addresses: string[]; lan_port: number | null; roster?: RosterEntry[]; password_set?: boolean; admission?: boolean; join_mode?: string; direct_listen_port?: number | null; direct_addresses?: DirectAddress[]; direct_mapping?: boolean; stunar_state?: string | null };
 type Signal = { type: "offer" | "answer"; sdp: string; id?: string };
+type LogSession = { session: string; timestamp: string; lines: string[] };
 
 const invokeMedia = <T,>(command: string, args?: Record<string, unknown>) => invoke<T>(command, args);
 const diagnosticError = (error: unknown, fallback: string) => error instanceof Error ? error.message : typeof error === "string" ? error : fallback;
@@ -133,6 +135,10 @@ function App() {
   const [watchMuted, setWatchMuted] = useState(false);
   const [escHint, setEscHint] = useState(false);
   const [tagline, setTagline] = useState(() => taglines[Math.floor(Math.random() * taglines.length)]);
+  const [logsOpen, setLogsOpen] = useState(false);
+  const [logs, setLogs] = useState<LogSession[]>([]);
+  const [activeLog, setActiveLog] = useState(0);
+  const [lastError, setLastError] = useState("");
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const remoteRef = useRef<HTMLVideoElement>(null);
   const peerRef = useRef<RTCPeerConnection | null>(null);
@@ -381,7 +387,9 @@ function App() {
     } catch (error) {
       const recovered = await invokeMedia<Snapshot>("get_media_session_state").catch(() => null);
       setSession(recovered && recovered.state !== "idle" ? recovered : null);
-      setNotice(diagnosticError(error, "Native capture could not start."));
+      const message = diagnosticError(error, "Native capture could not start.");
+      setLastError(message);
+      setNotice(message);
     } finally {
       setSessionAction("idle");
     }
@@ -531,6 +539,7 @@ function App() {
       if (joinSeqRef.current !== seq) return;
       setWatchIce("idle");
       const message = diagnosticError(error, "Could not join.");
+      setLastError(message);
       setNotice(message.includes("full") ? "This session is full." : message.includes("declined") ? "The host declined." : message.includes("banned") ? "Could not join." : message);
     } finally {
       setSessionAction("idle");
@@ -540,6 +549,39 @@ function App() {
     await navigator.clipboard?.writeText(text);
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1400);
+  };
+  const loadLogs = async () => {
+    try {
+      const next = await invokeMedia<LogSession[]>("get_app_logs");
+      setLogs(next);
+      setActiveLog(0);
+    } catch { /* keep the last list */ }
+  };
+  const openLogs = async () => {
+    setLogsOpen(true);
+    await loadLogs();
+  };
+  const closeLogs = () => setLogsOpen(false);
+  const copyActiveLog = async () => {
+    const active = logs[activeLog];
+    if (!active) return;
+    await copyText(active.lines.join("\n"));
+  };
+  const clearLogs = async () => {
+    try {
+      await invokeMedia("clear_app_logs");
+      setLogs([]);
+      setActiveLog(0);
+    } catch { /* keep the list */ }
+  };
+  const logLabel = (session: string) => {
+    const name = session.replace(/^session-/, "").replace(/\.log$/, "");
+    const parts = name.split("-");
+    if (parts.length >= 4) {
+      const [date, time, role, mode] = parts;
+      return `${role} · ${mode} · ${date} ${time}`;
+    }
+    return name;
   };
   const copyCode = async () => {
     if (!session?.session_code) return;
@@ -628,7 +670,10 @@ function App() {
             <small>{mode === "watch" ? (watchConnected ? "Watching the host" : "P2P on your LAN") : connected ? "Sharing is live" : "P2P on your LAN"}</small>
           </div>
         </div>
-        <div className="version">goDrinking <span>v0.1.0</span></div>
+        <div className="sidebar-footer">
+          <button className="logs-button" onClick={() => void openLogs()} title="View the last 5 session logs"><Icon name="terminal" size={13}/> View logs</button>
+          <div className="version">goDrinking <span>v0.1.0</span></div>
+        </div>
       </aside>
       <main className="main-content">
         <header className="topbar">
@@ -925,6 +970,43 @@ function App() {
           </div>
         )}
       </main>
+      {logsOpen && (
+        <div className="logs-overlay" onClick={closeLogs}>
+          <div className="logs-modal" role="dialog" aria-modal="true" aria-label="Session logs" onClick={(event) => event.stopPropagation()}>
+            <div className="logs-header">
+              <div>
+                <span className="section-kicker">Diagnostics</span>
+                <h2>Session logs</h2>
+              </div>
+              <button className="logs-close" onClick={closeLogs} aria-label="Close logs" title="Close">&times;</button>
+            </div>
+            <div className="logs-diagnostics">
+              <div><span>Join mode</span><code>{joinMode}</code></div>
+              <div><span>Rendezvous URL</span><code title={rendezvousUrl}>{rendezvousUrl || "—"}</code></div>
+              <div><span>Last error</span><code className={lastError ? "is-error" : ""} title={lastError}>{lastError || "—"}</code></div>
+            </div>
+            {logs.length === 0 ? (
+              <p className="logs-empty">No session logs yet. Start a session or try to join one, then come back here.</p>
+            ) : (
+              <>
+                <div className="logs-tabs" role="tablist" aria-label="Session logs">
+                  {logs.map((log, index) => (
+                    <button key={log.session} role="tab" aria-selected={activeLog === index} className={activeLog === index ? "selected" : ""} title={`${log.session} · ${log.timestamp}`} onClick={() => setActiveLog(index)}>
+                      {logLabel(log.session)}
+                    </button>
+                  ))}
+                </div>
+                <div className="logs-actions">
+                  <button onClick={() => void copyActiveLog()} disabled={!logs[activeLog]}><Icon name="copy" size={12}/> Copy</button>
+                  <button onClick={() => void loadLogs()}>Refresh</button>
+                  <button className="is-danger" onClick={() => void clearLogs()}>Clear all</button>
+                </div>
+                <pre className="logs-content">{logs[activeLog]?.lines.join("\n")}</pre>
+              </>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

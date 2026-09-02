@@ -10,6 +10,7 @@ mod access_unit;
 mod capabilities;
 mod engine;
 mod fanout;
+pub(crate) mod logger;
 mod peer_transport;
 mod pipeline;
 mod process_tap;
@@ -31,6 +32,7 @@ mod windows_encoder;
 
 pub use capabilities::MediaCapabilities;
 pub use engine::MediaEngine;
+pub use logger::{clear, read_sessions, LogSession};
 #[allow(unused_imports)]
 pub use peer_transport::{PeerSignal, PeerSignalKind};
 pub use room::{discover_direct, discover_room, submit_answer as submit_room_answer};

@@ -1,3 +1,4 @@
+use super::logger;
 use super::peer_transport::{rewrite_mdns_candidate_addresses, PeerSignal};
 use super::session_gate::{valid_nickname, SessionGate};
 use super::types::DirectAddress;
@@ -411,6 +412,7 @@ fn handle_tcp(
         .set_read_timeout(Some(LINE_TIMEOUT))
         .map_err(|error| error.to_string())?;
     let peer_ip = stream.peer_addr().ok().map(|addr| addr.ip());
+    logger::log("INFO", "golive2 conn", &format!("peer={peer_ip:?}"));
     let mut reader = BufReader::new(stream.try_clone().map_err(|error| error.to_string())?);
 
     let mut first = String::new();
@@ -421,9 +423,11 @@ fn handle_tcp(
     // Second-connection ANSWER (Fatia 1 flow): no HELLO/AUTH/NICK needed, the
     // offer id inside the JSON matches the Viewer.
     if let Some(json) = first.strip_prefix("ANSWER ") {
+        logger::log("INFO", "golive2 conn", &format!("ANSWER on second connection from {peer_ip:?}"));
         return accept_answer(json, peer_ip, &answers);
     }
     if first != "HELLO GOLIVE2" {
+        logger::log("WARN", "golive2 conn", &format!("expected HELLO GOLIVE2, got {first:?}"));
         let _ = stream.write_all(b"ERR PROTO\n");
         return Err("expected HELLO GOLIVE2".into());
     }
@@ -431,6 +435,7 @@ fn handle_tcp(
     // Ignore list check before AUTH: a banned IP never gets to NICK.
     if let Some(ip) = peer_ip {
         if gate.is_ignored(ip) {
+            logger::log("WARN", "golive2 conn", &format!("peer {ip} is on the ignore list; refused"));
             let _ = stream.write_all(b"ERR BANNED\n");
             return Err("peer ip is on the ignore list".into());
         }
@@ -444,6 +449,7 @@ fn handle_tcp(
     let offered = match auth_line.strip_prefix("AUTH") {
         Some(rest) => rest.strip_prefix(' ').unwrap_or(""),
         None => {
+            logger::log("WARN", "golive2 conn", "expected AUTH line");
             let _ = stream.write_all(b"ERR PROTO\n");
             return Err("expected AUTH line".into());
         }
@@ -452,6 +458,7 @@ fn handle_tcp(
         if let Some(ip) = peer_ip {
             gate.note_auth_failure(ip);
         }
+        logger::log("WARN", "golive2 conn", &format!("AUTH failed (password mismatch) from {peer_ip:?}"));
         let _ = stream.write_all(b"ERR AUTH\n");
         return Err("password mismatch".into());
     }
@@ -464,16 +471,19 @@ fn handle_tcp(
     let nickname = match nick_line.strip_prefix("NICK ") {
         Some(nickname) => nickname,
         None => {
+            logger::log("WARN", "golive2 conn", "expected NICK line");
             let _ = stream.write_all(b"ERR PROTO\n");
             return Err("expected NICK line".into());
         }
     };
     if !valid_nickname(nickname) {
+        logger::log("WARN", "golive2 conn", &format!("invalid nickname {nickname:?}"));
         let _ = stream.write_all(b"ERR NICK\n");
         return Err("invalid nickname".into());
     }
 
     if viewer_count() + gate.pending_roster().len() >= MAX_VIEWERS {
+        logger::log("WARN", "golive2 conn", "session is full; ERR FULL");
         let _ = stream.write_all(b"ERR FULL\n");
         return Err("session is full".into());
     }
@@ -481,21 +491,25 @@ fn handle_tcp(
     let id = random_viewer_id();
     if gate.admission() {
         let rx = gate.register_pending(id.clone(), nickname.to_string());
+        logger::log("INFO", "golive2 conn", &format!("PENDING {id} (admission on)"));
         let _ = stream.write_all(format!("PENDING {id}\n").as_bytes());
         if !SessionGate::wait_pending(rx) {
             // Timeout (60s) or Host Reject: remove the slot and tell the
             // Viewer. decide() also removes the slot on timeout.
             gate.decide(&id, false);
+            logger::log("INFO", "golive2 conn", &format!("REJECT {id}"));
             let _ = stream.write_all(b"REJECT\n");
             return Ok(());
         }
     }
 
     let payload = mint(&id, nickname).map_err(|error| {
+        logger::log("WARN", "golive2 conn", &format!("mint failed for {id}: {error}"));
         let _ = stream.write_all(b"ERR FULL\n");
         error
     })?;
     let body = serde_json::to_string(&payload).map_err(|error| error.to_string())?;
+    logger::log("INFO", "golive2 conn", &format!("OK {id} + OFFER"));
     let _ = stream.write_all(format!("OK {id}\n").as_bytes());
     // The Host's Nickname, so the Viewer can label the Session without
     // showing the raw IP:port. Sent before OFFER; old Viewers skip it.
@@ -514,6 +528,7 @@ fn handle_tcp(
     if reader.read_line(&mut answer_line).is_ok() {
         let answer_line = answer_line.trim_end();
         if let Some(json) = answer_line.strip_prefix("ANSWER ") {
+            logger::log("INFO", "golive2 conn", &format!("ANSWER on first connection from {peer_ip:?}"));
             accept_answer(json, peer_ip, &answers)?;
         }
     }
@@ -582,6 +597,8 @@ pub fn discover_room(
     password: &str,
     nickname: &str,
 ) -> Result<(SocketAddr, PeerSignal, String), String> {
+    logger::begin_session("viewer", "lan");
+    logger::log("INFO", "lan find", &format!("code={code} nickname={nickname}"));
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(|error| error.to_string())?;
     socket
         .set_broadcast(true)
@@ -592,24 +609,34 @@ pub fn discover_room(
     let query = format!("GOLIVE1 FIND {code}");
     socket
         .send_to(query.as_bytes(), ("255.255.255.255", DISCOVERY_PORT))
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            logger::log("ERROR", "lan find", &format!("broadcast failed: {error}"));
+            error.to_string()
+        })?;
     let mut buffer = [0_u8; 256];
-    let (size, from) = socket
-        .recv_from(&mut buffer)
-        .map_err(|_| "room was not found on this network".to_owned())?;
+    let (size, from) = socket.recv_from(&mut buffer).map_err(|_| {
+        logger::log("ERROR", "lan find", "no host answered (room not found on this network)");
+        "room was not found on this network".to_owned()
+    })?;
     let reply = String::from_utf8_lossy(&buffer[..size]);
     let mut parts = reply.split_whitespace();
     if parts.next() != Some("GOLIVE1") || parts.next() != Some("HOST") {
+        logger::log("ERROR", "lan find", &format!("invalid reply: {reply}"));
         return Err("invalid room discovery reply".into());
     }
     if parts.next() != Some(code) {
+        logger::log("ERROR", "lan find", &format!("code mismatch in reply: {reply}"));
         return Err("room code mismatch".into());
     }
     let port = parts
         .next()
         .and_then(|value| value.parse::<u16>().ok())
-        .ok_or_else(|| "room reply is missing a port".to_owned())?;
+        .ok_or_else(|| {
+            logger::log("ERROR", "lan find", &format!("reply missing port: {reply}"));
+            "room reply is missing a port".to_owned()
+        })?;
     let host = SocketAddr::new(from.ip(), port);
+    logger::log("INFO", "lan find", &format!("host found at {host}"));
     let (offer, host_nickname) = fetch_offer(host, password, nickname)?;
     Ok((host, offer, host_nickname))
 }
@@ -623,6 +650,7 @@ pub(crate) fn fetch_offer(
     password: &str,
     nickname: &str,
 ) -> Result<(PeerSignal, String), String> {
+    logger::log("INFO", "golive2", &format!("connect {host}"));
     let mut stream = TcpStream::connect_timeout(&host, Duration::from_secs(8))
         .map_err(|error| format!("connect: {error}"))?;
     stream
@@ -641,15 +669,18 @@ pub(crate) fn fetch_offer(
     stream
         .write_all(format!("NICK {nickname}\n").as_bytes())
         .map_err(|error| error.to_string())?;
+    logger::log("INFO", "golive2", "sent HELLO GOLIVE2 / AUTH / NICK");
     let mut reader = BufReader::new(stream);
     let mut host_nickname = String::new();
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).map_err(|error| error.to_string())? == 0 {
+            logger::log("WARN", "golive2", "host closed the connection");
             return Err("host closed the connection".into());
         }
         let line = line.trim_end();
         if let Some(json) = line.strip_prefix("OFFER ") {
+            logger::log("INFO", "golive2", "received OFFER");
             let signal = serde_json::from_str(json).map_err(|error| error.to_string())?;
             return Ok((signal, host_nickname));
         }
@@ -658,12 +689,15 @@ pub(crate) fn fetch_offer(
             continue;
         }
         if line == "REJECT" {
+            logger::log("WARN", "golive2", "received REJECT (host declined)");
             return Err("The host declined.".into());
         }
         if line == "PENDING" || line.starts_with("PENDING ") {
+            logger::log("INFO", "golive2", "received PENDING (waiting for the host)");
             continue;
         }
         if line == "OK" || line.starts_with("OK ") {
+            logger::log("INFO", "golive2", "received OK");
             continue;
         }
         if let Some(error) = line.strip_prefix("ERR ") {
@@ -679,8 +713,11 @@ pub fn discover_direct(
     password: &str,
     nickname: &str,
 ) -> Result<(PeerSignal, String), String> {
+    logger::begin_session("viewer", "direct");
+    logger::log("INFO", "direct connect", &format!("host={host} nickname={nickname}"));
     fetch_offer(host, password, nickname).map_err(|error| {
         if error.starts_with("connect: ") {
+            logger::log("ERROR", "direct connect", &error);
             "Could not reach that address.".into()
         } else {
             error
@@ -690,7 +727,9 @@ pub fn discover_direct(
 
 /// Maps `ERR *` lines to the generic UI strings of UI.md: wrong Password and
 /// unknown rooms are indistinguishable, and a banned IP gets the same answer.
+/// The raw code is logged so the UI string can be traced.
 fn protocol_error(code: &str) -> String {
+    logger::log("ERROR", "golive2 err", &format!("ERR {code}"));
     match code {
         "FULL" => "This session is full.".into(),
         _ => "Could not join.".into(),
