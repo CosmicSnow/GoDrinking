@@ -1,0 +1,13 @@
+networks:
+  main-npm:
+    external: true
+
+services:
+  godrinking-site:
+    image: ${IMAGE_NAME}:latest
+    container_name: godrinking-site
+    restart: unless-stopped
+    expose:
+      - "80"
+    networks:
+      - main-npm
