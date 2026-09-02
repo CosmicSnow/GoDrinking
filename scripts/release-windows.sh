@@ -9,7 +9,7 @@ tag="v${version}"
 repo="CosmicSnow/GoDrinking"
 target="x86_64-pc-windows-msvc"
 
-make_portable_zip() {
+make_portable_exe() {
   exe="$root_dir/src-tauri/target/${target}/release/godrinking.exe"
   if [ ! -f "$exe" ]; then
     exe="$root_dir/src-tauri/target/release/godrinking.exe"
@@ -25,14 +25,10 @@ make_portable_zip() {
   if [ ! -d "$bundle_dir" ]; then
     bundle_dir="$root_dir/src-tauri/target/release/bundle"
   fi
-  portable_zip="$bundle_dir/goDrinking-${version}-windows-portable.zip"
-  rm -f "$portable_zip"
-  if [ "$os" = "Darwin" ]; then
-    ditto -c -k "$exe" "$portable_zip"
-  else
-    zip -j "$portable_zip" "$exe"
-  fi
-  echo "Portable zip: $portable_zip"
+  portable_exe="$bundle_dir/goDrinking-${version}-windows-portable.exe"
+  rm -f "$portable_exe"
+  cp "$exe" "$portable_exe"
+  echo "Portable exe: $portable_exe"
 }
 
 upload_windows_assets() {
@@ -48,14 +44,14 @@ upload_windows_assets() {
     echo "no Windows installer under src-tauri/target"
     exit 1
   fi
-  make_portable_zip
+  make_portable_exe
   if ! gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
     gh release create "$tag" --repo "$repo" --title "goDrinking $tag" --notes "goDrinking $tag"
   fi
   assets=""
   [ -n "${nsis:-}" ] && assets="$assets $nsis"
   [ -n "${msi:-}" ] && assets="$assets $msi"
-  [ -n "${portable_zip:-}" ] && assets="$assets $portable_zip"
+  [ -n "${portable_exe:-}" ] && assets="$assets $portable_exe"
   # shellcheck disable=SC2086
   gh release upload "$tag" $assets --repo "$repo" --clobber
   echo "Uploaded Windows $tag → https://github.com/${repo}/releases/tag/${tag}"
