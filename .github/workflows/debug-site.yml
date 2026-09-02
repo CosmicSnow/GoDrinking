@@ -1,0 +1,47 @@
+name: Debug Site
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: godrinking
+    steps:
+      - name: Docker PS
+        run: docker ps -a | cat
+
+      - name: Inspect godrinking-site
+        run: |
+          echo "=== inspect network ==="
+          docker inspect godrinking-site --format '{{json .NetworkSettings.Networks}}' | jq . || docker inspect godrinking-site --format '{{json .NetworkSettings.Networks}}' || true
+          echo "=== inspect full (Networks) ==="
+          docker inspect godrinking-site | jq '.[0].NetworkSettings.Networks' || true
+          echo "=== ports ==="
+          docker inspect godrinking-site | jq '.[0].NetworkSettings.Ports' || true
+          echo "=== config expose ==="
+          docker inspect godrinking-site | jq '.[0].Config.ExposedPorts' || true
+
+      - name: Logs site
+        run: docker logs godrinking-site --tail 100 || true
+
+      - name: Network main-npm inspect
+        run: |
+          docker network ls | cat
+          echo "---"
+          docker network inspect main-npm || docker network inspect npm || true
+
+      - name: Curl from host to site (via docker)
+        run: |
+          echo "curl via host network"
+          curl -i http://godrinking-site:80/ || echo "curl localhost failed"
+          # try via docker run on same network
+          docker run --rm --network main-npm curlimages/curl:8.5.0 -i http://godrinking-site:80/ || echo "curl via container failed"
+          docker run --rm --network main-npm curlimages/curl:8.5.0 -i http://godrinking-site:80/__nuxt 2>&1 | head -n 50 || true
+
+      - name: Check NPM container network
+        run: |
+          docker ps | grep -i npm | cat
+          # find npm container and check its networks
+          NPM=$(docker ps --format '{{.Names}}' | grep -i npm | head -n1)
+          echo "NPM container: $NPM"
+          docker inspect "$NPM" | jq '.[0].NetworkSettings.Networks | keys' || true
