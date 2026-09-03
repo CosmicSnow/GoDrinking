@@ -119,6 +119,9 @@ function App() {
   // Backend do encoder no Windows, fixo no Start (Auto = hardware se houver).
   const [videoEncoder, setVideoEncoder] = useState<"auto" | "software" | "hardware">("auto");
   const hevcAvailable = caps?.platform === "macos";
+  // H.264 High funciona no Windows (Media Foundation / OpenH264) e no macOS
+  // (VideoToolbox). HEVC continua só macOS: não há encoder HEVC no Windows.
+  const h264HighAvailable = caps?.platform === "macos" || caps?.platform === "windows";
   const effectiveFloorMbps = Math.min(minBitrateMbps ?? AUTO_FLOOR_MBPS, effectiveMbps);
   const [systemAudio, setSystemAudio] = useState(false);
   const [excludedApps, setExcludedApps] = useState<string[]>([]);
@@ -740,7 +743,7 @@ function App() {
         </div>
         <div className="sidebar-footer">
           <button className="logs-button" onClick={() => void openLogs()} title="View the last 5 session logs"><Icon name="terminal" size={13}/> View logs</button>
-          <div className="version">goDrinking <span>v0.1.0</span></div>
+          <div className="version">goDrinking <span>v0.1.1</span></div>
         </div>
       </aside>
       <main className="main-content">
@@ -878,7 +881,7 @@ function App() {
                   </div>
                   <div className="segmented">
                     <button className={videoCodec === "h264" ? "selected" : ""} onClick={() => setVideoCodec("h264")} disabled={active}>H.264</button>
-                    <button className={videoCodec === "h264high" ? "selected" : ""} onClick={() => setVideoCodec("h264high")} disabled={active || !hevcAvailable} title={hevcAvailable ? "H.264 High — melhor qualidade no mesmo bitrate, qualquer browser abre" : "H.264 High exige macOS"}>H.264 High</button>
+                    <button className={videoCodec === "h264high" ? "selected" : ""} onClick={() => setVideoCodec("h264high")} disabled={active || !h264HighAvailable} title={h264HighAvailable ? "H.264 High — melhor qualidade no mesmo bitrate, qualquer browser abre" : "H.264 High exige macOS ou Windows"}>H.264 High</button>
                     <button className={videoCodec === "hevc" ? "selected" : ""} onClick={() => setVideoCodec("hevc")} disabled={active || !hevcAvailable} title={hevcAvailable ? "HEVC/H.265 — viewers precisam de browser com H.265" : "HEVC exige macOS"}>HEVC</button>
                   </div>
                   {videoCodec === "hevc" && <p className="quality-hint">HEVC economiza ~40% de bitrate, mas cada viewer precisa de decode H.265 no browser — se o peer travar em connecting, volte para H.264 High.</p>}

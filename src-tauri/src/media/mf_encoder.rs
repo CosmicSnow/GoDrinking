@@ -13,6 +13,7 @@
 
 use super::access_unit::{bgra_to_nv12, AccessUnitPushResult, AccessUnitQueue};
 use super::pipeline::{EncoderControl, NativeFrame, PipelineState};
+use super::types::VideoCodec;
 use super::windows_encoder::AnnexBConverter;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
@@ -127,6 +128,7 @@ pub(crate) struct MfH264Encoder {
     fps: u32,
     bitrate: u32,
     use_nv12: bool,
+    profile_high: bool,
     output_buffer_size: u32,
     _com: ComGuard,
 }
@@ -137,6 +139,7 @@ impl MfH264Encoder {
         height: u32,
         bitrate: u32,
         fps: u32,
+        video_codec: VideoCodec,
         output: AccessUnitQueue,
         _state: Arc<PipelineState>,
         control: Arc<EncoderControl>,
@@ -174,21 +177,32 @@ impl MfH264Encoder {
             use_nv12 = true;
         }
 
-        let output_high =
-            video_type(&MFVideoFormat_H264, width, height, fps, Some(bitrate), Some(H264_HIGH_PROFILE))
+        // The output profile must match the session codec: the SDP offer
+        // advertises Baseline (42e02a) for H.264 and High (64002a) for
+        // H.264 High, and the transport drops samples whose SPS disagrees.
+        // The session's profile is tried first; the other is only a fallback
+        // so the MFT still initializes on picky drivers.
+        let want_high = matches!(video_codec, VideoCodec::H264High);
+        let (first, second) = if want_high {
+            (H264_HIGH_PROFILE, H264_BASELINE_PROFILE)
+        } else {
+            (H264_BASELINE_PROFILE, H264_HIGH_PROFILE)
+        };
+        let output_first =
+            video_type(&MFVideoFormat_H264, width, height, fps, Some(bitrate), Some(first))
                 .map_err(hr)?;
-        if unsafe { transform.SetOutputType(0, &output_high, 0) }.is_err() {
-            eprintln!("[goDrinking] MF High profile rejected, trying Baseline");
-            let output_base = video_type(
-                &MFVideoFormat_H264,
-                width,
-                height,
-                fps,
-                Some(bitrate),
-                Some(H264_BASELINE_PROFILE),
-            )
-            .map_err(hr)?;
-            unsafe { transform.SetOutputType(0, &output_base, 0).map_err(hr)?; }
+        let mut profile_high = first == H264_HIGH_PROFILE;
+        if unsafe { transform.SetOutputType(0, &output_first, 0) }.is_err() {
+            eprintln!(
+                "[goDrinking] MF {} profile rejected, trying {}",
+                if profile_high { "High" } else { "Baseline" },
+                if profile_high { "Baseline" } else { "High" }
+            );
+            let output_second =
+                video_type(&MFVideoFormat_H264, width, height, fps, Some(bitrate), Some(second))
+                    .map_err(hr)?;
+            unsafe { transform.SetOutputType(0, &output_second, 0).map_err(hr)?; }
+            profile_high = second == H264_HIGH_PROFILE;
         }
 
         let codec_api: Option<ICodecAPI> = transform.cast().ok();
@@ -217,6 +231,7 @@ impl MfH264Encoder {
             fps,
             bitrate,
             use_nv12,
+            profile_high,
             output_buffer_size: OUTPUT_BUFFER_START,
             _com,
         };
@@ -287,6 +302,10 @@ impl MfH264Encoder {
         };
         let transform: IMFTransform = unsafe { first.ActivateObject().map_err(hr)? };
         Ok((transform, name))
+    }
+
+    pub(crate) fn is_high_profile(&self) -> bool {
+        self.profile_high
     }
 
     pub(crate) fn encode(&mut self, frame: &NativeFrame) -> Result<(), String> {

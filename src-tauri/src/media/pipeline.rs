@@ -760,7 +760,7 @@ fn encoder_worker_loop(
     fps: u32,
     quality: TransmissionQuality,
     bitrate_bps: Option<u32>,
-    _video_codec: VideoCodec,
+    video_codec: VideoCodec,
     encoder_backend: VideoEncoder,
     generation: u64,
     state: Arc<PipelineState>,
@@ -783,6 +783,13 @@ fn encoder_worker_loop(
             }
         }
 
+        fn is_high_profile(&self) -> bool {
+            match self {
+                Self::Hardware(encoder) => encoder.is_high_profile(),
+                Self::Software(encoder) => encoder.is_high_profile(),
+            }
+        }
+
         fn force_keyframe(&mut self) {
             match self {
                 Self::Hardware(encoder) => encoder.force_keyframe(),
@@ -800,6 +807,7 @@ fn encoder_worker_loop(
 
     fn create_windows_encoder(
         backend: VideoEncoder,
+        video_codec: VideoCodec,
         width: u32,
         height: u32,
         bitrate: u32,
@@ -808,16 +816,38 @@ fn encoder_worker_loop(
         state: &Arc<PipelineState>,
         control: &Arc<EncoderControl>,
     ) -> Option<WindowsVideoEncoder> {
+        // The encoder profile must match the session codec (Baseline for
+        // H.264, High for H.264 High): the SDP offer advertises exactly one
+        // of them and the transport drops samples whose SPS disagrees.
+        let want_high = matches!(video_codec, VideoCodec::H264High);
         let software = || {
             super::windows_encoder::OpenH264Encoder::new(
                 width,
                 height,
                 bitrate,
                 fps,
+                video_codec,
                 output.clone(),
                 Arc::clone(state),
                 Arc::clone(control),
             )
+        };
+        let software_or_fail = |error: String| {
+            if backend == VideoEncoder::Hardware {
+                state.fail(error);
+                None
+            } else {
+                eprintln!(
+                    "[goDrinking] hardware encoder unavailable ({error}); using OpenH264 software"
+                );
+                match software() {
+                    Ok(encoder) => Some(WindowsVideoEncoder::Software(encoder)),
+                    Err(error) => {
+                        state.fail(format!("OpenH264 initialization failed: {error}"));
+                        None
+                    }
+                }
+            }
         };
         match backend {
             VideoEncoder::Software => match software() {
@@ -833,26 +863,46 @@ fn encoder_worker_loop(
                     height,
                     bitrate,
                     fps,
+                    video_codec,
                     output.clone(),
                     Arc::clone(state),
                     Arc::clone(control),
                 ) {
                     Ok(encoder) => {
                         eprintln!("[goDrinking] hardware video encoder engaged");
-                        Some(WindowsVideoEncoder::Hardware(encoder))
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "[goDrinking] hardware encoder unavailable ({error}); using OpenH264 software"
-                        );
-                        match software() {
-                            Ok(encoder) => Some(WindowsVideoEncoder::Software(encoder)),
-                            Err(error) => {
-                                state.fail(format!("OpenH264 initialization failed: {error}"));
-                                None
+                        let encoder = WindowsVideoEncoder::Hardware(encoder);
+                        // The MFT fell back to the non-session profile: its
+                        // samples would be dropped by the transport, so prefer
+                        // the software encoder (Auto) rather than a black
+                        // stream. Explicit Hardware fails loudly instead.
+                        if encoder.is_high_profile() != want_high {
+                            eprintln!(
+                                "[goDrinking] hardware encoder negotiated {} profile for a {} session; {}",
+                                if encoder.is_high_profile() { "High" } else { "Baseline" },
+                                if want_high { "H.264 High" } else { "H.264" },
+                                if backend == VideoEncoder::Hardware {
+                                    "explicit Hardware cannot satisfy it"
+                                } else {
+                                    "using OpenH264 software"
+                                }
+                            );
+                            if backend == VideoEncoder::Hardware {
+                                state.fail(
+                                    "hardware encoder cannot produce the session profile; use Auto or Software".to_owned(),
+                                );
+                                return None;
                             }
+                            return match software() {
+                                Ok(encoder) => Some(WindowsVideoEncoder::Software(encoder)),
+                                Err(error) => {
+                                    state.fail(format!("OpenH264 initialization failed: {error}"));
+                                    None
+                                }
+                            };
                         }
+                        Some(encoder)
                     }
+                    Err(error) => software_or_fail(error),
                 }
             }
         }
@@ -926,6 +976,7 @@ fn encoder_worker_loop(
                     control.note_applied(initial);
                     match create_windows_encoder(
                         encoder_backend,
+                        video_codec,
                         width,
                         height,
                         initial,

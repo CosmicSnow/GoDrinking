@@ -9,6 +9,7 @@
 
 use super::access_unit::{AccessUnitPushResult, AccessUnitQueue, EncodedAccessUnit};
 use super::pipeline::{EncoderControl, NativeFrame, PipelineState};
+use super::types::VideoCodec;
 use openh264::encoder::{
     BitRate, Complexity, Encoder, EncoderConfig, FrameRate as OpenH264FrameRate, FrameType, Profile,
     RateControlMode, UsageType, VuiConfig,
@@ -59,6 +60,7 @@ fn downscale_bgra_frame(src: &[u8], src_width: u32, src_height: u32, dst_width: 
 
 pub(crate) struct OpenH264Encoder {
     encoder: Encoder,
+    high_profile: bool,
     converter: AnnexBConverter,
     output: AccessUnitQueue,
     control: Arc<EncoderControl>,
@@ -70,27 +72,52 @@ impl OpenH264Encoder {
         _height: u32,
         bitrate: u32,
         fps: u32,
+        video_codec: VideoCodec,
         output: AccessUnitQueue,
         _state: Arc<PipelineState>,
         control: Arc<EncoderControl>,
     ) -> Result<Self, String> {
-        let config = EncoderConfig::new()
-            .bitrate(BitRate::from_bps(bitrate))
-            .max_frame_rate(OpenH264FrameRate::from_hz(fps as f32))
-            .usage_type(UsageType::ScreenContentRealTime)
-            .rate_control_mode(RateControlMode::Bitrate)
-            .profile(Profile::Baseline)
-            .complexity(Complexity::Low)
-            .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(fps * 2))
-            .vui(VuiConfig::bt709_full());
-        let encoder = Encoder::with_api_config(OpenH264API::from_source(), config)
-            .map_err(|error| format!("OpenH264 initialization failed: {error}"))?;
+        // The software encoder must match the session codec: the SDP offer
+        // advertises Baseline (42e02a) for H.264 and High (64002a) for
+        // H.264 High, and the transport drops samples whose SPS disagrees.
+        let want_high = matches!(video_codec, VideoCodec::H264High);
+        let make = |high: bool| {
+            let config = EncoderConfig::new()
+                .bitrate(BitRate::from_bps(bitrate))
+                .max_frame_rate(OpenH264FrameRate::from_hz(fps as f32))
+                .usage_type(UsageType::ScreenContentRealTime)
+                .rate_control_mode(RateControlMode::Bitrate)
+                .profile(if high { Profile::High } else { Profile::Baseline })
+                .complexity(Complexity::Low)
+                .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(fps * 2))
+                .vui(VuiConfig::bt709_full());
+            Encoder::with_api_config(OpenH264API::from_source(), config)
+        };
+        let (encoder, high_profile) = match make(want_high) {
+            Ok(encoder) => (encoder, want_high),
+            Err(error) if want_high => {
+                eprintln!(
+                    "[goDrinking] OpenH264 High profile unavailable ({error}); falling back to Baseline"
+                );
+                (
+                    make(false)
+                        .map_err(|fallback| format!("OpenH264 initialization failed: {fallback}"))?,
+                    false,
+                )
+            }
+            Err(error) => return Err(format!("OpenH264 initialization failed: {error}")),
+        };
         Ok(Self {
             encoder,
+            high_profile,
             converter: AnnexBConverter::default(),
             output,
             control,
         })
+    }
+
+    pub(crate) fn is_high_profile(&self) -> bool {
+        self.high_profile
     }
 
     pub(crate) fn encode(&mut self, frame: &NativeFrame) -> Result<(), String> {

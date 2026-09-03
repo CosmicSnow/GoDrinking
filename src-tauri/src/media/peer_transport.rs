@@ -536,6 +536,10 @@ async fn run_peer(
     let sample_status = Arc::clone(&status);
     let sample_encoder_control = Arc::clone(&encoder_control);
     let sample_track = Arc::clone(&track);
+    // The sample gate must match the session codec: H.264 sessions carry
+    // Baseline (42e02a) only, H.264 High sessions (64002a) also accept
+    // Baseline (it decodes everywhere) but never anything else.
+    let allow_high_profile = video_codec == VideoCodec::H264High;
     let audio_worker = {
         let audio_status = Arc::clone(&status);
         let shutdown = Arc::clone(&shutdown);
@@ -580,14 +584,15 @@ async fn run_peer(
                 }
                 awaiting_keyframe = false;
             }
-            if unit
-                .profile_level_id
-                .as_deref()
-                .is_some_and(|profile| !super::access_unit::is_baseline_profile(profile))
-            {
+            let profile_ok = unit.profile_level_id.as_deref().map_or(true, |profile| {
+                super::access_unit::is_baseline_profile(profile)
+                    || (allow_high_profile && super::access_unit::is_high_profile(profile))
+            });
+            if !profile_ok {
                 eprintln!(
-                    "[goDrinking] skipping H.264 sample with profile {:?}",
-                    unit.profile_level_id
+                    "[goDrinking] skipping H.264 sample with profile {:?} (session {})",
+                    unit.profile_level_id,
+                    if allow_high_profile { "H.264 High" } else { "H.264" },
                 );
                 continue;
             }

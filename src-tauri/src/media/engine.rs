@@ -773,12 +773,12 @@ fn create_in_state(
         (state.capabilities.clone(), id, Arc::clone(&state.preview))
     };
 
-    // HEVC and H.264 High need a VideoToolbox encoder: reject them on
-    // Windows at Start so the session never begins with an encoder nobody
-    // can feed (Windows uses Baseline-only OpenH264).
-    if request.codec != VideoCodec::H264 && cfg!(target_os = "windows") {
+    // HEVC needs a VideoToolbox encoder: reject it on Windows at Start so
+    // the session never begins with an encoder nobody can feed. H.264 High
+    // is allowed (Media Foundation / OpenH264 produce it there).
+    if request.codec == VideoCodec::Hevc && cfg!(target_os = "windows") {
         return Err(MediaEngineError::Unsupported(
-            "HEVC and H.264 High are macOS-only for now (Windows uses OpenH264 Baseline)".into(),
+            "HEVC is macOS-only for now (no Windows HEVC encoder)".into(),
         ));
     }
     preview.begin_session();
