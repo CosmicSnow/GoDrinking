@@ -23,7 +23,7 @@ use windows::core::{Interface, GUID};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::Foundation::VARIANT_BOOL;
-use windows::Win32::System::Variant::{VARIANT, VARENUM, VT_BOOL, VT_UI4};
+use windows::Win32::System::Variant::{VARIANT, VARIANT_0_0, VT_BOOL, VT_UI4};
 
 // H.264 High profile for the output type; Baseline is the fallback when the
 // MFT rejects High. Plain integers avoid depending on profile enum bindings.
@@ -55,16 +55,28 @@ fn hr(error: windows::core::Error) -> String {
 }
 
 fn variant_ui4(value: u32) -> VARIANT {
+    let mut inner = VARIANT_0_0::default();
+    inner.vt = VT_UI4;
+    unsafe {
+        inner.Anonymous.ulVal = value;
+    }
     let mut variant = VARIANT::default();
-    variant.Anonymous.Anonymous.vt = VT_UI4;
-    variant.Anonymous.Anonymous.Anonymous.ulVal = value;
+    unsafe {
+        variant.Anonymous.Anonymous = ManuallyDrop::new(inner);
+    }
     variant
 }
 
 fn variant_bool(value: bool) -> VARIANT {
+    let mut inner = VARIANT_0_0::default();
+    inner.vt = VT_BOOL;
+    unsafe {
+        inner.Anonymous.boolVal = VARIANT_BOOL(if value { -1 } else { 0 });
+    }
     let mut variant = VARIANT::default();
-    variant.Anonymous.Anonymous.vt = VT_BOOL;
-    variant.Anonymous.Anonymous.Anonymous.boolVal = VARIANT_BOOL(if value { -1 } else { 0 });
+    unsafe {
+        variant.Anonymous.Anonymous = ManuallyDrop::new(inner);
+    }
     variant
 }
 
@@ -134,7 +146,7 @@ impl MfH264Encoder {
         }
         // S_OK and S_FALSE (already initialized) are both fine to ignore.
         unsafe {
-            CoInitializeEx(None, COINIT_MULTITHREADED);
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         }
         let _com = ComGuard(true);
         unsafe { MFStartup(MF_VERSION, 0).map_err(hr)?; }
@@ -179,7 +191,7 @@ impl MfH264Encoder {
             unsafe { transform.SetOutputType(0, &output_base, 0).map_err(hr)?; }
         }
 
-        let codec_api: Option<ICodecAPI> = unsafe { transform.cast().ok() };
+        let codec_api: Option<ICodecAPI> = transform.cast().ok();
         if let Some(api) = &codec_api {
             set_codec_u32(api, &CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR.0 as u32, "rate control CBR");
             set_codec_u32(api, &CODECAPI_AVEncCommonMeanBitRate, bitrate, "mean bitrate");
@@ -257,9 +269,22 @@ impl MfH264Encoder {
         unsafe {
             CoTaskMemFree(Some(activates as *const c_void));
         }
-        let name = unsafe { first.GetAllocatedString(&MFT_FRIENDLY_NAME_Attribute) }
-            .map(|value| value.to_string())
-            .unwrap_or_else(|_| "unknown".into());
+        let mut name_buffer = [0u16; 256];
+        let mut name_length: u32 = 0;
+        let name = match unsafe {
+            first.GetString(
+                &MFT_FRIENDLY_NAME_Attribute,
+                &mut name_buffer,
+                Some(&mut name_length),
+            )
+        } {
+            Ok(()) => String::from_utf16_lossy(
+                &name_buffer[..name_length as usize % (name_buffer.len() + 1)],
+            )
+            .trim_end_matches(char::from(0))
+            .to_string(),
+            Err(_) => "unknown".into(),
+        };
         let transform: IMFTransform = unsafe { first.ActivateObject().map_err(hr)? };
         Ok((transform, name))
     }
