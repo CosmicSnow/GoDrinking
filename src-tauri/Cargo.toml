@@ -33,7 +33,7 @@ dirs = "6"
 socket2 = "0.5"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.62", features = ["Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Variant"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant"] }
 windows-capture = "2.0.1"
 openh264 = "0.9.8"
 openh264-sys2 = "0.9.8"

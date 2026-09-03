@@ -22,7 +22,8 @@ use std::time::Duration;
 use windows::core::{Interface, GUID};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED};
-use windows::Win32::System::Variant::{VARIANT, VARENUM, VT_BOOL, VT_UI4, VARIANT_BOOL};
+use windows::Win32::Foundation::VARIANT_BOOL;
+use windows::Win32::System::Variant::{VARIANT, VARENUM, VT_BOOL, VT_UI4};
 
 // H.264 High profile for the output type; Baseline is the fallback when the
 // MFT rejects High. Plain integers avoid depending on profile enum bindings.
@@ -54,16 +55,16 @@ fn hr(error: windows::core::Error) -> String {
 }
 
 fn variant_ui4(value: u32) -> VARIANT {
-    let mut variant: VARIANT = unsafe { std::mem::zeroed() };
-    variant.Anonymous.Anonymous.ulVal = value;
-    variant.Anonymous.vt = VT_UI4;
+    let mut variant = VARIANT::default();
+    variant.Anonymous.Anonymous.vt = VT_UI4;
+    variant.Anonymous.Anonymous.Anonymous.ulVal = value;
     variant
 }
 
 fn variant_bool(value: bool) -> VARIANT {
-    let mut variant: VARIANT = unsafe { std::mem::zeroed() };
-    variant.Anonymous.Anonymous.boolVal = VARIANT_BOOL(if value { -1 } else { 0 });
-    variant.Anonymous.vt = VT_BOOL;
+    let mut variant = VARIANT::default();
+    variant.Anonymous.Anonymous.vt = VT_BOOL;
+    variant.Anonymous.Anonymous.Anonymous.boolVal = VARIANT_BOOL(if value { -1 } else { 0 });
     variant
 }
 
@@ -79,8 +80,11 @@ fn video_type(
         let media_type = MFCreateMediaType()?;
         media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         media_type.SetGUID(&MF_MT_SUBTYPE, subtype)?;
-        MFSetAttributeSize(&media_type, &MF_MT_FRAME_SIZE, width, height);
-        MFSetAttributeRatio(&media_type, &MF_MT_FRAME_RATE, fps, 1)?;
+        media_type.SetUINT64(
+            &MF_MT_FRAME_SIZE,
+            ((width as u64) << 32) | height as u64,
+        )?;
+        media_type.SetUINT64(&MF_MT_FRAME_RATE, ((fps as u64) << 32) | 1)?;
         media_type.SetUINT32(&MF_MT_INTERLACE_MODE, 2)?;
         if let Some(bitrate) = bitrate {
             media_type.SetUINT32(&MF_MT_AVG_BITRATE, bitrate)?;
@@ -128,7 +132,10 @@ impl MfH264Encoder {
         if width < 2 || height < 2 {
             return Err("MF encoder frame is too small".into());
         }
-        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).map_err(hr)?; }
+        // S_OK and S_FALSE (already initialized) are both fine to ignore.
+        unsafe {
+            CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
         let _com = ComGuard(true);
         unsafe { MFStartup(MF_VERSION, 0).map_err(hr)?; }
         let (transform, friendly_name) = Self::open_hardware_encoder()?;
@@ -230,14 +237,14 @@ impl MfH264Encoder {
             guidMajorType: MFMediaType_Video,
             guidSubtype: MFVideoFormat_H264,
         };
-        let mut activates: *mut *mut IMFActivate = null_mut();
+        let mut activates: *mut Option<IMFActivate> = null_mut();
         let mut count: u32 = 0;
         unsafe {
             MFTEnumEx(
-                &MFT_CATEGORY_VIDEO_ENCODER,
+                MFT_CATEGORY_VIDEO_ENCODER,
                 MFT_ENUM_FLAG_HARDWARE,
-                &input_info,
-                &output_info,
+                Some(&input_info as *const MFT_REGISTER_TYPE_INFO),
+                Some(&output_info as *const MFT_REGISTER_TYPE_INFO),
                 &mut activates,
                 &mut count,
             )
@@ -246,7 +253,7 @@ impl MfH264Encoder {
         if activates.is_null() || count == 0 {
             return Err("no hardware H.264 MFT found".into());
         }
-        let first: IMFActivate = unsafe { (*activates).clone() };
+        let first: IMFActivate = unsafe { (*activates).clone() }.ok_or("empty hardware MFT entry")?;
         unsafe {
             CoTaskMemFree(Some(activates as *const c_void));
         }
@@ -335,7 +342,9 @@ impl MfH264Encoder {
                 let mut pointer: *mut u8 = null_mut();
                 let mut max_length: u32 = 0;
                 let mut current_length: u32 = 0;
-                buffer.Lock(&mut pointer, &mut max_length, &mut current_length).map_err(hr)?;
+                buffer
+                    .Lock(&mut pointer, Some(&mut max_length), Some(&mut current_length))
+                    .map_err(hr)?;
                 if max_length < bytes.len() as u32 {
                     buffer.Unlock().map_err(hr)?;
                     return Err("MF input buffer too small".into());
@@ -366,7 +375,11 @@ impl MfH264Encoder {
                     pEvents: ManuallyDrop::new(None),
                 };
                 let mut status_flags: u32 = 0;
-                match self.transform.ProcessOutput(0, 1, &mut output, &mut status_flags) {
+                match self.transform.ProcessOutput(
+                    0,
+                    std::slice::from_mut(&mut output),
+                    &mut status_flags,
+                ) {
                     Ok(()) => {}
                     Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
                     Err(error) if error.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
@@ -393,7 +406,9 @@ impl MfH264Encoder {
                 let mut pointer: *mut u8 = null_mut();
                 let mut max_length: u32 = 0;
                 let mut current_length: u32 = 0;
-                contiguous.Lock(&mut pointer, &mut max_length, &mut current_length).map_err(hr)?;
+                contiguous
+                    .Lock(&mut pointer, Some(&mut max_length), Some(&mut current_length))
+                    .map_err(hr)?;
                 let data = std::slice::from_raw_parts(pointer, current_length as usize).to_vec();
                 contiguous.Unlock().map_err(hr)?;
                 data

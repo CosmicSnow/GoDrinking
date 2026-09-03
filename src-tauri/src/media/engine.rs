@@ -11,7 +11,7 @@ use super::types::{
     CreateMediaSessionRequest, FrameRate, JoinMode, MediaLifecycleState, MediaSessionSnapshot,
     NativeCaptureSource, NativeRunningApp, PeerTransportState, PreviewFrameEvent, RosterEntry,
     TransmissionQuality, UpdateCredentialsRequest, UpdateMediaSessionRequest, VideoCodec,
-    VideoEncoder, VideoResolution, MediaSessionStats, ViewerLinkStats,
+    VideoResolution, MediaSessionStats, ViewerLinkStats,
 };
 use super::MediaCapabilities;
 use std::collections::HashMap;
