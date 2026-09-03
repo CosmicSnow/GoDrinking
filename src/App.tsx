@@ -743,7 +743,7 @@ function App() {
         </div>
         <div className="sidebar-footer">
           <button className="logs-button" onClick={() => void openLogs()} title="View the last 5 session logs"><Icon name="terminal" size={13}/> View logs</button>
-          <div className="version">goDrinking <span>v0.1.1</span></div>
+          <div className="version">goDrinking <span>v0.1.0</span></div>
         </div>
       </aside>
       <main className="main-content">
