@@ -2196,6 +2196,7 @@ mod tests {
             quality: super::super::types::TransmissionQuality::Low,
             bitrate_bps: None,
             min_bitrate_bps: None,
+            codec: super::super::types::VideoCodec::H264,
             password: String::new(),
             nickname: "Host".into(),
             admission: false,

@@ -21,6 +21,9 @@ private final class GoLiveEncoder {
     let callback: GoLiveEncodedCallback
     let errorCallback: GoLiveEncoderErrorCallback
     let callbackContext: UnsafeMutableRawPointer?
+    /// 0 = H.264, 1 = HEVC. Selects the codec type, profile and the
+    /// Annex-B post-processing variant in the output callback.
+    let codec: Int32
     var session: VTCompressionSession?
     var forceNextKeyframe = false
     var closed = false
@@ -30,6 +33,7 @@ private final class GoLiveEncoder {
         height: Int32,
         bitrate: Int32,
         frameRate: Int32,
+        codec: Int32,
         callback: GoLiveEncodedCallback,
         errorCallback: GoLiveEncoderErrorCallback,
         callbackContext: UnsafeMutableRawPointer?
@@ -37,13 +41,15 @@ private final class GoLiveEncoder {
         self.callback = callback
         self.errorCallback = errorCallback
         self.callbackContext = callbackContext
+        self.codec = codec
 
+        let codecType: CMVideoCodecType = codec == 1 ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264
         var createdSession: VTCompressionSession?
         let status = VTCompressionSessionCreate(
             allocator: kCFAllocatorDefault,
             width: width,
             height: height,
-            codecType: kCMVideoCodecType_H264,
+            codecType: codecType,
             encoderSpecification: nil,
             imageBufferAttributes: nil,
             compressedDataAllocator: nil,
@@ -57,11 +63,20 @@ private final class GoLiveEncoder {
         session = createdSession
 
         try setProperty(kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-        // Baseline plus disabled frame reordering prevents B-frame latency and
-        // is accepted by the low-latency H.264 transport profiles.
+        // Baseline (H.264) / Main (HEVC) plus disabled frame reordering
+        // prevents B-frame latency and is accepted by the low-latency
+        // transport profiles.
+        let profileLevel: CFString
+        if codec == 1 {
+            profileLevel = kVTProfileLevel_HEVC_Main_AutoLevel
+        } else if codec == 2 {
+            profileLevel = kVTProfileLevel_H264_High_AutoLevel
+        } else {
+            profileLevel = kVTProfileLevel_H264_Baseline_4_2
+        }
         try setProperty(
             kVTCompressionPropertyKey_ProfileLevel,
-            value: kVTProfileLevel_H264_Baseline_4_2
+            value: profileLevel
         )
         try setProperty(
             kVTCompressionPropertyKey_AllowFrameReordering,
@@ -258,6 +273,55 @@ private func normalizeAvcc(_ data: Data, headerLength: Int) -> Data? {
     return result.isEmpty ? nil : result
 }
 
+private func containsIRAP(in data: Data) -> Bool {
+    var offset = 0
+    while data.count - offset >= 4 {
+        let length = Int(UInt32(data[offset]) << 24)
+            | Int(UInt32(data[offset + 1]) << 16)
+            | Int(UInt32(data[offset + 2]) << 8)
+            | Int(UInt32(data[offset + 3]))
+        offset += 4
+        guard length > 0, data.count - offset >= length else { return false }
+        let nalUnitType = (data[offset] >> 1) & 0x3f
+        if (16...23).contains(nalUnitType) { return true }
+        offset += length
+    }
+    return false
+}
+
+private func hevcParameterSets(_ format: CMFormatDescription) -> Data {
+    var count = 0
+    var headerLength: Int32 = 4
+    guard CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+        format,
+        parameterSetIndex: 0,
+        parameterSetPointerOut: nil,
+        parameterSetSizeOut: nil,
+        parameterSetCountOut: &count,
+        nalUnitHeaderLengthOut: &headerLength
+    ) == noErr else { return Data() }
+
+    var result = Data()
+    for index in 0..<count {
+        var parameterSet: UnsafePointer<UInt8>?
+        var size = 0
+        var setCount = 0
+        guard CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+            format,
+            parameterSetIndex: index,
+            parameterSetPointerOut: &parameterSet,
+            parameterSetSizeOut: &size,
+            parameterSetCountOut: &setCount,
+            nalUnitHeaderLengthOut: &headerLength
+        ) == noErr, let parameterSet else { continue }
+        result.append(contentsOf: withUnsafeBytes(of: UInt32(size).bigEndian) {
+            $0.bindMemory(to: UInt8.self)
+        })
+        result.append(parameterSet, count: size)
+    }
+    return result
+}
+
 private func containsIDR(in data: Data) -> Bool {
     var offset = 0
     while data.count - offset >= 4 {
@@ -294,13 +358,14 @@ private func goLiveCompressionOutput(
         return
     }
 
+    let isHevc = encoder.codec == 1
     var payload = Data()
     if let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
        let normalized = normalizeAvcc(
            blockData,
            headerLength: h264HeaderLength(formatDescription)
        ) {
-        payload.append(parameterSets(formatDescription))
+        payload.append(isHevc ? hevcParameterSets(formatDescription) : parameterSets(formatDescription))
         payload.append(normalized)
     } else {
         reportError(encoder, -1)
@@ -308,7 +373,8 @@ private func goLiveCompressionOutput(
     }
 
     let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-    let keyframe: UInt8 = containsIDR(in: payload) ? 1 : 0
+    let isKeyframe = isHevc ? containsIRAP(in: payload) : containsIDR(in: payload)
+    let keyframe: UInt8 = isKeyframe ? 1 : 0
     encoder.callback(
         encoder.callbackContext,
         payload.withUnsafeBytes { $0.bindMemory(to: UInt8.self).baseAddress },
@@ -325,6 +391,7 @@ public func golive_vt_encoder_create(
     _ height: Int32,
     _ bitrate: Int32,
     _ frameRate: Int32,
+    _ codec: Int32,
     _ callback: GoLiveEncodedCallback,
     _ errorCallback: GoLiveEncoderErrorCallback,
     _ callbackContext: UnsafeMutableRawPointer?
@@ -335,6 +402,7 @@ public func golive_vt_encoder_create(
             height: height,
             bitrate: bitrate,
             frameRate: frameRate,
+            codec: codec,
             callback: callback,
             errorCallback: errorCallback,
             callbackContext: callbackContext
@@ -406,6 +474,28 @@ public func golive_vt_encoder_set_bitrate(
     } catch {
         return -1
     }
+}
+
+@_cdecl("golive_vt_supports_av1")
+public func golive_vt_supports_av1() -> Bool {
+    if #available(macOS 13.0, *) {
+        var probe: VTCompressionSession?
+        let status = VTCompressionSessionCreate(
+            allocator: kCFAllocatorDefault,
+            width: 1280,
+            height: 720,
+            codecType: kCMVideoCodecType_AV1,
+            encoderSpecification: nil,
+            imageBufferAttributes: nil,
+            compressedDataAllocator: nil,
+            outputCallback: { _, _, _, _, _ in },
+            refcon: nil,
+            compressionSessionOut: &probe
+        )
+        probe = nil
+        return status == noErr
+    }
+    return false
 }
 
 @_cdecl("golive_vt_encoder_destroy")

@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use super::access_unit::{AccessUnitQueue, AccessUnitReceiver};
 use super::types::PreviewFrameEvent;
-use super::types::{FrameRate, TransmissionQuality, VideoResolution};
+use super::types::{FrameRate, TransmissionQuality, VideoCodec, VideoResolution};
 
 #[cfg(target_os = "macos")]
 use objc2::rc::Retained;
@@ -412,6 +412,7 @@ impl NativePipeline {
         quality: TransmissionQuality,
         bitrate_bps: Option<u32>,
         min_bitrate_bps: Option<u32>,
+        video_codec: VideoCodec,
     ) -> Self {
         let generation = preview.generation.load(Ordering::Acquire);
         let (capture_tx, capture_rx) = sync_channel::<NativeFrame>(CAPTURE_QUEUE_CAPACITY);
@@ -459,6 +460,7 @@ impl NativePipeline {
                     fps,
                     quality,
                     bitrate_bps,
+                    video_codec,
                     generation,
                     worker_state,
                     worker_shutdown,
@@ -642,6 +644,7 @@ fn encoder_worker_loop(
     fps: u32,
     quality: TransmissionQuality,
     bitrate_bps: Option<u32>,
+    video_codec: VideoCodec,
     generation: u64,
     state: Arc<PipelineState>,
     shutdown: Arc<AtomicBool>,
@@ -700,6 +703,7 @@ fn encoder_worker_loop(
                         size.1,
                         initial,
                         fps,
+                        video_codec,
                         output,
                         Arc::clone(&state),
                         Arc::clone(&control),
@@ -753,6 +757,7 @@ fn encoder_worker_loop(
     fps: u32,
     quality: TransmissionQuality,
     bitrate_bps: Option<u32>,
+    _video_codec: VideoCodec,
     generation: u64,
     state: Arc<PipelineState>,
     shutdown: Arc<AtomicBool>,
@@ -851,6 +856,7 @@ fn encoder_worker_loop(
     _fps: u32,
     _quality: TransmissionQuality,
     _bitrate_bps: Option<u32>,
+    _video_codec: VideoCodec,
     _generation: u64,
     _state: Arc<PipelineState>,
     _shutdown: Arc<AtomicBool>,
@@ -861,7 +867,7 @@ fn encoder_worker_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::{FrameRate, TransmissionQuality, VideoResolution};
+    use super::super::types::{FrameRate, TransmissionQuality, VideoCodec, VideoResolution};
     use super::{EncoderCommand, EncoderControl, NativeFrame, NativePipeline, PreviewState};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -921,6 +927,7 @@ mod tests {
             TransmissionQuality::High,
             None,
             None,
+            VideoCodec::H264,
         );
         let storage: Arc<[u8]> = Arc::from([1_u8, 2, 3]);
         let frame = NativeFrame {
@@ -955,6 +962,7 @@ mod tests {
             TransmissionQuality::High,
             None,
             None,
+            VideoCodec::H264,
         );
         pipeline
             .capture_tx
@@ -991,6 +999,7 @@ mod tests {
             TransmissionQuality::High,
             None,
             None,
+            VideoCodec::H264,
         );
         preview.begin_session();
         pipeline
@@ -1020,6 +1029,7 @@ mod tests {
             TransmissionQuality::Low,
             None,
             None,
+            VideoCodec::H264,
         );
         drop(pipeline);
     }

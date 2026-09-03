@@ -10,8 +10,8 @@ use super::session_gate::SessionGate;
 use super::types::{
     CreateMediaSessionRequest, FrameRate, JoinMode, MediaLifecycleState, MediaSessionSnapshot,
     NativeCaptureSource, NativeRunningApp, PeerTransportState, PreviewFrameEvent, RosterEntry,
-    TransmissionQuality, UpdateCredentialsRequest, UpdateMediaSessionRequest, VideoResolution,
-    MediaSessionStats, ViewerLinkStats,
+    TransmissionQuality, UpdateCredentialsRequest, UpdateMediaSessionRequest, VideoCodec,
+    VideoResolution, MediaSessionStats, ViewerLinkStats,
 };
 use super::MediaCapabilities;
 use std::collections::HashMap;
@@ -102,6 +102,7 @@ pub enum MediaEngineError {
     QueueClosed,
     StatePoisoned,
     UnsupportedPlatform,
+    Unsupported(String),
     SessionAlreadyActive,
     NoActiveSession,
     NativeCapture(String),
@@ -114,6 +115,7 @@ impl Display for MediaEngineError {
             Self::QueueClosed => "media worker is not available",
             Self::StatePoisoned => "media state is unavailable",
             Self::UnsupportedPlatform => "native media sessions are unsupported on this platform",
+            Self::Unsupported(message) => return formatter.write_str(message),
             Self::SessionAlreadyActive => "a media session is already active",
             Self::NoActiveSession => "no media session is active",
             Self::NativeCapture(message) => return formatter.write_str(message),
@@ -166,6 +168,7 @@ impl MediaEngine {
                 native_capture_implemented: false,
                 native_encoder_implemented: false,
                 native_peer_transport_implemented: false,
+                av1_encode_supported: false,
                 detail: "Native media state is unavailable.".into(),
             })
     }
@@ -770,6 +773,14 @@ fn create_in_state(
         (state.capabilities.clone(), id, Arc::clone(&state.preview))
     };
 
+    // HEVC and H.264 High need a VideoToolbox encoder: reject them on
+    // Windows at Start so the session never begins with an encoder nobody
+    // can feed (Windows uses Baseline-only OpenH264).
+    if request.codec != VideoCodec::H264 && cfg!(target_os = "windows") {
+        return Err(MediaEngineError::Unsupported(
+            "HEVC and H.264 High are macOS-only for now (Windows uses OpenH264 Baseline)".into(),
+        ));
+    }
     preview.begin_session();
     let mut pipeline = NativePipeline::new(
         preview,
@@ -778,6 +789,7 @@ fn create_in_state(
         request.quality,
         request.bitrate_bps,
         request.min_bitrate_bps,
+        request.codec,
     );
     // The engine owns the Opus channel for the session lifetime. The peer
     // keeps the receiver even if the first tap fails, so a later update can
@@ -1296,7 +1308,7 @@ fn mint_viewer_offer(
     nickname: &str,
 ) -> Result<PeerSignal, String> {
     logger::log("INFO", "mint offer", &format!("viewer={id} nickname={nickname}"));
-    let (video_rx, audio_rx, encoder_control, frame_duration, join_mode) = {
+    let (video_rx, audio_rx, encoder_control, frame_duration, join_mode, video_codec) = {
         let mut guard = state.lock().map_err(|_| "media state is unavailable".to_owned())?;
         let session = guard
             .session
@@ -1321,9 +1333,17 @@ fn mint_viewer_offer(
             Arc::clone(&session._pipeline.encoder_control),
             Duration::from_nanos(1_000_000_000 / frame_rate),
             session.request.join_mode,
+            session.request.codec,
         )
     };
-    let peer = PeerTransport::new(video_rx, audio_rx, encoder_control, frame_duration, join_mode)?;
+    let peer = PeerTransport::new(
+        video_rx,
+        audio_rx,
+        encoder_control,
+        frame_duration,
+        join_mode,
+        video_codec,
+    )?;
     let mut signal = peer
         .client()
         .create_offer()
@@ -1360,7 +1380,7 @@ mod tests {
     use super::super::types::MediaLifecycleState;
     use super::super::types::{
         CaptureSource, FrameRate, JoinMode, PreviewFrameEvent, TransmissionQuality,
-        UpdateCredentialsRequest, UpdateMediaSessionRequest, VideoResolution,
+        UpdateCredentialsRequest, UpdateMediaSessionRequest, VideoCodec, VideoResolution,
     };
 use super::{
     create_in_state, refresh_native_state, snapshot_from_state, stop_in_state,
@@ -1384,6 +1404,7 @@ use super::{
                 native_capture_implemented: false,
                 native_encoder_implemented: false,
                 native_peer_transport_implemented: false,
+                av1_encode_supported: false,
                 detail: "test".into(),
             },
             lifecycle: MediaLifecycleState::Idle,
@@ -1406,6 +1427,7 @@ use super::{
             quality: super::super::types::TransmissionQuality::High,
             bitrate_bps: None,
             min_bitrate_bps: None,
+            codec: super::super::types::VideoCodec::H264,
             password: String::new(),
             nickname: "Host".into(),
             admission: false,
@@ -1544,6 +1566,7 @@ use super::{
                 quality: TransmissionQuality::Low,
                 bitrate_bps: None,
                 min_bitrate_bps: None,
+                codec: VideoCodec::H264,
                 system_audio: false,
                 excluded_apps: vec!["Discord".into(), "com.hnc.Discord".into()],
             },
@@ -1585,6 +1608,7 @@ use super::{
                 quality: TransmissionQuality::Medium,
                 bitrate_bps: None,
                 min_bitrate_bps: None,
+                codec: VideoCodec::H264,
                 system_audio: true,
                 excluded_apps: Vec::new(),
             },
@@ -1607,6 +1631,7 @@ use super::{
                     quality: TransmissionQuality::High,
                     bitrate_bps: None,
                     min_bitrate_bps: None,
+                    codec: VideoCodec::H264,
                     system_audio: false,
                     excluded_apps: Vec::new(),
                 },

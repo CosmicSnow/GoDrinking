@@ -28,6 +28,8 @@ pub struct MediaCapabilities {
     pub native_capture_implemented: bool,
     pub native_encoder_implemented: bool,
     pub native_peer_transport_implemented: bool,
+    /// Host can encode AV1 (VideoToolbox M3+ on macOS; false elsewhere for now).
+    pub av1_encode_supported: bool,
     pub detail: String,
 }
 
@@ -53,6 +55,7 @@ pub fn detect() -> MediaCapabilities {
             native_capture_implemented: true,
             native_encoder_implemented: true,
             native_peer_transport_implemented: true,
+            av1_encode_supported: super::video_toolbox::av1_encode_supported(),
             detail: format!(
                 "{} Local-only native WebRTC is available. On macOS 14.2+, system audio can exclude selected apps.",
                 availability.detail
@@ -75,6 +78,7 @@ pub fn detect() -> MediaCapabilities {
             native_capture_implemented: true,
             native_encoder_implemented: true,
             native_peer_transport_implemented: true,
+            av1_encode_supported: false,
             detail: "Windows Graphics Capture and OpenH264 native capture are available. System audio is a full device loopback; per-app audio exclusion is unsupported (no mix-minus tap).".into(),
         };
     }
@@ -94,6 +98,7 @@ pub fn detect() -> MediaCapabilities {
             native_capture_implemented: false,
             native_encoder_implemented: false,
             native_peer_transport_implemented: false,
+            av1_encode_supported: false,
             detail: "Native media capture is unsupported on this platform; the WebView path remains the active implementation.".into(),
         }
     }

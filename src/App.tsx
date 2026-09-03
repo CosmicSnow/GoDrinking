@@ -31,7 +31,7 @@ function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
 
 type Source = { id: number; kind: "display" | "window"; title?: string; application_name?: string };
 type RunningApp = { name: string; bundle_id?: string | null; pid: number; emitting_audio?: boolean };
-type Capabilities = { supported: boolean; screen_capture_kit: boolean; source_enumeration_available: boolean; screen_recording_authorization: "granted" | "not_granted" | "unsupported"; app_audio_exclusion: "enhanced" | "best_effort" | "unsupported"; detail: string };
+type Capabilities = { platform?: string; supported: boolean; native_capture_implemented: boolean; screen_capture_kit: boolean; source_enumeration_available: boolean; screen_recording_authorization: "granted" | "not_granted" | "unsupported"; app_audio_exclusion: "enhanced" | "best_effort" | "unsupported"; av1_encode_supported?: boolean; detail: string };
 type RosterEntry = { id: string; nickname: string; state: string };
 type DirectAddress = { ip: string; port: number; version: number; kind: string; copy: string };
 type Snapshot = { state: string; session_id: string | null; source_id: number | null; bitrate_bps: number | null; native_capture_active: boolean; preview_callback_count: number; preview_frame_count: number; preview_dropped_count: number; preview_error: string | null; detail: string; peer_state: string; peer_detail: string; session_code: string | null; lan_addresses: string[]; lan_port: number | null; roster?: RosterEntry[]; password_set?: boolean; admission?: boolean; join_mode?: string; direct_listen_port?: number | null; direct_addresses?: DirectAddress[]; direct_mapping?: boolean; stunar_state?: string | null };
@@ -114,6 +114,9 @@ function App() {
   const effectiveMbps = bitrateMbps ?? qualityTargetMbps[quality];
   // Piso custom anti-colapso REMB em Mbps. null = 1 Mbps automático.
   const [minBitrateMbps, setMinBitrateMbps] = useState<number | null>(null);
+  // Codec da sessão, fixo no Start (HEVC e H.264 High exigem macOS).
+  const [videoCodec, setVideoCodec] = useState<"h264" | "h264high" | "hevc">("h264");
+  const hevcAvailable = caps?.platform === "macos";
   const effectiveFloorMbps = Math.min(minBitrateMbps ?? AUTO_FLOOR_MBPS, effectiveMbps);
   const [systemAudio, setSystemAudio] = useState(false);
   const [excludedApps, setExcludedApps] = useState<string[]>([]);
@@ -170,7 +173,10 @@ function App() {
   const watchStreamActive = watchConnected || watchIce === "connecting";
   const watchLabel = joinMode === "direct" ? (watchHostName || "via Direct") : watchCode;
   const lanConnected = mode === "watch" ? watchConnected : connected;
-  const canStart = Boolean(caps?.supported && caps.screen_recording_authorization === "granted");
+  // Windows has no Screen Recording gate (authorization is "unsupported"):
+  // capture readiness is native_capture_implemented there.
+  const captureReady = caps !== null && (caps.platform === "windows" ? caps.native_capture_implemented : caps.screen_recording_authorization === "granted");
+  const canStart = Boolean(caps?.supported && captureReady);
   const audioExclusion = caps?.app_audio_exclusion === "enhanced";
   const roomLabel = session?.session_code ? `${session.session_code}${session.lan_addresses[0] ? ` · ${session.lan_addresses[0]}` : ""}` : "";
   const nicknameValid = /^[A-Za-z0-9 _.-]+$/.test(nickname.trim()) && nickname.trim().length >= 2 && nickname.trim().length <= 24;
@@ -387,7 +393,7 @@ function App() {
     if (!active) { liveSettingsApplied.current = false; return; }
     if (sessionAction !== "idle") return;
     if (!liveSettingsApplied.current) { liveSettingsApplied.current = true; return; }
-    void invokeMedia<Snapshot | null>("update_media_session", { request: { quality, bitrate_bps: bitrateMbps !== null ? Math.round(bitrateMbps * 1_000_000) : null, min_bitrate_bps: minBitrateMbps !== null ? Math.round(minBitrateMbps * 1_000_000) : null, system_audio: systemAudio, excluded_apps: excludedApps } })
+    void invokeMedia<Snapshot | null>("update_media_session", { request: { quality, bitrate_bps: bitrateMbps !== null ? Math.round(bitrateMbps * 1_000_000) : null, min_bitrate_bps: minBitrateMbps !== null ? Math.round(minBitrateMbps * 1_000_000) : null, codec: videoCodec, system_audio: systemAudio, excluded_apps: excludedApps } })
       .then((next) => { if (next) setSession(next); })
       .catch((error) => setNotice(`Could not apply the change: ${diagnosticError(error, "unknown error")}`));
   }, [quality, bitrateMbps, minBitrateMbps, systemAudio, excludedApps, active, sessionAction]);
@@ -415,7 +421,8 @@ function App() {
     setNotice("Starting native capture…");
     try {
       const current = await refreshCapabilities();
-      if (!current?.supported || current.screen_recording_authorization !== "granted") throw new Error("Grant Screen Recording access first.");
+      const hostCaptureReady = current !== null && (current.platform === "windows" ? current.native_capture_implemented : current.screen_recording_authorization === "granted");
+      if (!current?.supported || !hostCaptureReady) throw new Error(current?.platform === "windows" ? "Native capture is unavailable on this PC." : "Grant Screen Recording access first.");
       if (sourceId === null && filteredSources.length > 0) throw new Error("Choose a display or window before starting.");
       if (!nicknameValid) throw new Error("Enter a nickname (2–24 letters, numbers, spaces, _ - .).");
       if (joinMode === "stunar" && !rendezvousUrl.trim()) throw new Error("Set the Stunar URL in settings.");
@@ -428,6 +435,7 @@ function App() {
           quality,
           bitrate_bps: bitrateMbps !== null ? Math.round(bitrateMbps * 1_000_000) : null,
           min_bitrate_bps: minBitrateMbps !== null ? Math.round(minBitrateMbps * 1_000_000) : null,
+          codec: videoCodec,
           resolution: preset.resolution,
           frame_rate: preset.frame_rate,
           system_audio: systemAudio,
@@ -702,7 +710,7 @@ function App() {
     return true;
   });
   const filteredSources = sources.filter((item) => item.kind === sourceKind);
-  const permissionLabel = caps === null ? "Checking Screen Recording access…" : caps.screen_recording_authorization === "granted" ? "Screen Recording ready" : caps.screen_recording_authorization === "not_granted" ? "Screen Recording permission needed" : "Native capture unavailable";
+  const permissionLabel = caps === null ? "Checking Screen Recording access…" : caps.platform === "windows" ? (caps.native_capture_implemented ? "Native capture ready" : "Native capture unavailable") : caps.screen_recording_authorization === "granted" ? "Screen Recording ready" : caps.screen_recording_authorization === "not_granted" ? "Screen Recording permission needed" : "Native capture unavailable";
 
   return (
     <div className={`app-shell${cinema ? " cinema" : ""}`}>
@@ -839,9 +847,9 @@ function App() {
             <section className="panel controls-panel">
               <div className="panel-title"><div><span className="section-kicker">01 / Source</span><h2>What do you want to share?</h2></div></div>
               <div className="permission-strip">
-                <span className={`permission-dot ${caps?.screen_recording_authorization === "granted" ? "ready" : ""}`}/>
+                <span className={`permission-dot ${captureReady ? "ready" : ""}`}/>
                 <div><strong>{permissionLabel}</strong><small>{caps?.detail ?? "Checking native media capability…"}</small></div>
-                {caps !== null && caps.screen_recording_authorization !== "granted" && <button onClick={() => void requestPermission()}>Check access</button>}
+                {caps !== null && caps.platform !== "windows" && caps.screen_recording_authorization !== "granted" && <button onClick={() => void requestPermission()}>Check access</button>}
               </div>
               <div className="source-grid" role="radiogroup">
                 <button className={`source-card ${sourceKind === "display" ? "selected" : ""}`} onClick={() => setSourceKind("display")}><span className="source-icon"><Icon name="monitor" size={20}/></span><span className="source-copy"><strong>Whole screen</strong><small>Native display capture</small></span></button>
@@ -861,6 +869,16 @@ function App() {
                     <button className={quality === "high" ? "selected" : ""} onClick={() => { setQuality("high"); setBitrateMbps(null); setMinBitrateMbps(null); }}>High</button>
                   </div>
                   <p className="quality-hint">Low 720p 30 · Medium 1080p 30 · High 1080p 60</p>
+                  <div className="bitrate-label-row">
+                    <span>Codec</span>
+                    <code>{videoCodec === "hevc" ? "HEVC/H.265" : videoCodec === "h264high" ? "H.264 High" : "H.264"}{caps?.av1_encode_supported ? " · AV1 HW a caminho" : ""}</code>
+                  </div>
+                  <div className="segmented">
+                    <button className={videoCodec === "h264" ? "selected" : ""} onClick={() => setVideoCodec("h264")} disabled={active}>H.264</button>
+                    <button className={videoCodec === "h264high" ? "selected" : ""} onClick={() => setVideoCodec("h264high")} disabled={active || !hevcAvailable} title={hevcAvailable ? "H.264 High — melhor qualidade no mesmo bitrate, qualquer browser abre" : "H.264 High exige macOS"}>H.264 High</button>
+                    <button className={videoCodec === "hevc" ? "selected" : ""} onClick={() => setVideoCodec("hevc")} disabled={active || !hevcAvailable} title={hevcAvailable ? "HEVC/H.265 — viewers precisam de browser com H.265" : "HEVC exige macOS"}>HEVC</button>
+                  </div>
+                  {videoCodec === "hevc" && <p className="quality-hint">HEVC economiza ~40% de bitrate, mas cada viewer precisa de decode H.265 no browser — se o peer travar em connecting, volte para H.264 High.</p>}
                   <div className="bitrate-block">
                     <div className="bitrate-label-row">
                       <span>Bitrate limite</span>
@@ -958,7 +976,7 @@ function App() {
                 <div className="preview-screen">
                   <div className="preview-grid"/>
                   <canvas ref={canvasRef} className={`native-preview ${active ? "visible" : ""}`} aria-label="Native capture preview"/>
-                  <div className={`preview-center ${active ? "is-hidden" : ""}`}><strong>Preview is ready</strong><small>{caps?.screen_recording_authorization === "granted" ? "Start a native session to begin" : "Grant Screen Recording access first"}</small></div>
+                  <div className={`preview-center ${active ? "is-hidden" : ""}`}><strong>Preview is ready</strong><small>{captureReady ? "Start a native session to begin" : caps?.platform === "windows" ? "Native capture unavailable on this PC" : "Grant Screen Recording access first"}</small></div>
                 </div>
               </section>
               <section className="panel connect-panel">

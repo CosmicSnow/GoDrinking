@@ -44,5 +44,5 @@ pub use room::{discover_direct, discover_room, submit_answer as submit_room_answ
 pub use types::{
     CreateMediaSessionRequest, DirectAddress, JoinMode, MediaSessionSnapshot, NativeCaptureSource,
     NativeRunningApp, PreviewFrameEvent, StunarState, UpdateCredentialsRequest,
-    UpdateMediaSessionRequest, MediaSessionStats, ViewerLinkStats,
+    UpdateMediaSessionRequest, MediaSessionStats, VideoCodec, ViewerLinkStats,
 };

@@ -132,6 +132,37 @@ fn default_host_nickname() -> String {
     "Host".into()
 }
 
+/// Session video codec. H.264 is universal; HEVC needs a capable host
+/// encoder (VideoToolbox on macOS) and a viewer browser with H.265 WebRTC
+/// decode. Fixed at session start — switching mid-stream needs a
+/// renegotiation cycle the transport does not do yet.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoCodec {
+    #[default]
+    H264,
+    H264High,
+    Hevc,
+}
+
+impl VideoCodec {
+    pub(crate) fn mime_type(self) -> &'static str {
+        match self {
+            Self::H264 | Self::H264High => "video/H264",
+            Self::Hevc => "video/H265",
+        }
+    }
+
+    /// SDP profile-level-id for the H.264 variants (None = not H.264).
+    pub(crate) fn h264_profile_level_id(self) -> Option<&'static str> {
+        match self {
+            Self::H264 => Some("42e02a"),
+            Self::H264High => Some("64002a"),
+            Self::Hevc => None,
+        }
+    }
+}
+
 /// How a Viewer finds the Host. LAN and Direct are implemented; Stunar needs
 /// the Rendezvous (Fatia 4/5).
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -178,6 +209,9 @@ pub struct CreateMediaSessionRequest {
     /// case on hunting estimators without disabling adaptation.
     #[serde(default)]
     pub min_bitrate_bps: Option<u32>,
+    /// Session video codec (default H.264). HEVC requires macOS.
+    #[serde(default)]
+    pub codec: VideoCodec,
     /// Password for the Session. Empty means no Password on LAN/Direct;
     /// Stunar rooms require one (4-64 chars) and the server rejects open
     /// without it.
@@ -223,6 +257,10 @@ pub struct UpdateMediaSessionRequest {
     /// Live congestion floor in bps (None = 1 Mbps auto).
     #[serde(default)]
     pub min_bitrate_bps: Option<u32>,
+    /// Carried for shape compatibility; the session codec is fixed at Start
+    /// and changes here are ignored (selector is disabled while active).
+    #[serde(default)]
+    pub codec: VideoCodec,
     pub system_audio: bool,
     pub excluded_apps: Vec<String>,
 }

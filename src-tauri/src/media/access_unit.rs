@@ -44,6 +44,18 @@ impl Display for AvccError {
 pub(crate) struct AvccAnnexBConverter {
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
+    allow_high_profile: bool,
+}
+
+impl AvccAnnexBConverter {
+    /// Baseline-strict (default) rejects non-Baseline SPS; the High-profile
+    /// variant additionally accepts High (0x64) SPS for H.264 High sessions.
+    pub(crate) fn high_profile() -> Self {
+        Self {
+            allow_high_profile: true,
+            ..Default::default()
+        }
+    }
 }
 
 impl AvccAnnexBConverter {
@@ -88,7 +100,10 @@ impl AvccAnnexBConverter {
             return Err(AvccError::MissingParameterSets);
         }
         let profile_level_id = self.sps.as_deref().and_then(sps_profile_level_id);
-        if contains_idr && !profile_level_id.as_deref().is_some_and(is_baseline_profile) {
+        let profile_ok = profile_level_id.as_deref().is_some_and(|id| {
+            is_baseline_profile(id) || (self.allow_high_profile && is_high_profile(id))
+        });
+        if contains_idr && !profile_ok {
             return Err(AvccError::IncompatibleProfileLevel);
         }
         let inject_parameter_sets = keyframe || contains_idr;
@@ -119,13 +134,110 @@ impl AvccAnnexBConverter {
     }
 }
 
+/// HEVC NAL unit type from the two-byte header (forbidden(1) | type(6) | ...).
+fn hevc_nal_unit_type(nal: &[u8]) -> Option<u8> {
+    nal.first().map(|byte| (byte >> 1) & 0x3f)
+}
+
+/// IRAP pictures (BLA/IDR/CRA, types 16-23) are HEVC random-access points.
+fn hevc_is_irap(nal_unit_type: u8) -> bool {
+    (16..=23).contains(&nal_unit_type)
+}
+
+/// Length-prefixed (HVCC) to Annex-B, mirroring AvccAnnexBConverter but for
+/// HEVC: caches VPS/SPS/PPS and injects them before every IRAP so a viewer
+/// joining mid-stream (or recovering after loss) can decode immediately.
+#[derive(Default)]
+pub(crate) struct HevcAnnexBConverter {
+    vps: Option<Vec<u8>>,
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
+}
+
+impl HevcAnnexBConverter {
+    pub(crate) fn convert(
+        &mut self,
+        hvcc: &[u8],
+        timestamp_90khz: u64,
+        keyframe: bool,
+    ) -> Result<EncodedAccessUnit, AvccError> {
+        if hvcc.is_empty() {
+            return Err(AvccError::Empty);
+        }
+        let mut offset = 0;
+        let mut nals = Vec::new();
+        while offset < hvcc.len() {
+            if hvcc.len() - offset < 4 {
+                return Err(AvccError::TruncatedLength);
+            }
+            let length = u32::from_be_bytes([
+                hvcc[offset],
+                hvcc[offset + 1],
+                hvcc[offset + 2],
+                hvcc[offset + 3],
+            ]) as usize;
+            offset += 4;
+            let end = offset.checked_add(length).ok_or(AvccError::TruncatedNal)?;
+            if end > hvcc.len() || length == 0 {
+                return Err(AvccError::TruncatedNal);
+            }
+            let nal = &hvcc[offset..end];
+            match hevc_nal_unit_type(nal) {
+                Some(HEVC_VPS_NUT) => self.vps = Some(nal.to_vec()),
+                Some(HEVC_SPS_NUT) => self.sps = Some(nal.to_vec()),
+                Some(HEVC_PPS_NUT) => self.pps = Some(nal.to_vec()),
+                _ => {}
+            }
+            nals.push(nal);
+            offset = end;
+        }
+
+        let contains_irap = nals
+            .iter()
+            .any(|nal| hevc_nal_unit_type(nal).is_some_and(hevc_is_irap));
+        if contains_irap && (self.vps.is_none() || self.sps.is_none() || self.pps.is_none()) {
+            return Err(AvccError::MissingParameterSets);
+        }
+        let inject_parameter_sets = keyframe || contains_irap;
+        let mut data = Vec::with_capacity(hvcc.len() + 96);
+        if inject_parameter_sets {
+            for set in [&self.vps, &self.sps, &self.pps].into_iter().flatten() {
+                data.extend_from_slice(ANNEX_B_START_CODE);
+                data.extend_from_slice(set);
+            }
+        }
+        for nal in nals {
+            let nut = hevc_nal_unit_type(nal).unwrap_or(0xff);
+            if inject_parameter_sets && matches!(nut, HEVC_VPS_NUT | HEVC_SPS_NUT | HEVC_PPS_NUT) {
+                continue;
+            }
+            data.extend_from_slice(ANNEX_B_START_CODE);
+            data.extend_from_slice(nal);
+        }
+        Ok(EncodedAccessUnit {
+            data,
+            timestamp_90khz,
+            keyframe: keyframe || contains_irap,
+            profile_level_id: None,
+        })
+    }
+}
+
 fn sps_profile_level_id(sps: &[u8]) -> Option<String> {
     (sps.len() >= 4).then(|| format!("{:02x}{:02x}{:02x}", sps[1], sps[2], sps[3]))
 }
 
+const HEVC_VPS_NUT: u8 = 32;
+const HEVC_SPS_NUT: u8 = 33;
+const HEVC_PPS_NUT: u8 = 34;
 pub(crate) fn is_baseline_profile(profile_level_id: &str) -> bool {
     let id = profile_level_id.to_ascii_lowercase();
     id.len() == 6 && id.starts_with("42")
+}
+
+pub(crate) fn is_high_profile(profile_level_id: &str) -> bool {
+    let id = profile_level_id.to_ascii_lowercase();
+    id.len() == 6 && id.starts_with("64")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -252,7 +364,7 @@ impl AccessUnitReceiver {
 
 #[cfg(test)]
 mod tests {
-    use super::{AvccAnnexBConverter, AvccError, H264_PROFILE_LEVEL_ID};
+    use super::{AvccAnnexBConverter, AvccError, HevcAnnexBConverter, H264_PROFILE_LEVEL_ID};
     use std::time::Duration;
 
     fn avcc(nals: &[&[u8]]) -> Vec<u8> {
@@ -352,6 +464,28 @@ mod tests {
     }
 
     #[test]
+    fn high_profile_converter_accepts_high_sps() {
+        let mut converter = AvccAnnexBConverter::high_profile();
+        converter
+            .convert(&avcc(&[&[0x67, 0x64, 0x00, 0x2a], &[0x68, 2]]), 0, false)
+            .expect("parameter sets");
+        let unit = converter.convert(&avcc(&[&[0x65, 3]]), 3_000, true).expect("high IDR");
+        assert_eq!(unit.profile_level_id.as_deref(), Some("64002a"));
+    }
+
+    #[test]
+    fn baseline_converter_still_rejects_high_sps() {
+        let mut converter = AvccAnnexBConverter::default();
+        converter
+            .convert(&avcc(&[&[0x67, 0x64, 0x00, 0x2a], &[0x68, 2]]), 0, false)
+            .expect("parameter sets");
+        assert_eq!(
+            converter.convert(&avcc(&[&[0x65, 3]]), 3_000, true),
+            Err(AvccError::IncompatibleProfileLevel)
+        );
+    }
+
+    #[test]
     fn rejects_an_sps_profile_that_does_not_match_the_negotiated_codec() {
         let mut converter = AvccAnnexBConverter::default();
         converter
@@ -398,5 +532,46 @@ mod tests {
                 .data,
             vec![5]
         );
+    }
+
+    // Two-byte HEVC headers: (type << 1) | layer bits, temporal_id_plus1 = 1.
+    const VPS: &[u8] = &[0x40, 0x01, 0x0c];
+    const SPS: &[u8] = &[0x42, 0x01, 0x0d];
+    const PPS: &[u8] = &[0x44, 0x01, 0x0e];
+    const IDR: &[u8] = &[0x26, 0x01, 0x11];
+    const CRA: &[u8] = &[0x2a, 0x01, 0x12];
+
+    #[test]
+    fn hevc_injects_vps_sps_pps_before_irap() {
+        let mut converter = HevcAnnexBConverter::default();
+        converter.convert(&avcc(&[VPS, SPS, PPS]), 0, false).expect("sets");
+        let unit = converter.convert(&avcc(&[IDR]), 3_000, true).expect("irap");
+        assert!(unit.keyframe);
+        assert_eq!(
+            unit.data,
+            vec![
+                0, 0, 0, 1, 0x40, 0x01, 0x0c,
+                0, 0, 0, 1, 0x42, 0x01, 0x0d,
+                0, 0, 0, 1, 0x44, 0x01, 0x0e,
+                0, 0, 0, 1, 0x26, 0x01, 0x11,
+            ]
+        );
+    }
+
+    #[test]
+    fn hevc_refuses_irap_without_parameter_sets() {
+        let mut converter = HevcAnnexBConverter::default();
+        assert_eq!(
+            converter.convert(&avcc(&[IDR]), 0, true),
+            Err(AvccError::MissingParameterSets)
+        );
+    }
+
+    #[test]
+    fn hevc_detects_cra_as_keyframe() {
+        let mut converter = HevcAnnexBConverter::default();
+        converter.convert(&avcc(&[VPS, SPS, PPS]), 0, false).expect("sets");
+        let unit = converter.convert(&avcc(&[CRA]), 3_000, false).expect("cra");
+        assert!(unit.keyframe);
     }
 }

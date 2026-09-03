@@ -1,8 +1,12 @@
 //! Safe Rust ownership for the Swift VideoToolbox C-ABI shim.
 
-use super::access_unit::{AccessUnitPushResult, AccessUnitQueue, AvccAnnexBConverter};
+use super::access_unit::{
+    AccessUnitPushResult, AccessUnitQueue, AvccAnnexBConverter, AvccError, EncodedAccessUnit,
+    HevcAnnexBConverter,
+};
 use super::pipeline::{EncoderControl, PipelineState};
 use super::timestamp::to_90khz;
+use super::types::VideoCodec;
 use std::ffi::c_void;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -22,6 +26,7 @@ unsafe extern "C" {
         height: i32,
         bitrate: i32,
         frame_rate: i32,
+        codec: i32,
         callback: EncodedCallback,
         error_callback: ErrorCallback,
         callback_context: *mut c_void,
@@ -36,6 +41,14 @@ unsafe extern "C" {
     fn golive_vt_encoder_force_keyframe(encoder: *mut c_void) -> i32;
     fn golive_vt_encoder_set_bitrate(encoder: *mut c_void, bitrate: i32) -> i32;
     fn golive_vt_encoder_destroy(encoder: *mut c_void);
+    fn golive_vt_supports_av1() -> bool;
+}
+
+/// Probes VideoToolbox for an AV1 encoder (hardware on M3+, macOS 13+).
+/// Used for capability reporting; the H.264 path is unaffected.
+pub(crate) fn av1_encode_supported() -> bool {
+    // SAFETY: probe creates and releases a scratch session, no shared state.
+    unsafe { golive_vt_supports_av1() }
 }
 
 #[derive(Debug, Clone)]
@@ -61,9 +74,38 @@ impl PipelineState {
 }
 
 #[cfg(target_os = "macos")]
+enum Converter {
+    H264(AvccAnnexBConverter),
+    Hevc(HevcAnnexBConverter),
+}
+
+#[cfg(target_os = "macos")]
+impl Converter {
+    fn for_codec(codec: VideoCodec) -> Self {
+        match codec {
+            VideoCodec::H264 => Self::H264(AvccAnnexBConverter::default()),
+            VideoCodec::H264High => Self::H264(AvccAnnexBConverter::high_profile()),
+            VideoCodec::Hevc => Self::Hevc(HevcAnnexBConverter::default()),
+        }
+    }
+
+    fn convert(
+        &mut self,
+        bytes: &[u8],
+        timestamp_90khz: u64,
+        keyframe: bool,
+    ) -> Result<EncodedAccessUnit, AvccError> {
+        match self {
+            Self::H264(converter) => converter.convert(bytes, timestamp_90khz, keyframe),
+            Self::Hevc(converter) => converter.convert(bytes, timestamp_90khz, keyframe),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 struct CallbackContext {
     output: AccessUnitQueue,
-    converter: Mutex<AvccAnnexBConverter>,
+    converter: Mutex<Converter>,
     state: Arc<PipelineState>,
     control: Arc<EncoderControl>,
 }
@@ -85,22 +127,29 @@ impl VideoToolboxEncoder {
         height: u32,
         bitrate: u32,
         frame_rate: u32,
+        codec: VideoCodec,
         output: AccessUnitQueue,
         state: Arc<PipelineState>,
         control: Arc<EncoderControl>,
     ) -> Result<Self, VideoToolboxError> {
         let callback_context = Box::into_raw(Box::new(CallbackContext {
             output,
-            converter: Mutex::new(AvccAnnexBConverter::default()),
+            converter: Mutex::new(Converter::for_codec(codec)),
             state: Arc::clone(&state),
             control,
         }));
+        let codec_flag = match codec {
+            VideoCodec::H264 => 0,
+            VideoCodec::Hevc => 1,
+            VideoCodec::H264High => 2,
+        };
         let handle = unsafe {
             golive_vt_encoder_create(
                 width as i32,
                 height as i32,
                 bitrate as i32,
                 frame_rate as i32,
+                codec_flag,
                 encoded_callback,
                 encoder_error_callback,
                 callback_context.cast(),
@@ -221,14 +270,14 @@ extern "C" fn encoded_callback(
     let bytes = unsafe { std::slice::from_raw_parts(data, len) };
     let Ok(mut converter) = context.converter.lock() else {
         context.state.report_error(VideoToolboxError(
-            "H.264 converter lock was poisoned".into(),
+            "converter lock was poisoned".into(),
         ));
         return;
     };
     let unit = match converter.convert(bytes, timestamp_90khz, keyframe != 0) {
         Ok(unit) => unit,
         Err(error) => {
-            eprintln!("[goDrinking] H.264 access-unit skipped: {error}");
+            eprintln!("[goDrinking] access-unit skipped: {error}");
             return;
         }
     };

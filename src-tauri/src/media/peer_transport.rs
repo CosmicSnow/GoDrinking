@@ -3,7 +3,7 @@
 use super::access_unit::AccessUnitReceiver;
 use super::pipeline::EncoderControl;
 use super::process_tap::EncodedAudioPacket;
-use super::types::{JoinMode, PeerTransportState};
+use super::types::{JoinMode, PeerTransportState, VideoCodec};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,7 +13,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_OPUS};
+use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_HEVC, MIME_TYPE_OPUS};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::ice::mdns::MulticastDnsMode;
@@ -104,6 +104,7 @@ impl PeerTransport {
         encoder_control: Arc<EncoderControl>,
         frame_duration: Duration,
         join_mode: JoinMode,
+        video_codec: VideoCodec,
     ) -> Result<Self, String> {
         let (command_tx, command_rx) = sync_channel(TRANSPORT_COMMAND_CAPACITY);
         let (ready_tx, ready_rx) = sync_channel(1);
@@ -146,6 +147,7 @@ impl PeerTransport {
                     encoder_control,
                     frame_duration,
                     join_mode,
+                    video_codec,
                     ready_tx,
                     worker_status,
                     worker_shutdown,
@@ -323,13 +325,23 @@ async fn run_peer(
     encoder_control: Arc<EncoderControl>,
     frame_duration: Duration,
     join_mode: JoinMode,
+    video_codec: VideoCodec,
     ready_tx: SyncSender<Result<(), String>>,
     status: Arc<Mutex<SharedStatus>>,
     shutdown: Arc<AtomicBool>,
 ) {
+    // Only the session codec is registered: the offer carries exactly what
+    // the encoder produces, so a viewer can never negotiate a codec the
+    // host is not sending.
     let mut media_engine = MediaEngine::default();
-    if let Err(error) = media_engine.register_codec(h264_codec(), RTPCodecType::Video) {
-        let message = format!("H.264 codec registration failed: {error}");
+    let session_codec = match video_codec {
+        VideoCodec::H264 | VideoCodec::H264High => {
+            h264_codec(video_codec.h264_profile_level_id().unwrap_or("42e02a"))
+        }
+        VideoCodec::Hevc => hevc_codec(),
+    };
+    if let Err(error) = media_engine.register_codec(session_codec.clone(), RTPCodecType::Video) {
+        let message = format!("{} codec registration failed: {error}", video_codec.mime_type());
         set_status(&status, PeerTransportState::Failed, message.clone());
         let _ = ready_tx.send(Err(message));
         return;
@@ -396,7 +408,7 @@ async fn run_peer(
         }
     };
     let track = Arc::new(TrackLocalStaticSample::new(
-        h264_codec().capability,
+        session_codec.capability,
         "godrinking-video".into(),
         "godrinking".into(),
     ));
@@ -405,7 +417,7 @@ async fn run_peer(
         async {
             peer.add_track(track_for_peer)
                 .await
-                .map_err(|error| format!("WebRTC H.264 track registration failed: {error}"))
+                .map_err(|error| format!("WebRTC video track registration failed: {error}"))
         },
         Arc::clone(&shutdown),
         "WebRTC track initialization",
@@ -815,14 +827,45 @@ fn opus_codec() -> RTCRtpCodecParameters {
     }
 }
 
-fn h264_codec() -> RTCRtpCodecParameters {
+/// Session HEVC codec: empty fmtp mirrors the webrtc-rs default
+/// registration; the encoder emits annex-B IRAPs the H265 payloader
+/// packetizes per RFC 7798 SSCH.
+fn hevc_codec() -> RTCRtpCodecParameters {
+    RTCRtpCodecParameters {
+        capability: RTCRtpCodecCapability {
+            mime_type: MIME_TYPE_HEVC.into(),
+            clock_rate: 90_000,
+            channels: 0,
+            sdp_fmtp_line: "".into(),
+            rtcp_feedback: vec![
+                RTCPFeedback {
+                    typ: "goog-remb".into(),
+                    parameter: "".into(),
+                },
+                RTCPFeedback {
+                    typ: "nack".into(),
+                    parameter: "pli".into(),
+                },
+                RTCPFeedback {
+                    typ: "ccm".into(),
+                    parameter: "fir".into(),
+                },
+            ],
+        },
+        payload_type: 103,
+        ..Default::default()
+    }
+}
+
+fn h264_codec(profile_level_id: &str) -> RTCRtpCodecParameters {
     RTCRtpCodecParameters {
         capability: RTCRtpCodecCapability {
             mime_type: MIME_TYPE_H264.into(),
             clock_rate: 90_000,
             channels: 0,
-            sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e02a"
-                .into(),
+            sdp_fmtp_line: format!(
+                "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={profile_level_id}"
+            ),
             rtcp_feedback: vec![
                 RTCPFeedback {
                     typ: "goog-remb".into(),
@@ -902,12 +945,37 @@ async fn set_answer(peer: &Arc<RTCPeerConnection>, answer: PeerSignal) -> Result
         return Err("set_answer requires an answer signal".into());
     }
     let sdp = rewrite_mdns_candidate_addresses(&answer.sdp, "127.0.0.1");
+    // Fail fast when the viewer rejects the video m-section (port 0):
+    // that means its browser has no decoder for the session codec (e.g.
+    // HEVC on Firefox). Without this the peer sits in "connecting" forever
+    // with no media flowing and no error anywhere.
+    if let Some(rejected) = rejected_video_section(&sdp) {
+        super::logger::log(
+            "WARN",
+            "set-answer",
+            &format!("viewer rejected the video stream ({rejected}) — browser likely lacks a decoder for the session codec"),
+        );
+        return Err("viewer rejected the video stream: browser has no decoder for this codec".into());
+    }
     peer.set_remote_description(
         RTCSessionDescription::answer(sdp)
             .map_err(|error| format!("invalid remote answer: {error}"))?,
     )
     .await
     .map_err(|error| format!("set remote answer failed: {error}"))
+}
+
+/// Inspects an SDP answer: returns the video m-line when its port is 0
+/// (stream rejected — no common codec), None when video was accepted.
+fn rejected_video_section(sdp: &str) -> Option<String> {
+    sdp.lines().find_map(|line| {
+        let line = line.trim().trim_end_matches('\r');
+        if !line.starts_with("m=video ") {
+            return None;
+        }
+        let rejected = line.split_whitespace().nth(1) == Some("0");
+        rejected.then(|| line.to_owned())
+    })
 }
 
 /// WKWebView/Safari obfuscate host ICE addresses as `<uuid>.local`.
@@ -1066,8 +1134,16 @@ mod tests {
     }
 
     #[test]
+    fn rejected_video_section_detects_port_zero() {
+        let accepted = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\nm=video 9 UDP/TLS/RTP/SAVPF 103\r\na=rtpmap:103 H265/90000\r\n";
+        assert_eq!(super::rejected_video_section(accepted), None);
+        let rejected = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\nm=video 0 UDP/TLS/RTP/SAVPF 103\r\n";
+        assert!(super::rejected_video_section(rejected).is_some());
+    }
+
+    #[test]
     fn h264_codec_advertises_low_latency_feedback() {
-        let codec = h264_codec();
+        let codec = h264_codec("42e02a");
         assert_eq!(codec.capability.mime_type, "video/H264");
         assert_eq!(codec.capability.clock_rate, 90_000);
         assert!(codec
