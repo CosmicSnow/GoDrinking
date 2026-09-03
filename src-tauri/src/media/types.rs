@@ -163,6 +163,18 @@ impl VideoCodec {
     }
 }
 
+/// Windows encoder backend. Auto tries the Media Foundation hardware
+/// encoder (NVENC silicon on NVIDIA) and falls back to OpenH264 software;
+/// the choice is fixed at Start like the codec.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoEncoder {
+    #[default]
+    Auto,
+    Software,
+    Hardware,
+}
+
 /// How a Viewer finds the Host. LAN and Direct are implemented; Stunar needs
 /// the Rendezvous (Fatia 4/5).
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -212,6 +224,10 @@ pub struct CreateMediaSessionRequest {
     /// Session video codec (default H.264). HEVC requires macOS.
     #[serde(default)]
     pub codec: VideoCodec,
+    /// Windows encoder backend (default Auto = hardware when available).
+    /// Ignored on macOS, which always uses VideoToolbox.
+    #[serde(default)]
+    pub encoder: VideoEncoder,
     /// Password for the Session. Empty means no Password on LAN/Direct;
     /// Stunar rooms require one (4-64 chars) and the server rejects open
     /// without it.
@@ -261,6 +277,10 @@ pub struct UpdateMediaSessionRequest {
     /// and changes here are ignored (selector is disabled while active).
     #[serde(default)]
     pub codec: VideoCodec,
+    /// Same deal as codec: swapping the encoder live would drop the stream,
+    /// so updates carry it but the running session keeps the Start choice.
+    #[serde(default)]
+    pub encoder: VideoEncoder,
     pub system_audio: bool,
     pub excluded_apps: Vec<String>,
 }

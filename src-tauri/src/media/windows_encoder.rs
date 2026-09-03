@@ -175,13 +175,13 @@ impl OpenH264Encoder {
 /// every IDR so the access-unit queue always starts a decodable GOP. Mirrors
 /// the `AvccAnnexBConverter` behavior used by the VideoToolbox path.
 #[derive(Default)]
-struct AnnexBConverter {
+pub(crate) struct AnnexBConverter {
     sps: Option<Vec<u8>>,
     pps: Option<Vec<u8>>,
 }
 
 impl AnnexBConverter {
-    fn convert(
+    pub(crate) fn convert(
         &mut self,
         data: &[u8],
         timestamp_90khz: u64,

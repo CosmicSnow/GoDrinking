@@ -2197,6 +2197,7 @@ mod tests {
             bitrate_bps: None,
             min_bitrate_bps: None,
             codec: super::super::types::VideoCodec::H264,
+            encoder: super::super::types::VideoEncoder::Auto,
             password: String::new(),
             nickname: "Host".into(),
             admission: false,

@@ -30,6 +30,8 @@ mod windows_capture;
 #[cfg(target_os = "windows")]
 mod windows_encoder;
 #[cfg(target_os = "windows")]
+mod mf_encoder;
+#[cfg(target_os = "windows")]
 pub(crate) mod firewall;
 #[cfg(not(target_os = "windows"))]
 pub(crate) mod firewall;
@@ -44,5 +46,5 @@ pub use room::{discover_direct, discover_room, submit_answer as submit_room_answ
 pub use types::{
     CreateMediaSessionRequest, DirectAddress, JoinMode, MediaSessionSnapshot, NativeCaptureSource,
     NativeRunningApp, PreviewFrameEvent, StunarState, UpdateCredentialsRequest,
-    UpdateMediaSessionRequest, MediaSessionStats, VideoCodec, ViewerLinkStats,
+    UpdateMediaSessionRequest, MediaSessionStats, VideoCodec, VideoEncoder, ViewerLinkStats,
 };

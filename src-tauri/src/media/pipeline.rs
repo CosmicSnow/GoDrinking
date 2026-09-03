@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use super::access_unit::{AccessUnitQueue, AccessUnitReceiver};
 use super::types::PreviewFrameEvent;
-use super::types::{FrameRate, TransmissionQuality, VideoCodec, VideoResolution};
+use super::types::{FrameRate, TransmissionQuality, VideoCodec, VideoEncoder, VideoResolution};
 
 #[cfg(target_os = "macos")]
 use objc2::rc::Retained;
@@ -413,6 +413,7 @@ impl NativePipeline {
         bitrate_bps: Option<u32>,
         min_bitrate_bps: Option<u32>,
         video_codec: VideoCodec,
+        encoder_backend: VideoEncoder,
     ) -> Self {
         let generation = preview.generation.load(Ordering::Acquire);
         let (capture_tx, capture_rx) = sync_channel::<NativeFrame>(CAPTURE_QUEUE_CAPACITY);
@@ -461,6 +462,7 @@ impl NativePipeline {
                     quality,
                     bitrate_bps,
                     video_codec,
+                    encoder_backend,
                     generation,
                     worker_state,
                     worker_shutdown,
@@ -645,6 +647,7 @@ fn encoder_worker_loop(
     quality: TransmissionQuality,
     bitrate_bps: Option<u32>,
     video_codec: VideoCodec,
+    _encoder_backend: VideoEncoder,
     generation: u64,
     state: Arc<PipelineState>,
     shutdown: Arc<AtomicBool>,
@@ -758,12 +761,104 @@ fn encoder_worker_loop(
     quality: TransmissionQuality,
     bitrate_bps: Option<u32>,
     _video_codec: VideoCodec,
+    encoder_backend: VideoEncoder,
     generation: u64,
     state: Arc<PipelineState>,
     shutdown: Arc<AtomicBool>,
     control: Arc<EncoderControl>,
 ) {
-    let mut encoder: Option<super::windows_encoder::OpenH264Encoder> = None;
+    // Auto tries the Media Foundation hardware encoder first (NVENC silicon
+    // on NVIDIA) and falls back to OpenH264 software with a log line, so a
+    // missing driver can never kill the session.
+    enum WindowsVideoEncoder {
+        Hardware(super::mf_encoder::MfH264Encoder),
+        Software(super::windows_encoder::OpenH264Encoder),
+    }
+
+    impl WindowsVideoEncoder {
+        fn encode(&mut self, frame: &NativeFrame) -> Result<(), String> {
+            match self {
+                Self::Hardware(encoder) => encoder.encode(frame),
+                Self::Software(encoder) => encoder.encode(frame),
+            }
+        }
+
+        fn force_keyframe(&mut self) {
+            match self {
+                Self::Hardware(encoder) => encoder.force_keyframe(),
+                Self::Software(encoder) => encoder.force_keyframe(),
+            }
+        }
+
+        fn set_bitrate(&mut self, bitrate: u32) -> Result<(), String> {
+            match self {
+                Self::Hardware(encoder) => encoder.set_bitrate(bitrate),
+                Self::Software(encoder) => encoder.set_bitrate(bitrate),
+            }
+        }
+    }
+
+    fn create_windows_encoder(
+        backend: VideoEncoder,
+        width: u32,
+        height: u32,
+        bitrate: u32,
+        fps: u32,
+        output: AccessUnitQueue,
+        state: &Arc<PipelineState>,
+        control: &Arc<EncoderControl>,
+    ) -> Option<WindowsVideoEncoder> {
+        let software = || {
+            super::windows_encoder::OpenH264Encoder::new(
+                width,
+                height,
+                bitrate,
+                fps,
+                output.clone(),
+                Arc::clone(state),
+                Arc::clone(control),
+            )
+        };
+        match backend {
+            VideoEncoder::Software => match software() {
+                Ok(encoder) => Some(WindowsVideoEncoder::Software(encoder)),
+                Err(error) => {
+                    state.fail(format!("OpenH264 initialization failed: {error}"));
+                    None
+                }
+            },
+            VideoEncoder::Hardware | VideoEncoder::Auto => {
+                match super::mf_encoder::MfH264Encoder::new(
+                    width,
+                    height,
+                    bitrate,
+                    fps,
+                    output.clone(),
+                    Arc::clone(state),
+                    Arc::clone(control),
+                ) {
+                    Ok(encoder) => {
+                        eprintln!("[goDrinking] hardware video encoder engaged");
+                        Some(WindowsVideoEncoder::Hardware(encoder))
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[goDrinking] hardware encoder unavailable ({error}); using OpenH264 software"
+                        );
+                        match software() {
+                            Ok(encoder) => Some(WindowsVideoEncoder::Software(encoder)),
+                            Err(error) => {
+                                state.fail(format!("OpenH264 initialization failed: {error}"));
+                                None
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut encoder: Option<WindowsVideoEncoder> = None;
     let mut pending_output = Some(output);
     // Stashed control command seen while coalescing video frames. A plain
     // try_recv drain would swallow it, so it is replayed at the top of the
@@ -829,21 +924,22 @@ fn encoder_worker_loop(
                     let initial = encoder_bitrate(width, height, quality, bitrate_bps);
                     control.set_target(initial);
                     control.note_applied(initial);
-                    match super::windows_encoder::OpenH264Encoder::new(
+                    match create_windows_encoder(
+                        encoder_backend,
                         width,
                         height,
                         initial,
                         fps,
                         output,
-                        Arc::clone(&state),
-                        Arc::clone(&control),
+                        &state,
+                        &control,
                     ) {
-                        Ok(next) => {
+                        Some(next) => {
                             encoder = Some(next);
                             control.request_keyframe();
                         }
-                        Err(error) => {
-                            state.fail(format!("OpenH264 initialization failed: {error}"));
+                        // create_windows_encoder already failed the state.
+                        None => {
                             return;
                         }
                     }
@@ -880,6 +976,7 @@ fn encoder_worker_loop(
     _quality: TransmissionQuality,
     _bitrate_bps: Option<u32>,
     _video_codec: VideoCodec,
+    _encoder_backend: VideoEncoder,
     _generation: u64,
     _state: Arc<PipelineState>,
     _shutdown: Arc<AtomicBool>,
@@ -890,7 +987,7 @@ fn encoder_worker_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::{FrameRate, TransmissionQuality, VideoCodec, VideoResolution};
+    use super::super::types::{FrameRate, TransmissionQuality, VideoCodec, VideoEncoder, VideoResolution};
     use super::{EncoderCommand, EncoderControl, NativeFrame, NativePipeline, PreviewState};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -951,6 +1048,7 @@ mod tests {
             None,
             None,
             VideoCodec::H264,
+            VideoEncoder::Auto,
         );
         let storage: Arc<[u8]> = Arc::from([1_u8, 2, 3]);
         let frame = NativeFrame {
@@ -986,6 +1084,7 @@ mod tests {
             None,
             None,
             VideoCodec::H264,
+            VideoEncoder::Auto,
         );
         pipeline
             .capture_tx
@@ -1023,6 +1122,7 @@ mod tests {
             None,
             None,
             VideoCodec::H264,
+            VideoEncoder::Auto,
         );
         preview.begin_session();
         pipeline
@@ -1053,6 +1153,7 @@ mod tests {
             None,
             None,
             VideoCodec::H264,
+            VideoEncoder::Auto,
         );
         drop(pipeline);
     }

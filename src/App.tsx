@@ -116,6 +116,8 @@ function App() {
   const [minBitrateMbps, setMinBitrateMbps] = useState<number | null>(null);
   // Codec da sessão, fixo no Start (HEVC e H.264 High exigem macOS).
   const [videoCodec, setVideoCodec] = useState<"h264" | "h264high" | "hevc">("h264");
+  // Backend do encoder no Windows, fixo no Start (Auto = hardware se houver).
+  const [videoEncoder, setVideoEncoder] = useState<"auto" | "software" | "hardware">("auto");
   const hevcAvailable = caps?.platform === "macos";
   const effectiveFloorMbps = Math.min(minBitrateMbps ?? AUTO_FLOOR_MBPS, effectiveMbps);
   const [systemAudio, setSystemAudio] = useState(false);
@@ -393,7 +395,7 @@ function App() {
     if (!active) { liveSettingsApplied.current = false; return; }
     if (sessionAction !== "idle") return;
     if (!liveSettingsApplied.current) { liveSettingsApplied.current = true; return; }
-    void invokeMedia<Snapshot | null>("update_media_session", { request: { quality, bitrate_bps: bitrateMbps !== null ? Math.round(bitrateMbps * 1_000_000) : null, min_bitrate_bps: minBitrateMbps !== null ? Math.round(minBitrateMbps * 1_000_000) : null, codec: videoCodec, system_audio: systemAudio, excluded_apps: excludedApps } })
+    void invokeMedia<Snapshot | null>("update_media_session", { request: { quality, bitrate_bps: bitrateMbps !== null ? Math.round(bitrateMbps * 1_000_000) : null, min_bitrate_bps: minBitrateMbps !== null ? Math.round(minBitrateMbps * 1_000_000) : null, codec: videoCodec, encoder: videoEncoder, system_audio: systemAudio, excluded_apps: excludedApps } })
       .then((next) => { if (next) setSession(next); })
       .catch((error) => setNotice(`Could not apply the change: ${diagnosticError(error, "unknown error")}`));
   }, [quality, bitrateMbps, minBitrateMbps, systemAudio, excludedApps, active, sessionAction]);
@@ -436,6 +438,7 @@ function App() {
           bitrate_bps: bitrateMbps !== null ? Math.round(bitrateMbps * 1_000_000) : null,
           min_bitrate_bps: minBitrateMbps !== null ? Math.round(minBitrateMbps * 1_000_000) : null,
           codec: videoCodec,
+          encoder: videoEncoder,
           resolution: preset.resolution,
           frame_rate: preset.frame_rate,
           system_audio: systemAudio,
@@ -879,6 +882,17 @@ function App() {
                     <button className={videoCodec === "hevc" ? "selected" : ""} onClick={() => setVideoCodec("hevc")} disabled={active || !hevcAvailable} title={hevcAvailable ? "HEVC/H.265 — viewers precisam de browser com H.265" : "HEVC exige macOS"}>HEVC</button>
                   </div>
                   {videoCodec === "hevc" && <p className="quality-hint">HEVC economiza ~40% de bitrate, mas cada viewer precisa de decode H.265 no browser — se o peer travar em connecting, volte para H.264 High.</p>}
+                  {caps?.platform === "windows" && <>
+                    <div className="bitrate-label-row">
+                      <span>Encoder</span>
+                      <code>{videoEncoder === "hardware" ? "Hardware (NVENC/AMF/QSV)" : videoEncoder === "software" ? "Software (OpenH264)" : "Auto (hardware se houver)"}</code>
+                    </div>
+                    <div className="segmented">
+                      <button className={videoEncoder === "auto" ? "selected" : ""} onClick={() => setVideoEncoder("auto")} disabled={active} title="Tenta hardware, cai para software sozinho">Auto</button>
+                      <button className={videoEncoder === "hardware" ? "selected" : ""} onClick={() => setVideoEncoder("hardware")} disabled={active} title="Só hardware; cai para software com aviso se falhar">Hardware</button>
+                      <button className={videoEncoder === "software" ? "selected" : ""} onClick={() => setVideoEncoder("software")} disabled={active} title="Sempre OpenH264 em CPU">Software</button>
+                    </div>
+                  </>}
                   <div className="bitrate-block">
                     <div className="bitrate-label-row">
                       <span>Bitrate limite</span>

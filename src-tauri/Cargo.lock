@@ -1867,6 +1867,7 @@ dependencies = [
  "tokio-tungstenite",
  "wasapi",
  "webrtc",
+ "windows 0.62.2",
  "windows-capture",
 ]
 

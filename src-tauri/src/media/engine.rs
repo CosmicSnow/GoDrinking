@@ -11,7 +11,7 @@ use super::types::{
     CreateMediaSessionRequest, FrameRate, JoinMode, MediaLifecycleState, MediaSessionSnapshot,
     NativeCaptureSource, NativeRunningApp, PeerTransportState, PreviewFrameEvent, RosterEntry,
     TransmissionQuality, UpdateCredentialsRequest, UpdateMediaSessionRequest, VideoCodec,
-    VideoResolution, MediaSessionStats, ViewerLinkStats,
+    VideoEncoder, VideoResolution, MediaSessionStats, ViewerLinkStats,
 };
 use super::MediaCapabilities;
 use std::collections::HashMap;
@@ -790,6 +790,7 @@ fn create_in_state(
         request.bitrate_bps,
         request.min_bitrate_bps,
         request.codec,
+        request.encoder,
     );
     // The engine owns the Opus channel for the session lifetime. The peer
     // keeps the receiver even if the first tap fails, so a later update can
@@ -1380,7 +1381,8 @@ mod tests {
     use super::super::types::MediaLifecycleState;
     use super::super::types::{
         CaptureSource, FrameRate, JoinMode, PreviewFrameEvent, TransmissionQuality,
-        UpdateCredentialsRequest, UpdateMediaSessionRequest, VideoCodec, VideoResolution,
+        UpdateCredentialsRequest, UpdateMediaSessionRequest, VideoCodec, VideoEncoder,
+        VideoResolution,
     };
 use super::{
     create_in_state, refresh_native_state, snapshot_from_state, stop_in_state,
@@ -1428,6 +1430,7 @@ use super::{
             bitrate_bps: None,
             min_bitrate_bps: None,
             codec: super::super::types::VideoCodec::H264,
+            encoder: super::super::types::VideoEncoder::Auto,
             password: String::new(),
             nickname: "Host".into(),
             admission: false,
@@ -1567,6 +1570,7 @@ use super::{
                 bitrate_bps: None,
                 min_bitrate_bps: None,
                 codec: VideoCodec::H264,
+                encoder: VideoEncoder::Auto,
                 system_audio: false,
                 excluded_apps: vec!["Discord".into(), "com.hnc.Discord".into()],
             },
@@ -1609,6 +1613,7 @@ use super::{
                 bitrate_bps: None,
                 min_bitrate_bps: None,
                 codec: VideoCodec::H264,
+                encoder: VideoEncoder::Auto,
                 system_audio: true,
                 excluded_apps: Vec::new(),
             },
@@ -1632,6 +1637,7 @@ use super::{
                     bitrate_bps: None,
                     min_bitrate_bps: None,
                     codec: VideoCodec::H264,
+                encoder: VideoEncoder::Auto,
                     system_audio: false,
                     excluded_apps: Vec::new(),
                 },
