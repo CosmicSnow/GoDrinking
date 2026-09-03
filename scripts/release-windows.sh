@@ -76,7 +76,18 @@ case "$os" in
     fi
     rustup target add "$target" >/dev/null
     echo "Cross-compiling goDrinking ${tag} for ${target} with cargo-xwin + NSIS…"
-    eval "$(cargo xwin env --target "$target")"
+    # cargo-xwin recreates its clang-cl/lld-link shims on every env call. When
+    # a stale shim cannot be replaced (e.g. leftover com.apple.provenance),
+    # the call fails; clear the shims so xwin rebuilds them and retry once.
+    xwin_env_output=$(cargo xwin env --target "$target" 2>/dev/null) || {
+      echo "cargo xwin env failed; clearing stale shims and retrying…"
+      rm -f "${HOME}/Library/Caches/cargo-xwin/clang-cl" "${HOME}/Library/Caches/cargo-xwin/lld-link"
+      xwin_env_output=$(cargo xwin env --target "$target") || {
+        echo "cargo xwin env still failing after shim cleanup"
+        exit 1
+      }
+    }
+    eval "$xwin_env_output"
     unset CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER
     export PATH="/opt/homebrew/opt/llvm/bin:${PATH}"
     # Opus's bundled CMakeLists still declares cmake_minimum_required < 3.5.
