@@ -111,7 +111,7 @@ pub(crate) struct PreviewDiagnostics {
 }
 
 impl PreviewDiagnostics {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             callback_count: AtomicU64::new(0),
             frame_count: AtomicU64::new(0),

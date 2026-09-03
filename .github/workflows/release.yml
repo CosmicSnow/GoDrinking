@@ -30,8 +30,14 @@ jobs:
         with:
           node-version: "22"
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
       - run: npm ci
       - run: npm exec tauri build -- --bundles app,dmg --ci
+        env:
+          # Opus's bundled CMakeLists still declares cmake_minimum_required < 3.5.
+          CMAKE_POLICY_VERSION_MINIMUM: 3.5
       - name: Zip .app
         run: |
           version=$(node -p "require('./package.json').version")
@@ -58,8 +64,14 @@ jobs:
         with:
           node-version: "22"
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
       - run: npm ci
       - run: npm exec tauri build -- --bundles nsis,msi --ci
+        env:
+          # Opus's bundled CMakeLists still declares cmake_minimum_required < 3.5.
+          CMAKE_POLICY_VERSION_MINIMUM: 3.5
       - name: Upload to GitHub Release
         shell: bash
         env:

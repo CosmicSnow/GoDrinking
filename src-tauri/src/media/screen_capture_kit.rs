@@ -2185,6 +2185,7 @@ mod tests {
             CaptureSource, CreateMediaSessionRequest, FrameRate, VideoResolution,
         };
         use std::sync::mpsc::sync_channel;
+        use std::sync::Arc;
 
         let request = CreateMediaSessionRequest {
             source: CaptureSource::Screen,
@@ -2207,12 +2208,13 @@ mod tests {
         let mut adapter = ScreenCaptureKitAdapter::new();
         let (capture_tx, _capture_rx) = sync_channel::<NativeFrame>(1);
         let (encoder_tx, _encoder_rx) = sync_channel::<EncoderCommand>(1);
+        let diagnostics = super::super::pipeline::PreviewDiagnostics::new();
         assert!(adapter
-            .start_capture(&request, capture_tx.clone(), encoder_tx.clone(), 1)
+            .start_capture(&request, capture_tx.clone(), encoder_tx.clone(), Arc::clone(&diagnostics), 1)
             .is_err());
         assert_eq!(adapter.lifecycle(), CaptureLifecycle::Idle);
         assert!(adapter
-            .start_capture(&request, capture_tx, encoder_tx, 1)
+            .start_capture(&request, capture_tx, encoder_tx, diagnostics, 1)
             .is_err());
         assert_eq!(adapter.lifecycle(), CaptureLifecycle::Idle);
     }
