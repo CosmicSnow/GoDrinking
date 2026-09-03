@@ -12,7 +12,7 @@
 use super::pipeline::{EncoderCommand, NativeFrame, PreviewDiagnostics};
 use super::types::{
     CaptureSource, CreateMediaSessionRequest, FrameRate, NativeCaptureSource, NativeRunningApp,
-    NativeSourceKind,
+    NativeSourceKind, VideoResolution,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -41,6 +41,8 @@ struct CaptureFlags {
     encoder_tx: SyncSender<EncoderCommand>,
     diagnostics: Arc<PreviewDiagnostics>,
     generation: u64,
+    target_width: u32,
+    target_height: u32,
 }
 
 /// Error type required by `GraphicsCaptureApiHandler`. Frame-handling errors
@@ -57,6 +59,96 @@ impl std::fmt::Display for CaptureError {
 
 impl std::error::Error for CaptureError {}
 
+// Fixed preview thumbnail size and RGB8 layout, mirroring the macOS path
+// (160x90x3 = ~43KB per poll instead of a full-res BGRA frame).
+const PREVIEW_WIDTH: u32 = 160;
+const PREVIEW_HEIGHT: u32 = 90;
+
+// Session encode ceiling per axis, from the request resolution. Source
+// frames are fit inside preserving aspect ratio (a 5120x1440 ultrawide
+// becomes 1920x540 at High), always even for the encoder.
+fn encode_ceiling(resolution: VideoResolution) -> (u32, u32) {
+    match resolution {
+        VideoResolution::P1080 => (1920, 1080),
+        VideoResolution::P720 => (1280, 720),
+    }
+}
+
+fn fit_within(src_width: u32, src_height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
+    if src_width < 2 || src_height < 2 {
+        return (2, 2);
+    }
+    if src_width <= max_width && src_height <= max_height {
+        return ((src_width & !1).max(2), (src_height & !1).max(2));
+    }
+    let scale = (max_width as f64 / src_width as f64).min(max_height as f64 / src_height as f64);
+    let width = ((src_width as f64 * scale) as u32).max(2) & !1;
+    let height = ((src_height as f64 * scale) as u32).max(2) & !1;
+    (width.max(2), height.max(2))
+}
+
+// Nearest-neighbor BGRA downscale. Sizes that already match are still
+// resampled (same cost profile, no extra branch in the hot path).
+fn downscale_bgra(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+) -> Option<Vec<u8>> {
+    let src_w = src_width as usize;
+    let src_h = src_height as usize;
+    let dst_w = dst_width as usize;
+    let dst_h = dst_height as usize;
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return None;
+    }
+    let stride = src_w.checked_mul(4)?;
+    if src.len() < stride.checked_mul(src_h)? {
+        return None;
+    }
+    let mut dst = vec![0_u8; dst_w.checked_mul(dst_h)?.checked_mul(4)?];
+    for y in 0..dst_h {
+        let src_y = y * src_h / dst_h;
+        for x in 0..dst_w {
+            let src_x = x * src_w / dst_w;
+            let src_offset = src_y * stride + src_x * 4;
+            let dst_offset = (y * dst_w + x) * 4;
+            dst[dst_offset..dst_offset + 4].copy_from_slice(&src[src_offset..src_offset + 4]);
+        }
+    }
+    Some(dst)
+}
+
+// Small RGB thumbnail derived from a BGRA source frame for the preview
+// queue. Same nearest-neighbor sampling the macOS path uses.
+fn thumbnail_rgb(src: &[u8], src_width: u32, src_height: u32) -> Option<Vec<u8>> {
+    let src_w = src_width as usize;
+    let src_h = src_height as usize;
+    let dst_w = PREVIEW_WIDTH as usize;
+    let dst_h = PREVIEW_HEIGHT as usize;
+    if src_w == 0 || src_h == 0 {
+        return None;
+    }
+    let stride = src_w.checked_mul(4)?;
+    if src.len() < stride.checked_mul(src_h)? {
+        return None;
+    }
+    let mut dst = vec![0_u8; dst_w * dst_h * 3];
+    for y in 0..dst_h {
+        let src_y = y * src_h / dst_h;
+        for x in 0..dst_w {
+            let src_x = x * src_w / dst_w;
+            let src_offset = src_y * stride + src_x * 4;
+            let dst_offset = (y * dst_w + x) * 3;
+            dst[dst_offset] = src[src_offset + 2];
+            dst[dst_offset + 1] = src[src_offset + 1];
+            dst[dst_offset + 2] = src[src_offset];
+        }
+    }
+    Some(dst)
+}
+
 /// The WGC frame handler. Lives on the capture thread inside a
 /// `CaptureControl`; forwards every BGRA8 frame to the preview and encoder
 /// queues sharing one `Arc<[u8]>` allocation.
@@ -65,6 +157,8 @@ struct CaptureHandler {
     encoder_tx: SyncSender<EncoderCommand>,
     diagnostics: Arc<PreviewDiagnostics>,
     generation: u64,
+    target_width: u32,
+    target_height: u32,
     sequence: AtomicU64,
     scratch: Vec<u8>,
 }
@@ -79,6 +173,8 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             encoder_tx: context.flags.encoder_tx,
             diagnostics: context.flags.diagnostics,
             generation: context.flags.generation,
+            target_width: context.flags.target_width,
+            target_height: context.flags.target_height,
             sequence: AtomicU64::new(0),
             scratch: Vec::new(),
         })
@@ -103,36 +199,55 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             .and_then(|time| u64::try_from(time.Duration / 10).ok())
             .unwrap_or_else(monotonic_micros);
 
+        // Downscale before the Arc: a 5120x1440 ultrawide frame is 29MB and
+        // must never reach the queues (1.7GB/s of garbage at 60fps froze the
+        // whole app). The borrowed source pixels are resampled into a
+        // session-size BGRA frame plus a small RGB preview thumbnail.
+        let (enc_width, enc_height) = fit_within(width, height, self.target_width, self.target_height);
         let mut scratch = std::mem::take(&mut self.scratch);
-        let bytes = match frame.buffer() {
-            Ok(buffer) => buffer.as_nopadding_buffer(&mut scratch).to_vec(),
+        let downsized = match frame.buffer() {
+            Ok(buffer) => {
+                let source = buffer.as_nopadding_buffer(&mut scratch);
+                let encoded = downscale_bgra(source, width, height, enc_width, enc_height);
+                let thumb = thumbnail_rgb(source, width, height);
+                match (encoded, thumb) {
+                    (Some(encoded), Some(thumb)) => Some((encoded, thumb)),
+                    _ => {
+                        self.diagnostics.record_error(
+                            "Windows capture downscale failed: undersized frame buffer.",
+                        );
+                        None
+                    }
+                }
+            }
             Err(error) => {
                 self.diagnostics
                     .record_error(format!("Windows capture buffer read failed: {error}"));
-                self.scratch = scratch;
-                return Ok(());
+                None
             }
         };
         self.scratch = scratch;
-        let storage: Arc<[u8]> = bytes.into();
+        let Some((encoded, thumb)) = downsized else {
+            return Ok(());
+        };
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
 
         // Encoder first: the encoder queue is the latency-critical path.
         let _ = self.encoder_tx.try_send(EncoderCommand::Video(NativeFrame {
-            storage: Arc::clone(&storage),
+            storage: encoded.into(),
             timestamp_micros,
             sequence,
-            width,
-            height,
+            width: enc_width,
+            height: enc_height,
             generation: self.generation,
         }));
 
         let result = self.capture_tx.try_send(NativeFrame {
-            storage,
+            storage: thumb.into(),
             timestamp_micros,
             sequence,
-            width,
-            height,
+            width: PREVIEW_WIDTH,
+            height: PREVIEW_HEIGHT,
             generation: self.generation,
         });
         match result {
@@ -187,11 +302,14 @@ impl WindowsCaptureAdapter {
             FrameRate::Fps60 => 60,
             FrameRate::Fps30 => 30,
         };
+        let (target_width, target_height) = encode_ceiling(request.resolution);
         let flags = CaptureFlags {
             capture_tx,
             encoder_tx,
             diagnostics,
             generation,
+            target_width,
+            target_height,
         };
         let control = match resolve_target(request)? {
             CaptureTarget::Monitor(monitor) => {

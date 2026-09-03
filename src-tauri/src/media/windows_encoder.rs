@@ -22,6 +22,41 @@ use std::sync::Arc;
 
 const ANNEX_B_START_CODE: &[u8] = &[0, 0, 0, 1];
 
+// Defensive ceiling: capture already downscales to the session size, but a
+// full-res leak must never reach OpenH264 (a 7MP software encode per frame
+// pegs the CPU and the session falls behind forever).
+const MAX_ENCODE_WIDTH: u32 = 1920;
+const MAX_ENCODE_HEIGHT: u32 = 1080;
+
+fn fit_encode_size(width: u32, height: u32) -> (u32, u32) {
+    if width < 2 || height < 2 {
+        return (2, 2);
+    }
+    if width <= MAX_ENCODE_WIDTH && height <= MAX_ENCODE_HEIGHT {
+        return (width, height);
+    }
+    let scale =
+        (MAX_ENCODE_WIDTH as f64 / width as f64).min(MAX_ENCODE_HEIGHT as f64 / height as f64);
+    let fitted_w = ((width as f64 * scale) as u32).max(2) & !1;
+    let fitted_h = ((height as f64 * scale) as u32).max(2) & !1;
+    (fitted_w.max(2), fitted_h.max(2))
+}
+
+fn downscale_bgra_frame(src: &[u8], src_width: u32, src_height: u32, dst_width: u32, dst_height: u32) -> Vec<u8> {
+    let mut dst = vec![0_u8; (dst_width as usize) * (dst_height as usize) * 4];
+    let stride = (src_width as usize) * 4;
+    for y in 0..(dst_height as usize) {
+        let src_y = y * (src_height as usize) / (dst_height as usize);
+        for x in 0..(dst_width as usize) {
+            let src_x = x * (src_width as usize) / (dst_width as usize);
+            let src_offset = src_y * stride + src_x * 4;
+            let dst_offset = (y * (dst_width as usize) + x) * 4;
+            dst[dst_offset..dst_offset + 4].copy_from_slice(&src[src_offset..src_offset + 4]);
+        }
+    }
+    dst
+}
+
 pub(crate) struct OpenH264Encoder {
     encoder: Encoder,
     converter: AnnexBConverter,
@@ -59,24 +94,42 @@ impl OpenH264Encoder {
     }
 
     pub(crate) fn encode(&mut self, frame: &NativeFrame) -> Result<(), String> {
-        let width = frame.width;
-        let height = frame.height;
-        if width < 2 || height < 2 {
+        if frame.width < 2 || frame.height < 2 {
             return Ok(());
         }
+        if frame.storage.len() < (frame.width as usize) * (frame.height as usize) * 4 {
+            return Err("OpenH264 frame storage is undersized".into());
+        }
+        // Apply the defensive ceiling first so an unexpected full-res frame
+        // degrades to a downscale instead of a multi-second software encode.
+        let (fit_width, fit_height) = fit_encode_size(frame.width, frame.height);
+        let fitted: Cow<[u8]> = if (fit_width, fit_height) == (frame.width, frame.height) {
+            Cow::Borrowed(frame.storage.as_ref())
+        } else {
+            Cow::Owned(downscale_bgra_frame(
+                frame.storage.as_ref(),
+                frame.width,
+                frame.height,
+                fit_width,
+                fit_height,
+            ))
+        };
+        let width = fit_width;
+        let height = fit_height;
         // OpenH264 requires even dimensions. WGC frames are normally even; when
         // they are not, crop the last row/column into a temporary buffer.
         let (bgra, enc_width, enc_height): (Cow<[u8]>, u32, u32) =
             if width % 2 == 0 && height % 2 == 0 {
-                (Cow::Borrowed(frame.storage.as_ref()), width, height)
+                (fitted, width, height)
             } else {
                 let even_width = width & !1;
                 let even_height = height & !1;
                 let mut cropped = Vec::with_capacity((even_width * even_height * 4) as usize);
+                let fitted_bytes: &[u8] = fitted.as_ref();
                 for y in 0..even_height {
                     let row_start = (y * width * 4) as usize;
                     cropped.extend_from_slice(
-                        &frame.storage[row_start..row_start + (even_width * 4) as usize],
+                        &fitted_bytes[row_start..row_start + (even_width * 4) as usize],
                     );
                 }
                 (Cow::Owned(cropped), even_width, even_height)

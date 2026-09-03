@@ -765,6 +765,10 @@ fn encoder_worker_loop(
 ) {
     let mut encoder: Option<super::windows_encoder::OpenH264Encoder> = None;
     let mut pending_output = Some(output);
+    // Stashed control command seen while coalescing video frames. A plain
+    // try_recv drain would swallow it, so it is replayed at the top of the
+    // next iteration instead.
+    let mut pending: Option<EncoderCommand> = None;
     loop {
         if control.stop_requested() {
             return;
@@ -782,18 +786,37 @@ fn encoder_worker_loop(
         if state.is_failed() {
             break;
         }
-        let command = match receiver.recv_timeout(Duration::from_millis(10)) {
-            Ok(command) => command,
-            Err(RecvTimeoutError::Timeout) => {
-                if shutdown.load(Ordering::Acquire) {
-                    break;
+        let command = match pending.take() {
+            Some(command) => command,
+            None => match receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok(command) => command,
+                Err(RecvTimeoutError::Timeout) => {
+                    if shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
-            }
-            Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
         };
         match command {
             EncoderCommand::Video(frame) => {
+                // Coalesce: when the software encoder falls behind, encode
+                // only the newest frame instead of burning CPU on stale ones.
+                let mut frame = frame;
+                while let Ok(next) = receiver.try_recv() {
+                    match next {
+                        EncoderCommand::Video(newer) => {
+                            if newer.generation == generation {
+                                frame = newer;
+                            }
+                        }
+                        other => {
+                            pending = Some(other);
+                            break;
+                        }
+                    }
+                }
                 if frame.generation != generation {
                     continue;
                 }
