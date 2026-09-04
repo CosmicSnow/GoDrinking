@@ -10,7 +10,18 @@
 import http from "node:http";
 import { randomBytes, scrypt, timingSafeEqual } from "node:crypto";
 import { WebSocketServer } from "ws";
-import { nextMaster } from "./succession.mjs";
+
+/** Master succession for Sala. Oldest remaining joinedAt, then id. */
+function nextMaster(members, leavingId) {
+  const rest = members
+    .filter((member) => member.id !== leavingId)
+    .slice()
+    .sort((left, right) => {
+      if (left.joinedAt !== right.joinedAt) return left.joinedAt - right.joinedAt;
+      return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+    });
+  return rest[0] ? rest[0].id : null;
+}
 
 const PORT = Number(process.env.PORT || 8787);
 const BIND = process.env.BIND || "127.0.0.1";
