@@ -1,6 +1,6 @@
 # goDrinking site
 
-Site de apresentação do goDrinking — screen share P2P entre Macs.
+Site de apresentação do goDrinking — screen share P2P para Windows e macOS.
 
 ## Requisitos
 
@@ -38,4 +38,4 @@ npm run build
 
 - Projeto isolado na pasta `site/`, sem backend.
 - Design editorial, sem degradês, sem glassmorphism, sem blobs.
-- Substitua os links de download/GitHub em `app/app.vue` pelos URLs reais do repositório.
+- Download puxa `https://api.github.com/repos/CosmicSnow/GoDrinking/releases/latest`. Com o repo privado a API falha e o botão cai na página de releases.

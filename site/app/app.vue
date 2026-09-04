@@ -8,63 +8,57 @@
           <img src="/logo.png" alt="" width="32" height="32" />
           goDrinking
         </a>
-        <nav class="nav" aria-label="Navegação principal">
-          <a href="#o-que-e">O que é</a>
-          <a href="#como-funciona">Como funciona</a>
-          <a href="#modos">Modos</a>
-          <a href="#manifesto">Manifesto</a>
-          <a href="#faq">FAQ</a>
-          <a href="#download" class="btn btn-primary">Baixar</a>
-        </nav>
+        <div class="header-end">
+          <nav class="nav" aria-label="Navegação principal">
+            <a href="#o-que-e">O que é</a>
+            <a href="#como-funciona">Como funciona</a>
+            <a href="#modos">Modos</a>
+            <a href="#faq">FAQ</a>
+            <a href="#download" class="btn btn-primary">Baixar</a>
+          </nav>
+          <a
+            class="github-mark"
+            :href="githubUrl"
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="Código no GitHub"
+            title="GitHub"
+          >
+            <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+              <path fill="currentColor" d="M12 .3a12 12 0 0 0-3.8 23.4c.6.1.8-.3.8-.6v-2.1c-3.3.7-4-1.6-4-1.6-.5-1.4-1.3-1.8-1.3-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.7-.3-5.5-1.3-5.5-6 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.2 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0c2.3-1.5 3.3-1.2 3.3-1.2.6 1.7.2 2.9.1 3.2.8.8 1.2 1.9 1.2 3.2 0 4.7-2.8 5.7-5.5 6 .4.4.8 1.1.8 2.2v3.2c0 .3.2.7.8.6A12 12 0 0 0 12 .3z"/>
+            </svg>
+          </a>
+        </div>
       </div>
     </header>
 
     <main id="conteudo">
-      <!-- Ticker -->
       <div class="ticker" aria-hidden="true">
         <div class="ticker-track">
-          <span class="ticker-item">Não é um app de bar</span>
-          <span class="ticker-item">Não é Golang</span>
-          <span class="ticker-item">Ninguém aqui está "going drinking"</span>
-          <span class="ticker-item">Discord de pobre</span>
-          <span class="ticker-item">Sem datacenter na Virginia</span>
-          <span class="ticker-item">Rage against the machine</span>
-          <span class="ticker-item">A luta continua</span>
-          <span class="ticker-item">Sous les pavés, la plage</span>
-          <span class="ticker-item">Não é um app de bar</span>
-          <span class="ticker-item">Não é Golang</span>
-          <span class="ticker-item">Ninguém aqui está "going drinking"</span>
-          <span class="ticker-item">Discord de pobre</span>
-          <span class="ticker-item">Sem datacenter na Virginia</span>
-          <span class="ticker-item">Rage against the machine</span>
-          <span class="ticker-item">A luta continua</span>
-          <span class="ticker-item">Sous les pavés, la plage</span>
+          <span class="ticker-item" v-for="(item, i) in ticker" :key="i">{{ item }}</span>
         </div>
       </div>
 
-      <!-- Hero -->
       <section class="hero">
         <div class="wrap">
           <div class="hero-grid">
             <div>
               <div class="hero-kicker">
                 <span class="dot" aria-hidden="true"></span>
-                Screen share P2P para macOS
+                Screen share P2P · Windows e macOS
               </div>
               <h1 class="hero-title font-display">
                 Divide a tela.<br />
                 Não os dados<span class="cursor" aria-hidden="true"></span>
               </h1>
               <p class="hero-sub">
-                Dois Macs, uma rede, nenhum servidor no meio. O Host captura. O Viewer assiste. A mídia viaja direto — sem nuvem, sem STUN público, sem a sua tela passando por um datacenter em Virginia.
+                Host captura. Viewer assiste. O vídeo vai direto de um PC para o outro. Sem nuvem, sem login, sem a tela passando por um datacenter.
               </p>
               <div class="hero-actions">
-                <a href="#download" class="btn btn-primary btn-large">
-                  Baixar para macOS
+                <a :href="primaryHref" class="btn btn-primary btn-large" :download="primaryDownload" rel="noopener noreferrer">
+                  {{ primaryLabel }}
                 </a>
-                <a href="#como-funciona" class="btn btn-large">
-                  Ver como funciona
-                </a>
+                <a href="#download" class="btn btn-large">Windows e macOS</a>
               </div>
               <div class="hero-meta">
                 <span>
@@ -76,13 +70,13 @@
                   Sem login, sem conta
                 </span>
                 <span>
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
-                  macOS only (por enquanto)
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+                  Windows 10/11 · macOS 14.2+
                 </span>
               </div>
             </div>
 
-            <div class="mock-window" role="img" aria-label="Demonstração da janela do Host com código de 6 caracteres">
+            <div class="mock-window" role="img" aria-label="Janela do Host com código de sessão">
               <div class="mock-titlebar">
                 <span class="mock-dot"></span>
                 <span class="mock-dot"></span>
@@ -92,7 +86,7 @@
               <div class="mock-body">
                 <div class="mock-row">
                   <div>
-                    <div class="mock-label">Room code</div>
+                    <div class="mock-label">Session code</div>
                     <div class="mock-code" aria-live="polite">{{ demoCode }}</div>
                   </div>
                   <button class="mock-button" @click="copyCode" type="button">
@@ -100,7 +94,7 @@
                   </button>
                 </div>
                 <div class="mock-status">
-                  Session ativa · 1 Viewer no Roster
+                  P2P · Windows e macOS · Stunar só apresenta
                 </div>
                 <pre class="mock-ascii" aria-hidden="true">HOST  ───────┐
              │  WebRTC P2P
@@ -111,264 +105,182 @@ VIEWER ──────┘  (sem nuvem)</pre>
         </div>
       </section>
 
-      <!-- O que é / O que não é -->
       <section id="o-que-e" class="section">
         <div class="wrap">
           <div class="section-label">Guia de campo</div>
-          <h2 class="section-title font-display">
-            Não é Go. Não é bar. Não é Discord.
-          </h2>
+          <h2 class="section-title font-display">Screen share. Ponto a ponto.</h2>
           <div class="def-grid">
             <div class="def-box">
-              <h3>É sim</h3>
+              <h3>É</h3>
               <ul class="def-list">
-                <li>Screen share P2P entre um Host e um ou mais Viewers.</li>
-                <li>Código de 6 caracteres para entrar na Session.</li>
-                <li>Captura nativa do macOS com ScreenCaptureKit + VideoToolbox.</li>
-                <li>Áudio de sistema opcional, com exclude list para apps sensíveis.</li>
-                <li>Quality presets: Low 720p30, Medium 1080p30, High 1080p60.</li>
-                <li>Controle de Admission e Roster para quem entra.</li>
+                <li>Broadcast (1 host, N viewers) ou Sala (todo mundo pode compartilhar).</li>
+                <li>Windows 10/11 e macOS 14.2+.</li>
+                <li>Código de 6 caracteres. LAN, Direct ou Stunar.</li>
+                <li>H.264. Áudio de sistema opcional, com exclusão de apps.</li>
+                <li>Licença PolyForm Noncommercial.</li>
               </ul>
             </div>
             <div class="def-box">
-              <h3>É não</h3>
+              <h3>Não é</h3>
               <ul class="def-list">
-                <li>Não é escrito em Go. O nome é uma piada que fugiu do controle.</li>
-                <li>Não é tracker de shots, receitas de drink ou app de bar.</li>
-                <li>Não é Discord: não há servidor processando a sua tela.</li>
-                <li>Não é "sobe um TURN e resolve". Fora de âmbito.</li>
-                <li>Não funciona no Windows. Ainda é um comentário sarcástico no futuro.</li>
-                <li>Não é Open Source OSI. Licença PolyForm Noncommercial.</li>
+                <li>Não é Go. O nome é uma piada que saiu do controle.</li>
+                <li>Não é app de bar nem tracker de drink.</li>
+                <li>Não há servidor vendo ou reencaminhando o vídeo.</li>
+                <li>Não é Open Source OSI. Uso comercial precisa de autorização.</li>
               </ul>
             </div>
           </div>
         </div>
       </section>
 
-      <!-- Como funciona -->
       <section id="como-funciona" class="section">
         <div class="wrap">
           <div class="section-label">Fluxo</div>
           <h2 class="section-title font-display">Três passos. Nenhuma nuvem.</h2>
           <p class="section-intro">
-            O Host inicia uma Session, escolhe o que compartilhar e recebe um Room code. O Viewer usa o código, o Host aceita se Admission estiver ligada, e a mídia liga direto entre os dois.
+            O Host abre a sessão e ganha um código. O Viewer entra com o código. O vídeo liga direto entre os dois.
           </p>
-
           <div class="steps">
             <article class="step">
               <h3>Host clica em Share</h3>
-              <p>Escolhe tela inteira ou janela, define a qualidade e decide se inclui áudio de sistema. Aí dá Start.</p>
+              <p>Tela ou janela, qualidade, áudio se quiser. Broadcast ou Sala. Start.</p>
             </article>
             <article class="step">
-              <h3>Copia o Room code</h3>
-              <p>Um código de 6 caracteres aparece. Manda no WhatsApp da família. Ou grita pela casa. Funciona dos dois jeitos.</p>
+              <h3>Copia o código</h3>
+              <p>Seis caracteres. Manda no chat. Ou grita pela casa.</p>
             </article>
             <article class="step">
               <h3>Viewer cola e entra</h3>
-              <p>Com o Room code, o Viewer pede acesso. Se Admission estiver ligada, o Host aceita. A conexão P2P liga sozinha.</p>
+              <p>Se Admission estiver ligada, o Host aceita. A conexão P2P sobe sozinha.</p>
             </article>
           </div>
-
-          <div class="diagram" aria-label="Diagrama simplificado da conexão">
-            <div class="diagram-row">
-              <div class="diagram-node">
-                Host
-                <small>ScreenCaptureKit · H.264</small>
-              </div>
-              <div class="diagram-arrow">
-                <span>→</span>
-                Signaling
-                <span>(offer/answer)</span>
-              </div>
-              <div class="diagram-node">
-                Viewer
-                <small>WKWebView · WebRTC</small>
-              </div>
-            </div>
-          </div>
           <p class="mt-md" style="color: var(--gray); font-size: 0.9rem;">
-            A mídia nunca passa pelo Rendezvous. Ele só apresenta os lados. Depois disso, os pacotes viajam direto entre Host e Viewer.
+            O Rendezvous (Stunar) só apresenta os lados. RTP não passa por ele.
           </p>
         </div>
       </section>
 
-      <!-- Join modes -->
       <section id="modos" class="section">
         <div class="wrap">
           <div class="section-label">Join modes</div>
-          <h2 class="section-title font-display">Três jeitos de encontrar o Host.</h2>
-          <p class="section-intro">
-            Dependendo de onde você está, escolhe como o Viewer encontra a Session: LAN, Direct ou Stunar. A terminologia importa — leia com atenção.
-          </p>
-
+          <h2 class="section-title font-display">Três jeitos de se achar.</h2>
           <div class="cards-grid">
             <article class="card">
               <div class="card-icon">LAN</div>
               <h3>LAN</h3>
-              <p>Viewer usa o Room code e descobre o Host por broadcast na rede local. É o modo clássico: funciona na mesma Wi-Fi, sem internet.</p>
-              <small>Quando usar: mesma rede, roteador não é um tijolo.</small>
+              <p>Mesma Wi-Fi. Código de 6 caracteres. Sem internet.</p>
             </article>
             <article class="card">
               <div class="card-icon">DIR</div>
               <h3>Direct</h3>
-              <p>Viewer liga direto ao endereço IP:porta que o Host mostra. Sem broadcast, sem Rendezvous. Só o endereço e, se houver, a Password.</p>
-              <small>Quando usar: você sabe o IP e o firewall deixa passar.</small>
+              <p>IP:porta que o Host mostra. Sem broadcast, sem Rendezvous.</p>
             </article>
             <article class="card">
               <div class="card-icon">STN</div>
               <h3>Stunar</h3>
-              <p>Host e Viewer falam com o Rendezvous por HTTPS usando Room code (e Password, se houver). O Rendezvous só apresenta os lados. Não é STUN.</p>
-              <small>Quando usar: redes diferentes, com um Rendezvous próprio.</small>
+              <p>Redes diferentes. O Rendezvous só troca recado. Não é STUN. Não vê o vídeo.</p>
             </article>
           </div>
         </div>
       </section>
 
-      <!-- Features -->
       <section id="features" class="section">
         <div class="wrap">
-          <div class="section-label">O que tem de verdade</div>
-          <h2 class="section-title font-display">Features que não são marketing.</h2>
-
+          <div class="section-label">O que tem</div>
+          <h2 class="section-title font-display">O que o app faz.</h2>
           <div class="features-list">
             <div class="feature">
-              <span class="feature-tag">Quality presets</span>
+              <span class="feature-tag">Broadcast / Sala</span>
+              <h3>Um host, ou todo mundo</h3>
+              <p>Broadcast: você compartilha, eles assistem. Sala: cada um escolhe quem assistir, grelha, pin, zoom.</p>
+            </div>
+            <div class="feature">
+              <span class="feature-tag">Quality</span>
               <h3>Low / Medium / High</h3>
-              <p>720p30, 1080p30 e 1080p60. Encode H.264 Baseline no VideoToolbox. Você escolhe se quer economizar banda ou mostrar cada pixel.</p>
+              <p>720p30, 1080p30, 1080p60. H.264. Ultrawide mantém o formato.</p>
             </div>
             <div class="feature">
               <span class="feature-tag">System audio</span>
-              <h3>Áudio com exclude list</h3>
-              <p>Compartilha o som do sistema, mas tira Discord, Spotify ou aquele Zoom do seu pai do mix. Se o Core Audio acordar do lado certo da cama.</p>
+              <h3>Áudio com exclusão</h3>
+              <p>Compartilha o som do PC e tira apps da mix, tipo o chat de voz.</p>
             </div>
             <div class="feature">
               <span class="feature-tag">Admission</span>
-              <h3>Roster e controle de entrada</h3>
-              <p>Com Admission ligada, o Host aceita cada Viewer antes da sinalização. O Roster mostra quem pediu e quem já está dentro.</p>
-            </div>
-            <div class="feature">
-              <span class="feature-tag">Ignore list</span>
-              <h3>Resfriamento automático</h3>
-              <p>IPs que falham repetidamente vão para a Ignore list por um tempo. Não é banimento, é uma pausa para pensar na vida.</p>
-            </div>
-            <div class="feature">
-              <span class="feature-tag">Heartbeat</span>
-              <h3>Sala viva enquanto durar</h3>
-              <p>No Stunar, o Host manda um Heartbeat para o Rendezvous. Sem sinal por 5 minutos, a sala some. Como deve ser.</p>
-            </div>
-            <div class="feature">
-              <span class="feature-tag">Token</span>
-              <h3>Password substituída na conversa</h3>
-              <p>Depois que o Viewer é aceito, o Rendezvous entrega um Token opaco. A Password fica para trás. A conversa continua segura.</p>
+              <h3>Quem entra, entra</h3>
+              <p>Admission ligada: o Host aceita cada Viewer. Roster mostra quem está dentro.</p>
             </div>
           </div>
         </div>
       </section>
 
-      <!-- Manifesto -->
-      <section id="manifesto" class="section manifesto">
-        <div class="wrap">
-          <div class="section-label">Manifesto</div>
-          <h2 class="section-title font-display">Por que sem servidor?</h2>
-          <p class="section-intro">
-            Porque "gratuito" na internet geralmente significa "a gente vende seus metadados". O goDrinking não coleta, não processa e não enxerga a sua tela. A mídia sai do seu Mac e entra no de quem você escolheu.
-          </p>
-
-          <div class="manifesto-grid">
-            <div class="manifesto-item">
-              <h3>Privacidade real</h3>
-              <p>A tela não passa por Virginia, por Frankfurt ou por lugar nenhum. Ela passa pelo ar da sua casa.</p>
-            </div>
-            <div class="manifesto-item">
-              <h3>Sem conta</h3>
-              <p>Não precisa de e-mail, telefone, nickname único ou senha eterna. Só um Nickname qualquer para o Roster.</p>
-            </div>
-            <div class="manifesto-item">
-              <h3>Código aberto, uso honesto</h3>
-              <p>Código visível sob PolyForm Noncommercial. Pessoal, hobby e organizações não-comerciais: ok. Empresa querendo lucrar: fala com a gente.</p>
-            </div>
-          </div>
-
-          <div class="mt-lg" style="display:flex;gap:0.75rem;flex-wrap:wrap;align-items:center;">
-            <span class="sticker sticker-lime">Rage against the machine</span>
-            <span class="sticker">A luta continua</span>
-            <span class="sticker sticker-ink">Sous les pavés, la plage</span>
-          </div>
-        </div>
-      </section>
-
-      <!-- Download -->
       <section id="download" class="section">
         <div class="wrap">
           <div class="download-box">
             <div class="section-label">Download</div>
-            <h2 class="section-title font-display">Instala no seu Mac. Não no servidor de ninguém.</h2>
-            <a href="#" class="btn btn-primary btn-large" target="_blank" rel="noopener noreferrer">
-              Baixar para macOS
-            </a>
-            <div class="requirements">
-              <span>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-                macOS 14.2+
-              </span>
-              <span>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
-                Permissão de Screen Recording
-              </span>
-              <span>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
-                Licença PolyForm Noncommercial
-              </span>
+            <h2 class="section-title font-display">Windows e macOS. Instala no seu PC.</h2>
+            <p class="section-intro" style="margin-bottom: 1.25rem;">
+              {{ latestTag ? `Última versão: ${latestTag}` : 'Puxa a última release do GitHub.' }}
+            </p>
+            <div class="hero-actions">
+              <a :href="primaryHref" class="btn btn-primary btn-large" :download="primaryDownload" rel="noopener noreferrer">
+                {{ primaryLabel }}
+              </a>
+              <a v-if="secondaryHref" :href="secondaryHref" class="btn btn-large" :download="secondaryDownload" rel="noopener noreferrer">
+                {{ secondaryLabel }}
+              </a>
             </div>
+            <div class="requirements">
+              <span>Windows 10/11 · GTX 1050+</span>
+              <span>macOS 14.2+ · M1+</span>
+              <span>PolyForm Noncommercial</span>
+            </div>
+            <ul v-if="otherAssets.length" class="download-others">
+              <li v-for="asset in otherAssets" :key="asset.id">
+                <a :href="asset.browser_download_url" :download="asset.name" rel="noopener noreferrer">{{ asset.name }}</a>
+              </li>
+            </ul>
             <p class="download-note">
-              <a href="#" target="_blank" rel="noopener noreferrer">Código no GitHub</a>
-              · build local com <code>npm install && npm run macos:app</code>
+              <a :href="githubUrl" target="_blank" rel="noopener noreferrer">Código no GitHub</a>
+              ·
+              <a :href="releasesUrl" target="_blank" rel="noopener noreferrer">Todas as releases</a>
             </p>
           </div>
         </div>
       </section>
 
-      <!-- FAQ -->
       <section id="faq" class="section">
         <div class="wrap">
           <div class="section-label">FAQ</div>
-          <h2 class="section-title font-display">Perguntas que a gente já ouviu.</h2>
-
+          <h2 class="section-title font-display">Perguntas curtas.</h2>
           <div class="faq-list">
             <details>
-              <summary>Preciso de internet para usar?</summary>
+              <summary>Preciso de internet?</summary>
               <div class="faq-answer">
-                No modo LAN, não. Basta que Host e Viewer estejam na mesma rede local. No modo Stunar, os dois precisam alcançar o Rendezvous por HTTPS — mas a mídia ainda viaja direto entre eles.
+                No LAN, não. No Stunar, os dois precisam alcançar o Rendezvous. O vídeo ainda vai direto entre vocês.
               </div>
             </details>
             <details>
-              <summary>Funciona no Windows? E no Linux?</summary>
+              <summary>Windows e macOS?</summary>
               <div class="faq-answer">
-                Não. A captura usa ScreenCaptureKit e VideoToolbox, que são específicos do macOS. Windows é, no momento, um comentário sarcástico no futuro.
+                Sim. Windows 10/11 e macOS 14.2+ (Apple Silicon). Host e Viewer podem ser de sistemas diferentes.
               </div>
             </details>
             <details>
               <summary>Por que o nome é goDrinking?</summary>
               <div class="faq-answer">
-                Em português a gente fala "vai tomando". Alguém traduziu para o inglês, ficou goDrinking, e agora o GitHub acha que somos um clube da cachaça escrito em Go. Somos nenhuma das duas coisas.
+                Em português a gente fala "vai tomando". Alguém traduziu, ficou goDrinking. Não é Go. Não é bar.
               </div>
             </details>
             <details>
-              <summary>O Rendezvous vê a minha tela?</summary>
+              <summary>O servidor vê a minha tela?</summary>
               <div class="faq-answer">
-                Não. O Rendezvous só guarda salas vivas e troca recados de sinalização. Ele não vê, não guarda e não reencaminha mídia. A mídia é WebRTC P2P entre Host e Viewer.
+                Não. O Rendezvous só troca recado de sinalização. A mídia é WebRTC P2P.
               </div>
             </details>
             <details>
               <summary>Posso usar no trabalho?</summary>
               <div class="faq-answer">
-                Depende. A licença PolyForm Noncommercial permite uso pessoal, hobby e organizações não-comerciais. Uso comercial exige autorização explícita. Não é Open Source OSI.
-              </div>
-            </details>
-            <details>
-              <summary>Quantos Viewers cabem numa Session?</summary>
-              <div class="faq-answer">
-                Dois ou mais, se a LAN aguentar o drama. No limite, é WebRTC mesh host-only: o Host manda para quem está no Roster.
+                PolyForm Noncommercial: pessoal, hobby, org sem fins lucrativos. Uso comercial precisa de autorização.
               </div>
             </details>
           </div>
@@ -376,7 +288,6 @@ VIEWER ──────┘  (sem nuvem)</pre>
       </section>
     </main>
 
-    <!-- Footer -->
     <footer class="site-footer">
       <div class="wrap">
         <div class="footer-grid">
@@ -392,24 +303,23 @@ VIEWER ──────┘  (sem nuvem)</pre>
             <ul>
               <li><a href="#o-que-e">O que é</a></li>
               <li><a href="#como-funciona">Como funciona</a></li>
-              <li><a href="#modos">Join modes</a></li>
-              <li><a href="#features">Features</a></li>
-              <li><a href="#manifesto">Manifesto</a></li>
+              <li><a href="#modos">Modos</a></li>
+              <li><a href="#download">Download</a></li>
             </ul>
           </div>
           <div class="footer-col">
             <h4>Links</h4>
             <ul>
-              <li><a href="#download">Download</a></li>
-              <li><a href="#" target="_blank" rel="noopener noreferrer">GitHub</a></li>
-              <li><a href="#" target="_blank" rel="noopener noreferrer">Licença PolyForm</a></li>
+              <li><a :href="githubUrl" target="_blank" rel="noopener noreferrer">GitHub</a></li>
+              <li><a :href="releasesUrl" target="_blank" rel="noopener noreferrer">Releases</a></li>
+              <li><a :href="licenseUrl" target="_blank" rel="noopener noreferrer">Licença PolyForm</a></li>
               <li><a href="#faq">FAQ</a></li>
             </ul>
           </div>
         </div>
         <div class="footer-bottom">
           <span>© {{ new Date().getFullYear() }} goDrinking. Não é um app de bar.</span>
-          <span>Licenciado sob PolyForm Noncommercial 1.0.0</span>
+          <span>PolyForm Noncommercial 1.0.0</span>
         </div>
       </div>
     </footer>
@@ -417,26 +327,88 @@ VIEWER ──────┘  (sem nuvem)</pre>
 </template>
 
 <script setup>
+const REPO = 'CosmicSnow/GoDrinking'
+const githubUrl = `https://github.com/${REPO}`
+const releasesUrl = `${githubUrl}/releases`
+const licenseUrl = `${githubUrl}/blob/main/LICENSE`
+
 const demoCode = ref('A3B9K7')
 const copied = ref(false)
+const os = ref('mac')
+const latest = ref(null)
+
+const tickerOnce = [
+  'Não é um app de bar',
+  'Não é Golang',
+  'Windows e macOS',
+  'Sem datacenter na Virginia',
+  'Rage against the machine',
+  'A luta continua',
+  'Sous les pavés, la plage',
+]
+const ticker = [...tickerOnce, ...tickerOnce]
 
 const taglines = [
   'Rage against the machine',
   'A luta continua',
   'Sous les pavés, la plage',
   'Não é Go. Não é bar.',
-  'Discord de pobre',
-  'Sua tela não passa por Virginia'
+  'Sua tela não passa por Virginia',
 ]
-
 const randomTagline = taglines[Math.floor(Math.random() * taglines.length)]
+
+const latestTag = computed(() => latest.value?.tag_name || '')
+const assets = computed(() => latest.value?.assets || [])
+
+function pickMac(list) {
+  return list.find((a) => a.name.toLowerCase().endsWith('.dmg'))
+    || list.find((a) => /macos/i.test(a.name) && a.name.toLowerCase().endsWith('.zip'))
+}
+function pickWin(list) {
+  return list.find((a) => /setup/i.test(a.name) && a.name.toLowerCase().endsWith('.exe'))
+    || list.find((a) => a.name.toLowerCase().endsWith('.msi'))
+    || list.find((a) => /portable/i.test(a.name) && a.name.toLowerCase().endsWith('.exe'))
+}
+
+const macAsset = computed(() => pickMac(assets.value))
+const winAsset = computed(() => pickWin(assets.value))
+const primaryIsWin = computed(() => os.value === 'win')
+const primaryAsset = computed(() => (primaryIsWin.value ? winAsset.value : macAsset.value))
+const secondaryAsset = computed(() => (primaryIsWin.value ? macAsset.value : winAsset.value))
+const fallbackLatest = `${githubUrl}/releases/latest`
+
+const primaryHref = computed(() => primaryAsset.value?.browser_download_url || fallbackLatest)
+const secondaryHref = computed(() => secondaryAsset.value?.browser_download_url || '')
+const primaryDownload = computed(() => primaryAsset.value?.name || undefined)
+const secondaryDownload = computed(() => secondaryAsset.value?.name || undefined)
+const primaryLabel = computed(() => {
+  if (primaryIsWin.value) return latestTag.value ? `Baixar Windows ${latestTag.value}` : 'Baixar para Windows'
+  return latestTag.value ? `Baixar macOS ${latestTag.value}` : 'Baixar para macOS'
+})
+const secondaryLabel = computed(() => (primaryIsWin.value ? 'Baixar macOS' : 'Baixar Windows'))
+const otherAssets = computed(() => {
+  const skip = new Set([primaryAsset.value?.id, secondaryAsset.value?.id].filter(Boolean))
+  return assets.value.filter((a) => !skip.has(a.id))
+})
+
+onMounted(async () => {
+  const ua = navigator.userAgent
+  os.value = /Windows/i.test(ua) ? 'win' : 'mac'
+  try {
+    const res = await fetch(`https://api.github.com/repos/${REPO}/releases/latest`, {
+      headers: { Accept: 'application/vnd.github+json' },
+    })
+    if (!res.ok) return
+    latest.value = await res.json()
+  } catch {
+    // Repo ainda privado: o botão cai na página de releases.
+  }
+})
 
 function generateCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
   let code = ''
-  for (let i = 0; i < 6; i++) {
-    code += chars.charAt(Math.floor(Math.random() * chars.length))
-  }
+  for (let i = 0; i < 6; i++) code += chars.charAt(Math.floor(Math.random() * chars.length))
   return code
 }
 
@@ -445,12 +417,8 @@ async function copyCode() {
   try {
     await navigator.clipboard.writeText(demoCode.value)
     copied.value = true
-    setTimeout(() => {
-      copied.value = false
-    }, 1600)
-  } catch {
-    // Fallback: apenas gera novo código
-  }
+    setTimeout(() => { copied.value = false }, 1600)
+  } catch { /* ignore */ }
 }
 </script>
 
@@ -466,8 +434,35 @@ async function copyCode() {
   text-decoration: none;
   font-weight: 600;
 }
+.skip-link:focus { top: 0; }
 
-.skip-link:focus {
-  top: 0;
+.github-mark {
+  display: inline-grid;
+  place-items: center;
+  width: 2.35rem;
+  height: 2.35rem;
+  border: 1.5px solid var(--line);
+  border-radius: 999px;
+  background: var(--ink);
+  color: var(--bg);
+  text-decoration: none;
+  transition: transform 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+.github-mark:hover {
+  background: var(--lime);
+  color: var(--ink);
+  transform: rotate(-8deg) scale(1.06);
+  text-decoration: none;
+}
+
+.download-others {
+  list-style: none;
+  padding: 0;
+  margin: 1.1rem 0 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.1rem;
+  font-size: 0.85rem;
+  font-family: 'DM Mono', monospace;
 }
 </style>

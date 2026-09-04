@@ -9,7 +9,7 @@ export default defineNuxtConfig({
       meta: [
         { charset: 'utf-8' },
         { name: 'viewport', content: 'width=device-width, initial-scale=1' },
-        { name: 'description', content: 'Screen share P2P entre Macs. Sem nuvem, sem STUN público, sem a sua tela passando por um datacenter na Virginia.' },
+        { name: 'description', content: 'Screen share P2P para Windows e macOS. Sem nuvem. A tela vai direto de um PC para o outro.' },
         { name: 'theme-color', content: '#7ABF4A' }
       ],
       link: [
