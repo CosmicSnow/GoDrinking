@@ -171,6 +171,11 @@ pub(crate) enum EncoderCommand {
     Flush,
     ForceKeyframe,
     SetBitrate(u32),
+    /// Live resolution/fps change: drop the encoder so the next frame
+    /// recreates it at the new rate (capture restarts separately).
+    Reconfigure {
+        fps: u32,
+    },
     Stop,
 }
 
@@ -668,6 +673,7 @@ fn encoder_worker_loop(
     shutdown: Arc<AtomicBool>,
     control: Arc<EncoderControl>,
 ) {
+    let mut fps = fps;
     let mut encoder: Option<super::video_toolbox::VideoToolboxEncoder> = None;
     let mut pending_output = Some(output);
     loop {
@@ -762,6 +768,11 @@ fn encoder_worker_loop(
             EncoderCommand::SetBitrate(bitrate) => {
                 control.set_bitrate(bitrate);
             }
+            EncoderCommand::Reconfigure { fps: next_fps } => {
+                fps = next_fps;
+                encoder = None;
+                control.request_keyframe();
+            }
             EncoderCommand::Stop => {
                 control.request_stop();
             }
@@ -785,6 +796,7 @@ fn encoder_worker_loop(
     shutdown: Arc<AtomicBool>,
     control: Arc<EncoderControl>,
 ) {
+    let mut fps = fps;
     // Auto tries the Media Foundation hardware encoder first (NVENC silicon
     // on NVIDIA) and falls back to OpenH264 software with a log line, so a
     // missing driver can never kill the session.
@@ -1094,6 +1106,11 @@ fn encoder_worker_loop(
             }
             EncoderCommand::SetBitrate(bitrate) => {
                 control.set_bitrate(bitrate);
+            }
+            EncoderCommand::Reconfigure { fps: next_fps } => {
+                fps = next_fps;
+                encoder = None;
+                control.request_keyframe();
             }
             EncoderCommand::Stop => {
                 control.request_stop();

@@ -329,7 +329,8 @@ impl CreateMediaSessionRequest {
 }
 
 /// Live settings update for an active session. Applied without tearing down
-/// capture, the room, or the WebRTC peer.
+/// the room or the WebRTC peer. Resolution/frame rate restart capture and
+/// recreate the encoder (brief freeze, no rejoin); None keeps the Start value.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct UpdateMediaSessionRequest {
     pub quality: TransmissionQuality,
@@ -339,6 +340,12 @@ pub struct UpdateMediaSessionRequest {
     /// Live congestion floor in bps (None = 1 Mbps auto).
     #[serde(default)]
     pub min_bitrate_bps: Option<u32>,
+    /// Live capture cap (None = keep). Restarts capture + encoder.
+    #[serde(default)]
+    pub resolution: Option<VideoResolution>,
+    /// Live frame rate (None = keep). Restarts capture + encoder.
+    #[serde(default)]
+    pub frame_rate: Option<FrameRate>,
     /// Carried for shape compatibility; the session codec is fixed at Start
     /// and changes here are ignored (selector is disabled while active).
     #[serde(default)]
