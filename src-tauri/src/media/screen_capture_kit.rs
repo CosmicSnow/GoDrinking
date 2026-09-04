@@ -2209,6 +2209,7 @@ mod tests {
             rendezvous_url: None,
             session_mode: super::super::room_mode::SessionMode::Broadcast,
             attach_only: false,
+            share_on_start: true,
         };
         let mut adapter = ScreenCaptureKitAdapter::new();
         let (capture_tx, _capture_rx) = sync_channel::<NativeFrame>(1);

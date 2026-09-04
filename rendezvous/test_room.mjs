@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
+import WebSocket from "ws";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const PORT = 18791;
@@ -82,6 +83,51 @@ try {
   await post("/v1/member/heartbeat", { token: b2.json.viewer_token });
   await post("/v1/member/leave", { host_token: open2.json.host_token });
   await post("/v1/member/leave", { token: b2.json.viewer_token });
+
+  const open3 = await post("/v1/host/open", {
+    nickname: "Ada",
+    password: "secret1",
+    mode: "room",
+  });
+  const code3 = open3.json.code;
+  const masterId = open3.json.member_id;
+  const hostWs = new WebSocket(`ws://127.0.0.1:${PORT}/v1/ws?role=host&token=${open3.json.host_token}`);
+  const hostMsgs = [];
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("host ws timeout")), 4000);
+    hostWs.on("open", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    hostWs.on("error", reject);
+  });
+  hostWs.on("message", (data) => hostMsgs.push(JSON.parse(String(data))));
+  const bob = await post("/v1/viewer/ask", { code: code3, nickname: "Bob", password: "secret1" });
+  const bobWs = new WebSocket(`ws://127.0.0.1:${PORT}/v1/ws?role=viewer&token=${bob.json.viewer_token}`);
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("bob ws timeout")), 4000);
+    bobWs.on("open", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    bobWs.on("error", reject);
+  });
+  bobWs.send(JSON.stringify({ t: "watch", to: masterId }));
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.ok(
+    hostMsgs.some((msg) => msg.t === "watch" && msg.from === bob.json.member_id && msg.to === masterId),
+    "host should receive watch",
+  );
+  bobWs.send(JSON.stringify({ t: "unwatch", to: masterId }));
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.ok(
+    hostMsgs.some((msg) => msg.t === "unwatch" && msg.from === bob.json.member_id),
+    "host should receive unwatch",
+  );
+  hostWs.close();
+  bobWs.close();
+  await post("/v1/member/leave", { host_token: open3.json.host_token });
+  await post("/v1/member/leave", { token: bob.json.viewer_token });
 
   console.log("room mode ok");
 } finally {

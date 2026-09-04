@@ -637,6 +637,21 @@ function handleClientMessage(ws, meta, data) {
     return;
   }
 
+  if (room.mode === "room" && (msg.t === "watch" || msg.t === "unwatch")) {
+    if (typeof msg.to !== "string") return;
+    const dest = room.members.get(msg.to);
+    if (!dest) return;
+    const payload = { t: msg.t, from: fromId, to: msg.to };
+    const sock =
+      dest.ws && dest.ws.readyState === 1
+        ? dest.ws
+        : dest.id === room.masterId && room.hostWs && room.hostWs.readyState === 1
+          ? room.hostWs
+          : null;
+    if (sock) send(sock, payload);
+    return;
+  }
+
   if (!msg || msg.t !== "signal" || !isValidSignal(msg.payload)) return;
 
   if (room.mode === "room" && typeof msg.to === "string") {
@@ -717,6 +732,9 @@ wss.on("connection", (ws, req, meta) => {
       if (member) member.ws = ws;
     }
     if (viewer.state === "accepted") send(ws, { t: "accepted", viewer_id: viewer.id });
+    if (room.mode === "room") {
+      send(ws, { t: "roster", entries: rosterEntries(room), master_id: room.masterId ?? null, mode: room.mode });
+    }
     if (viewer.inbox) {
       send(ws, { t: "signal", payload: viewer.inbox });
       viewer.inbox = null;

@@ -369,6 +369,29 @@ fn announce_media_share(engine: State<'_, MediaEngine>, start: bool) -> Result<(
     engine.announce_share(start).map_err(|error| error.to_string())
 }
 
+#[derive(serde::Deserialize)]
+struct WatchRequest {
+    to: String,
+    start: bool,
+}
+
+#[tauri::command]
+fn stunar_watch(engine: State<'_, MediaEngine>, request: WatchRequest) -> Result<(), String> {
+    engine
+        .request_watch(&request.to, request.start)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn start_media_share(engine: State<'_, MediaEngine>) -> Result<MediaSessionSnapshot, String> {
+    engine.start_share().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn stop_media_share(engine: State<'_, MediaEngine>) -> Result<MediaSessionSnapshot, String> {
+    engine.stop_share().map_err(|error| error.to_string())
+}
+
 /// Returns the last 5 session log files (newest first) for the View logs UI.
 #[tauri::command]
 async fn get_app_logs() -> Vec<media::LogSession> {
@@ -483,7 +506,10 @@ pub fn run() {
             send_stunar_room_answer,
             send_stunar_room_offer,
             create_member_offer,
-            announce_media_share
+            announce_media_share,
+            stunar_watch,
+            start_media_share,
+            stop_media_share
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

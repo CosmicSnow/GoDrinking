@@ -77,6 +77,10 @@ enum Outgoing {
     Share {
         start: bool,
     },
+    Watch {
+        to: String,
+        start: bool,
+    },
     Close,
 }
 
@@ -92,6 +96,8 @@ struct WsInbox {
     master_id: Option<String>,
     answers: Vec<PeerSignal>,
     offers: Vec<StunarIncomingOffer>,
+    watch_from: Vec<String>,
+    unwatch_from: Vec<String>,
     you_are_master: bool,
     gone: bool,
     kicked: bool,
@@ -175,6 +181,16 @@ fn apply_ws_message(text: &str, inbox: &mut WsInbox) {
         "you-are-master" => inbox.you_are_master = true,
         "gone" => inbox.gone = true,
         "kicked" | "rejected" => inbox.kicked = true,
+        "watch" => {
+            if let Some(from) = msg["from"].as_str() {
+                inbox.watch_from.push(from.to_owned());
+            }
+        }
+        "unwatch" => {
+            if let Some(from) = msg["from"].as_str() {
+                inbox.unwatch_from.push(from.to_owned());
+            }
+        }
         _ => {}
     }
 }
@@ -192,6 +208,8 @@ pub(crate) struct StunarHost {
     roster: Arc<Mutex<HashMap<String, RosterViewer>>>,
     answers: Arc<Mutex<Vec<PeerSignal>>>,
     incoming_offers: Arc<Mutex<Vec<StunarIncomingOffer>>>,
+    watch_from: Arc<Mutex<Vec<String>>>,
+    unwatch_from: Arc<Mutex<Vec<String>>>,
     master_id: Arc<Mutex<Option<String>>>,
     pub(crate) self_id: Option<String>,
     outgoing: UnboundedSender<Outgoing>,
@@ -232,6 +250,8 @@ impl StunarHost {
         let roster = Arc::new(Mutex::new(HashMap::new()));
         let answers = Arc::new(Mutex::new(Vec::new()));
         let incoming_offers = Arc::new(Mutex::new(Vec::new()));
+        let watch_from = Arc::new(Mutex::new(Vec::new()));
+        let unwatch_from = Arc::new(Mutex::new(Vec::new()));
         let master_id = Arc::new(Mutex::new(None));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (outgoing_tx, outgoing_rx) = unbounded_channel();
@@ -241,6 +261,8 @@ impl StunarHost {
         let worker_roster = Arc::clone(&roster);
         let worker_answers = Arc::clone(&answers);
         let worker_offers = Arc::clone(&incoming_offers);
+        let worker_watch = Arc::clone(&watch_from);
+        let worker_unwatch = Arc::clone(&unwatch_from);
         let worker_master = Arc::clone(&master_id);
         let worker_shutdown = Arc::clone(&shutdown);
         let worker = thread::Builder::new()
@@ -256,6 +278,8 @@ impl StunarHost {
                     worker_roster,
                     worker_answers,
                     worker_offers,
+                    worker_watch,
+                    worker_unwatch,
                     worker_master,
                     worker_shutdown,
                     outgoing_rx,
@@ -270,6 +294,8 @@ impl StunarHost {
             roster,
             answers,
             incoming_offers,
+            watch_from,
+            unwatch_from,
             master_id,
             self_id,
             outgoing: outgoing_tx,
@@ -399,11 +425,41 @@ impl StunarHost {
             .map_err(|_| "Stunar is unreachable.".to_owned())
     }
 
+    pub(crate) fn send_watch(&self, to: &str, start: bool) -> Result<(), String> {
+        self.outgoing
+            .send(Outgoing::Watch {
+                to: to.to_owned(),
+                start,
+            })
+            .map_err(|_| "Stunar is unreachable.".to_owned())
+    }
+
     pub(crate) fn take_incoming_offers(&self) -> Vec<StunarIncomingOffer> {
         self.incoming_offers
             .lock()
             .map(|mut offers| std::mem::take(&mut *offers))
             .unwrap_or_default()
+    }
+
+    pub(crate) fn take_watch_requests(&self) -> (Vec<String>, Vec<String>) {
+        let watch = self
+            .watch_from
+            .lock()
+            .map(|mut list| std::mem::take(&mut *list))
+            .unwrap_or_default();
+        let unwatch = self
+            .unwatch_from
+            .lock()
+            .map(|mut list| std::mem::take(&mut *list))
+            .unwrap_or_default();
+        (watch, unwatch)
+    }
+
+    pub(crate) fn nickname_of(&self, id: &str) -> Option<String> {
+        self.roster
+            .lock()
+            .ok()
+            .and_then(|roster| roster.get(id).map(|viewer| viewer.nickname.clone()))
     }
 
     pub(crate) fn master_id(&self) -> Option<String> {
@@ -593,6 +649,8 @@ async fn host_worker(
     roster: Arc<Mutex<HashMap<String, RosterViewer>>>,
     answers: Arc<Mutex<Vec<PeerSignal>>>,
     incoming_offers: Arc<Mutex<Vec<StunarIncomingOffer>>>,
+    watch_from: Arc<Mutex<Vec<String>>>,
+    unwatch_from: Arc<Mutex<Vec<String>>>,
     master_id: Arc<Mutex<Option<String>>>,
     shutdown: Arc<AtomicBool>,
     mut outgoing: UnboundedReceiver<Outgoing>,
@@ -646,6 +704,8 @@ async fn host_worker(
                                         &roster,
                                         &answers,
                                         &incoming_offers,
+                                        &watch_from,
+                                        &unwatch_from,
                                         &master_id,
                                     );
                                 }
@@ -674,6 +734,16 @@ async fn host_worker(
                                 Some(Outgoing::Share { start }) => {
                                     let text = json!({
                                         "t": if start { "share-start" } else { "share-stop" },
+                                    })
+                                    .to_string();
+                                    if ws.send(Message::Text(text.into())).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Some(Outgoing::Watch { to, start }) => {
+                                    let text = json!({
+                                        "t": if start { "watch" } else { "unwatch" },
+                                        "to": to,
                                     })
                                     .to_string();
                                     if ws.send(Message::Text(text.into())).await.is_err() {
@@ -710,15 +780,15 @@ async fn host_worker(
     heartbeat.abort();
 }
 
-fn handle_host_message(
-    text: &str,
+fn apply_inbox_side_effects(
+    inbox: WsInbox,
     roster: &Arc<Mutex<HashMap<String, RosterViewer>>>,
     answers: &Arc<Mutex<Vec<PeerSignal>>>,
     incoming_offers: &Arc<Mutex<Vec<StunarIncomingOffer>>>,
+    watch_from: &Arc<Mutex<Vec<String>>>,
+    unwatch_from: &Arc<Mutex<Vec<String>>>,
     master_id: &Arc<Mutex<Option<String>>>,
 ) {
-    let mut inbox = WsInbox::default();
-    apply_ws_message(text, &mut inbox);
     if let Some(next) = inbox.roster {
         logger::log(
             "INFO",
@@ -749,9 +819,41 @@ fn handle_host_message(
             offers.extend(inbox.offers);
         }
     }
+    if !inbox.watch_from.is_empty() {
+        if let Ok(mut list) = watch_from.lock() {
+            list.extend(inbox.watch_from);
+        }
+    }
+    if !inbox.unwatch_from.is_empty() {
+        if let Ok(mut list) = unwatch_from.lock() {
+            list.extend(inbox.unwatch_from);
+        }
+    }
     if inbox.gone {
         logger::log("WARN", "stunar ws message", "gone (room died)");
     }
+}
+
+fn handle_host_message(
+    text: &str,
+    roster: &Arc<Mutex<HashMap<String, RosterViewer>>>,
+    answers: &Arc<Mutex<Vec<PeerSignal>>>,
+    incoming_offers: &Arc<Mutex<Vec<StunarIncomingOffer>>>,
+    watch_from: &Arc<Mutex<Vec<String>>>,
+    unwatch_from: &Arc<Mutex<Vec<String>>>,
+    master_id: &Arc<Mutex<Option<String>>>,
+) {
+    let mut inbox = WsInbox::default();
+    apply_ws_message(text, &mut inbox);
+    apply_inbox_side_effects(
+        inbox,
+        roster,
+        answers,
+        incoming_offers,
+        watch_from,
+        unwatch_from,
+        master_id,
+    );
 }
 
 // --- Viewer ----------------------------------------------------------------
@@ -762,6 +864,10 @@ pub(crate) struct StunarViewer {
     outgoing: UnboundedSender<Outgoing>,
     incoming_offers: Arc<Mutex<Vec<StunarIncomingOffer>>>,
     answers: Arc<Mutex<Vec<PeerSignal>>>,
+    roster: Arc<Mutex<HashMap<String, RosterViewer>>>,
+    watch_from: Arc<Mutex<Vec<String>>>,
+    unwatch_from: Arc<Mutex<Vec<String>>>,
+    master_id: Arc<Mutex<Option<String>>>,
     shutdown: Arc<AtomicBool>,
     pub(crate) token: String,
     pub(crate) member_id: Option<String>,
@@ -791,10 +897,59 @@ impl StunarViewer {
             .map_err(|_| "Stunar is unreachable.".to_owned())
     }
 
+    pub(crate) fn send_watch(&self, to: &str, start: bool) -> Result<(), String> {
+        self.outgoing
+            .send(Outgoing::Watch {
+                to: to.to_owned(),
+                start,
+            })
+            .map_err(|_| "Stunar is unreachable.".to_owned())
+    }
+
     pub(crate) fn take_incoming_offers(&self) -> Vec<StunarIncomingOffer> {
         self.incoming_offers
             .lock()
             .map(|mut offers| std::mem::take(&mut *offers))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn take_watch_requests(&self) -> (Vec<String>, Vec<String>) {
+        let watch = self
+            .watch_from
+            .lock()
+            .map(|mut list| std::mem::take(&mut *list))
+            .unwrap_or_default();
+        let unwatch = self
+            .unwatch_from
+            .lock()
+            .map(|mut list| std::mem::take(&mut *list))
+            .unwrap_or_default();
+        (watch, unwatch)
+    }
+
+    pub(crate) fn nickname_of(&self, id: &str) -> Option<String> {
+        self.roster
+            .lock()
+            .ok()
+            .and_then(|roster| roster.get(id).map(|viewer| viewer.nickname.clone()))
+    }
+
+    pub(crate) fn room_roster(&self) -> Vec<(String, String, bool, bool)> {
+        self.roster
+            .lock()
+            .map(|roster| {
+                roster
+                    .iter()
+                    .map(|(id, viewer)| {
+                        (
+                            id.clone(),
+                            viewer.nickname.clone(),
+                            viewer.master,
+                            viewer.share,
+                        )
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -830,11 +985,19 @@ pub(crate) fn discover_stunar_room(
     );
     let incoming_offers = Arc::new(Mutex::new(Vec::new()));
     let answers = Arc::new(Mutex::new(Vec::new()));
+    let roster = Arc::new(Mutex::new(HashMap::new()));
+    let watch_from = Arc::new(Mutex::new(Vec::new()));
+    let unwatch_from = Arc::new(Mutex::new(Vec::new()));
+    let master_id = Arc::new(Mutex::new(None));
     let shutdown = Arc::new(AtomicBool::new(false));
     let (outgoing_tx, outgoing_rx) = unbounded_channel();
     let (ready_tx, ready_rx) = sync_channel(1);
     let worker_offers = Arc::clone(&incoming_offers);
     let worker_answers = Arc::clone(&answers);
+    let worker_roster = Arc::clone(&roster);
+    let worker_watch = Arc::clone(&watch_from);
+    let worker_unwatch = Arc::clone(&unwatch_from);
+    let worker_master = Arc::clone(&master_id);
     let worker_shutdown = Arc::clone(&shutdown);
     let worker_base = base.clone();
     let worker_code = code.to_owned();
@@ -856,6 +1019,12 @@ pub(crate) fn discover_stunar_room(
                     &worker_code,
                     &worker_password,
                     &worker_nickname,
+                    &worker_roster,
+                    &worker_offers,
+                    &worker_answers,
+                    &worker_watch,
+                    &worker_unwatch,
+                    &worker_master,
                 )
                 .await
                 {
@@ -863,8 +1032,12 @@ pub(crate) fn discover_stunar_room(
                         let _ = ready_tx.send(Ok((token, offer, member_id, mode)));
                         viewer_worker(
                             ws,
+                            worker_roster,
                             worker_offers,
                             worker_answers,
+                            worker_watch,
+                            worker_unwatch,
+                            worker_master,
                             worker_shutdown,
                             outgoing_rx,
                         )
@@ -890,6 +1063,10 @@ pub(crate) fn discover_stunar_room(
             outgoing: outgoing_tx,
             incoming_offers,
             answers,
+            roster,
+            watch_from,
+            unwatch_from,
+            master_id,
             shutdown,
             token,
             member_id,
@@ -904,6 +1081,12 @@ async fn viewer_handshake(
     code: &str,
     password: &str,
     nickname: &str,
+    roster: &Arc<Mutex<HashMap<String, RosterViewer>>>,
+    incoming_offers: &Arc<Mutex<Vec<StunarIncomingOffer>>>,
+    answers: &Arc<Mutex<Vec<PeerSignal>>>,
+    watch_from: &Arc<Mutex<Vec<String>>>,
+    unwatch_from: &Arc<Mutex<Vec<String>>>,
+    master_id: &Arc<Mutex<Option<String>>>,
 ) -> Result<(String, PeerSignal, WsStream, Option<String>, String), String> {
     let client = http_client()?;
     let body = json!({ "code": code, "password": password, "nickname": nickname });
@@ -980,20 +1163,74 @@ async fn viewer_handshake(
         let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) else {
             continue;
         };
-        match msg["t"].as_str() {
-            Some("accepted") => {
-                logger::log("INFO", "stunar ws message", "accepted (waiting for offer)");
+        let mut inbox = WsInbox::default();
+        apply_ws_message(&text, &mut inbox);
+        let event = match msg["t"].as_str() {
+            Some("accepted") => super::room_mode::HandshakeEvent::Accepted,
+            Some("rejected") => super::room_mode::HandshakeEvent::Rejected,
+            Some("gone") => super::room_mode::HandshakeEvent::Gone,
+            Some("signal")
+                if inbox.offers.first().is_some()
+                    || msg["payload"].get("type").and_then(|kind| kind.as_str())
+                        == Some("offer") =>
+            {
+                super::room_mode::HandshakeEvent::Offer
+            }
+            _ => {
+                apply_inbox_side_effects(
+                    inbox,
+                    roster,
+                    answers,
+                    incoming_offers,
+                    watch_from,
+                    unwatch_from,
+                    master_id,
+                );
                 continue;
             }
-            Some("rejected") => {
-                logger::log("WARN", "stunar ws message", "rejected (host declined)");
-                return Err("The host declined.".into());
+        };
+        match super::room_mode::handshake_outcome(&mode, event) {
+            super::room_mode::HandshakeOutcome::KeepWaiting => {
+                logger::log("INFO", "stunar ws message", "accepted (waiting for offer)");
+                apply_inbox_side_effects(
+                    inbox,
+                    roster,
+                    answers,
+                    incoming_offers,
+                    watch_from,
+                    unwatch_from,
+                    master_id,
+                );
             }
-            Some("gone") => {
-                logger::log("ERROR", "stunar ws message", "gone (room died)");
-                return Err("Could not join.".into());
+            super::room_mode::HandshakeOutcome::ReadyWithoutOffer => {
+                logger::log("INFO", "stunar ws message", "accepted (sala, no offer yet)");
+                apply_inbox_side_effects(
+                    inbox,
+                    roster,
+                    answers,
+                    incoming_offers,
+                    watch_from,
+                    unwatch_from,
+                    master_id,
+                );
+                let offer = PeerSignal {
+                    kind: PeerSignalKind::Offer,
+                    sdp: String::new(),
+                    id: None,
+                };
+                return Ok((token, offer, ws, member_id, mode));
             }
-            Some("signal") => {
+            super::room_mode::HandshakeOutcome::ReadyWithOffer => {
+                inbox.offers.clear();
+                apply_inbox_side_effects(
+                    inbox,
+                    roster,
+                    answers,
+                    incoming_offers,
+                    watch_from,
+                    unwatch_from,
+                    master_id,
+                );
                 let payload = &msg["payload"];
                 if payload.get("type").and_then(|kind| kind.as_str()) == Some("offer") {
                     if let Some(sdp) = payload.get("sdp").and_then(|sdp| sdp.as_str()) {
@@ -1008,15 +1245,26 @@ async fn viewer_handshake(
                     }
                 }
             }
-            _ => continue,
+            super::room_mode::HandshakeOutcome::Rejected => {
+                logger::log("WARN", "stunar ws message", "rejected (host declined)");
+                return Err("The host declined.".into());
+            }
+            super::room_mode::HandshakeOutcome::Gone => {
+                logger::log("ERROR", "stunar ws message", "gone (room died)");
+                return Err("Could not join.".into());
+            }
         }
     }
 }
 
 async fn viewer_worker(
     mut ws: WsStream,
+    roster: Arc<Mutex<HashMap<String, RosterViewer>>>,
     incoming_offers: Arc<Mutex<Vec<StunarIncomingOffer>>>,
     answers: Arc<Mutex<Vec<PeerSignal>>>,
+    watch_from: Arc<Mutex<Vec<String>>>,
+    unwatch_from: Arc<Mutex<Vec<String>>>,
+    master_id: Arc<Mutex<Option<String>>>,
     shutdown: Arc<AtomicBool>,
     mut outgoing: UnboundedReceiver<Outgoing>,
 ) {
@@ -1027,17 +1275,17 @@ async fn viewer_worker(
                     Some(Ok(Message::Text(text))) => {
                         let mut inbox = WsInbox::default();
                         apply_ws_message(&text, &mut inbox);
-                        if !inbox.offers.is_empty() {
-                            if let Ok(mut offers) = incoming_offers.lock() {
-                                offers.extend(inbox.offers);
-                            }
-                        }
-                        if !inbox.answers.is_empty() {
-                            if let Ok(mut slot) = answers.lock() {
-                                slot.extend(inbox.answers);
-                            }
-                        }
-                        if inbox.gone || inbox.kicked {
+                        let gone = inbox.gone || inbox.kicked;
+                        apply_inbox_side_effects(
+                            inbox,
+                            &roster,
+                            &answers,
+                            &incoming_offers,
+                            &watch_from,
+                            &unwatch_from,
+                            &master_id,
+                        );
+                        if gone {
                             break;
                         }
                     }
@@ -1071,6 +1319,17 @@ async fn viewer_worker(
                         let text = json!({ "t": if start { "share-start" } else { "share-stop" } }).to_string();
                         if ws.send(Message::Text(text.into())).await.is_err() {
                             logger::log("WARN", "stunar ws", "viewer share announce failed");
+                            break;
+                        }
+                    }
+                    Some(Outgoing::Watch { to, start }) => {
+                        let text = json!({
+                            "t": if start { "watch" } else { "unwatch" },
+                            "to": to,
+                        })
+                        .to_string();
+                        if ws.send(Message::Text(text.into())).await.is_err() {
+                            logger::log("WARN", "stunar ws", "viewer watch send failed");
                             break;
                         }
                     }
@@ -1131,5 +1390,14 @@ mod tests {
         assert!(roster["ada"].master && roster["ada"].share);
         assert!(!roster["bob"].master && !roster["bob"].share);
         assert_eq!(inbox.master_id.as_deref(), Some("ada"));
+    }
+
+    #[test]
+    fn watch_request_carries_the_asker() {
+        let mut inbox = WsInbox::default();
+        apply_ws_message(r#"{"t":"watch","from":"bob","to":"ada"}"#, &mut inbox);
+        assert_eq!(inbox.watch_from, vec!["bob".to_string()]);
+        apply_ws_message(r#"{"t":"unwatch","from":"bob","to":"ada"}"#, &mut inbox);
+        assert_eq!(inbox.unwatch_from, vec!["bob".to_string()]);
     }
 }
