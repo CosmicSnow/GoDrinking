@@ -254,13 +254,21 @@ impl MediaEngine {
             return;
         };
         for answer in answers {
-            let client = self.state.lock().ok().and_then(|state| {
+            let pending = self.state.lock().ok().and_then(|state| {
                 let session = state.session.as_ref()?;
                 let id = answer.id.as_deref()?;
-                Some(session.viewers.get(id)?.peer.client())
+                let viewer = session.viewers.get(id)?;
+                Some((
+                    viewer.peer.client(),
+                    Arc::clone(&session._pipeline.encoder_control),
+                ))
             });
-            if let Some(client) = client {
+            if let Some((client, control)) = pending {
                 let _ = client.set_answer(answer);
+                // Fresh IDR as the peer connects: the pump starts streaming
+                // on the first keyframe, so this bounds viewer join latency
+                // to one encode interval even on static screens.
+                control.request_keyframe();
             }
         }
     }
@@ -1340,7 +1348,7 @@ fn mint_viewer_offer(
     let peer = PeerTransport::new(
         video_rx,
         audio_rx,
-        encoder_control,
+        Arc::clone(&encoder_control),
         frame_duration,
         join_mode,
         video_codec,
@@ -1370,6 +1378,10 @@ fn mint_viewer_offer(
             peer,
         },
     );
+    // A new viewer must get SPS/PPS + IDR immediately: on static screens the
+    // encoder emits mostly SKIP frames, so without a forced keyframe the
+    // viewer would wait (up to the intra period) for decodable data.
+    encoder_control.request_keyframe();
     Ok(signal)
 }
 
