@@ -644,7 +644,10 @@ function handleClientMessage(ws, meta, data) {
     if (!viewer || viewer.state !== "accepted") return; // pending never gets SDP
     viewer.inbox = msg.payload; // 1-slot mailbox; a new offer replaces an unread one
     if (viewer.ws && viewer.ws.readyState === 1) {
-      send(viewer.ws, { t: "signal", payload: msg.payload });
+      // Broadcast has no member ids: stamp the host so the viewer inbox
+      // accepts the offer (it drops offers with empty `from`) and the
+      // answer has a target. "host" matches the viewer UI convention.
+      send(viewer.ws, { t: "signal", from: "host", payload: msg.payload });
       viewer.inbox = null; // delivered, not stored
     }
   } else {
@@ -707,7 +710,9 @@ wss.on("connection", (ws, req, meta) => {
     }
     if (viewer.state === "accepted") send(ws, { t: "accepted", viewer_id: viewer.id });
     if (viewer.inbox) {
-      send(ws, { t: "signal", payload: viewer.inbox });
+      // Inbox only ever holds a broadcast host offer (room-mode member
+      // signals route directly): same `from` stamp as the live path.
+      send(ws, { t: "signal", from: "host", payload: viewer.inbox });
       viewer.inbox = null;
     }
     log("info", ip, "ws", room.code, viewer.id);

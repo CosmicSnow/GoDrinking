@@ -158,7 +158,8 @@ impl MfH264Encoder {
         }
         let _com = ComGuard(true);
         unsafe { MFStartup(MF_VERSION, 0).map_err(hr)?; }
-        let (transform, friendly_name) = Self::open_hardware_encoder()?;
+        let (transform, friendly_name) = Self::open_hardware_encoder()
+            .map_err(|error| format!("MF hardware MFT open failed: {error}"))?;
         eprintln!("[goDrinking] MF hardware encoder: {friendly_name}");
 
         // Unlock async MFTs when present; harmless for synchronous ones.
@@ -175,10 +176,17 @@ impl MfH264Encoder {
             .map_err(hr)?;
         let mut use_nv12 = false;
         if let Err(error) = unsafe { transform.SetInputType(0, &input_rgb32, 0) } {
-            eprintln!("[goDrinking] MF RGB32 input rejected, trying NV12: {}", hr(error));
+            // Mirrored to the log file: stderr is invisible in release/portable runs.
+            let message = format!("MF RGB32 input rejected, trying NV12: {}", hr(error));
+            eprintln!("[goDrinking] {message}");
+            logger::log("WARN", "mf encoder", &message);
             let input_nv12 = video_type(&MFVideoFormat_NV12, width, height, fps, None, None)
                 .map_err(hr)?;
-            unsafe { transform.SetInputType(0, &input_nv12, 0).map_err(hr)?; }
+            unsafe {
+                transform
+                    .SetInputType(0, &input_nv12, 0)
+                    .map_err(|error| format!("MF NV12 input rejected: {}", hr(error)))?
+            }
             use_nv12 = true;
         }
 
@@ -198,15 +206,21 @@ impl MfH264Encoder {
                 .map_err(hr)?;
         let mut profile_high = first == H264_HIGH_PROFILE;
         if unsafe { transform.SetOutputType(0, &output_first, 0) }.is_err() {
-            eprintln!(
-                "[goDrinking] MF {} profile rejected, trying {}",
+            let message = format!(
+                "MF {} profile rejected, trying {}",
                 if profile_high { "High" } else { "Baseline" },
                 if profile_high { "Baseline" } else { "High" }
             );
+            eprintln!("[goDrinking] {message}");
+            logger::log("WARN", "mf encoder", &message);
             let output_second =
                 video_type(&MFVideoFormat_H264, width, height, fps, Some(bitrate), Some(second))
                     .map_err(hr)?;
-            unsafe { transform.SetOutputType(0, &output_second, 0).map_err(hr)?; }
+            unsafe {
+                transform.SetOutputType(0, &output_second, 0).map_err(|error| {
+                    format!("MF output type rejected (both profiles): {}", hr(error))
+                })?
+            }
             profile_high = second == H264_HIGH_PROFILE;
         }
 

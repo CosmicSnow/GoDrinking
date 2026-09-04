@@ -297,7 +297,13 @@ impl MediaEngine {
             let Ok(signal) = mint_viewer_offer(&self.state, &id, &nickname) else {
                 continue;
             };
-            let _ = stunar.send_signal(&id, &signal);
+            if let Err(error) = stunar.send_signal(&id, &signal) {
+                logger::log(
+                    "WARN",
+                    "mint offer",
+                    &format!("send failed viewer={id}: {error}"),
+                );
+            }
         }
         for (id, signal) in to_resend {
             logger::log(
@@ -305,7 +311,13 @@ impl MediaEngine {
                 "mint offer",
                 &format!("resending unanswered offer viewer={id}"),
             );
-            let _ = stunar.send_signal(&id, &signal);
+            if let Err(error) = stunar.send_signal(&id, &signal) {
+                logger::log(
+                    "WARN",
+                    "mint offer",
+                    &format!("resend failed viewer={id}: {error}"),
+                );
+            }
         }
     }
 
@@ -334,7 +346,13 @@ impl MediaEngine {
         if answers.is_empty() {
             return;
         }
+        logger::log(
+            "INFO",
+            "room answer",
+            &format!("received answers={}", answers.len()),
+        );
         for answer in answers {
+            let answer_id = answer.id.clone().unwrap_or_default();
             let pending = self.state.lock().ok().and_then(|state| {
                 let session = state.session.as_ref()?;
                 let id = answer.id.as_deref()?;
@@ -344,12 +362,26 @@ impl MediaEngine {
                     Arc::clone(&session._pipeline.encoder_control),
                 ))
             });
-            if let Some((client, control)) = pending {
-                let _ = client.set_answer(answer);
-                // Fresh IDR as the peer connects: the pump starts streaming
-                // on the first keyframe, so this bounds viewer join latency
-                // to one encode interval even on static screens.
-                control.request_keyframe();
+            match pending {
+                Some((client, control)) => {
+                    logger::log(
+                        "INFO",
+                        "room answer",
+                        &format!("applied answer id={answer_id}"),
+                    );
+                    let _ = client.set_answer(answer);
+                    // Fresh IDR as the peer connects: the pump starts streaming
+                    // on the first keyframe, so this bounds viewer join latency
+                    // to one encode interval even on static screens.
+                    control.request_keyframe();
+                }
+                None => {
+                    logger::log(
+                        "WARN",
+                        "room answer",
+                        &format!("dropped answer id={answer_id} (no matching viewer)"),
+                    );
+                }
             }
         }
     }
@@ -1082,6 +1114,68 @@ fn create_in_state(
     Ok(snapshot_from_state(&state))
 }
 
+fn format_resolution(resolution: VideoResolution) -> &'static str {
+    match resolution {
+        VideoResolution::P2160 => "2160p",
+        VideoResolution::P1440 => "1440p",
+        VideoResolution::P1080 => "1080p",
+        VideoResolution::P720 => "720p",
+        VideoResolution::P480 => "480p",
+    }
+}
+
+fn format_frame_rate(frame_rate: FrameRate) -> &'static str {
+    match frame_rate {
+        FrameRate::Fps120 => "120fps",
+        FrameRate::Fps60 => "60fps",
+        FrameRate::Fps30 => "30fps",
+    }
+}
+
+/// Restarts native capture against an updated request (live resolution/fps).
+/// The pipeline, room, roster and peers are untouched and frames resume
+/// under the same generation; the encoder recreates itself on the next
+/// frame via a separate Reconfigure command.
+fn restart_capture(
+    session: &mut SessionRecord,
+    request: &CreateMediaSessionRequest,
+) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        session
+            .adapter
+            .stop_capture(session.generation)
+            .map_err(|error| format!("macOS capture stop failed: {error}"))?;
+        session.adapter.start_capture(
+            request,
+            session._pipeline.capture_tx.clone(),
+            session._pipeline.encoder_tx.clone(),
+            session._pipeline.preview_diagnostics(),
+            session.generation,
+        )
+        .map_err(|error| format!("macOS capture restart failed: {error}"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        session
+            .adapter
+            .stop_capture()
+            .map_err(|error| format!("Windows capture stop failed: {error}"))?;
+        session.adapter.start_capture(
+            request,
+            session._pipeline.capture_tx.clone(),
+            session._pipeline.encoder_tx.clone(),
+            session._pipeline.preview_diagnostics(),
+            session.generation,
+        )
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let _ = (session, request);
+        Err("native capture is not implemented on this platform".into())
+    }
+}
+
 /// Applies live settings to the active session. Capture, the room, and the
 /// WebRTC peer are never torn down: quality is a live bitrate/keyframe update
 /// and audio changes recreate only the process tap against the engine-owned
@@ -1116,6 +1210,50 @@ fn update_in_state(
         session.request.min_bitrate_bps = request.min_bitrate_bps;
     }
 
+    // 1b. Resolution/frame rate: live re-apply. Capture restarts with the new
+    // cap/interval and the encoder is recreated on the next frame; the room,
+    // roster and peers are untouched (brief freeze, no rejoin). None keeps
+    // the Start value, so preset switches never restart capture by accident.
+    let mut reconfig_note = String::new();
+    let new_resolution = request.resolution.unwrap_or(session.request.resolution);
+    let new_frame_rate = request.frame_rate.unwrap_or(session.request.frame_rate);
+    if new_resolution != session.request.resolution || new_frame_rate != session.request.frame_rate
+    {
+        let mut updated = session.request.clone();
+        updated.resolution = new_resolution;
+        updated.frame_rate = new_frame_rate;
+        let restart = restart_capture(session, &updated);
+        match restart {
+            Ok(()) => {
+                session.request = updated;
+                let _ = session._pipeline.encoder_tx.send(
+                    super::pipeline::EncoderCommand::Reconfigure {
+                        fps: new_frame_rate.hertz(),
+                    },
+                );
+                let _ = session._pipeline.force_keyframe();
+                reconfig_note = format!(
+                    " Capture restarted at {} {} (live).",
+                    format_resolution(new_resolution),
+                    format_frame_rate(new_frame_rate)
+                );
+                logger::log(
+                    "INFO",
+                    "session",
+                    &format!(
+                        "live re-apply: capture restarted ({} {}).",
+                        format_resolution(new_resolution),
+                        format_frame_rate(new_frame_rate)
+                    ),
+                );
+            }
+            Err(error) => {
+                reconfig_note = " Capture restart failed; keeping previous size and rate.".into();
+                logger::log("WARN", "session", &format!("live re-apply failed: {error}"));
+            }
+        }
+    }
+
     // 2. Audio: recreate only the process tap. The peer keeps its original
     // receiver, so a restarted tap feeds the same audio track.
     let mut audio_note = String::new();
@@ -1146,6 +1284,7 @@ fn update_in_state(
 
     let mut detail =
         "Session settings updated; capture and peer transport kept running.".to_string();
+    detail.push_str(&reconfig_note);
     detail.push_str(&audio_note);
     state.detail = detail;
     Ok(snapshot_from_state(&state))

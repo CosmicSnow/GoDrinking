@@ -31,15 +31,35 @@ fn fit_encode_size(width: u32, height: u32) -> (u32, u32) {
     crate::media::types::fitted_even_size(width, height, 1920, 1080)
 }
 
+// Nearest-neighbor BGRA downscale with fixed-point stepping: no division
+// in the hot loop. Mirrors the capture-side resampler: the per-pixel
+// division version cost tens of ms per frame and starved the encoder.
 fn downscale_bgra_frame(src: &[u8], src_width: u32, src_height: u32, dst_width: u32, dst_height: u32) -> Vec<u8> {
-    let mut dst = vec![0_u8; (dst_width as usize) * (dst_height as usize) * 4];
-    let stride = (src_width as usize) * 4;
-    for y in 0..(dst_height as usize) {
-        let src_y = y * (src_height as usize) / (dst_height as usize);
-        for x in 0..(dst_width as usize) {
-            let src_x = x * (src_width as usize) / (dst_width as usize);
-            let src_offset = src_y * stride + src_x * 4;
-            let dst_offset = (y * (dst_width as usize) + x) * 4;
+    let src_w = src_width as usize;
+    let src_h = src_height as usize;
+    let dst_w = dst_width as usize;
+    let dst_h = dst_height as usize;
+    let mut dst = vec![0_u8; dst_w * dst_h * 4];
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return dst;
+    }
+    if src.len() < src_w * src_h * 4 {
+        return dst;
+    }
+    let x_step = ((src_w as u64) << 16) / dst_w as u64;
+    let y_step = ((src_h as u64) << 16) / dst_h as u64;
+    let mut src_y_fp = 0u64;
+    for y in 0..dst_h {
+        let src_y = (src_y_fp >> 16) as usize;
+        src_y_fp += y_step;
+        let src_row_start = src_y * src_w * 4;
+        let dst_row_start = y * dst_w * 4;
+        let mut src_x_fp = 0u64;
+        for x in 0..dst_w {
+            let src_x = (src_x_fp >> 16) as usize;
+            src_x_fp += x_step;
+            let src_offset = src_row_start + src_x * 4;
+            let dst_offset = dst_row_start + x * 4;
             dst[dst_offset..dst_offset + 4].copy_from_slice(&src[src_offset..src_offset + 4]);
         }
     }

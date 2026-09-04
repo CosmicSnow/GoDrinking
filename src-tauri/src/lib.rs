@@ -369,12 +369,18 @@ fn announce_media_share(engine: State<'_, MediaEngine>, start: bool) -> Result<(
     engine.announce_share(start).map_err(|error| error.to_string())
 }
 
-/// Returns the last 5 session log files (newest first) for the View logs UI.
+/// Returns the last 30 session log files (newest first) for the View logs UI.
 #[tauri::command]
 async fn get_app_logs() -> Vec<media::LogSession> {
     tauri::async_runtime::spawn_blocking(media::read_sessions)
         .await
         .unwrap_or_default()
+}
+
+/// Absolute path of the session logs directory, for the "open folder" action.
+#[tauri::command]
+fn get_logs_dir() -> Option<String> {
+    media::logs_dir_string()
 }
 
 /// Deletes every session log file.
@@ -476,6 +482,7 @@ pub fn run() {
             stunar_viewer_close,
             get_app_logs,
             clear_app_logs,
+            get_logs_dir,
             reset_firewall_rules,
             get_firewall_status,
             run_media_benchmark,

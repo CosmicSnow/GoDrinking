@@ -957,19 +957,20 @@ pub(crate) fn discover_stunar_room(
     let worker = thread::Builder::new()
         .name("godrinking-stunar-viewer".into())
         .spawn(move || {
-            let Ok(runtime) = current_thread_runtime() else {
-                return;
-            };
-            let _ = runtime.block_on(viewer_worker(
+            // The WS stream is bound to this runtime's reactor: it must be
+            // polled on this runtime, and the runtime must outlive the worker.
+            // (A fresh runtime here orphans the stream and the worker dies on
+            // its first poll, breaking the answer send with "unreachable".)
+            runtime.block_on(viewer_worker(
                 ws,
                 worker_offers,
                 worker_answers,
                 worker_shutdown,
                 outgoing_rx,
             ));
+            logger::log("INFO", "stunar ws", "viewer worker stopped");
         })
         .ok();
-    drop(runtime);
     Ok((
         token.clone(),
         offer,
