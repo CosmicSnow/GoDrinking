@@ -71,7 +71,7 @@ mod stunar_integration {
             eprintln!("SKIP: rendezvous not running on {base}");
             return;
         }
-        let host = StunarHost::start(base, "senha", "Ana", true).expect("open");
+        let host = StunarHost::start(base, "senha", "Ana", true, super::super::room_mode::SessionMode::Broadcast).expect("open");
         let code = host.code();
         assert_eq!(code.len(), 6);
         assert!(code.chars().all(|ch| ch.is_ascii_alphanumeric()));
@@ -145,7 +145,7 @@ mod stunar_integration {
             eprintln!("SKIP: rendezvous not running on {base}");
             return;
         }
-        let host = StunarHost::start(base, "senha", "Ana", false).expect("open");
+        let host = StunarHost::start(base, "senha", "Ana", false, super::super::room_mode::SessionMode::Broadcast).expect("open");
         let code = host.code();
 
         // Viewer asks; admission off => accepted immediately, no pending step.
@@ -183,7 +183,7 @@ mod stunar_integration {
             eprintln!("SKIP: rendezvous not running on {base}");
             return;
         }
-        let host = StunarHost::start(base, "senha", "Ana", false).expect("open");
+        let host = StunarHost::start(base, "senha", "Ana", false, super::super::room_mode::SessionMode::Broadcast).expect("open");
         let code = host.code();
         assert_eq!(code.len(), 6);
 

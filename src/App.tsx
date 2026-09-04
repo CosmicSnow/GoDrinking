@@ -168,6 +168,8 @@ function App() {
   const [playingOnly, setPlayingOnly] = useState(false);
   const [session, setSession] = useState<Snapshot | null>(null);
   const [joinCode, setJoinCode] = useState("");
+  const [sessionMode, setSessionMode] = useState<"broadcast" | "room">("broadcast");
+  const [benchNote, setBenchNote] = useState("");
   const [joinMode, setJoinMode] = useState<"lan" | "direct" | "stunar">(() => {
     const saved = localStorage.getItem("godrinking.join_mode");
     return saved === "direct" || saved === "stunar" ? saved : "lan";
@@ -485,6 +487,54 @@ function App() {
       setNotice(diagnosticError(error, "Screen Recording permission could not be checked."));
     }
   };
+  const runBenchmark = async () => {
+    try {
+      const report = await invokeMedia<{ recommended: "low" | "medium" | "high"; note: string }>("run_media_benchmark");
+      applyPreset(report.recommended);
+      setBenchNote(report.note);
+      try { localStorage.setItem("godrinking.benchmark", JSON.stringify({ ...report, at: Date.now() })); } catch { /* ignore */ }
+    } catch (error) {
+      setBenchNote(diagnosticError(error, "Could not measure this PC."));
+    }
+  };
+  const startAttachShare = async () => {
+    if (sessionAction !== "idle") return;
+    setSessionAction("starting");
+    setNotice(copy.startHint);
+    try {
+      const next = await invokeMedia<Snapshot>("create_media_session", {
+        request: {
+          source: sourceKind === "display" ? "screen" : "window",
+          source_id: sourceId,
+          quality,
+          bitrate_bps: bitrateMbps !== null ? Math.round(bitrateMbps * 1_000_000) : null,
+          min_bitrate_bps: minBitrateMbps !== null ? Math.round(minBitrateMbps * 1_000_000) : null,
+          codec: videoCodec,
+          encoder: videoEncoder,
+          resolution: resolvedResolution,
+          frame_rate: resolvedFrameRate,
+          system_audio: systemAudio,
+          excluded_apps: excludedApps,
+          password: hostPassword,
+          nickname: nickname.trim() || "Host",
+          admission: hostAdmission,
+          join_mode: joinMode,
+          rendezvous_url: joinMode === "stunar" ? rendezvousUrl.trim() : null,
+          session_mode: "room",
+          attach_only: true
+        }
+      });
+      setSession(next);
+      setMode("share");
+      setNotice(next.detail || "Your screen is going out. They still don't go through the server.");
+    } catch (error) {
+      const message = diagnosticError(error, "Could not share your screen.");
+      setLastError(message);
+      setNotice(message);
+    } finally {
+      setSessionAction("idle");
+    }
+  };
   const startSharing = async () => {
     if (sessionAction !== "idle") return;
     setSessionAction("starting");
@@ -514,7 +564,9 @@ function App() {
           nickname: nickname.trim() || "Host",
           admission: hostAdmission,
           join_mode: joinMode,
-          rendezvous_url: joinMode === "stunar" ? rendezvousUrl.trim() : null
+          rendezvous_url: joinMode === "stunar" ? rendezvousUrl.trim() : null,
+          session_mode: sessionMode,
+          attach_only: false
         }
       });
       setSession(next);
@@ -864,6 +916,9 @@ function App() {
                 <button className="primary-cta" disabled={sessionAction !== "idle" || !nicknameValid || !stunarJoinPasswordValid} onClick={() => void joinRoom()}>
                   {sessionAction === "joining" ? copy.joining : copy.joinSession}
                 </button>
+                {watchConnected && (
+                  <button className="copy-button" style={{marginTop: 10, width: "100%"}} disabled={sessionAction !== "idle"} onClick={() => void startAttachShare()}>{copy.shareMine}</button>
+                )}
               </section>
             )}
             <section className={`panel preview-panel ${watchConnected ? "watch-preview" : ""}`}>
@@ -1014,6 +1069,9 @@ function App() {
                     </div>
                     <p className="quality-hint">{copy.floorHint}</p>
                   </div>
+                  <button className="copy-button" style={{marginTop: 10}} disabled={active || sessionAction !== "idle"} onClick={() => void runBenchmark()}>{copy.measurePc}</button>
+                  {benchNote && <p className="quality-hint">{benchNote}</p>}
+                  <p className="quality-hint">{copy.measureHint}</p>
                   </div>
                   )}
                 </div>
@@ -1072,6 +1130,14 @@ function App() {
                   <button className={joinMode === "stunar" ? "selected" : ""} disabled={active} onClick={() => setJoinMode("stunar")}>Stunar</button>
                 </div>
                 <p className="quality-hint">{joinModeHelp}</p>
+              </div>
+              <div className="join-mode-block">
+                <span>{copy.sessionMode}</span>
+                <div className="segmented">
+                  <button className={sessionMode === "broadcast" ? "selected" : ""} disabled={active} onClick={() => setSessionMode("broadcast")}>{copy.broadcast}</button>
+                  <button className={sessionMode === "room" ? "selected" : ""} disabled={active} onClick={() => setSessionMode("room")}>{copy.room}</button>
+                </div>
+                <p className="quality-hint">{sessionMode === "room" ? copy.roomHint : copy.broadcastHint}</p>
               </div>
               {joinMode === "stunar" && (
                 <>

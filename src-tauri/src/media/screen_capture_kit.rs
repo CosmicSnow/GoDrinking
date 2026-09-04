@@ -2207,6 +2207,8 @@ mod tests {
             admission: false,
             join_mode: super::super::types::JoinMode::Lan,
             rendezvous_url: None,
+            session_mode: super::super::room_mode::SessionMode::Broadcast,
+            attach_only: false,
         };
         let mut adapter = ScreenCaptureKitAdapter::new();
         let (capture_tx, _capture_rx) = sync_channel::<NativeFrame>(1);

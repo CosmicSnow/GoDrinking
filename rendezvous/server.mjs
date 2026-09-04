@@ -10,6 +10,7 @@
 import http from "node:http";
 import { randomBytes, scrypt, timingSafeEqual } from "node:crypto";
 import { WebSocketServer } from "ws";
+import { nextMaster } from "./succession.mjs";
 
 const PORT = Number(process.env.PORT || 8787);
 const BIND = process.env.BIND || "127.0.0.1";
@@ -32,7 +33,16 @@ const SCRYPT_P = 1;
 const SCRYPT_KEYLEN = 32;
 const SALT_LEN = 16;
 const RATE_WINDOW_MS = 60 * 1000;
-const RATE_LIMITS = { "host/open": 5, "host/heartbeat": 6, "viewer/ask": 10, ws: 20, rest: 60 };
+const RATE_LIMITS = {
+  "host/open": 5,
+  "host/heartbeat": 6,
+  "viewer/ask": 10,
+  "member/leave": 10,
+  "member/heartbeat": 12,
+  "master/kick": 10,
+  ws: 20,
+  rest: 60,
+};
 const IGNORE_WINDOW_MS = 10 * 60 * 1000;
 // Escalating ignore: 5,10,15,20 fails in the window -> 15min,1h,6h,24h.
 const IGNORE_PENALTIES = [15 * 60 * 1000, 60 * 60 * 1000, 6 * 60 * 60 * 1000, 24 * 60 * 60 * 1000];
@@ -48,6 +58,9 @@ const ROUTES = new Set([
   "/v1/host/close",
   "/v1/viewer/ask",
   "/v1/host/decide",
+  "/v1/member/leave",
+  "/v1/member/heartbeat",
+  "/v1/master/kick",
 ]);
 
 // --- State (RAM) -----------------------------------------------------------
@@ -228,11 +241,30 @@ function storeFakeToken(token) {
 // --- Room lifecycle --------------------------------------------------------
 
 function rosterEntries(room) {
+  if (room.mode === "room") {
+    return [...room.members.values()].map((member) => ({
+      id: member.id,
+      nickname: member.nickname,
+      state: member.share ? "sharing" : "accepted",
+      master: member.id === room.masterId,
+      share: member.share === true,
+    }));
+  }
   return [...room.viewers.values()].map((v) => ({
     id: v.id,
     nickname: v.nickname,
     state: v.state,
   }));
+}
+
+function broadcastRoster(room) {
+  const entries = rosterEntries(room);
+  send(room.hostWs, { t: "roster", entries, master_id: room.masterId ?? null, mode: room.mode });
+  if (room.mode === "room") {
+    for (const member of room.members.values()) {
+      send(member.ws, { t: "roster", entries, master_id: room.masterId, mode: "room" });
+    }
+  }
 }
 
 function send(ws, obj) {
@@ -248,7 +280,50 @@ function destroyRoom(room) {
     send(viewer.ws, { t: "gone" });
     if (viewer.ws) viewer.ws.close(4000, "gone");
   }
+  if (room.members) {
+    for (const member of room.members.values()) {
+      tokens.delete(member.token);
+      send(member.ws, { t: "gone" });
+      if (member.ws) member.ws.close(4000, "gone");
+    }
+  }
   if (room.hostWs) room.hostWs.close(4000, "gone");
+}
+
+function promoteMaster(room, newMasterId) {
+  const member = room.members.get(newMasterId);
+  if (!member) return;
+  room.masterId = newMasterId;
+  room.hostToken = member.token;
+  const tokenMeta = tokens.get(member.token);
+  if (tokenMeta) tokenMeta.role = "host";
+  member.role = "host";
+  send(member.ws, { t: "you-are-master", member_id: member.id });
+  broadcastRoster(room);
+}
+
+function dropMember(room, memberId) {
+  const member = room.members.get(memberId);
+  if (!member) return;
+  const leavingWasMaster = room.masterId === memberId;
+  room.members.delete(memberId);
+  tokens.delete(member.token);
+  send(member.ws, { t: "gone" });
+  if (member.ws) member.ws.close(4000, "gone");
+  if (room.members.size === 0) {
+    destroyRoom(room);
+    return;
+  }
+  if (leavingWasMaster) {
+    const next = nextMaster(
+      [...room.members.values()].map((item) => ({ id: item.id, joinedAt: item.joinedAt })),
+      "",
+    );
+    if (next) promoteMaster(room, next);
+    else destroyRoom(room);
+  } else {
+    broadcastRoster(room);
+  }
 }
 
 // --- REST handlers ---------------------------------------------------------
@@ -273,31 +348,43 @@ async function handleOpen(ip, json, res) {
   const hostToken = randomToken();
   const passwordSalt = randomBytes(SALT_LEN);
   const passwordHash = await scryptAsync(password, passwordSalt);
+  const mode = json.mode === "room" ? "room" : "broadcast";
+  const masterId = randomViewerId();
+  const now = Date.now();
   const room = {
     code,
+    mode,
     passwordHash,
     passwordSalt,
     admission: json.admission === true,
     hostNickname: json.nickname,
     hostToken,
-    heartbeatAt: Date.now(),
+    masterId,
+    heartbeatAt: now,
     hostWs: null,
     viewers: new Map(),
+    members: new Map(),
   };
+  if (mode === "room") {
+    room.members.set(masterId, {
+      id: masterId,
+      nickname: json.nickname,
+      token: hostToken,
+      joinedAt: now,
+      heartbeatAt: now,
+      ws: null,
+      share: true,
+      role: "host",
+    });
+  }
   rooms.set(code, room);
-  tokens.set(hostToken, { role: "host", code });
-  log("info", ip, "open", code);
-  ok(res, { ok: true, host_token: hostToken, code });
+  tokens.set(hostToken, { role: "host", code, memberId: masterId });
+  log("info", ip, "open", code, "-", mode);
+  ok(res, { ok: true, host_token: hostToken, code, mode, member_id: masterId });
 }
 
 function handleHeartbeat(ip, json, res) {
-  const token = typeof json.host_token === "string" ? json.host_token : "";
-  const entry = tokens.get(token);
-  if (!entry || entry.role !== "host") return deny(res);
-  const room = rooms.get(entry.code);
-  if (!room || room.hostToken !== token) return deny(res);
-  room.heartbeatAt = Date.now();
-  ok(res, { ok: true });
+  return handleMemberHeartbeat(ip, json, res);
 }
 
 async function handleRotate(ip, json, res) {
@@ -379,19 +466,103 @@ async function handleAsk(ip, json, res) {
   const state = room.admission ? "pending" : "accepted";
   const viewer = { id: viewerId, nickname, token: viewerToken, state, ws: null, inbox: null };
   room.viewers.set(viewerId, viewer);
-  tokens.set(viewerToken, { role: "viewer", code, viewerId });
+  tokens.set(viewerToken, { role: "viewer", code, viewerId, memberId: viewerId });
+
+  if (room.mode === "room") {
+    room.members.set(viewerId, {
+      id: viewerId,
+      nickname,
+      token: viewerToken,
+      joinedAt: Date.now(),
+      heartbeatAt: Date.now(),
+      ws: null,
+      share: false,
+      role: "member",
+    });
+  }
 
   if (state === "accepted") {
     log("info", ip, "ask", code, viewerId, "accepted");
-    ok(res, { ok: true, status: "accepted", viewer_token: viewerToken });
-    // The Host needs to know about the new accepted Viewer to mint an offer.
-    send(room.hostWs, { t: "roster", entries: rosterEntries(room) });
+    ok(res, {
+      ok: true,
+      status: "accepted",
+      viewer_token: viewerToken,
+      mode: room.mode,
+      member_id: viewerId,
+      master_id: room.masterId ?? null,
+    });
+    broadcastRoster(room);
   } else {
     log("info", ip, "ask", code, viewerId, "pending");
-    ok(res, { ok: true, status: "pending", viewer_token: viewerToken });
+    ok(res, { ok: true, status: "pending", viewer_token: viewerToken, mode: room.mode, member_id: viewerId });
     send(room.hostWs, { t: "pending", viewer_id: viewerId, nickname });
-    send(room.hostWs, { t: "roster", entries: rosterEntries(room) });
+    broadcastRoster(room);
   }
+}
+
+function tokenRoom(token) {
+  const entry = tokens.get(token);
+  if (!entry) return null;
+  const room = rooms.get(entry.code);
+  if (!room) return null;
+  return { entry, room };
+}
+
+function handleMemberLeave(ip, json, res) {
+  const token = typeof json.token === "string" ? json.token : typeof json.host_token === "string" ? json.host_token : typeof json.viewer_token === "string" ? json.viewer_token : "";
+  const found = tokenRoom(token);
+  if (!found) return deny(res);
+  const { entry, room } = found;
+  if (room.mode !== "room") {
+    if (entry.role === "host") {
+      log("info", ip, "close", room.code);
+      destroyRoom(room);
+      return ok(res, { ok: true });
+    }
+    return deny(res);
+  }
+  const memberId = entry.memberId || entry.viewerId || room.masterId;
+  log("info", ip, "leave", room.code, memberId);
+  dropMember(room, memberId);
+  ok(res, { ok: true });
+}
+
+function handleMemberHeartbeat(ip, json, res) {
+  const token = typeof json.token === "string" ? json.token : typeof json.host_token === "string" ? json.host_token : "";
+  const found = tokenRoom(token);
+  if (!found) return deny(res);
+  const { entry, room } = found;
+  const now = Date.now();
+  room.heartbeatAt = now;
+  if (room.mode === "room") {
+    const memberId = entry.memberId || entry.viewerId || room.masterId;
+    const member = room.members.get(memberId);
+    if (member) member.heartbeatAt = now;
+  }
+  ok(res, { ok: true, master_id: room.masterId ?? null });
+}
+
+function handleMasterKick(ip, json, res) {
+  const token = typeof json.host_token === "string" ? json.host_token : typeof json.token === "string" ? json.token : "";
+  const found = tokenRoom(token);
+  if (!found || found.entry.role !== "host") return deny(res);
+  const { room } = found;
+  if (room.hostToken !== token) return deny(res);
+  const targetId = typeof json.target_id === "string" ? json.target_id : "";
+  if (!targetId || targetId === room.masterId) return invalid(res);
+  log("info", ip, "kick", room.code, targetId);
+  if (room.mode === "room") dropMember(room, targetId);
+  else {
+    const viewer = room.viewers.get(targetId);
+    if (viewer) {
+      room.viewers.delete(targetId);
+      tokens.delete(viewer.token);
+      send(viewer.ws, { t: "kicked" });
+      if (viewer.ws) viewer.ws.close(4000, "kick");
+      broadcastRoster(room);
+    }
+  }
+  ok(res, { ok: true });
 }
 
 function handleDecide(ip, json, res) {
@@ -443,9 +614,29 @@ function handleClientMessage(ws, meta, data) {
   } catch {
     return;
   }
-  if (!msg || msg.t !== "signal" || !isValidSignal(msg.payload)) return;
   const room = rooms.get(meta.code);
   if (!room) return;
+  const fromId = meta.role === "host" ? room.masterId : meta.viewerId;
+
+  if (room.mode === "room" && (msg.t === "share-start" || msg.t === "share-stop")) {
+    const member = fromId ? room.members.get(fromId) : null;
+    if (!member) return;
+    member.share = msg.t === "share-start";
+    broadcastRoster(room);
+    return;
+  }
+
+  if (!msg || msg.t !== "signal" || !isValidSignal(msg.payload)) return;
+
+  if (room.mode === "room" && typeof msg.to === "string") {
+    const dest = room.members.get(msg.to);
+    if (!dest) return;
+    send(dest.ws, { t: "signal", from: fromId, to: msg.to, payload: msg.payload });
+    if (dest.id === room.masterId) {
+      send(room.hostWs, { t: "signal", from: fromId, to: msg.to, payload: msg.payload });
+    }
+    return;
+  }
 
   if (meta.role === "host") {
     const viewerId = typeof msg.viewer_id === "string" ? msg.viewer_id : "";
@@ -497,7 +688,11 @@ wss.on("connection", (ws, req, meta) => {
       return;
     }
     room.hostWs = ws; // one socket per role; reconnect replaces it
-    send(ws, { t: "roster", entries: rosterEntries(room) });
+    if (room.mode === "room" && room.masterId) {
+      const master = room.members.get(room.masterId);
+      if (master) master.ws = ws;
+    }
+    send(ws, { t: "roster", entries: rosterEntries(room), master_id: room.masterId ?? null, mode: room.mode });
     log("info", ip, "ws", room.code, "host");
   } else {
     const viewer = room.viewers.get(meta.viewerId);
@@ -506,6 +701,10 @@ wss.on("connection", (ws, req, meta) => {
       return;
     }
     viewer.ws = ws;
+    if (room.mode === "room") {
+      const member = room.members.get(viewer.id);
+      if (member) member.ws = ws;
+    }
     if (viewer.state === "accepted") send(ws, { t: "accepted", viewer_id: viewer.id });
     if (viewer.inbox) {
       send(ws, { t: "signal", payload: viewer.inbox });
@@ -598,6 +797,15 @@ const server = http.createServer(async (req, res) => {
         return handleClose(ip, json, res);
       case "/v1/viewer/ask":
         return await handleAsk(ip, json, res);
+      case "/v1/member/leave":
+        handleMemberLeave(ip, json, res);
+        break;
+      case "/v1/member/heartbeat":
+        handleMemberHeartbeat(ip, json, res);
+        break;
+      case "/v1/master/kick":
+        handleMasterKick(ip, json, res);
+        break;
       case "/v1/host/decide":
         return handleDecide(ip, json, res);
       default:
@@ -667,6 +875,15 @@ setInterval(() => {
 setInterval(() => {
   const now = Date.now();
   for (const [code, room] of rooms) {
+    if (room.mode === "room") {
+      for (const member of [...room.members.values()]) {
+        if (now - member.heartbeatAt > HEARTBEAT_TTL_MS) {
+          log("warn", "-", "gc-member", code, member.id);
+          dropMember(room, member.id);
+        }
+      }
+      continue;
+    }
     if (now - room.heartbeatAt > HEARTBEAT_TTL_MS) {
       log("warn", "-", "gc", code);
       destroyRoom(room);

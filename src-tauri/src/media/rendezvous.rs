@@ -107,17 +107,18 @@ impl StunarHost {
         password: &str,
         nickname: &str,
         admission: bool,
+        session_mode: super::room_mode::SessionMode,
     ) -> Result<Self, String> {
         logger::begin_session("host", "stunar");
         logger::log(
             "INFO",
             "stunar open",
-            &format!("base={base} nickname={nickname} admission={admission}"),
+            &format!("base={base} nickname={nickname} admission={admission} mode={session_mode:?}"),
         );
         let runtime = current_thread_runtime()?;
         let client = http_client()?;
         let (host_token, code) =
-            runtime.block_on(host_open(&client, base, password, nickname, admission))?;
+            runtime.block_on(host_open(&client, base, password, nickname, admission, session_mode))?;
         let state = Arc::new(Mutex::new(StunarState::Calling));
         let roster = Arc::new(Mutex::new(HashMap::new()));
         let answers = Arc::new(Mutex::new(Vec::new()));
@@ -293,10 +294,15 @@ async fn host_open(
     password: &str,
     nickname: &str,
     admission: bool,
+    session_mode: super::room_mode::SessionMode,
 ) -> Result<(String, String), String> {
     let base = normalize_base(base);
     // The server generates the Room code; the Host never sends one.
-    let body = json!({ "password": password, "nickname": nickname, "admission": admission });
+    let mode = match session_mode {
+        super::room_mode::SessionMode::Room => "room",
+        super::room_mode::SessionMode::Broadcast => "broadcast",
+    };
+    let body = json!({ "password": password, "nickname": nickname, "admission": admission, "mode": mode });
     let response = client
         .post(format!("{base}/v1/host/open"))
         .json(&body)

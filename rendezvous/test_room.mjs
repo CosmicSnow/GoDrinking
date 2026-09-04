@@ -1,0 +1,75 @@
+import { spawn } from "node:child_process";
+import assert from "node:assert/strict";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const PORT = 18791;
+const base = `http://127.0.0.1:${PORT}`;
+
+function post(path, body) {
+  return fetch(base + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).then(async (res) => ({ status: res.status, json: await res.json() }));
+}
+
+const child = spawn(process.execPath, ["server.mjs"], {
+  cwd: here,
+  env: { ...process.env, PORT: String(PORT), BIND: "127.0.0.1", HEARTBEAT_TTL_MS: "8000" },
+  stdio: ["ignore", "pipe", "pipe"],
+});
+
+await new Promise((resolve, reject) => {
+  const timer = setTimeout(() => reject(new Error("server start timeout")), 4000);
+  child.stdout.on("data", (buf) => {
+    if (String(buf).includes("listen")) {
+      clearTimeout(timer);
+      resolve();
+    }
+  });
+  child.on("error", reject);
+});
+
+try {
+  const open = await post("/v1/host/open", {
+    nickname: "Ada",
+    password: "secret1",
+    mode: "room",
+  });
+  assert.equal(open.status, 200);
+  assert.equal(open.json.mode, "room");
+  assert.ok(open.json.host_token);
+  assert.ok(open.json.member_id);
+  const code = open.json.code;
+  const hostToken = open.json.host_token;
+
+  const b = await post("/v1/viewer/ask", { code, nickname: "Bob", password: "secret1" });
+  assert.equal(b.json.status, "accepted");
+  const c = await post("/v1/viewer/ask", { code, nickname: "Cyd", password: "secret1" });
+  assert.equal(c.json.status, "accepted");
+
+  const leaveHost = await post("/v1/member/leave", { host_token: hostToken });
+  assert.equal(leaveHost.status, 200);
+
+  const hbB = await post("/v1/member/heartbeat", { token: b.json.viewer_token });
+  assert.equal(hbB.status, 200);
+  assert.equal(hbB.json.master_id, b.json.member_id);
+
+  await post("/v1/member/leave", { token: b.json.viewer_token });
+  await post("/v1/member/leave", { token: c.json.viewer_token });
+
+  const gone = await post("/v1/viewer/ask", { code, nickname: "Dan", password: "secret1" });
+  assert.equal(gone.status, 404);
+
+  const broadcast = await post("/v1/host/open", {
+    nickname: "Ada",
+    password: "secret1",
+  });
+  assert.equal(broadcast.json.mode, "broadcast");
+
+  console.log("room mode ok");
+} finally {
+  child.kill("SIGTERM");
+}

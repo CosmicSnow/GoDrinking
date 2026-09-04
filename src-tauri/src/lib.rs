@@ -3,7 +3,7 @@ mod media;
 use media::logger;
 use media::{
     CreateMediaSessionRequest, JoinMode, MediaEngine, MediaSessionSnapshot, NativeCaptureSource,
-    NativeRunningApp, PeerSignal, PreviewFrameEvent, UpdateCredentialsRequest,
+    NativeRunningApp, PeerSignal, PreviewFrameEvent, ProbeReport, UpdateCredentialsRequest,
     UpdateMediaSessionRequest, MediaSessionStats,
 };
 use std::net::IpAddr;
@@ -368,6 +368,19 @@ fn update_media_session_credentials(
         .map_err(|error| error.to_string())
 }
 
+/// Local encoder probe. No Session, no Rendezvous, no Media on the wire.
+#[tauri::command]
+fn run_media_benchmark(
+    engine: State<'_, MediaEngine>,
+) -> Result<ProbeReport, String> {
+    let caps = engine.capabilities();
+    Ok(media::run_local_probe(
+        caps.native_encoder_implemented,
+        caps.av1_encode_supported,
+        cfg!(target_os = "macos"),
+    ))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -398,7 +411,8 @@ pub fn run() {
             get_app_logs,
             clear_app_logs,
             reset_firewall_rules,
-            get_firewall_status
+            get_firewall_status,
+            run_media_benchmark
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

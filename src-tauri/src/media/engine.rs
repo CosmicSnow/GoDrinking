@@ -815,7 +815,10 @@ fn create_in_state(
     // Stunar opens the room on the Rendezvous before anything else starts,
     // so a failure (missing URL, unreachable relay) aborts cleanly. The
     // Rendezvous generates the Room code; the Host never sends one.
-    let stunar = match request.join_mode {
+    let stunar = if request.attach_only {
+        None
+    } else {
+        match request.join_mode {
         JoinMode::Stunar => {
             let base = request.rendezvous_url.as_deref().ok_or_else(|| {
                 MediaEngineError::NativePeer("Set the Stunar URL in settings.".into())
@@ -833,7 +836,7 @@ fn create_in_state(
                 ));
             }
             Some(Arc::new(
-                StunarHost::start(base, &request.password, &request.nickname, request.admission)
+                StunarHost::start(base, &request.password, &request.nickname, request.admission, request.session_mode)
                     .map_err(|error| {
                         logger::log("ERROR", "stunar open", &error);
                         MediaEngineError::NativePeer(error)
@@ -841,6 +844,7 @@ fn create_in_state(
             ))
         }
         JoinMode::Lan | JoinMode::Direct => None,
+        }
     };
     let (capabilities, id, preview) = {
         let mut state = state.lock().map_err(|_| MediaEngineError::StatePoisoned)?;
@@ -950,7 +954,10 @@ fn create_in_state(
             .and_then(|state| state.session.as_ref().map(|session| session.viewers.len()))
             .unwrap_or(0)
     });
-    let room = match request.join_mode {
+    let room = if request.attach_only {
+        None
+    } else {
+        match request.join_mode {
         JoinMode::Lan => {
             LanRoom::start(
                 Arc::clone(&mint),
@@ -961,12 +968,17 @@ fn create_in_state(
             .ok()
         }
         JoinMode::Direct | JoinMode::Stunar => None,
+        }
     };
-    let direct_room = match request.join_mode {
+    let direct_room = if request.attach_only {
+        None
+    } else {
+        match request.join_mode {
         JoinMode::Direct => {
             DirectRoom::start(mint, Arc::clone(&gate), viewer_count, request.nickname.clone()).ok()
         }
         JoinMode::Lan | JoinMode::Stunar => None,
+        }
     };
     let mut state = state.lock().map_err(|_| MediaEngineError::StatePoisoned)?;
     let audio_note = if request.system_audio && audio_tap.is_none() {
@@ -1323,6 +1335,7 @@ fn snapshot_from_state(state: &EngineState) -> MediaSessionSnapshot {
         password_set: session.gate.password_set(),
         admission: session.gate.admission(),
         join_mode: session.request.join_mode,
+        session_mode: session.request.session_mode,
         direct_listen_port: session.direct_room.as_ref().map(|room| room.port),
         direct_addresses: session
             .direct_room
@@ -1538,6 +1551,8 @@ use super::{
             admission: false,
             join_mode: JoinMode::Lan,
             rendezvous_url: None,
+            session_mode: super::super::room_mode::SessionMode::Broadcast,
+            attach_only: false,
         }
     }
 
