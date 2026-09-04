@@ -337,6 +337,14 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         Ok(())
     }
 
+    fn on_closed(&mut self) -> Result<(), Self::Error> {
+        self.diagnostics
+            .record_error("Windows capture source closed; capture ended.");
+        Ok(())
+    }
+}
+
+impl CaptureHandler {
     fn maybe_log_summary(&mut self) {
         if self.callbacks == 1 || self.callbacks % 600 == 0 {
             logger::log(
@@ -353,12 +361,6 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
                 ),
             );
         }
-    }
-
-    fn on_closed(&mut self) -> Result<(), Self::Error> {
-        self.diagnostics
-            .record_error("Windows capture source closed; capture ended.");
-        Ok(())
     }
 }
 
