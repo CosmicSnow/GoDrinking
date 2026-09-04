@@ -1,4 +1,5 @@
-import { useEffect, useState, type RefObject } from "react";
+import { useEffect, useRef, useState, type PointerEvent, type RefObject } from "react";
+import { collectViewerStats, type ViewerStatsPrev } from "./sessionStats";
 
 export type RoomPerson = {
   id: string;
@@ -13,6 +14,7 @@ export type RoomTile = {
   nickname: string;
   stream: MediaStream | null;
   local?: boolean;
+  pc?: RTCPeerConnection | null;
 };
 
 type Props = {
@@ -53,9 +55,9 @@ export function liveRoomTiles(tiles: RoomTile[], watching: Set<string>): RoomTil
   });
 }
 
-type TileCtl = { zoom: number; volume: number; muted: boolean };
+type TileCtl = { zoom: number; panX: number; panY: number; volume: number; muted: boolean };
 
-const defaultCtl = (): TileCtl => ({ zoom: 1, volume: 80, muted: false });
+const defaultCtl = (): TileCtl => ({ zoom: 1, panX: 0, panY: 0, volume: 80, muted: false });
 
 function TileVideo({
   tile,
@@ -63,41 +65,70 @@ function TileVideo({
   pinned,
   cinema,
   ctl,
+  statsOpen,
+  statsText,
   onPin,
   onUnwatch,
   onZoom,
+  onPan,
   onVolume,
   onMute,
   onCinema,
+  onStats,
 }: {
   tile: RoomTile;
   localCanvas?: RefObject<HTMLCanvasElement | null>;
   pinned: string | null;
   cinema: boolean;
   ctl: TileCtl;
+  statsOpen: boolean;
+  statsText: string;
   onPin: (id: string | null) => void;
   onUnwatch: (id: string) => void;
   onZoom: (id: string, zoom: number) => void;
+  onPan: (id: string, panX: number, panY: number) => void;
   onVolume: (id: string, volume: number) => void;
   onMute: (id: string, muted: boolean) => void;
   onCinema: (id: string | null) => void;
+  onStats: (id: string | null) => void;
 }) {
   const zoomOut = Math.max(1, Math.round((ctl.zoom - 0.25) * 100) / 100);
   const zoomIn = Math.min(3, Math.round((ctl.zoom + 0.25) * 100) / 100);
+  const drag = useRef<null | { x: number; y: number; panX: number; panY: number }>(null);
+  const transform = `translate(${ctl.panX}px, ${ctl.panY}px) scale(${ctl.zoom})`;
+  const onPointerDown = (event: PointerEvent<HTMLDivElement>) => {
+    if (ctl.zoom <= 1 || event.button !== 0) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    drag.current = { x: event.clientX, y: event.clientY, panX: ctl.panX, panY: ctl.panY };
+  };
+  const onPointerMove = (event: PointerEvent<HTMLDivElement>) => {
+    if (!drag.current) return;
+    onPan(tile.id, drag.current.panX + (event.clientX - drag.current.x), drag.current.panY + (event.clientY - drag.current.y));
+  };
+  const onPointerUp = (event: PointerEvent<HTMLDivElement>) => {
+    if (drag.current) {
+      try { event.currentTarget.releasePointerCapture(event.pointerId); } catch { /* already released */ }
+    }
+    drag.current = null;
+  };
   return (
     <div
-      className={`room-tile ${pinned === tile.id ? "is-pinned-tile" : ""} ${cinema ? "is-cinema-tile" : ""}`}
+      className={`room-tile ${pinned === tile.id ? "is-pinned-tile" : ""} ${cinema ? "is-cinema-tile" : ""} ${ctl.zoom > 1 ? "is-zoomed" : ""}`}
       onDoubleClick={() => onPin(pinned === tile.id ? null : tile.id)}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerUp}
     >
       {tile.local ? (
-        <canvas ref={localCanvas} className="room-video visible" aria-label="Your screen" style={{ transform: `scale(${ctl.zoom})` }}/>
+        <canvas ref={localCanvas} className="room-video visible" aria-label="Your screen" style={{ transform }}/>
       ) : (
         <video
           className="room-video visible"
           autoPlay
           playsInline
           data-slot={tile.id}
-          style={{ transform: `scale(${ctl.zoom})` }}
+          style={{ transform }}
           ref={(el) => {
             if (!el) return;
             if (tile.stream && el.srcObject !== tile.stream) el.srcObject = tile.stream;
@@ -106,11 +137,15 @@ function TileVideo({
           }}
         />
       )}
+      {statsOpen && <div className="room-tile-stats" onPointerDown={(event) => event.stopPropagation()}>{statsText}</div>}
       <div className="room-tile-hud">
         <span>{tile.nickname}{tile.local ? " · you" : ""}</span>
-        <span className="room-tile-actions" onClick={(event) => event.stopPropagation()}>
+        <span className="room-tile-actions" onClick={(event) => event.stopPropagation()} onPointerDown={(event) => event.stopPropagation()}>
+          <button type="button" className="room-stat-btn" onClick={() => onStats(statsOpen ? null : tile.id)} title="Stream status" aria-label="Stream status">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>
+          </button>
           <button type="button" onClick={() => onZoom(tile.id, zoomOut)} disabled={ctl.zoom <= 1} title="Zoom out">−</button>
-          <button type="button" onClick={() => onZoom(tile.id, 1)} title="Reset zoom">{Math.round(ctl.zoom * 100)}%</button>
+          <button type="button" onClick={() => { onZoom(tile.id, 1); onPan(tile.id, 0, 0); }} title="Reset zoom">{Math.round(ctl.zoom * 100)}%</button>
           <button type="button" onClick={() => onZoom(tile.id, zoomIn)} disabled={ctl.zoom >= 3} title="Zoom in">+</button>
           {!tile.local && (
             <>
@@ -165,10 +200,37 @@ export function RoomStage({
   const visible = liveRoomTiles(tiles, watching);
   const [ctl, setCtl] = useState<Record<string, TileCtl>>({});
   const [cinemaId, setCinemaId] = useState<string | null>(null);
+  const [statsId, setStatsId] = useState<string | null>(null);
+  const [statsText, setStatsText] = useState("Collecting…");
+  const statsPrev = useRef<ViewerStatsPrev>(null);
   const ctlOf = (id: string) => ctl[id] ?? defaultCtl();
   const patchCtl = (id: string, next: Partial<TileCtl>) => {
     setCtl((current) => ({ ...current, [id]: { ...defaultCtl(), ...current[id], ...next } }));
   };
+  useEffect(() => {
+    if (!statsId) return undefined;
+    const tile = tiles.find((item) => item.id === statsId);
+    const pc = tile?.pc;
+    if (!pc) {
+      setStatsText(tile?.local ? "Your encoder. Open Status in Settings for the full readout." : "No peer yet.");
+      return undefined;
+    }
+    let alive = true;
+    const tick = async () => {
+      const video = document.querySelector<HTMLVideoElement>(`video[data-slot="${statsId}"]`);
+      const { stats, prev } = await collectViewerStats(pc, video, statsPrev.current);
+      statsPrev.current = prev;
+      if (!alive) return;
+      const bits = stats.bitrateMbps != null ? `${stats.bitrateMbps} Mbps` : "—";
+      const res = stats.resolution ?? "—";
+      const fps = stats.fps != null ? `${stats.fps} fps` : "—";
+      const rtt = stats.rttMs != null ? `${stats.rttMs} ms` : "—";
+      setStatsText(`${bits} · ${res} · ${fps} · RTT ${rtt}`);
+    };
+    void tick();
+    const timer = window.setInterval(() => void tick(), 1000);
+    return () => { alive = false; window.clearInterval(timer); };
+  }, [statsId, tiles]);
   const stageTiles = cinemaId
     ? visible.filter((tile) => tile.id === cinemaId)
     : pinned
@@ -226,12 +288,16 @@ export function RoomStage({
                 pinned={pinned}
                 cinema={cinemaId === tile.id}
                 ctl={ctlOf(tile.id)}
+                statsOpen={statsId === tile.id}
+                statsText={statsText}
                 onPin={onPin}
                 onUnwatch={onUnwatch}
-                onZoom={(id, zoom) => patchCtl(id, { zoom })}
+                onZoom={(id, zoom) => patchCtl(id, { zoom, ...(zoom <= 1 ? { panX: 0, panY: 0 } : {}) })}
+                onPan={(id, panX, panY) => patchCtl(id, { panX, panY })}
                 onVolume={(id, volume) => patchCtl(id, { volume })}
                 onMute={(id, muted) => patchCtl(id, { muted })}
                 onCinema={setCinemaId}
+                onStats={setStatsId}
               />
             ))}
           </div>
@@ -270,8 +336,8 @@ export function RoomStage({
           ) : (
             <button type="button" className="room-share-btn" disabled={shareBusy || !canShare} onClick={onShare}>Share my screen</button>
           )}
-          <p className="room-rail-label">In the room</p>
-          {me && (
+          <p className="room-rail-label">In the room · {people.length || 1}</p>
+          {me ? (
             <div className="room-person is-you">
               <span>
                 {me.master ? <span className="roster-crown" title="Master">♛</span> : null}
@@ -279,8 +345,12 @@ export function RoomStage({
                 <small>{sharing ? "Sharing · you" : "You"}</small>
               </span>
             </div>
+          ) : (
+            <div className="room-person is-you">
+              <span>You<small>{sharing ? "Sharing" : "In the room"}</small></span>
+            </div>
           )}
-          {others.length === 0 && <p className="roster-empty">Waiting for people.</p>}
+          {others.length === 0 && <p className="roster-empty">You're the only one here for now.</p>}
           {others.map((person) => {
             const on = watching.has(person.id);
             return (

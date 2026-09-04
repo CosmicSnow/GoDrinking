@@ -254,17 +254,19 @@ function App() {
   const roster = session?.roster ?? [];
   const pendingRoster = roster.filter((entry) => entry.state === "pending");
   const connectedRoster = roster.filter((entry) => entry.state !== "pending" && entry.id !== session?.self_id);
-  const roomPeople = roster.filter((entry) => entry.state !== "pending");
+  const [stickyPeople, setStickyPeople] = useState<RosterEntry[]>([]);
+  const roomPeople = stickyPeople;
   const roomTiles = [
     ...(session?.native_capture_active ? [{ id: "local", nickname: nickname.trim() || "You", stream: null as MediaStream | null, local: true }] : []),
     ...remoteIds.filter((id) => id !== "local" && id !== session?.self_id && watching.has(id)).map((id) => {
       const slot = remotesRef.current.get(id);
-      const person = roster.find((entry) => entry.id === id);
+      const person = stickyPeople.find((entry) => entry.id === id) ?? roster.find((entry) => entry.id === id);
       return {
         id,
         nickname: person?.nickname || id.slice(0, 8),
         stream: slot?.stream ?? null,
-        local: false
+        local: false,
+        pc: slot?.pc ?? null
       };
     })
   ];
@@ -494,6 +496,25 @@ function App() {
     const timer = window.setInterval(() => void poll(), 500);
     return () => window.clearInterval(timer);
   }, [active, roomJoined]);
+  useEffect(() => {
+    if (!inSala) {
+      setStickyPeople([]);
+      return;
+    }
+    const incoming = (session?.roster ?? []).filter((entry) => entry.state !== "pending");
+    setStickyPeople((prev) => {
+      if (incoming.length === 0) {
+        if (prev.length > 0) return prev;
+        if (session?.self_id) return [{ id: session.self_id, nickname: nickname.trim() || "You", state: "new", master: true, share: Boolean(session.native_capture_active) }];
+        return prev;
+      }
+      const byId = new Map(incoming.map((entry) => [entry.id, entry]));
+      if (session?.self_id && !byId.has(session.self_id)) {
+        byId.set(session.self_id, { id: session.self_id, nickname: nickname.trim() || "You", state: "new", master: true, share: Boolean(session.native_capture_active) });
+      }
+      return [...byId.values()];
+    });
+  }, [inSala, session?.roster, session?.self_id, session?.native_capture_active, nickname]);
   useEffect(() => {
     if (!active || !session?.session_id) { liveSettingsApplied.current = false; return; }
     if (sessionAction !== "idle") return;
@@ -1088,7 +1109,7 @@ function App() {
                   <>
                     <label className="native-select-label" htmlFor="join-host">Host (IP:port)</label>
                     <input id="join-host" className="native-source" value={directHost} onChange={(event) => setDirectHost(event.target.value)} placeholder="192.168.1.40:41234 or [2001:db8::1]:41234"/>
-                    <p className="quality-hint">Cole o endereço completo que o Host mostrou (com porta, IPv6 entre [ ]). </p>
+                    <p className="quality-hint">Paste the full address the host showed you, including the port. Wrap IPv6 in [ ].</p>
                   </>
                 )}
                 {joinMode === "stunar" && (
@@ -1478,7 +1499,7 @@ function App() {
             {mode === "share" ? (
               <>
                 <div className="stats-grid">
-                  <div><span>Encoder target</span><code>{session?.bitrate_bps ? `${Math.round(session.bitrate_bps / 1e5) / 10} Mbps aplicados` : `${qualityTargetMbps[quality]} Mbps (preset)`} · {(session?.resolution ?? resolvedResolution)} · {(session?.frame_rate ?? resolvedFrameRate).replace("_fps", "fps")}{bitrateMbps !== null ? " · custom" : ""}</code></div>
+                  <div><span>Encoder target</span><code>{session?.bitrate_bps ? `${Math.round(session.bitrate_bps / 1e5) / 10} Mbps applied` : `${qualityTargetMbps[quality]} Mbps (preset)`} · {(session?.resolution ?? resolvedResolution)} · {(session?.frame_rate ?? resolvedFrameRate).replace("_fps", "fps")}{bitrateMbps !== null ? " · custom" : ""}</code></div>
                   <div><span>Session / peer</span><code>{session?.state ?? "idle"} / {session?.peer_state ?? "—"}</code></div>
                   {session?.detail ? <div><span>Session detail</span><code className={session?.state === "failed" ? "is-error" : ""} title={session.detail}>{session.detail}</code></div> : null}
                   <div><span>Viewers connected</span><code>{connectedRoster.length}{pendingRoster.length > 0 ? " (+" + pendingRoster.length + " waiting)" : ""}</code></div>
@@ -1487,16 +1508,16 @@ function App() {
                   <div><span>Capture preview</span><code>{hostPreviewFps !== null ? hostPreviewFps + " fps" : "—"}{session ? " · " + session.preview_frame_count + " frames" : ""}{session && session.preview_dropped_count > 0 ? " · " + session.preview_dropped_count + " dropped" : ""}</code></div>
                   <div><span>Peer detail</span><code title={session?.peer_detail ?? ""}>{session?.peer_detail || "—"}</code></div>
                   <div><span>Preview error</span><code className={session?.preview_error ? "is-error" : ""}>{session?.preview_error || "—"}</code></div>
-                  <div><span>Efetivo (adaptação)</span><code className={congestionMbps !== null && session?.bitrate_bps ? (congestionMbps < session.bitrate_bps / 1e6 / 2 ? "is-warn" : "") : ""}>{congestionMbps !== null ? `${congestionMbps} Mbps (REMB/sondagem)` : "sem sinal — usando o alvo"}{floorAppliedMbps !== null ? ` · piso ${floorAppliedMbps}` : ""}</code></div>
+                  <div><span>Effective (adapted)</span><code className={congestionMbps !== null && session?.bitrate_bps ? (congestionMbps < session.bitrate_bps / 1e6 / 2 ? "is-warn" : "") : ""}>{congestionMbps !== null ? `${congestionMbps} Mbps (REMB)` : "no signal, using the target"}{floorAppliedMbps !== null ? ` · floor ${floorAppliedMbps}` : ""}</code></div>
                 </div>
                 <div className="stats-links">
-                  <span className="stats-links-title">Viewers · ms da conexão</span>
+                  <span className="stats-links-title">Viewers · link RTT</span>
                   {!hostLinks || hostLinks.length === 0 ? (
-                    <code className="stats-links-empty">{active ? "Nenhum viewer com transporte ativo — o ms aparece aqui quando alguém conectar." : "Inicie uma sessão para medir."}</code>
+                    <code className="stats-links-empty">{active ? "No viewer with an active transport yet. RTT shows up once someone connects." : "Start a session to measure."}</code>
                   ) : hostLinks.map((link) => (
                     <div className="stats-link-row" key={link.id}>
                       <span className="stats-link-name">{link.nickname}<small>{link.state}</small></span>
-                      <code className={link.rtt_ms !== null && link.rtt_ms > 150 ? "is-warn" : ""}>{link.rtt_ms !== null ? `${link.rtt_ms} ms` : "medindo…"}</code>
+                      <code className={link.rtt_ms !== null && link.rtt_ms > 150 ? "is-warn" : ""}>{link.rtt_ms !== null ? `${link.rtt_ms} ms` : "measuring…"}</code>
                     </div>
                   ))}
                 </div>
@@ -1505,19 +1526,19 @@ function App() {
             ) : (
               <>
                 <div className="stats-grid">
-                  <div><span>Bitrate recebido</span><code className={viewerStats?.bitrateMbps !== null && viewerStats?.bitrateMbps !== undefined && viewerStats.bitrateMbps < 1 ? "is-warn" : ""}>{viewerStats?.bitrateMbps !== null && viewerStats?.bitrateMbps !== undefined ? viewerStats.bitrateMbps + " Mbps" : "—"}</code></div>
-                  <div><span>Resolução</span><code>{viewerStats?.resolution ?? "—"}</code></div>
+                  <div><span>Received bitrate</span><code className={viewerStats?.bitrateMbps !== null && viewerStats?.bitrateMbps !== undefined && viewerStats.bitrateMbps < 1 ? "is-warn" : ""}>{viewerStats?.bitrateMbps !== null && viewerStats?.bitrateMbps !== undefined ? viewerStats.bitrateMbps + " Mbps" : "—"}</code></div>
+                  <div><span>Resolution</span><code>{viewerStats?.resolution ?? "—"}</code></div>
                   <div><span>FPS</span><code>{viewerStats?.fps !== null && viewerStats?.fps !== undefined ? String(viewerStats.fps) : "—"}</code></div>
                   <div><span>Codec</span><code>{viewerStats?.codec ?? "—"}</code></div>
-                  <div><span>RTT (delay rede)</span><code>{viewerStats?.rttMs !== null && viewerStats?.rttMs !== undefined ? viewerStats.rttMs + " ms" : "—"}</code></div>
+                  <div><span>RTT</span><code>{viewerStats?.rttMs !== null && viewerStats?.rttMs !== undefined ? viewerStats.rttMs + " ms" : "—"}</code></div>
                   <div><span>Jitter</span><code>{viewerStats?.jitterMs !== null && viewerStats?.jitterMs !== undefined ? viewerStats.jitterMs + " ms" : "—"}</code></div>
-                  <div><span>Pacotes (perda)</span><code>{viewerStats?.packetsLost !== null && viewerStats?.packetsLost !== undefined ? viewerStats.packetsLost + " perdidos" + (viewerStats.lossPercent !== null && viewerStats.lossPercent !== undefined ? " · " + viewerStats.lossPercent + "%" : "") : "—"}</code></div>
-                  <div><span>Frames (descarte)</span><code>{viewerStats?.framesDecoded !== null && viewerStats?.framesDecoded !== undefined ? viewerStats.framesDecoded + " dec." + (viewerStats.dropPercent !== null && viewerStats.dropPercent !== undefined ? " · " + viewerStats.dropPercent + "% drop" : "") : "—"}</code></div>
-                  <div><span>Atraso do player</span><code>{viewerStats?.liveDelaySec !== null && viewerStats?.liveDelaySec !== undefined ? viewerStats.liveDelaySec + " s" : "—"}</code></div>
-                  <div><span>Conexão / ICE</span><code>{viewerStats?.connectionState ?? watchIce}{viewerStats?.iceState ? " / " + viewerStats.iceState : ""}</code></div>
+                  <div><span>Packets (loss)</span><code>{viewerStats?.packetsLost !== null && viewerStats?.packetsLost !== undefined ? viewerStats.packetsLost + " lost" + (viewerStats.lossPercent !== null && viewerStats.lossPercent !== undefined ? " · " + viewerStats.lossPercent + "%" : "") : "—"}</code></div>
+                  <div><span>Frames (drop)</span><code>{viewerStats?.framesDecoded !== null && viewerStats?.framesDecoded !== undefined ? viewerStats.framesDecoded + " dec." + (viewerStats.dropPercent !== null && viewerStats.dropPercent !== undefined ? " · " + viewerStats.dropPercent + "% drop" : "") : "—"}</code></div>
+                  <div><span>Player delay</span><code>{viewerStats?.liveDelaySec !== null && viewerStats?.liveDelaySec !== undefined ? viewerStats.liveDelaySec + " s" : "—"}</code></div>
+                  <div><span>Connection / ICE</span><code>{viewerStats?.connectionState ?? watchIce}{viewerStats?.iceState ? " / " + viewerStats.iceState : ""}</code></div>
                 </div>
-                {!watchConnected && <p className="stats-hint">Sem mídia ainda — os números aparecem após conectar.</p>}
-                {watchConnected && (viewerStats?.bitrateMbps === null || viewerStats?.bitrateMbps === undefined) && <p className="stats-hint">Coletando amostras… aguarde 1–2s.</p>}
+                {!watchConnected && <p className="stats-hint">No media yet. Numbers show up after you connect.</p>}
+                {watchConnected && (viewerStats?.bitrateMbps === null || viewerStats?.bitrateMbps === undefined) && <p className="stats-hint">Sampling… give it a second or two.</p>}
                 <p className="stats-hint">{copy.statsViewerHint(quality, qualityTargetMbps[quality])}</p>
               </>
             )}

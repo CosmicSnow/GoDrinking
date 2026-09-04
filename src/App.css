@@ -92,6 +92,10 @@
 .room-tile-actions button:disabled{opacity:.35}
 .room-tile-vol{-webkit-appearance:none;appearance:none;width:72px;height:3px;margin:0 2px;border-radius:2px;background:#2b353b;outline:none;cursor:pointer}
 .room-tile-vol::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:10px;height:10px;border-radius:50%;background:var(--lime);border:0;cursor:pointer}
+.room-tile.is-zoomed{cursor:grab}
+.room-tile.is-zoomed:active{cursor:grabbing}
+.room-tile-stats{position:absolute;top:10px;left:10px;z-index:4;max-width:calc(100% - 20px);padding:6px 8px;border-radius:5px;background:#0d1216f2;border:1px solid #2b353b;font:10px var(--mono);color:#c5d0c8;letter-spacing:.02em}
+.room-stat-btn{display:inline-grid;place-items:center;width:24px;height:24px;padding:0}
 .room-live-shell.is-cinema .room-live-bar,.room-live-shell.is-cinema .room-live-rail,.room-live-shell.is-cinema .room-filmstrip{display:none}
 .room-live-shell.is-cinema .room-live-body{grid-template-columns:1fr}
 .room-live-shell.is-cinema .room-live-stage{padding:0}
