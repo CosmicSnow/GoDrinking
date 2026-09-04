@@ -39,6 +39,7 @@ pub(crate) mod firewall;
 pub(crate) mod firewall;
 
 pub use benchmark::{run_local_probe, ProbeReport, RecommendedPreset};
+pub use rendezvous::StunarIncomingOffer;
 pub use capabilities::MediaCapabilities;
 pub use engine::MediaEngine;
 pub use room_mode::SessionMode;
@@ -48,7 +49,7 @@ pub use peer_transport::{PeerSignal, PeerSignalKind};
 pub use room::{discover_direct, discover_room, submit_answer as submit_room_answer};
 #[allow(unused_imports)]
 pub use types::{
-    CreateMediaSessionRequest, DirectAddress, JoinMode, MediaSessionSnapshot, NativeCaptureSource,
+    CreateMediaSessionRequest, DirectAddress, JoinMode, MediaLifecycleState, MediaSessionSnapshot, NativeCaptureSource,
     NativeRunningApp, PreviewFrameEvent, StunarState, UpdateCredentialsRequest,
     UpdateMediaSessionRequest, MediaSessionStats, VideoCodec, VideoEncoder, ViewerLinkStats,
 };

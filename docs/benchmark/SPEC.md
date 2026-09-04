@@ -68,3 +68,11 @@ Se High nem chegou a correr (encoder recusou o tamanho): não é High.
 - Zero Media na rede.
 - Zero frames no Rendezvous.
 - Não altera codec da sessão a correr (benchmark só com Session idle).
+
+## Aceite
+
+- [ ] “Medir este PC” na Customize e um link na vista simples.
+- [ ] Com Session idle, devolve `recommended` + `note` numa linha e selecciona Low/Medium/High.
+- [ ] Com Session a correr, recusa com mensagem clara (não mexe no codec).
+- [ ] Não abre LAN/Stunar, não cria PeerTransport.
+- [ ] Resultado em `localStorage` `godrinking.benchmark`.

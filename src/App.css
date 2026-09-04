@@ -63,6 +63,10 @@
 .watch-volume::-moz-range-thumb{width:11px;height:11px;border-radius:50%;background:var(--lime);border:0;cursor:pointer}
 .watch-volume::-moz-range-track{height:3px;border-radius:2px;background:#2b353b}
 .quality-options.single{grid-template-columns:1fr}
+.roster-crown{color:var(--lime);margin-right:6px;font-size:11px}
+.room-thumbs{position:absolute;right:10px;top:12px;z-index:5;display:flex;flex-direction:column;gap:6px}
+.room-thumb{padding:5px 8px;border:1px solid #2b353b;border-radius:5px;background:#0d1216d9;color:#9fb0a6;font:9px var(--mono)}
+.room-thumb.selected{border-color:#4b5e3c;color:var(--lime);background:#273322}
 #quality-fields .segmented{flex-wrap:wrap}
 #quality-fields .segmented button{min-width:72px}
 .quality-hint{margin:8px 0 0;font:9px var(--mono);color:#65737a;letter-spacing:.03em}

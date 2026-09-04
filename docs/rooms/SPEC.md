@@ -87,3 +87,16 @@ N membros, S a partilhar: `S * (N-1)` fluxos de vídeo. N=8, S=8 → 56. Pesado.
 - Rendezvous não vê, não guarda, não reencaminha Media.
 - Broadcast não muda o fio actual além do campo `mode` default.
 - Sem TURN.
+
+## Aceite (beta)
+
+- [ ] Abrir em Broadcast continua 1 Host / N Viewers; o campo `mode` default é `broadcast`.
+- [ ] Abrir em Sala devolve `mode: room` e `member_id` do Master.
+- [ ] Dois membros entram; o Master sai; o segundo `joinedAt` passa a Master (`you-are-master`); o código da Sala continua válido.
+- [ ] O último membro sai; um Join com o mesmo código recebe `denied`.
+- [ ] Master kicka um membro; esse WS recebe `kicked` e não volta a receber SDP.
+- [ ] Membro C clica “Share my screen too”: A e B recebem a tela de C por WebRTC P2P. tcpdump no Rendezvous não mostra RTP.
+- [ ] A (Master) consegue pôr a tela de C no palco grande e a dela nos thumbs.
+- [ ] Coroa lima no Nickname do Master. Kick só no Master.
+- [ ] Mais de 4 Share slots Live: aviso na UI. 8 membros: `full`.
+- [ ] LAN/Direct em Sala: se o Master cai, a Sala acaba (sem Rendezvous a guardar o código). Documentado na UI.

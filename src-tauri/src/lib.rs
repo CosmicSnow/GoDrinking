@@ -309,6 +309,66 @@ fn stunar_viewer_close(engine: State<'_, MediaEngine>) {
     engine.close_stunar_viewer();
 }
 
+#[tauri::command]
+fn poll_stunar_offers(engine: State<'_, MediaEngine>) -> Vec<media::StunarIncomingOffer> {
+    engine.poll_incoming_offers()
+}
+
+#[derive(serde::Deserialize)]
+struct RoomSignalRequest {
+    to: String,
+    answer: PeerSignal,
+}
+
+#[tauri::command]
+fn send_stunar_room_answer(
+    engine: State<'_, MediaEngine>,
+    request: RoomSignalRequest,
+) -> Result<(), String> {
+    let mut signal = request.answer;
+    signal.id = Some(request.to.clone());
+    engine
+        .send_stunar_signal(&request.to, signal)
+        .map_err(|error| error.to_string())
+}
+
+#[derive(serde::Deserialize)]
+struct RoomOfferSendRequest {
+    to: String,
+    offer: PeerSignal,
+}
+
+#[tauri::command]
+fn send_stunar_room_offer(
+    engine: State<'_, MediaEngine>,
+    request: RoomOfferSendRequest,
+) -> Result<(), String> {
+    engine
+        .send_stunar_signal(&request.to, request.offer)
+        .map_err(|error| error.to_string())
+}
+
+#[derive(serde::Deserialize)]
+struct MemberOfferRequest {
+    id: String,
+    nickname: String,
+}
+
+#[tauri::command]
+fn create_member_offer(
+    engine: State<'_, MediaEngine>,
+    request: MemberOfferRequest,
+) -> Result<PeerSignal, String> {
+    engine
+        .offer_for_member(&request.id, &request.nickname)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn announce_media_share(engine: State<'_, MediaEngine>, start: bool) -> Result<(), String> {
+    engine.announce_share(start).map_err(|error| error.to_string())
+}
+
 /// Returns the last 5 session log files (newest first) for the View logs UI.
 #[tauri::command]
 async fn get_app_logs() -> Vec<media::LogSession> {
@@ -373,6 +433,12 @@ fn update_media_session_credentials(
 fn run_media_benchmark(
     engine: State<'_, MediaEngine>,
 ) -> Result<ProbeReport, String> {
+    let snapshot = engine.snapshot();
+    if snapshot.state == media::MediaLifecycleState::Running
+        || snapshot.native_capture_active
+    {
+        return Err("Stop the session before measuring this PC.".into());
+    }
     let caps = engine.capabilities();
     Ok(media::run_local_probe(
         caps.native_encoder_implemented,
@@ -412,7 +478,12 @@ pub fn run() {
             clear_app_logs,
             reset_firewall_rules,
             get_firewall_status,
-            run_media_benchmark
+            run_media_benchmark,
+            poll_stunar_offers,
+            send_stunar_room_answer,
+            send_stunar_room_offer,
+            create_member_offer,
+            announce_media_share
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

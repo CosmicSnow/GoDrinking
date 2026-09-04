@@ -245,10 +245,14 @@ impl MediaEngine {
                 return;
             };
             let accepted = stunar.accepted_roster();
+            let self_id = stunar.self_id.clone();
             let accepted_ids: HashSet<&str> =
                 accepted.iter().map(|(id, _)| id.as_str()).collect();
             let mut to_mint = Vec::new();
             for (id, nickname) in &accepted {
+                if self_id.as_deref() == Some(id.as_str()) {
+                    continue;
+                }
                 if !session.viewers.contains_key(id) {
                     to_mint.push((id.clone(), nickname.clone()));
                 }
@@ -306,18 +310,30 @@ impl MediaEngine {
     }
 
     fn apply_room_answer(&self) {
-        let pending = self.state.lock().ok().and_then(|state| {
-            let session = state.session.as_ref()?;
-            session
-                .room
-                .as_ref()
-                .map(|room| room.take_answers())
-                .or_else(|| session.direct_room.as_ref().map(|room| room.take_answers()))
-                .or_else(|| session.stunar.as_ref().map(|stunar| stunar.take_answers()))
-        });
-        let Some(answers) = pending else {
-            return;
+        let answers = {
+            let Ok(state) = self.state.lock() else {
+                return;
+            };
+            let mut answers = Vec::new();
+            if let Some(session) = state.session.as_ref() {
+                if let Some(room) = session.room.as_ref() {
+                    answers.extend(room.take_answers());
+                }
+                if let Some(room) = session.direct_room.as_ref() {
+                    answers.extend(room.take_answers());
+                }
+                if let Some(stunar) = session.stunar.as_ref() {
+                    answers.extend(stunar.take_answers());
+                }
+            }
+            if let Some(viewer) = state.stunar_viewer.as_ref() {
+                answers.extend(viewer.take_answers());
+            }
+            answers
         };
+        if answers.is_empty() {
+            return;
+        }
         for answer in answers {
             let pending = self.state.lock().ok().and_then(|state| {
                 let session = state.session.as_ref()?;
@@ -725,18 +741,62 @@ impl MediaEngine {
 
     /// Viewer-side Stunar: sends the answer signal over the stored WS.
     pub fn submit_stunar_answer(&self, answer: PeerSignal) -> Result<(), MediaEngineError> {
-        let viewer = {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| MediaEngineError::StatePoisoned)?;
-            state
-                .stunar_viewer
-                .take()
-                .ok_or_else(|| MediaEngineError::NativePeer("no stunar session".into()))?
-        };
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| MediaEngineError::StatePoisoned)?;
+        let viewer = state
+            .stunar_viewer
+            .as_ref()
+            .ok_or_else(|| MediaEngineError::NativePeer("no stunar session".into()))?;
         super::rendezvous::submit_stunar_answer(viewer, &answer)
             .map_err(MediaEngineError::NativePeer)
+    }
+
+    pub fn poll_incoming_offers(&self) -> Vec<super::rendezvous::StunarIncomingOffer> {
+        let Ok(state) = self.state.lock() else {
+            return Vec::new();
+        };
+        let mut offers = Vec::new();
+        if let Some(host) = state.session.as_ref().and_then(|session| session.stunar.as_ref()) {
+            offers.extend(host.take_incoming_offers());
+        }
+        if let Some(viewer) = state.stunar_viewer.as_ref() {
+            offers.extend(viewer.take_incoming_offers());
+        }
+        offers
+    }
+
+    pub fn send_stunar_signal(&self, to: &str, signal: PeerSignal) -> Result<(), MediaEngineError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| MediaEngineError::StatePoisoned)?;
+        if let Some(host) = state.session.as_ref().and_then(|session| session.stunar.as_ref()) {
+            return host.send_signal(to, &signal).map_err(MediaEngineError::NativePeer);
+        }
+        if let Some(viewer) = state.stunar_viewer.as_ref() {
+            return viewer.send_signal(to, &signal).map_err(MediaEngineError::NativePeer);
+        }
+        Err(MediaEngineError::NativePeer("no stunar session".into()))
+    }
+
+    pub fn offer_for_member(&self, id: &str, nickname: &str) -> Result<PeerSignal, MediaEngineError> {
+        mint_viewer_offer(&self.state, id, nickname).map_err(MediaEngineError::NativePeer)
+    }
+
+    pub fn announce_share(&self, start: bool) -> Result<(), MediaEngineError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| MediaEngineError::StatePoisoned)?;
+        if let Some(host) = state.session.as_ref().and_then(|session| session.stunar.as_ref()) {
+            let _ = host.send_share(start);
+        }
+        if let Some(viewer) = state.stunar_viewer.as_ref() {
+            let _ = viewer.send_share(start);
+        }
+        Ok(())
     }
 
     /// Viewer-side Stunar: drops the stored WS (disconnect).
@@ -1248,6 +1308,8 @@ fn snapshot_from_state(state: &EngineState) -> MediaSessionSnapshot {
                 id: viewer.id.clone(),
                 nickname: viewer.nickname.clone(),
                 state: status.state,
+                master: false,
+                share: true,
             }
         })
         .collect();
@@ -1258,6 +1320,8 @@ fn snapshot_from_state(state: &EngineState) -> MediaSessionSnapshot {
             id,
             nickname,
             state: PeerTransportState::Pending,
+            master: false,
+            share: false,
         });
     }
     // Stunar pending Viewers live on the Rendezvous, not in the gate.
@@ -1267,7 +1331,27 @@ fn snapshot_from_state(state: &EngineState) -> MediaSessionSnapshot {
                 id,
                 nickname,
                 state: PeerTransportState::Pending,
+                master: false,
+                share: false,
             });
+        }
+        for (id, nickname, master, share) in stunar.room_roster() {
+            if let Some(entry) = roster.iter_mut().find(|entry| entry.id == id) {
+                entry.master = master;
+                entry.share = share || entry.share;
+            } else {
+                roster.push(RosterEntry {
+                    id,
+                    nickname,
+                    state: if share {
+                        PeerTransportState::Connected
+                    } else {
+                        PeerTransportState::New
+                    },
+                    master,
+                    share,
+                });
+            }
         }
     }
     let peer_status = session

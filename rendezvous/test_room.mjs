@@ -69,6 +69,20 @@ try {
   });
   assert.equal(broadcast.json.mode, "broadcast");
 
+  const open2 = await post("/v1/host/open", {
+    nickname: "Ada",
+    password: "secret1",
+    mode: "room",
+  });
+  const code2 = open2.json.code;
+  const b2 = await post("/v1/viewer/ask", { code: code2, nickname: "Bob", password: "secret1" });
+  assert.equal(b2.status, 200);
+  // Member-to-member signal is accepted by the HTTP-less WS path; the REST
+  // surface only needs to keep the room alive for that.
+  await post("/v1/member/heartbeat", { token: b2.json.viewer_token });
+  await post("/v1/member/leave", { host_token: open2.json.host_token });
+  await post("/v1/member/leave", { token: b2.json.viewer_token });
+
   console.log("room mode ok");
 } finally {
   child.kill("SIGTERM");

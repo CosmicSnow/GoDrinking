@@ -453,6 +453,10 @@ pub struct RosterEntry {
     pub id: String,
     pub nickname: String,
     pub state: PeerTransportState,
+    #[serde(default)]
+    pub master: bool,
+    #[serde(default)]
+    pub share: bool,
 }
 
 /// One copyable address the Host can share for Direct joins.

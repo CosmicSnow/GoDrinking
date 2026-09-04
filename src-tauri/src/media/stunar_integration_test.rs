@@ -107,7 +107,7 @@ mod stunar_integration {
 
         // Viewer answers over the WS; the host inbox receives it.
         submit_stunar_answer(
-            viewer_ws,
+            &viewer_ws,
             &PeerSignal {
                 kind: PeerSignalKind::Answer,
                 sdp: "v=0\r\n".into(),

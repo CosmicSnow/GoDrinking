@@ -111,6 +111,7 @@ export const copy = {
   broadcastHint: "You share. They watch. That's it.",
   roomHint: "Everyone can share. The first person is Master; if they leave, the next in line gets the crown.",
   shareMine: "Share my screen too",
+  shareWarn: "More than 4 screens at once will hurt. Keep it small.",
   measurePc: "Measure this PC",
   measureHint: "Local encoder probe. Nothing goes on the network.",
 } as const;

@@ -33,7 +33,8 @@ function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
 type Source = { id: number; kind: "display" | "window"; title?: string; application_name?: string };
 type RunningApp = { name: string; bundle_id?: string | null; pid: number; emitting_audio?: boolean };
 type Capabilities = { platform?: string; supported: boolean; native_capture_implemented: boolean; screen_capture_kit: boolean; source_enumeration_available: boolean; screen_recording_authorization: "granted" | "not_granted" | "unsupported"; app_audio_exclusion: "enhanced" | "best_effort" | "unsupported"; wasapi?: boolean; process_loopback?: boolean; av1_encode_supported?: boolean; detail: string };
-type RosterEntry = { id: string; nickname: string; state: string };
+type RosterEntry = { id: string; nickname: string; state: string; master?: boolean; share?: boolean };
+type IncomingOffer = { from: string; sdp: string };
 type DirectAddress = { ip: string; port: number; version: number; kind: string; copy: string };
 type Snapshot = { state: string; session_id: string | null; source_id: number | null; bitrate_bps: number | null; native_capture_active: boolean; preview_callback_count: number; preview_frame_count: number; preview_dropped_count: number; preview_error: string | null; detail: string; peer_state: string; peer_detail: string; session_code: string | null; lan_addresses: string[]; lan_port: number | null; roster?: RosterEntry[]; password_set?: boolean; admission?: boolean; join_mode?: string; direct_listen_port?: number | null; direct_addresses?: DirectAddress[]; direct_mapping?: boolean; stunar_state?: string | null; resolution?: string | null; frame_rate?: string | null };
 type Signal = { type: "offer" | "answer"; sdp: string; id?: string };
@@ -77,6 +78,7 @@ const rgbToRgba = (payload: number[], width: number, height: number) => {
   }
   return rgba;
 };
+const iceServersFor = (joinMode: string) => joinMode === "lan" ? [] : [{ urls: ["stun:stun.l.google.com:19302"] }];
 const waitIce = (pc: RTCPeerConnection) => new Promise<void>((resolve) => {
   if (pc.iceGatheringState === "complete") { resolve(); return; }
   const done = () => { if (pc.iceGatheringState === "complete") { pc.removeEventListener("icegatheringstatechange", done); resolve(); } };
@@ -170,6 +172,10 @@ function App() {
   const [joinCode, setJoinCode] = useState("");
   const [sessionMode, setSessionMode] = useState<"broadcast" | "room">("broadcast");
   const [benchNote, setBenchNote] = useState("");
+  const [stageId, setStageId] = useState<string>("host");
+  const remotesRef = useRef<Map<string, { pc: RTCPeerConnection; stream: MediaStream }>>(new Map());
+  const [remoteIds, setRemoteIds] = useState<string[]>([]);
+  const seenOffers = useRef<Set<string>>(new Set());
   const [joinMode, setJoinMode] = useState<"lan" | "direct" | "stunar">(() => {
     const saved = localStorage.getItem("godrinking.join_mode");
     return saved === "direct" || saved === "stunar" ? saved : "lan";
@@ -526,6 +532,14 @@ function App() {
       });
       setSession(next);
       setMode("share");
+      await invokeMedia("announce_media_share", { start: true }).catch(() => undefined);
+      const others = (next.roster ?? []).filter((entry) => entry.state !== "pending");
+      for (const entry of others) {
+        try {
+          const offer = await invokeMedia<Signal>("create_member_offer", { request: { id: entry.id, nickname: entry.nickname } });
+          await invokeMedia("send_stunar_room_offer", { request: { to: entry.id, offer } });
+        } catch { /* one peer failing must not stop the rest */ }
+      }
       setNotice(next.detail || "Your screen is going out. They still don't go through the server.");
     } catch (error) {
       const message = diagnosticError(error, "Could not share your screen.");
@@ -570,6 +584,9 @@ function App() {
         }
       });
       setSession(next);
+      if (sessionMode === "room") {
+        await invokeMedia("announce_media_share", { start: true }).catch(() => undefined);
+      }
       setNotice(next.session_code ? `Session ${next.session_code} is live. Share that code.` : next.detail);
     } catch (error) {
       const recovered = await invokeMedia<Snapshot>("get_media_session_state").catch(() => null);
@@ -630,6 +647,11 @@ function App() {
     peerRef.current = null;
     remoteStreamRef.current = null;
     if (remoteRef.current) remoteRef.current.srcObject = null;
+    remotesRef.current.forEach((slot) => slot.pc.close());
+    remotesRef.current.clear();
+    seenOffers.current.clear();
+    setRemoteIds([]);
+    setStageId("host");
     void invokeMedia("stunar_viewer_close").catch(() => undefined);
     setWatchIce("idle");
     setWatchCode("");
@@ -639,6 +661,39 @@ function App() {
     setSessionAction("idle");
     setNotice("Disconnected.");
   };
+  const acceptIncomingOffer = async (incoming: IncomingOffer) => {
+    if (seenOffers.current.has(incoming.from + incoming.sdp.slice(0, 24))) return;
+    seenOffers.current.add(incoming.from + incoming.sdp.slice(0, 24));
+    const existing = remotesRef.current.get(incoming.from);
+    existing?.pc.close();
+    const pc = new RTCPeerConnection({ iceServers: iceServersFor(joinMode) });
+    const stream = new MediaStream();
+    pc.ontrack = (event) => {
+      event.streams[0]?.getTracks().forEach((track) => stream.addTrack(track));
+      if (!event.streams[0] && event.track) stream.addTrack(event.track);
+      remotesRef.current.set(incoming.from, { pc, stream });
+      setRemoteIds(["host", ...[...remotesRef.current.keys()].filter((id) => id !== "host")].filter((id, index, all) => all.indexOf(id) === index));
+      if (stageId === "host" && incoming.from !== "host") setStageId(incoming.from);
+      const el = document.querySelector<HTMLVideoElement>(`video[data-slot="${incoming.from}"]`);
+      if (el && el.srcObject !== stream) el.srcObject = stream;
+    };
+    remotesRef.current.set(incoming.from, { pc, stream });
+    await pc.setRemoteDescription({ type: "offer", sdp: incoming.sdp });
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await waitIce(pc);
+    if (!pc.localDescription?.sdp) return;
+    await invokeMedia("send_stunar_room_answer", { request: { to: incoming.from, answer: { type: "answer", sdp: pc.localDescription.sdp, id: incoming.from } } });
+  };
+  useEffect(() => {
+    if (!watchConnected && !active) return;
+    const timer = window.setInterval(() => {
+      void invokeMedia<IncomingOffer[]>("poll_stunar_offers").then((offers) => {
+        for (const offer of offers) void acceptIncomingOffer(offer);
+      }).catch(() => undefined);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [watchConnected, active, joinMode, stageId]);
   const joinRoom = async () => {
     if (sessionAction !== "idle") return;
     if (!nicknameValid) {
@@ -685,7 +740,7 @@ function App() {
       const [host, offer, hostName] = await invokeMedia<[string, Signal, string]>("discover_media_room", { request });
       if (joinSeqRef.current !== seq) return;
       const displayLabel = joinMode === "direct" ? (hostName.trim() || "via Direct") : targetLabel;
-      const pc = new RTCPeerConnection({ iceServers: joinMode === "lan" ? [] : [{ urls: ["stun:stun.l.google.com:19302"] }] });
+      const pc = new RTCPeerConnection({ iceServers: iceServersFor(joinMode) });
       peerRef.current?.close();
       peerRef.current = pc;
       setWatchIce("connecting");
@@ -694,6 +749,9 @@ function App() {
       pc.ontrack = (event) => {
         const stream = event.streams[0] ?? new MediaStream(event.track ? [event.track] : []);
         remoteStreamRef.current = stream;
+        remotesRef.current.set("host", { pc, stream });
+        setRemoteIds(["host", ...[...remotesRef.current.keys()].filter((id) => id !== "host")]);
+        setStageId("host");
         if (remoteRef.current && remoteRef.current.srcObject !== stream) remoteRef.current.srcObject = stream;
       };
       await pc.setRemoteDescription({ type: "offer", sdp: offer.sdp });
@@ -930,7 +988,25 @@ function App() {
                 </span>
               </div>
               <div className={`preview-screen ${watchConnected ? "watch-stage" : ""}`} style={watchConnected ? ({ "--watch-zoom": watchZoom } as CSSProperties) : undefined}>
-                <video ref={remoteRef} className="remote-preview visible" autoPlay playsInline />
+                <video ref={remoteRef} className="remote-preview visible" autoPlay playsInline data-slot="host" style={stageId !== "host" ? { opacity: 0, pointerEvents: "none" } : undefined} />
+                {[...remotesRef.current.entries()].filter(([id]) => id !== "host").map(([id, slot]) => (
+                  <video key={id} data-slot={id} className="remote-preview visible" autoPlay playsInline ref={(el) => { if (el && slot.stream && el.srcObject !== slot.stream) el.srcObject = slot.stream; }} style={stageId !== id ? { opacity: 0, pointerEvents: "none" } : undefined} />
+                ))}
+                {remoteIds.length > 1 && (
+                  <div className="room-thumbs">
+                    {remoteIds.map((id) => (
+                      <button key={id} className={`room-thumb ${stageId === id ? "selected" : ""}`} onClick={() => {
+                        setStageId(id);
+                        const slot = remotesRef.current.get(id);
+                        if (id === "host" && remoteRef.current && remoteStreamRef.current) remoteRef.current.srcObject = remoteStreamRef.current;
+                        if (slot) {
+                          const el = document.querySelector<HTMLVideoElement>(`video[data-slot="${id}"]`);
+                          if (el) el.srcObject = slot.stream;
+                        }
+                      }}>{id === "host" ? (watchHostName || "Host") : id.slice(0, 6)}</button>
+                    ))}
+                  </div>
+                )}
                 {watchConnected && (
                   <>
                     <div className="watch-hud">
@@ -994,6 +1070,8 @@ function App() {
                     <button className={quality === "high" ? "selected" : ""} onClick={() => applyPreset("high")}>{copy.qualityHigh}</button>
                   </div>
                   <p className="quality-hint">{copy.qualityLine[quality]}</p>
+                  {!active && <button className="bitrate-auto" onClick={() => void runBenchmark()}>{copy.measurePc}</button>}
+                  {benchNote && <p className="quality-hint">{benchNote}</p>}
                   <button className="manual-toggle" aria-expanded={qualityOpen} aria-controls="quality-fields" onClick={() => setQualityOpen((open) => !open)} title={copy.customize}>
                     <Icon name="chevron" size={13}/> {copy.customize}<span>{qualitySummary}</span>
                   </button>
@@ -1234,7 +1312,7 @@ function App() {
                         <div className="roster-group">
                           {connectedRoster.map((entry) => (
                             <div className="roster-row" key={`connected-${entry.id}`}>
-                              <span className="roster-name">{entry.nickname}<small>{entry.state === "connected" ? "Connected" : "Connecting…"}</small></span>
+                              <span className="roster-name">{entry.master ? <span className="roster-crown" title="Master">♛</span> : null}{entry.nickname}<small>{entry.share ? "Sharing" : entry.state === "connected" ? "Connected" : "Connecting…"}</small></span>
                               <span className="roster-actions">
                                 <button onClick={() => void kickViewer(entry.id)}>Disconnect</button>
                               </span>
