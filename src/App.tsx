@@ -31,7 +31,7 @@ function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
 
 type Source = { id: number; kind: "display" | "window"; title?: string; application_name?: string };
 type RunningApp = { name: string; bundle_id?: string | null; pid: number; emitting_audio?: boolean };
-type Capabilities = { platform?: string; supported: boolean; native_capture_implemented: boolean; screen_capture_kit: boolean; source_enumeration_available: boolean; screen_recording_authorization: "granted" | "not_granted" | "unsupported"; app_audio_exclusion: "enhanced" | "best_effort" | "unsupported"; av1_encode_supported?: boolean; detail: string };
+type Capabilities = { platform?: string; supported: boolean; native_capture_implemented: boolean; screen_capture_kit: boolean; source_enumeration_available: boolean; screen_recording_authorization: "granted" | "not_granted" | "unsupported"; app_audio_exclusion: "enhanced" | "best_effort" | "unsupported"; wasapi?: boolean; process_loopback?: boolean; av1_encode_supported?: boolean; detail: string };
 type RosterEntry = { id: string; nickname: string; state: string };
 type DirectAddress = { ip: string; port: number; version: number; kind: string; copy: string };
 type Snapshot = { state: string; session_id: string | null; source_id: number | null; bitrate_bps: number | null; native_capture_active: boolean; preview_callback_count: number; preview_frame_count: number; preview_dropped_count: number; preview_error: string | null; detail: string; peer_state: string; peer_detail: string; session_code: string | null; lan_addresses: string[]; lan_port: number | null; roster?: RosterEntry[]; password_set?: boolean; admission?: boolean; join_mode?: string; direct_listen_port?: number | null; direct_addresses?: DirectAddress[]; direct_mapping?: boolean; stunar_state?: string | null; resolution?: string | null; frame_rate?: string | null };
@@ -41,6 +41,28 @@ type ViewerLinkStats = { id: string; nickname: string; state: string; rtt_ms: nu
 type SessionLinkStats = { links: ViewerLinkStats[]; target_bps: number; congestion_bps: number | null; floor_bps: number };
 
 const invokeMedia = <T,>(command: string, args?: Record<string, unknown>) => invoke<T>(command, args);
+// Tiny WebAudio blips for viewer connect/disconnect (no audio assets).
+// Connect rises, disconnect falls; quiet by design.
+let blipCtx: AudioContext | null = null;
+const blipTone = (freq: number, delay: number, duration: number) => {
+  try {
+    if (!blipCtx) blipCtx = new AudioContext();
+    if (blipCtx.state === "suspended") void blipCtx.resume();
+    const start = blipCtx.currentTime + delay;
+    const osc = blipCtx.createOscillator();
+    const gain = blipCtx.createGain();
+    osc.type = "sine";
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, start);
+    gain.gain.exponentialRampToValueAtTime(0.12, start + 0.015);
+    gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+    osc.connect(gain).connect(blipCtx.destination);
+    osc.start(start);
+    osc.stop(start + duration + 0.02);
+  } catch { /* audio unavailable; stay silent */ }
+};
+const playConnectBlip = () => { blipTone(660, 0, 0.09); blipTone(990, 0.09, 0.14); };
+const playDisconnectBlip = () => { blipTone(520, 0, 0.09); blipTone(360, 0.09, 0.14); };
 const diagnosticError = (error: unknown, fallback: string) => error instanceof Error ? error.message : typeof error === "string" ? error : fallback;
 const rgbToRgba = (payload: number[], width: number, height: number) => {
   const expected = width * height * 3;
@@ -190,6 +212,11 @@ function App() {
   const captureReady = caps !== null && (caps.platform === "windows" ? caps.native_capture_implemented : caps.screen_recording_authorization === "granted");
   const canStart = Boolean(caps?.supported && captureReady);
   const audioExclusion = caps?.app_audio_exclusion === "enhanced";
+  // Windows per-app exclusion via WASAPI process loopback (one app per session).
+  const windowsExclusion = caps?.process_loopback === true;
+  const exclusionListAvailable = audioExclusion || windowsExclusion;
+  // Windows has no per-app exclusion, but full-device WASAPI loopback works.
+  const systemAudioSupported = audioExclusion || caps?.wasapi === true;
   const roomLabel = session?.session_code ? `${session.session_code}${session.lan_addresses[0] ? ` · ${session.lan_addresses[0]}` : ""}` : "";
   const nicknameValid = /^[A-Za-z0-9 _.-]+$/.test(nickname.trim()) && nickname.trim().length >= 2 && nickname.trim().length <= 24;
   const passwordValid = (password: string) => password.length >= 4 && password.length <= 64;
@@ -198,6 +225,27 @@ function App() {
   const roster = session?.roster ?? [];
   const pendingRoster = roster.filter((entry) => entry.state === "pending");
   const connectedRoster = roster.filter((entry) => entry.state !== "pending");
+  const watchIcePrevRef = useRef<"idle" | "connecting" | "connected" | "lost">("idle");
+  const rosterIdsRef = useRef<string[]>([]);
+  // Watcher ears: beep when our own link connects or drops.
+  useEffect(() => {
+    const prev = watchIcePrevRef.current;
+    if (prev !== watchIce) {
+      if (watchIce === "connected") playConnectBlip();
+      else if (prev === "connected") playDisconnectBlip();
+      watchIcePrevRef.current = watchIce;
+    }
+  }, [watchIce]);
+  // Host ears: beep when a viewer joins or leaves the connected roster.
+  useEffect(() => {
+    if (mode !== "share" || !active) { rosterIdsRef.current = []; return; }
+    const ids = connectedRoster.map((entry) => entry.id);
+    const prev = rosterIdsRef.current;
+    if (ids.some((id) => !prev.includes(id))) playConnectBlip();
+    else if (prev.some((id) => !ids.includes(id))) playDisconnectBlip();
+    rosterIdsRef.current = ids;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, active, connectedRoster]);
   const directAddresses = session?.direct_addresses ?? [];
   const joinModeHelp = {
     lan: mode === "share" ? "Same network. They type your code." : "Code from the host on your network.",
@@ -253,11 +301,11 @@ function App() {
     void loadApps();
   }, [caps?.source_enumeration_available]);
   useEffect(() => {
-    if (mode !== "share" || !systemAudio || !audioExclusion) return undefined;
+    if (mode !== "share" || !systemAudio || !exclusionListAvailable) return undefined;
     void loadApps();
     const timer = window.setInterval(() => void loadApps(), 1000);
     return () => window.clearInterval(timer);
-  }, [mode, systemAudio, audioExclusion]);
+  }, [mode, systemAudio, exclusionListAvailable]);
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     void getCurrentWindow().onFocusChanged(({ payload }) => {
@@ -955,11 +1003,14 @@ function App() {
                   </div>
                 </div>
               </div>
-              <label className={`unsupported-option ${audioExclusion ? "" : "is-disabled"}`}>
-                <div><strong>Share system audio</strong><small>{audioExclusion ? "Viewers hear your system sound" : "Needs macOS 14.2+ process taps"}</small></div>
-                <input type="checkbox" checked={systemAudio} onChange={(event) => setSystemAudio(event.target.checked)} disabled={!audioExclusion}/>
+              <label className={`unsupported-option ${systemAudioSupported ? "" : "is-disabled"}`}>
+                <div><strong>Share system audio</strong><small>{systemAudioSupported ? "Viewers hear your system sound" : "Needs macOS 14.2+ process taps or Windows"}</small></div>
+                <input type="checkbox" checked={systemAudio} onChange={(event) => setSystemAudio(event.target.checked)} disabled={!systemAudioSupported}/>
               </label>
-              {systemAudio && audioExclusion && (
+              {systemAudio && systemAudioSupported && !exclusionListAvailable && (
+                <p className="exclude-hint">Full device mix — per-app exclusion needs macOS 14.2+ or a Windows build with process loopback.</p>
+              )}
+              {systemAudio && exclusionListAvailable && (
                 <>
                   <p className="native-select-label">Don't share audio from</p>
                   <div className="exclude-tools">
@@ -993,7 +1044,7 @@ function App() {
                       })}
                     </div>
                   )}
-                  <p className="exclude-hint">Viewers won't hear the apps you pick here. For example, pick Discord to mute it.</p>
+                  <p className="exclude-hint">Viewers won't hear the apps you pick here. For example, pick Discord to mute it.{windowsExclusion && !audioExclusion ? " Windows excludes one app per session — the first selection applies." : ""}</p>
                 </>
               )}
               <label className="native-select-label" htmlFor="share-nickname">Nickname</label>

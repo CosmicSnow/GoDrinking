@@ -188,8 +188,14 @@ impl MediaEngine {
         {
             // Windows has no pre-flight permission probe: WGC fails at capture
             // start if display capture is blocked. Report the static
-            // capabilities as granted.
+            // capabilities as granted. The process-loopback probe runs here
+            // (command thread, cached after the first call) instead of the
+            // constructor so no COM work ever blocks the main thread.
             let _ = app;
+            let supported = super::process_tap::is_process_loopback_supported();
+            if let Ok(mut state) = self.state.lock() {
+                state.capabilities.process_loopback = supported;
+            }
             self.capabilities()
         }
         #[cfg(not(target_os = "windows"))]

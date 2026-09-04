@@ -73,13 +73,16 @@ pub fn detect() -> MediaCapabilities {
             source_enumeration_available: true,
             windows_graphics_capture: true,
             wasapi: true,
+            // Never probed here: COM work must not run on the main thread
+            // inside the constructor at startup. Lazily probed (and cached)
+            // on the first get_media_capabilities call; see engine.rs.
             process_loopback: false,
             app_audio_exclusion: AppAudioExclusionSupport::Unsupported,
             native_capture_implemented: true,
             native_encoder_implemented: true,
             native_peer_transport_implemented: true,
             av1_encode_supported: false,
-            detail: "Windows Graphics Capture and OpenH264 native capture are available. System audio is a full device loopback; per-app audio exclusion is unsupported (no mix-minus tap).".into(),
+            detail: "Windows Graphics Capture and OpenH264 native capture are available. System audio is a device loopback; excluding apps needs process-loopback support (newer Windows 10/11 builds), otherwise the full mix is shared.".into(),
         };
     }
 

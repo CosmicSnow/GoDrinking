@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame;
-use windows_capture::graphics_capture_api::InternalCaptureControl;
+use windows_capture::graphics_capture_api::{GraphicsCaptureApi, InternalCaptureControl};
 use windows_capture::monitor::Monitor;
 use windows_capture::settings::{
     ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
@@ -37,6 +37,7 @@ enum CaptureTarget {
 }
 
 /// Handler flags carried through `Settings` into `CaptureHandler::new`.
+#[derive(Clone)]
 struct CaptureFlags {
     capture_tx: SyncSender<NativeFrame>,
     encoder_tx: SyncSender<EncoderCommand>,
@@ -583,20 +584,97 @@ fn start_free_threaded<T>(
     fps: u32,
 ) -> Result<CaptureControl<CaptureHandler, CaptureError>, String>
 where
-    T: TryInto<GraphicsCaptureItemType> + Send + 'static,
+    T: TryInto<GraphicsCaptureItemType> + Clone + Send + 'static,
 {
-    let settings = Settings::new(
-        item,
-        CursorCaptureSettings::Default,
-        DrawBorderSettings::Default,
-        SecondaryWindowSettings::Default,
-        MinimumUpdateIntervalSettings::Custom(Duration::from_micros(1_000_000 / u64::from(fps))),
-        DirtyRegionSettings::Default,
-        ColorFormat::Bgra8,
-        flags,
+    let custom_interval = Duration::from_micros(1_000_000 / u64::from(fps.max(1)));
+    // Older Windows 10 builds implement WGC but not the MinUpdateInterval
+    // property, so probing first avoids a doomed `Custom` attempt there.
+    let custom_supported =
+        GraphicsCaptureApi::is_minimum_update_interval_supported().unwrap_or(true);
+    // The system draws a colored border around the captured item; users find
+    // it ugly, so turn it off where the OS allows (same probe-and-fallback).
+    let borderless_supported =
+        GraphicsCaptureApi::is_border_settings_supported().unwrap_or(true);
+    if !borderless_supported {
+        logger::log(
+            "WARN",
+            "capture",
+            "capture border toggle unsupported on this Windows build, keeping the system default border",
+        );
+    }
+
+    let build_settings = |item: T, flags: CaptureFlags, custom: bool, borderless: bool| {
+        Settings::new(
+            item,
+            CursorCaptureSettings::Default,
+            if borderless {
+                DrawBorderSettings::WithoutBorder
+            } else {
+                DrawBorderSettings::Default
+            },
+            SecondaryWindowSettings::Default,
+            if custom {
+                MinimumUpdateIntervalSettings::Custom(custom_interval)
+            } else {
+                MinimumUpdateIntervalSettings::Default
+            },
+            DirtyRegionSettings::Default,
+            ColorFormat::Bgra8,
+            flags,
+        )
+    };
+
+    if !custom_supported {
+        logger::log(
+            "WARN",
+            "capture",
+            "minimum update interval unsupported on this Windows build, starting with Default interval",
+        );
+        let fallback = build_settings(item, flags, false, borderless_supported);
+        return CaptureHandler::start_free_threaded(fallback)
+            .map_err(|error| format!("Windows Graphics Capture start failed: {error}"));
+    }
+
+    let settings = build_settings(
+        item.clone(),
+        flags.clone(),
+        custom_supported,
+        borderless_supported,
     );
-    CaptureHandler::start_free_threaded(settings)
-        .map_err(|error| format!("Windows Graphics Capture start failed: {error}"))
+    match CaptureHandler::start_free_threaded(settings) {
+        Ok(control) => Ok(control),
+        Err(error) => {
+            let message = error.to_string();
+            let interval_fallback = custom_supported && is_min_interval_unsupported(&message);
+            let border_fallback =
+                borderless_supported && message.to_lowercase().contains("border");
+            if interval_fallback || border_fallback {
+                logger::log(
+                    "WARN",
+                    "capture",
+                    &format!(
+                        "capture setting rejected by this Windows build, retrying with Default: {message}"
+                    ),
+                );
+                let fallback = build_settings(
+                    item,
+                    flags,
+                    custom_supported && !interval_fallback,
+                    borderless_supported && !border_fallback,
+                );
+                CaptureHandler::start_free_threaded(fallback)
+                    .map_err(|error| format!("Windows Graphics Capture start failed: {error}"))
+            } else {
+                Err(format!("Windows Graphics Capture start failed: {message}"))
+            }
+        }
+    }
+}
+
+/// Matches the `windows-capture` `MinimumUpdateIntervalUnsupported` error
+/// without depending on its exact enum shape at the call site.
+fn is_min_interval_unsupported(message: &str) -> bool {
+    message.to_lowercase().contains("minimum update interval")
 }
 
 fn monotonic_micros() -> u64 {

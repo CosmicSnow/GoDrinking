@@ -1,10 +1,14 @@
-//! macOS 14.2+ system-audio capture with per-app exclusion.
+//! System-audio capture with per-app exclusion (macOS 14.2+ process taps;
+//! Windows WASAPI process loopback where the OS supports it, full device
+//! loopback otherwise).
 
 #[cfg(target_os = "macos")]
 use std::ffi::c_void;
 #[cfg(target_os = "macos")]
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "windows")]
+use std::sync::OnceLock;
 #[cfg(target_os = "macos")]
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::mpsc::SyncSender;
@@ -189,15 +193,135 @@ fn start_macos(
     })
 }
 
+/// Whether this Windows build supports per-process loopback capture
+/// (`AudioClientActivationParams` process loopback). Probed once by
+/// activating (not starting) a loopback client on our own process; older
+/// builds fail and callers fall back to full device loopback.
+#[cfg(target_os = "windows")]
+pub(crate) fn is_process_loopback_supported() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let _ = wasapi::initialize_mta();
+        wasapi::AudioClient::new_application_loopback_client(std::process::id(), true)
+            .is_ok()
+    })
+}
+
+/// Resolves the first excludable app token (exe name, e.g. `Discord.exe`) to
+/// its process-tree root PID. The loopback API excludes a single tree per
+/// client, so only the first live match applies; the rest are logged.
+#[cfg(target_os = "windows")]
+fn resolve_exclusion_root(excluded_apps: &[String]) -> Option<(String, u32)> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let snapshot: Vec<(u32, u32, String)> = unsafe {
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return None;
+        };
+        if snapshot.is_invalid() {
+            return None;
+        }
+        let mut out = Vec::new();
+        let mut entry = PROCESSENTRY32W::default();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut more = Process32FirstW(snapshot, &mut entry).is_ok();
+        while more {
+            let len = entry
+                .szExeFile
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(entry.szExeFile.len());
+            out.push((
+                entry.th32ProcessID,
+                entry.th32ParentProcessID,
+                String::from_utf16_lossy(&entry.szExeFile[..len]),
+            ));
+            more = Process32NextW(snapshot, &mut entry).is_ok();
+        }
+        let _ = CloseHandle(snapshot);
+        out
+    };
+    let own_pid = std::process::id();
+    let matches_token = |exe: &str, token: &str| {
+        exe.eq_ignore_ascii_case(token)
+            || exe.eq_ignore_ascii_case(&format!("{token}.exe"))
+            || token.eq_ignore_ascii_case(exe.strip_suffix(".exe").unwrap_or(exe))
+    };
+    let mut first: Option<(String, u32)> = None;
+    for token in excluded_apps.iter().map(|item| item.trim()).filter(|item| !item.is_empty()) {
+        let mut pids: Vec<(u32, u32)> = snapshot
+            .iter()
+            .filter(|(_, _, exe)| matches_token(exe, token) )
+            .map(|(pid, ppid, _)| (*pid, *ppid))
+            .filter(|(pid, _)| *pid != own_pid)
+            .collect();
+        if pids.is_empty() {
+            eprintln!("[goDrinking] audio exclusion '{token}' matches no running process; skipping");
+            continue;
+        }
+        pids.sort_unstable();
+        pids.dedup();
+        // Roots cover multi-process apps (e.g. Discord renderers): a matched
+        // PID whose parent is not also matched starts its own tree.
+        let roots: Vec<u32> = pids
+            .iter()
+            .filter(|(_, ppid)| !pids.iter().any(|(other, _)| other == ppid))
+            .map(|(pid, _)| *pid)
+            .collect();
+        let root = roots.into_iter().next().unwrap_or(pids[0].0);
+        if first.is_none() {
+            first = Some((token.to_owned(), root));
+        } else {
+            eprintln!(
+                "[goDrinking] Windows process loopback excludes one app per session; '{token}' (pid {root}) is ignored"
+            );
+        }
+    }
+    first
+}
+
 #[cfg(target_os = "windows")]
 fn start_windows(
     excluded_apps: &[String],
     opus_tx: SyncSender<EncodedAudioPacket>,
 ) -> Result<ProcessTap, String> {
+    // Per-app exclusion via process loopback; any failure falls through to
+    // the full device loopback below so audio still works.
     if !excluded_apps.is_empty() {
-        eprintln!(
-            "[goDrinking] Windows system audio is a full device loopback; app exclusions are ignored (no mix-minus tap)."
-        );
+        if !is_process_loopback_supported() {
+            eprintln!(
+                "[goDrinking] Windows system audio is a full device loopback on this build; app exclusions are ignored (process loopback unsupported)."
+            );
+        } else if let Some((name, pid)) = resolve_exclusion_root(excluded_apps) {
+            match wasapi::AudioClient::new_application_loopback_client(pid, false) {
+                Ok(client) => match spawn_loopback(client, opus_tx.clone(), "process") {
+                    Ok(tap) => {
+                        eprintln!(
+                            "[goDrinking] Windows system audio excluding {name} (pid {pid}) via process loopback"
+                        );
+                        return Ok(tap);
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[goDrinking] process loopback for {name} failed ({error}); falling back to full device loopback"
+                        );
+                    }
+                },
+                Err(error) => {
+                    eprintln!(
+                        "[goDrinking] process loopback activation for {name} failed ({error}); falling back to full device loopback"
+                    );
+                }
+            }
+        } else {
+            eprintln!(
+                "[goDrinking] none of the excluded apps are running; sharing the full device mix"
+            );
+        }
     }
     let _ = wasapi::initialize_mta();
     let enumerator = wasapi::DeviceEnumerator::new()
@@ -205,9 +329,21 @@ fn start_windows(
     let device = enumerator
         .get_default_device(&wasapi::Direction::Render)
         .map_err(|error| format!("no default render device for loopback: {error}"))?;
-    let mut client = device
+    let client = device
         .get_iaudioclient()
         .map_err(|error| format!("WASAPI audio client failed: {error}"))?;
+    spawn_loopback(client, opus_tx, "device")
+}
+
+/// Initializes a loopback client (device or per-process) for 48 kHz stereo
+/// float event-driven capture and spawns the Opus worker thread. Shared by
+/// both Windows audio paths so they behave identically downstream.
+#[cfg(target_os = "windows")]
+fn spawn_loopback(
+    mut client: wasapi::AudioClient,
+    opus_tx: SyncSender<EncodedAudioPacket>,
+    kind: &str,
+) -> Result<ProcessTap, String> {
     // Request 48 kHz stereo float; autoconvert lets the audio engine resample
     // any device mix format into this shape.
     let desired = wasapi::WaveFormat::new(32, 32, &wasapi::SampleType::Float, 48_000, 2, None);
@@ -217,7 +353,7 @@ fn start_windows(
     };
     client
         .initialize_client(&desired, &wasapi::Direction::Capture, &mode)
-        .map_err(|error| format!("WASAPI loopback client init failed: {error}"))?;
+        .map_err(|error| format!("WASAPI {kind} loopback client init failed: {error}"))?;
     let event = client
         .set_get_eventhandle()
         .map_err(|error| format!("WASAPI event handle failed: {error}"))?;
