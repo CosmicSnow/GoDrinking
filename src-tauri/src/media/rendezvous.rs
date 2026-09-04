@@ -15,6 +15,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -827,150 +828,62 @@ pub(crate) fn discover_stunar_room(
         "stunar ask",
         &format!("base={base} code={code} nickname={nickname}"),
     );
-    let runtime = current_thread_runtime()?;
-    let result: Result<(String, PeerSignal, WsStream, Option<String>, String), String> =
-        runtime.block_on(async {
-        let client = http_client()?;
-        // Stunar rooms always have a Password; the ask always carries it.
-        let body = json!({ "code": code, "password": password, "nickname": nickname });
-        let response = client
-            .post(format!("{base}/v1/viewer/ask"))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| {
-                logger::log(
-                    "ERROR",
-                    "stunar ask",
-                    &format!("network failure: {error} (unreachable)"),
-                );
-                "Stunar is unreachable.".to_owned()
-            })?;
-        let status = response.status();
-        let json: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|_| "Stunar is unreachable.".to_owned())?;
-        if !status.is_success() || json["ok"] != true {
-            // The raw server error code goes to the log file verbatim so a
-            // generic UI message can be traced: denied (wrong code/password
-            // or tarpit), invalid (bad request/password), full, busy (rate
-            // limit), unreachable (network).
-            let raw = json["error"].as_str().unwrap_or("unknown");
-            logger::log(
-                "ERROR",
-                "stunar ask response",
-                &format!("status={status} error={raw}"),
-            );
-            return Err(match raw {
-                "full" => "This session is full.".into(),
-                "invalid" => "Could not join. (server: invalid — check the password)".into(),
-                "busy" => {
-                    "Could not join. (server: busy — too many attempts, wait a bit)".into()
-                }
-                "denied" => {
-                    "Could not join. (server: denied — wrong code or password)".into()
-                }
-                _ => "Could not join.".into(),
-            });
-        }
-        logger::log("INFO", "stunar ask response", "accepted; viewer token issued");
-        let token = json["viewer_token"]
-            .as_str()
-            .ok_or_else(|| "Could not join.".to_owned())?
-            .to_owned();
-        let member_id = json["member_id"].as_str().map(str::to_owned);
-        let mode = json["mode"].as_str().unwrap_or("broadcast").to_owned();
-        let ws_url = ws_url(&base, "viewer", &token)?;
-        let mut ws = connect_ws(&ws_url).await.map_err(|error| {
-            logger::log("ERROR", "stunar ws", &format!("connect failed: {error}"));
-            "Stunar is unreachable.".to_owned()
-        })?;
-        logger::log("INFO", "stunar ws", "connected (viewer)");
-        let deadline = tokio::time::Instant::now() + VIEWER_WAIT_TIMEOUT;
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                logger::log("WARN", "stunar ws", "timed out waiting for the offer (65s)");
-                return Err("The host declined.".into());
-            }
-            let incoming = tokio::time::timeout(remaining, ws.next())
-                .await
-                .map_err(|_| {
-                    logger::log("WARN", "stunar ws", "timed out waiting for the offer (65s)");
-                    "The host declined.".to_owned()
-                })?
-                .ok_or_else(|| {
-                    logger::log("WARN", "stunar ws", "closed while waiting for the offer");
-                    "Stunar is unreachable.".to_owned()
-                })?
-                .map_err(|error| {
-                    logger::log("WARN", "stunar ws", &format!("error: {error}"));
-                    "Stunar is unreachable.".to_owned()
-                })?;
-            let Message::Text(text) = incoming else {
-                continue;
-            };
-            let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) else {
-                continue;
-            };
-            match msg["t"].as_str() {
-                Some("accepted") => {
-                    logger::log("INFO", "stunar ws message", "accepted (waiting for offer)");
-                    continue;
-                }
-                Some("rejected") => {
-                    logger::log("WARN", "stunar ws message", "rejected (host declined)");
-                    return Err("The host declined.".into());
-                }
-                Some("gone") => {
-                    logger::log("ERROR", "stunar ws message", "gone (room died)");
-                    return Err("Could not join.".into());
-                }
-                Some("signal") => {
-                    let payload = &msg["payload"];
-                    if payload.get("type").and_then(|kind| kind.as_str()) == Some("offer") {
-                        if let Some(sdp) = payload.get("sdp").and_then(|sdp| sdp.as_str()) {
-                            logger::log("INFO", "stunar ws message", "offer received");
-                            let from = msg["from"].as_str().map(str::to_owned);
-                            let offer = PeerSignal {
-                                kind: PeerSignalKind::Offer,
-                                sdp: sdp.to_owned(),
-                                id: from,
-                            };
-                            return Ok((token, offer, ws, member_id, mode));
-                        }
-                    }
-                }
-                _ => continue,
-            }
-        }
-    });
-    let (token, offer, ws, member_id, mode) = result?;
     let incoming_offers = Arc::new(Mutex::new(Vec::new()));
     let answers = Arc::new(Mutex::new(Vec::new()));
     let shutdown = Arc::new(AtomicBool::new(false));
     let (outgoing_tx, outgoing_rx) = unbounded_channel();
+    let (ready_tx, ready_rx) = sync_channel(1);
     let worker_offers = Arc::clone(&incoming_offers);
     let worker_answers = Arc::clone(&answers);
     let worker_shutdown = Arc::clone(&shutdown);
+    let worker_base = base.clone();
+    let worker_code = code.to_owned();
+    let worker_password = password.to_owned();
+    let worker_nickname = nickname.to_owned();
     let worker = thread::Builder::new()
         .name("godrinking-stunar-viewer".into())
         .spawn(move || {
-            let Ok(runtime) = current_thread_runtime() else {
-                return;
+            let runtime = match current_thread_runtime() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error));
+                    return;
+                }
             };
-            let _ = runtime.block_on(viewer_worker(
-                ws,
-                worker_offers,
-                worker_answers,
-                worker_shutdown,
-                outgoing_rx,
-            ));
+            runtime.block_on(async move {
+                match viewer_handshake(
+                    &worker_base,
+                    &worker_code,
+                    &worker_password,
+                    &worker_nickname,
+                )
+                .await
+                {
+                    Ok((token, offer, ws, member_id, mode)) => {
+                        let _ = ready_tx.send(Ok((token, offer, member_id, mode)));
+                        viewer_worker(
+                            ws,
+                            worker_offers,
+                            worker_answers,
+                            worker_shutdown,
+                            outgoing_rx,
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                    }
+                }
+            });
         })
-        .ok();
-    drop(runtime);
-    Ok((
+        .map_err(|error| error.to_string())?;
+    let (token, offer, member_id, mode) = ready_rx
+        .recv_timeout(VIEWER_WAIT_TIMEOUT + HTTP_TIMEOUT + Duration::from_secs(5))
+        .map_err(|_| {
+            logger::log("ERROR", "stunar ask", "timed out waiting for the viewer handshake");
+            "Stunar is unreachable.".to_owned()
+        })??;
+    return Ok((
         token.clone(),
         offer,
         StunarViewer {
@@ -981,9 +894,123 @@ pub(crate) fn discover_stunar_room(
             token,
             member_id,
             mode,
-            _worker: worker,
+            _worker: Some(worker),
         },
-    ))
+    ));
+}
+
+async fn viewer_handshake(
+    base: &str,
+    code: &str,
+    password: &str,
+    nickname: &str,
+) -> Result<(String, PeerSignal, WsStream, Option<String>, String), String> {
+    let client = http_client()?;
+    let body = json!({ "code": code, "password": password, "nickname": nickname });
+    let response = client
+        .post(format!("{base}/v1/viewer/ask"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| {
+            logger::log(
+                "ERROR",
+                "stunar ask",
+                &format!("network failure: {error} (unreachable)"),
+            );
+            "Stunar is unreachable.".to_owned()
+        })?;
+    let status = response.status();
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|_| "Stunar is unreachable.".to_owned())?;
+    if !status.is_success() || json["ok"] != true {
+        let raw = json["error"].as_str().unwrap_or("unknown");
+        logger::log(
+            "ERROR",
+            "stunar ask response",
+            &format!("status={status} error={raw}"),
+        );
+        return Err(match raw {
+            "full" => "This session is full.".into(),
+            "invalid" => "Could not join. (server: invalid — check the password)".into(),
+            "busy" => "Could not join. (server: busy — too many attempts, wait a bit)".into(),
+            "denied" => "Could not join. (server: denied — wrong code or password)".into(),
+            _ => "Could not join.".into(),
+        });
+    }
+    logger::log("INFO", "stunar ask response", "accepted; viewer token issued");
+    let token = json["viewer_token"]
+        .as_str()
+        .ok_or_else(|| "Could not join.".to_owned())?
+        .to_owned();
+    let member_id = json["member_id"].as_str().map(str::to_owned);
+    let mode = json["mode"].as_str().unwrap_or("broadcast").to_owned();
+    let ws_url = ws_url(base, "viewer", &token)?;
+    let mut ws = connect_ws(&ws_url).await.map_err(|error| {
+        logger::log("ERROR", "stunar ws", &format!("connect failed: {error}"));
+        "Stunar is unreachable.".to_owned()
+    })?;
+    logger::log("INFO", "stunar ws", "connected (viewer)");
+    let deadline = tokio::time::Instant::now() + VIEWER_WAIT_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            logger::log("WARN", "stunar ws", "timed out waiting for the offer (65s)");
+            return Err("The host declined.".into());
+        }
+        let incoming = tokio::time::timeout(remaining, ws.next())
+            .await
+            .map_err(|_| {
+                logger::log("WARN", "stunar ws", "timed out waiting for the offer (65s)");
+                "The host declined.".to_owned()
+            })?
+            .ok_or_else(|| {
+                logger::log("WARN", "stunar ws", "closed while waiting for the offer");
+                "Stunar is unreachable.".to_owned()
+            })?
+            .map_err(|error| {
+                logger::log("WARN", "stunar ws", &format!("error: {error}"));
+                "Stunar is unreachable.".to_owned()
+            })?;
+        let Message::Text(text) = incoming else {
+            continue;
+        };
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        match msg["t"].as_str() {
+            Some("accepted") => {
+                logger::log("INFO", "stunar ws message", "accepted (waiting for offer)");
+                continue;
+            }
+            Some("rejected") => {
+                logger::log("WARN", "stunar ws message", "rejected (host declined)");
+                return Err("The host declined.".into());
+            }
+            Some("gone") => {
+                logger::log("ERROR", "stunar ws message", "gone (room died)");
+                return Err("Could not join.".into());
+            }
+            Some("signal") => {
+                let payload = &msg["payload"];
+                if payload.get("type").and_then(|kind| kind.as_str()) == Some("offer") {
+                    if let Some(sdp) = payload.get("sdp").and_then(|sdp| sdp.as_str()) {
+                        logger::log("INFO", "stunar ws message", "offer received");
+                        let from = msg["from"].as_str().map(str::to_owned);
+                        let offer = PeerSignal {
+                            kind: PeerSignalKind::Offer,
+                            sdp: sdp.to_owned(),
+                            id: from,
+                        };
+                        return Ok((token, offer, ws, member_id, mode));
+                    }
+                }
+            }
+            _ => continue,
+        }
+    }
 }
 
 async fn viewer_worker(
@@ -1018,7 +1045,14 @@ async fn viewer_worker(
                         let _ = ws.send(Message::Pong(Vec::new().into())).await;
                     }
                     Some(Ok(_)) => {}
-                    Some(Err(_)) | None => break,
+                    Some(Err(error)) => {
+                        logger::log("WARN", "stunar ws", &format!("viewer inbox error: {error}"));
+                        break;
+                    }
+                    None => {
+                        logger::log("WARN", "stunar ws", "viewer inbox closed");
+                        break;
+                    }
                 }
             }
             outgoing = outgoing.recv() => {
@@ -1029,12 +1063,14 @@ async fn viewer_worker(
                             body["to"] = json!(to);
                         }
                         if ws.send(Message::Text(body.to_string().into())).await.is_err() {
+                            logger::log("WARN", "stunar ws", "viewer signal send failed");
                             break;
                         }
                     }
                     Some(Outgoing::Share { start }) => {
                         let text = json!({ "t": if start { "share-start" } else { "share-stop" } }).to_string();
                         if ws.send(Message::Text(text.into())).await.is_err() {
+                            logger::log("WARN", "stunar ws", "viewer share announce failed");
                             break;
                         }
                     }
