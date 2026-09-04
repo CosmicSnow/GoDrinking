@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 
 import "./index.css";
 import "./App.css";
 import logo from "./assets/logo.png";
-import { APP_VERSION, copy } from "./copy";
+import { APP_VERSION, detectLocale, dictionaries, type Copy, type Locale } from "./copy";
 import { RoomStage } from "./RoomStage";
 import { autoFloorMbps, BITRATE_MAX_MBPS, BITRATE_MIN_MBPS, FLOOR_MAX_MBPS, FLOOR_MIN_MBPS, collectViewerStats, qualityTargetMbps, type ViewerStats, type ViewerStatsPrev } from "./sessionStats";
 
@@ -128,6 +128,12 @@ const taglines = [
 ];
 
 function App() {
+  const [locale, setLocale] = useState<Locale>(() => detectLocale());
+  const copy: Copy = dictionaries[locale];
+  const setLocalePersist = (next: Locale) => {
+    setLocale(next);
+    try { localStorage.setItem("godrinking.locale", next); } catch { /* ignore */ }
+  };
   const [mode, setMode] = useState<"share" | "watch">("share");
   const [caps, setCaps] = useState<Capabilities | null>(null);
   const [sources, setSources] = useState<Source[]>([]);
@@ -1035,7 +1041,7 @@ function App() {
             <span className="brand-tagline" title={tagline}>{tagline}</span>
           </div>
         </div>
-        <div className="nav-label">Workspace</div>
+        <div className="nav-label">{copy.workspace}</div>
         <nav aria-label="Main navigation">
           <button className={`nav-item ${mode === "share" ? "active" : ""}`} onClick={() => setMode("share")}><Icon name="grid"/> {copy.shareNav}</button>
           <button className={`nav-item ${mode === "watch" ? "active" : ""}`} onClick={() => setMode("watch")}><Icon name="monitor"/> {copy.watchNav}{watchStreamActive ? <span className="nav-live"><i/>Live</span> : null}</button>
@@ -1049,6 +1055,10 @@ function App() {
           </div>
         </div>
         <div className="sidebar-footer">
+          <div className="lang-switch" role="group" aria-label={copy.language}>
+            <button type="button" className={locale === "en" ? "selected" : ""} onClick={() => setLocalePersist("en")}>EN</button>
+            <button type="button" className={locale === "pt-BR" ? "selected" : ""} onClick={() => setLocalePersist("pt-BR")}>PT</button>
+          </div>
           <button className="logs-button" onClick={() => void openLogs()} title="View the last 5 session logs"><Icon name="terminal" size={13}/> View logs</button>
           <div className="version">goDrinking <span>v{APP_VERSION}</span></div>
         </div>
@@ -1083,6 +1093,7 @@ function App() {
             onSettings={() => setRoomDesk(true)}
             onLeave={leaveSala}
             localCanvas={canvasRef}
+            copy={copy}
           />
         )}
         {(watchStreamActive || mode === "watch") && !onStage ? (

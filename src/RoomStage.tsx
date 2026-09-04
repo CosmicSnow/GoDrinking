@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type PointerEvent, type RefObject } from "react";
 import { collectViewerStats, type ViewerStatsPrev } from "./sessionStats";
+import type { Copy } from "./copy";
 
 export type RoomPerson = {
   id: string;
@@ -35,6 +36,7 @@ type Props = {
   onSettings: () => void;
   onLeave: () => void;
   localCanvas?: RefObject<HTMLCanvasElement | null>;
+  copy: Copy;
 };
 
 export function roomGridShape(count: number): { cols: number; rows: number } {
@@ -75,6 +77,7 @@ function TileVideo({
   onMute,
   onCinema,
   onStats,
+  copy,
 }: {
   tile: RoomTile;
   localCanvas?: RefObject<HTMLCanvasElement | null>;
@@ -91,6 +94,7 @@ function TileVideo({
   onMute: (id: string, muted: boolean) => void;
   onCinema: (id: string | null) => void;
   onStats: (id: string | null) => void;
+  copy: Copy;
 }) {
   const zoomOut = Math.max(1, Math.round((ctl.zoom - 0.25) * 100) / 100);
   const zoomIn = Math.min(3, Math.round((ctl.zoom + 0.25) * 100) / 100);
@@ -141,7 +145,7 @@ function TileVideo({
       <div className="room-tile-hud">
         <span>{tile.nickname}{tile.local ? " · you" : ""}</span>
         <span className="room-tile-actions" onClick={(event) => event.stopPropagation()} onPointerDown={(event) => event.stopPropagation()}>
-          <button type="button" className="room-stat-btn" onClick={() => onStats(statsOpen ? null : tile.id)} title="Stream status" aria-label="Stream status">
+          <button type="button" className="room-stat-btn" onClick={() => onStats(statsOpen ? null : tile.id)} title={copy.streamStatus} aria-label={copy.streamStatus}>
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>
           </button>
           <button type="button" onClick={() => onZoom(tile.id, zoomOut)} disabled={ctl.zoom <= 1} title="Zoom out">−</button>
@@ -149,7 +153,7 @@ function TileVideo({
           <button type="button" onClick={() => onZoom(tile.id, zoomIn)} disabled={ctl.zoom >= 3} title="Zoom in">+</button>
           {!tile.local && (
             <>
-              <button type="button" onClick={() => onMute(tile.id, !ctl.muted)} title={ctl.muted ? "Unmute" : "Mute"}>{ctl.muted ? "Muted" : "Vol"}</button>
+              <button type="button" onClick={() => onMute(tile.id, !ctl.muted)} title={ctl.muted ? copy.muted : copy.volume}>{ctl.muted ? copy.muted : copy.volume}</button>
               <input
                 className="room-tile-vol"
                 type="range"
@@ -167,10 +171,10 @@ function TileVideo({
               />
             </>
           )}
-          <button type="button" onClick={() => onCinema(cinema ? null : tile.id)} title={cinema ? "Exit video only" : "Video only"}>{cinema ? "Exit" : "Video only"}</button>
-          <button type="button" onClick={() => onPin(pinned === tile.id ? null : tile.id)}>{pinned === tile.id ? "Unpin" : "Pin"}</button>
+          <button type="button" onClick={() => onCinema(cinema ? null : tile.id)} title={cinema ? copy.videoOnlyExit : copy.videoOnly}>{cinema ? copy.videoOnlyExit : copy.videoOnly}</button>
+          <button type="button" onClick={() => onPin(pinned === tile.id ? null : tile.id)}>{pinned === tile.id ? copy.unpinTile : copy.pinTile}</button>
           {!tile.local && (
-            <button type="button" onClick={() => onUnwatch(tile.id)}>Stop</button>
+            <button type="button" onClick={() => onUnwatch(tile.id)}>{copy.unwatchPerson}</button>
           )}
         </span>
       </div>
@@ -196,12 +200,13 @@ export function RoomStage({
   onSettings,
   onLeave,
   localCanvas,
+  copy,
 }: Props) {
   const visible = liveRoomTiles(tiles, watching);
   const [ctl, setCtl] = useState<Record<string, TileCtl>>({});
   const [cinemaId, setCinemaId] = useState<string | null>(null);
   const [statsId, setStatsId] = useState<string | null>(null);
-  const [statsText, setStatsText] = useState("Collecting…");
+  const [statsText, setStatsText] = useState(copy.collecting);
   const statsPrev = useRef<ViewerStatsPrev>(null);
   const ctlOf = (id: string) => ctl[id] ?? defaultCtl();
   const patchCtl = (id: string, next: Partial<TileCtl>) => {
@@ -212,7 +217,7 @@ export function RoomStage({
     const tile = tiles.find((item) => item.id === statsId);
     const pc = tile?.pc;
     if (!pc) {
-      setStatsText(tile?.local ? "Your encoder. Open Status in Settings for the full readout." : "No peer yet.");
+      setStatsText(tile?.local ? copy.yourEncoder : copy.noPeerYet);
       return undefined;
     }
     let alive = true;
@@ -230,7 +235,7 @@ export function RoomStage({
     void tick();
     const timer = window.setInterval(() => void tick(), 1000);
     return () => { alive = false; window.clearInterval(timer); };
-  }, [statsId, tiles]);
+  }, [statsId, tiles, copy.yourEncoder, copy.noPeerYet]);
   const stageTiles = cinemaId
     ? visible.filter((tile) => tile.id === cinemaId)
     : pinned
@@ -257,12 +262,12 @@ export function RoomStage({
     <div className={`room-live-shell ${cinemaId ? "is-cinema" : ""}`}>
       <header className="room-live-bar">
         <div className="room-live-ident">
-          <span className="room-live-kicker">Sala</span>
+          <span className="room-live-kicker">{copy.room}</span>
           <strong>{roomLabel || "Room"}</strong>
         </div>
         <div className="room-live-bar-actions">
-          <button type="button" className="room-bar-btn" onClick={onSettings}>Settings</button>
-          <button type="button" className="room-bar-btn is-leave" onClick={onLeave}>Leave</button>
+          <button type="button" className="room-bar-btn" onClick={onSettings}>{copy.roomSettings}</button>
+          <button type="button" className="room-bar-btn is-leave" onClick={onLeave}>{copy.leave}</button>
         </div>
       </header>
       <div className="room-live-body">
@@ -276,8 +281,8 @@ export function RoomStage({
           >
             {stageTiles.length === 0 && (
               <div className="room-empty">
-                <strong>Nobody on screen</strong>
-                <small>Watch someone who is sharing. Empty tiles stay off the grid.</small>
+                <strong>{copy.nobodyOnScreen}</strong>
+                <small>{copy.nobodyOnScreenHint}</small>
               </div>
             )}
             {stageTiles.map((tile) => (
@@ -298,6 +303,7 @@ export function RoomStage({
                 onMute={(id, muted) => patchCtl(id, { muted })}
                 onCinema={setCinemaId}
                 onStats={setStatsId}
+                copy={copy}
               />
             ))}
           </div>
@@ -332,25 +338,25 @@ export function RoomStage({
         </div>
         <aside className="room-live-rail">
           {sharing ? (
-            <button type="button" className="room-share-btn is-live" disabled={shareBusy} onClick={onStopShare}>Stop sharing</button>
+            <button type="button" className="room-share-btn is-live" disabled={shareBusy} onClick={onStopShare}>{copy.stopShareMine}</button>
           ) : (
-            <button type="button" className="room-share-btn" disabled={shareBusy || !canShare} onClick={onShare}>Share my screen</button>
+            <button type="button" className="room-share-btn" disabled={shareBusy || !canShare} onClick={onShare}>{copy.shareMine}</button>
           )}
-          <p className="room-rail-label">In the room · {people.length || 1}</p>
+          <p className="room-rail-label">{copy.inTheRoom} · {people.length || 1}</p>
           {me ? (
             <div className="room-person is-you">
               <span>
                 {me.master ? <span className="roster-crown" title="Master">♛</span> : null}
                 {me.nickname}
-                <small>{sharing ? "Sharing · you" : "You"}</small>
+                <small>{sharing ? copy.sharingYou : copy.you}</small>
               </span>
             </div>
           ) : (
             <div className="room-person is-you">
-              <span>You<small>{sharing ? "Sharing" : "In the room"}</small></span>
+              <span>{copy.you}<small>{sharing ? copy.sharing : copy.inRoom}</small></span>
             </div>
           )}
-          {others.length === 0 && <p className="roster-empty">You're the only one here for now.</p>}
+          {others.length === 0 && <p className="roster-empty">{copy.onlyYou}</p>}
           {others.map((person) => {
             const on = watching.has(person.id);
             return (
@@ -358,7 +364,7 @@ export function RoomStage({
                 <span>
                   {person.master ? <span className="roster-crown" title="Master">♛</span> : null}
                   {person.nickname}
-                  <small>{person.share ? (on ? "Live · watching" : "Sharing") : "In the room"}</small>
+                  <small>{person.share ? (on ? copy.liveWatching : copy.sharing) : copy.inRoom}</small>
                 </span>
                 <button
                   type="button"
@@ -366,7 +372,7 @@ export function RoomStage({
                   disabled={!person.share && !on}
                   onClick={() => (on ? onUnwatch(person.id) : onWatch(person.id))}
                 >
-                  {on ? "Stop" : "Watch"}
+                  {on ? copy.unwatchPerson : copy.watchPerson}
                 </button>
               </div>
             );
