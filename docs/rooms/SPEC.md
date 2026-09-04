@@ -56,17 +56,20 @@ Receptor = JS `RTCPeerConnection` receive, um `<video>` por Share slot remoto.
 
 Quando C começa a partilhar numa Sala com membros {A,B,C}:
 
-1. C `share-start` via Rendezvous.
-2. C cria offer para A e para B (dois PeerTransports).
-3. A e B respondem. ICE P2P. RTP não toca o servidor.
+1. C `share-start` via Rendezvous. **Não** minta offers a toda a gente.
+2. A (ou B) clica Watch em C: `watch` → C. C minta offer só para quem pediu.
+3. Quem pediu responde. ICE P2P. RTP não toca o servidor.
+4. `unwatch` fecha o PeerTransport nesse par (poupa CPU e rede).
 
-Quando D entra a meio: o Rendezvous manda o Roster; cada capturador vivo faz offer para D.
+Abrir a Sala **não** começa captura. Host e Watcher partilham quando quiserem (`share_on_start: false`).
+
+Quando D entra a meio: o Roster diz quem está a partilhar; D clica Watch em quem quiser. Sem auto-subscribe.
 
 ## UI
 
 - Seletor Broadcast | Sala no painel de Start (vista simples).
-- Em Sala: botão “Partilhar a minha tela” no palco, mesmo para quem não é Master.
-- Palco: vídeo grande do Share slot escolhido; fila de thumbs dos outros.
+- Em Sala: botão “Partilhar a minha tela” / “Stop sharing”, mesmo para quem não é Master. Abrir a Sala não captura.
+- Palco: grelha das streams a que te ligaste. Cada tile: maior/menor, pin (só essa), Stop (desliga o P2P). Lista de pessoas com Watch/Stop. Host e Watcher iguais.
 - Coroa (ícone lima) ao lado do Master no Roster.
 - Kick só visível para o Master.
 
@@ -95,8 +98,9 @@ N membros, S a partilhar: `S * (N-1)` fluxos de vídeo. N=8, S=8 → 56. Pesado.
 - [ ] Dois membros entram; o Master sai; o segundo `joinedAt` passa a Master (`you-are-master`); o código da Sala continua válido.
 - [ ] O último membro sai; um Join com o mesmo código recebe `denied`.
 - [ ] Master kicka um membro; esse WS recebe `kicked` e não volta a receber SDP.
-- [ ] Membro C clica “Share my screen too”: A e B recebem a tela de C por WebRTC P2P. tcpdump no Rendezvous não mostra RTP.
-- [ ] A (Master) consegue pôr a tela de C no palco grande e a dela nos thumbs.
+- [ ] Membro C clica “Share my screen”: o Roster marca share; A e B **não** recebem vídeo até clicarem Watch.
+- [ ] A (Master) e um Watcher vêem a mesma grelha, ligam/desligam cada stream, redimensionam tiles e alfinetam uma.
+- [ ] Host abre a Sala sem transmitir. Pode partilhar mais tarde, ou nunca.
 - [ ] Coroa lima no Nickname do Master. Kick só no Master.
 - [ ] Mais de 4 Share slots Live: aviso na UI. 8 membros: `full`.
 - [ ] LAN/Direct em Sala: se o Master cai, a Sala acaba (sem Rendezvous a guardar o código). Documentado na UI.

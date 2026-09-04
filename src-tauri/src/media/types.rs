@@ -178,6 +178,10 @@ fn default_host_nickname() -> String {
     "Host".into()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Session video codec. Presets always send H.264 Baseline so mixed
 /// Mac/Windows (GTX 1050 through 40-series, M1+) can decode. HEVC and AV1
 /// are Customize-only: they need a capable Host encoder and a Viewer that
@@ -298,6 +302,11 @@ pub struct CreateMediaSessionRequest {
     /// when a Sala member starts their own Share slot.
     #[serde(default)]
     pub attach_only: bool,
+    /// When false, open the Session (code, roster, signaling) without
+    /// capturing. Sala Hosts start this way; they share later if they want.
+    /// Default true so Broadcast keeps capturing on Start.
+    #[serde(default = "default_true")]
+    pub share_on_start: bool,
     /// Rendezvous base URL, only used by Stunar (not in this fatia).
     #[serde(default)]
     pub rendezvous_url: Option<String>,
@@ -505,6 +514,9 @@ pub struct MediaSessionSnapshot {
     pub lan_addresses: Vec<String>,
     pub lan_port: Option<u16>,
     pub roster: Vec<RosterEntry>,
+    /// This member's id on the Rendezvous (Sala) or None for Broadcast Host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_id: Option<String>,
     /// True when the Session has a Password. The Password itself never leaves
     /// the native side.
     pub password_set: bool,
@@ -549,6 +561,7 @@ impl MediaSessionSnapshot {
             lan_addresses: Vec::new(),
             lan_port: None,
             roster: Vec::new(),
+            self_id: None,
             password_set: false,
             admission: false,
             join_mode: JoinMode::Lan,

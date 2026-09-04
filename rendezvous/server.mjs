@@ -10,7 +10,18 @@
 import http from "node:http";
 import { randomBytes, scrypt, timingSafeEqual } from "node:crypto";
 import { WebSocketServer } from "ws";
-import { nextMaster } from "./succession.mjs";
+
+/** Master succession for Sala. Oldest remaining joinedAt, then id. */
+function nextMaster(members, leavingId) {
+  const rest = members
+    .filter((member) => member.id !== leavingId)
+    .slice()
+    .sort((left, right) => {
+      if (left.joinedAt !== right.joinedAt) return left.joinedAt - right.joinedAt;
+      return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+    });
+  return rest[0] ? rest[0].id : null;
+}
 
 const PORT = Number(process.env.PORT || 8787);
 const BIND = process.env.BIND || "127.0.0.1";
@@ -373,7 +384,7 @@ async function handleOpen(ip, json, res) {
       joinedAt: now,
       heartbeatAt: now,
       ws: null,
-      share: true,
+      share: false,
       role: "host",
     });
   }
@@ -626,6 +637,21 @@ function handleClientMessage(ws, meta, data) {
     return;
   }
 
+  if (room.mode === "room" && (msg.t === "watch" || msg.t === "unwatch")) {
+    if (typeof msg.to !== "string") return;
+    const dest = room.members.get(msg.to);
+    if (!dest) return;
+    const payload = { t: msg.t, from: fromId, to: msg.to };
+    const sock =
+      dest.ws && dest.ws.readyState === 1
+        ? dest.ws
+        : dest.id === room.masterId && room.hostWs && room.hostWs.readyState === 1
+          ? room.hostWs
+          : null;
+    if (sock) send(sock, payload);
+    return;
+  }
+
   if (!msg || msg.t !== "signal" || !isValidSignal(msg.payload)) return;
 
   if (room.mode === "room" && typeof msg.to === "string") {
@@ -709,6 +735,9 @@ wss.on("connection", (ws, req, meta) => {
       if (member) member.ws = ws;
     }
     if (viewer.state === "accepted") send(ws, { t: "accepted", viewer_id: viewer.id });
+    if (room.mode === "room") {
+      send(ws, { t: "roster", entries: rosterEntries(room), master_id: room.masterId ?? null, mode: room.mode });
+    }
     if (viewer.inbox) {
       // Inbox only ever holds a broadcast host offer (room-mode member
       // signals route directly): same `from` stamp as the live path.
