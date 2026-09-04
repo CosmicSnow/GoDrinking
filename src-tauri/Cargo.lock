@@ -1838,7 +1838,7 @@ dependencies = [
 
 [[package]]
 name = "godrinking"
-version = "0.3.0-beta.1"
+version = "0.3.0-1"
 dependencies = [
  "block2",
  "core-foundation",
