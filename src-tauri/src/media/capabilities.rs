@@ -119,13 +119,19 @@ mod tests {
         let capabilities = detect();
         #[cfg(target_os = "macos")]
         assert!(capabilities.native_capture_implemented);
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        assert!(capabilities.native_capture_implemented);
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         assert!(!capabilities.native_capture_implemented);
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         assert!(!capabilities.native_encoder_implemented);
         #[cfg(target_os = "macos")]
         assert!(capabilities.native_encoder_implemented);
+        #[cfg(target_os = "windows")]
+        assert!(capabilities.native_encoder_implemented);
         #[cfg(target_os = "macos")]
+        assert!(capabilities.native_peer_transport_implemented);
+        #[cfg(target_os = "windows")]
         assert!(capabilities.native_peer_transport_implemented);
         assert!(!capabilities.detail.is_empty());
     }

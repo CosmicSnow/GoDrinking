@@ -127,6 +127,8 @@ function App() {
   const [frameFps, setFrameFps] = useState<"auto" | "30_fps" | "60_fps" | "120_fps">("auto");
   const resolvedResolution = resolution === "auto" ? qualityPresets[quality].resolution : resolution;
   const resolvedFrameRate = frameFps === "auto" ? qualityPresets[quality].frame_rate : frameFps;
+  const [qualityOpen, setQualityOpen] = useState(false);
+  const qualitySummary = `${quality[0].toUpperCase()}${quality.slice(1)} · ${resolvedResolution} · ${resolvedFrameRate.replace("_fps", "fps")} · ${videoCodec === "hevc" ? "HEVC" : videoCodec === "h264high" ? "H.264 High" : "H.264"} · ${videoEncoder === "auto" ? "Auto" : videoEncoder === "hardware" ? "Hardware" : "Software"}`;
   const effectiveFloorMbps = Math.min(minBitrateMbps ?? AUTO_FLOOR_MBPS, effectiveMbps);
   const [systemAudio, setSystemAudio] = useState(false);
   const [excludedApps, setExcludedApps] = useState<string[]>([]);
@@ -872,6 +874,11 @@ function App() {
               </select>
               <div className="quality-options single">
                 <div>
+                  <button className="manual-toggle" aria-expanded={qualityOpen} aria-controls="quality-fields" onClick={() => setQualityOpen((open) => !open)} title="Mostrar/ocultar ajustes de qualidade">
+                    <Icon name="chevron" size={13}/> Quality<span>{qualitySummary}</span>
+                  </button>
+                  {qualityOpen && (
+                  <div id="quality-fields">
                   <span>Quality</span>
                   <div className="segmented">
                     <button className={quality === "low" ? "selected" : ""} onClick={() => { setQuality("low"); setBitrateMbps(null); setMinBitrateMbps(null); }}>Low</button>
@@ -920,8 +927,10 @@ function App() {
                       <button className={videoEncoder === "auto" ? "selected" : ""} onClick={() => setVideoEncoder("auto")} disabled={active} title="Tenta hardware, cai para software sozinho">Auto</button>
                       <button className={videoEncoder === "hardware" ? "selected" : ""} onClick={() => setVideoEncoder("hardware")} disabled={active} title="Só hardware; cai para software com aviso se falhar">Hardware</button>
                       <button className={videoEncoder === "software" ? "selected" : ""} onClick={() => setVideoEncoder("software")} disabled={active} title="Sempre OpenH264 em CPU">Software</button>
-                    </div>
-                  </>}
+                      </div>
+                    </>}
+                  </div>
+                  )}
                   <div className="bitrate-block">
                     <div className="bitrate-label-row">
                       <span>Bitrate limite</span>

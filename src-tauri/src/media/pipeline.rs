@@ -664,11 +664,11 @@ fn encoder_worker_loop(
                 let _ = encoder.set_bitrate(bitrate);
             }
         }
-        if control.take_keyframe() {
-            if let Some(encoder) = encoder.as_mut() {
-                let _ = encoder.force_keyframe();
-            }
-        }
+        // NOTE: the keyframe flag is NOT consumed here on purpose: this
+        // loop spins on 10ms timeouts while the capture is paced, and
+        // consuming the flag on an empty spin would waste a viewer-join
+        // IDR request (force_intra with no frame to apply to). It is
+        // consumed in the Video arm, right before the next encode.
         if state.is_failed() {
             break;
         }
@@ -721,6 +721,9 @@ fn encoder_worker_loop(
                 let Some(active) = encoder.as_mut() else {
                     continue;
                 };
+                if control.take_keyframe() {
+                    let _ = active.force_keyframe();
+                }
                 if let Err(error) = active.encode(
                     &*frame.pixel_buffer as *const CVPixelBuffer as *mut CVPixelBuffer,
                     frame.timestamp_micros as i64,
@@ -968,11 +971,11 @@ fn encoder_worker_loop(
                 let _ = encoder.set_bitrate(bitrate);
             }
         }
-        if control.take_keyframe() {
-            if let Some(encoder) = encoder.as_mut() {
-                encoder.force_keyframe();
-            }
-        }
+        // NOTE: the keyframe flag is NOT consumed here on purpose: this
+        // loop spins on 10ms timeouts while the capture is paced, and
+        // consuming the flag on an empty spin would waste a viewer-join
+        // IDR request (force_intra with no frame to apply to). It is
+        // consumed in the Video arm, right before the next encode.
         if state.is_failed() {
             break;
         }
@@ -1043,6 +1046,9 @@ fn encoder_worker_loop(
                 let Some(active) = encoder.as_mut() else {
                     continue;
                 };
+                if control.take_keyframe() {
+                    active.force_keyframe();
+                }
                 match active.encode(&frame) {
                     Ok(()) => {
                         frames_accepted += 1;

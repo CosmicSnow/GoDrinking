@@ -226,12 +226,18 @@ mod tests {
     #[test]
     fn session_roundtrip_and_clear() {
         // Uses the real data dir; acceptable for a debug logger.
+        // NOTE: other tests (and real app runs) share this dir and the
+        // global file handle in parallel, so the marker is searched in
+        // EVERY session file instead of assuming sessions[0] is ours.
         begin_session("host", "stunar");
         log("INFO", "test", "hello from the logger");
         let sessions = read_sessions();
         assert!(!sessions.is_empty(), "a session file should exist");
         assert!(
-            sessions[0].lines.iter().any(|line| line.contains("hello from the logger")),
+            sessions
+                .iter()
+                .flat_map(|session| session.lines.iter())
+                .any(|line| line.contains("hello from the logger")),
             "the written line should be readable back"
         );
         clear();

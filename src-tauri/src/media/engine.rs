@@ -14,12 +14,12 @@ use super::types::{
     VideoResolution, MediaSessionStats, ViewerLinkStats,
 };
 use super::MediaCapabilities;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CONTROL_QUEUE_CAPACITY: usize = 32;
 const MAX_VIEWERS: usize = 8;
@@ -28,6 +28,13 @@ struct ViewerLink {
     id: String,
     nickname: String,
     peer: PeerTransport,
+    /// Last offer SDP sent to this viewer (kept so a signal lost on the
+    /// Rendezvous WS can be resent without minting a fresh peer).
+    last_offer: Option<PeerSignal>,
+    /// When the current offer was minted/last resent.
+    offered_at: Instant,
+    /// Bounded resends of an unanswered offer (see apply_stunar_accepts).
+    offer_resends: u8,
 }
 
 struct SessionRecord {
@@ -209,34 +216,86 @@ impl MediaEngine {
     /// Rendezvous, so there is no pending step to trigger the mint. Polled
     /// from `snapshot()`: any accepted Viewer without a ViewerLink gets an
     /// offer minted and sent over the WS inbox.
+    ///
+    /// This also heals two join-path failures without user action:
+    /// - Links whose id vanished from the Rendezvous roster (leave/kick/
+    ///   timeout) while never connecting are dropped, so a rejoin mints a
+    ///   fresh peer instead of hitting the stale entry (and the 8-viewer cap
+    ///   is not eaten by ghosts).
+    /// - An offer lost on the WS (minted + stored, answer never arrives,
+    ///   peer stuck in New) is resent a bounded number of times.
     fn apply_stunar_accepts(&self) {
-        let to_mint = self.state.lock().ok().and_then(|state| {
-            let session = state.session.as_ref()?;
-            let stunar = session.stunar.as_ref()?;
+        const OFFER_RESEND_AFTER: Duration = Duration::from_secs(5);
+        const MAX_OFFER_RESENDS: u8 = 6;
+        let (to_mint, to_resend, dropped, stunar) = {
+            let mut guard = match self.state.lock() {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
+            let Some(session) = guard.session.as_mut() else {
+                return;
+            };
+            let Some(stunar) = session.stunar.clone() else {
+                return;
+            };
             let accepted = stunar.accepted_roster();
-            Some(
-                accepted
-                    .into_iter()
-                    .filter(|(id, _)| !session.viewers.contains_key(id))
-                    .collect::<Vec<_>>(),
-            )
-        });
-        let Some(to_mint) = to_mint else {
-            return;
+            let accepted_ids: HashSet<&str> =
+                accepted.iter().map(|(id, _)| id.as_str()).collect();
+            let mut to_mint = Vec::new();
+            for (id, nickname) in &accepted {
+                if !session.viewers.contains_key(id) {
+                    to_mint.push((id.clone(), nickname.clone()));
+                }
+            }
+            let mut to_resend: Vec<(String, PeerSignal)> = Vec::new();
+            let mut dropped_ids = Vec::new();
+            let now = Instant::now();
+            for (id, link) in session.viewers.iter_mut() {
+                if link.peer.status().state == PeerTransportState::Connected {
+                    continue;
+                }
+                if !accepted_ids.contains(id.as_str()) {
+                    dropped_ids.push(id.clone());
+                } else if link.peer.status().state == PeerTransportState::New {
+                    if let Some(signal) = link.last_offer.clone() {
+                        if link.offer_resends < MAX_OFFER_RESENDS
+                            && now.duration_since(link.offered_at) >= OFFER_RESEND_AFTER
+                        {
+                            link.offered_at = now;
+                            link.offer_resends += 1;
+                            to_resend.push((id.clone(), signal));
+                        }
+                    }
+                }
+            }
+            let mut dropped = Vec::new();
+            for id in dropped_ids {
+                if let Some(fanout) = session.fanout.as_ref() {
+                    fanout.unsubscribe(&id);
+                }
+                if let Some(link) = session.viewers.remove(&id) {
+                    logger::log("INFO", "roster", &format!("dropping stale viewer={id}"));
+                    dropped.push(link);
+                }
+            }
+            (to_mint, to_resend, dropped, stunar)
         };
+        // Peer close can block (teardown deadline); never hold the engine
+        // lock for it.
+        drop(dropped);
         for (id, nickname) in to_mint {
             let Ok(signal) = mint_viewer_offer(&self.state, &id, &nickname) else {
                 continue;
             };
-            let stunar = self.state.lock().ok().and_then(|state| {
-                state
-                    .session
-                    .as_ref()
-                    .and_then(|session| session.stunar.clone())
-            });
-            if let Some(stunar) = stunar {
-                let _ = stunar.send_signal(&id, &signal);
-            }
+            let _ = stunar.send_signal(&id, &signal);
+        }
+        for (id, signal) in to_resend {
+            logger::log(
+                "INFO",
+                "mint offer",
+                &format!("resending unanswered offer viewer={id}"),
+            );
+            let _ = stunar.send_signal(&id, &signal);
         }
     }
 
@@ -297,12 +356,22 @@ impl MediaEngine {
             .session
             .as_mut()
             .ok_or(MediaEngineError::NoActiveSession)?;
-        if let Some(viewer) = session.viewers.remove(id) {
+        let dropped = if let Some(viewer) = session.viewers.remove(id) {
             if let Some(fanout) = session.fanout.as_ref() {
                 fanout.unsubscribe(id);
             }
-            drop(viewer);
-        }
+            Some(viewer)
+        } else {
+            None
+        };
+        drop(state);
+        // Peer close can block on the teardown deadline; never hold the
+        // engine lock for it.
+        drop(dropped);
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| MediaEngineError::StatePoisoned)?;
         Ok(snapshot_from_state(&state))
     }
 
@@ -1334,18 +1403,28 @@ fn mint_viewer_offer(
             session.request.codec,
         )
     };
-    let peer = PeerTransport::new(
+    let peer = match PeerTransport::new(
         video_rx,
         audio_rx,
         Arc::clone(&encoder_control),
         frame_duration,
         join_mode,
         video_codec,
-    )?;
-    let mut signal = peer
-        .client()
-        .create_offer()
-        .map_err(|error| error.to_string())?;
+    ) {
+        Ok(peer) => peer,
+        Err(error) => {
+            unsubscribe_fanout(state, id);
+            return Err(error);
+        }
+    };
+    let mut signal = match peer.client().create_offer() {
+        Ok(signal) => signal,
+        Err(error) => {
+            drop(peer);
+            unsubscribe_fanout(state, id);
+            return Err(error.to_string());
+        }
+    };
     signal.id = Some(id.to_owned());
     let mut guard = state.lock().map_err(|_| "media state is unavailable".to_owned())?;
     let session = guard
@@ -1365,6 +1444,9 @@ fn mint_viewer_offer(
             id: id.to_owned(),
             nickname: nickname.to_owned(),
             peer,
+            last_offer: Some(signal.clone()),
+            offered_at: Instant::now(),
+            offer_resends: 0,
         },
     );
     // A new viewer must get SPS/PPS + IDR immediately: on static screens the
@@ -1372,6 +1454,19 @@ fn mint_viewer_offer(
     // viewer would wait (up to the intra period) for decodable data.
     encoder_control.request_keyframe();
     Ok(signal)
+}
+
+/// Best-effort fanout cleanup for a mint that failed after subscribing
+/// (PeerTransport::new / create_offer error): without it every failed join
+/// attempt leaks a dead per-viewer queue.
+fn unsubscribe_fanout(state: &Arc<Mutex<EngineState>>, id: &str) {
+    if let Ok(guard) = state.lock() {
+        if let Some(session) = guard.session.as_ref() {
+            if let Some(fanout) = session.fanout.as_ref() {
+                fanout.unsubscribe(id);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

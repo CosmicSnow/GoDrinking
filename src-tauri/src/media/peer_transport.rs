@@ -597,6 +597,13 @@ async fn run_peer(
             if awaiting_keyframe {
                 if !unit.keyframe {
                     dropped_awaiting += 1;
+                    // Self-heal: re-assert the IDR request while waiting so
+                    // a keyframe request lost to encoder-queue pacing (or a
+                    // quiet coalescing window) cannot black-screen the viewer
+                    // until the next natural intra period.
+                    if dropped_awaiting % 30 == 0 {
+                        sample_encoder_control.request_keyframe();
+                    }
                     if dropped_awaiting % 300 == 0 {
                         super::logger::log(
                             "WARN",
@@ -936,11 +943,12 @@ async fn create_offer(peer: &Arc<RTCPeerConnection>) -> Result<PeerSignal, Strin
     peer.set_local_description(offer)
         .await
         .map_err(|error| format!("set local offer failed: {error}"))?;
-    wait_for_ice(gather).await?;
+    gather_candidates_best_effort(gather, "offer").await;
     let description = peer
         .local_description()
         .await
         .ok_or_else(|| "local offer is unavailable".to_owned())?;
+    require_candidates(&description.sdp, "offer")?;
     Ok(PeerSignal {
         kind: PeerSignalKind::Offer,
         sdp: description.sdp,
@@ -969,11 +977,12 @@ async fn accept_offer(
     peer.set_local_description(answer)
         .await
         .map_err(|error| format!("set local answer failed: {error}"))?;
-    wait_for_ice(gather).await?;
+    gather_candidates_best_effort(gather, "answer").await;
     let description = peer
         .local_description()
         .await
         .ok_or_else(|| "local answer is unavailable".to_owned())?;
+    require_candidates(&description.sdp, "answer")?;
     Ok(PeerSignal {
         kind: PeerSignalKind::Answer,
         sdp: description.sdp,
@@ -1057,6 +1066,41 @@ async fn wait_for_ice(mut gather: tokio::sync::mpsc::Receiver<()>) -> Result<(),
         .await
         .map(|_| ())
         .map_err(|_| "ICE gathering timed out".to_owned())
+}
+
+/// Best-effort ICE wait: a slow/blocked STUN mirror must not fail the whole
+/// join when host candidates are already usable (same NAT, LAN, loopback).
+/// Only a candidate-less SDP still fails (via require_candidates).
+async fn gather_candidates_best_effort(
+    gather: tokio::sync::mpsc::Receiver<()>,
+    what: &str,
+) {
+    if let Err(error) = wait_for_ice(gather).await {
+        super::logger::log(
+            "WARN",
+            "ice",
+            &format!("{error} while gathering {what} candidates; proceeding with partial SDP"),
+        );
+    }
+}
+
+/// Fail fast only when the SDP carries zero candidates: without any
+/// candidate no ICE pair can ever form, so minting/sending it would leave a
+/// viewer stuck in Connecting forever.
+fn require_candidates(sdp: &str, what: &str) -> Result<(), String> {
+    let has_candidate = sdp
+        .lines()
+        .any(|line| line.trim().starts_with("a=candidate:"));
+    if has_candidate {
+        Ok(())
+    } else {
+        super::logger::log(
+            "WARN",
+            "ice",
+            &format!("{what} SDP has no ICE candidates; not sending"),
+        );
+        Err(format!("{what} gathered no ICE candidates"))
+    }
 }
 
 /// Round-trip time in ms for the selected ICE pair (STUN-based, same as
