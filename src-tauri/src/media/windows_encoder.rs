@@ -8,6 +8,7 @@
 //! error is logged and a keyframe requested rather than failing the session.
 
 use super::access_unit::{AccessUnitPushResult, AccessUnitQueue, EncodedAccessUnit};
+use super::logger;
 use super::pipeline::{EncoderControl, NativeFrame, PipelineState};
 use super::types::VideoCodec;
 use openh264::encoder::{
@@ -64,6 +65,10 @@ pub(crate) struct OpenH264Encoder {
     converter: AnnexBConverter,
     output: AccessUnitQueue,
     control: Arc<EncoderControl>,
+    frames_seen: u64,
+    empty_bitstream: u64,
+    converter_none: u64,
+    pushed_units: u64,
 }
 
 impl OpenH264Encoder {
@@ -113,6 +118,10 @@ impl OpenH264Encoder {
             converter: AnnexBConverter::default(),
             output,
             control,
+            frames_seen: 0,
+            empty_bitstream: 0,
+            converter_none: 0,
+            pushed_units: 0,
         })
     }
 
@@ -171,15 +180,52 @@ impl OpenH264Encoder {
         let keyframe = bitstream.frame_type() == FrameType::IDR;
         let timestamp_90khz = frame.timestamp_micros.saturating_mul(9) / 100;
         let bytes = bitstream.to_vec();
+        self.frames_seen += 1;
+        if bytes.is_empty() {
+            self.empty_bitstream += 1;
+        }
         let Some(unit) = self.converter.convert(&bytes, timestamp_90khz, keyframe) else {
+            self.converter_none += 1;
+            if self.converter_none == 1 {
+                logger::log(
+                    "WARN",
+                    "encoder",
+                    &format!(
+                        "converter dropped first frame ({} bytes, frame_type={:?}); no NALs parsed",
+                        bytes.len(),
+                        bitstream.frame_type()
+                    ),
+                );
+            }
             return Ok(());
         };
+        let unit_len = unit.data.len();
+        let unit_keyframe = unit.keyframe;
+        let unit_profile = unit.profile_level_id.clone();
         match self.output.try_push(unit) {
-            AccessUnitPushResult::Enqueued => {}
+            AccessUnitPushResult::Enqueued => {
+                self.pushed_units += 1;
+            }
             AccessUnitPushResult::DroppedUntilKeyframe => {
                 self.control.request_keyframe();
             }
             AccessUnitPushResult::Closed => {}
+        }
+        if self.frames_seen == 1 || self.frames_seen % 600 == 0 {
+            logger::log(
+                "INFO",
+                "encoder",
+                &format!(
+                    "encode stats: frames={} empty_bs={} converter_none={} pushed={} (last {} bytes keyframe={} profile={:?})",
+                    self.frames_seen,
+                    self.empty_bitstream,
+                    self.converter_none,
+                    self.pushed_units,
+                    unit_len,
+                    unit_keyframe,
+                    unit_profile
+                ),
+            );
         }
         Ok(())
     }
