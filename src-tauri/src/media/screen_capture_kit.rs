@@ -220,6 +220,7 @@ mod native {
     use objc2::runtime::ProtocolObject;
     use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass};
     use objc2_core_media::{CMSampleBuffer, CMTime};
+    use objc2_core_graphics::kCGColorSpaceITUR_709;
     use objc2_core_video::{
         kCVPixelFormatType_32BGRA, kCVReturnSuccess, CVPixelBuffer, CVPixelBufferGetBaseAddress,
         CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType,
@@ -1431,6 +1432,7 @@ mod native {
             configuration.setWidth(width as usize);
             configuration.setHeight(height as usize);
             configuration.setPixelFormat(kCVPixelFormatType_32BGRA);
+            configuration.setColorSpaceName(kCGColorSpaceITUR_709);
             configuration.setMinimumFrameInterval(interval);
             configuration.setQueueDepth(3);
             configuration.setCapturesAudio(false);

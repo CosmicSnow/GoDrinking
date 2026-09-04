@@ -77,6 +77,7 @@ impl PipelineState {
 enum Converter {
     H264(AvccAnnexBConverter),
     Hevc(HevcAnnexBConverter),
+    Av1,
 }
 
 #[cfg(target_os = "macos")]
@@ -86,6 +87,7 @@ impl Converter {
             VideoCodec::H264 => Self::H264(AvccAnnexBConverter::default()),
             VideoCodec::H264High => Self::H264(AvccAnnexBConverter::high_profile()),
             VideoCodec::Hevc => Self::Hevc(HevcAnnexBConverter::default()),
+            VideoCodec::Av1 => Self::Av1,
         }
     }
 
@@ -98,6 +100,12 @@ impl Converter {
         match self {
             Self::H264(converter) => converter.convert(bytes, timestamp_90khz, keyframe),
             Self::Hevc(converter) => converter.convert(bytes, timestamp_90khz, keyframe),
+            Self::Av1 => Ok(EncodedAccessUnit {
+                data: bytes.to_vec(),
+                timestamp_90khz,
+                keyframe,
+                profile_level_id: None,
+            }),
         }
     }
 }
@@ -142,6 +150,7 @@ impl VideoToolboxEncoder {
             VideoCodec::H264 => 0,
             VideoCodec::Hevc => 1,
             VideoCodec::H264High => 2,
+            VideoCodec::Av1 => 3,
         };
         let handle = unsafe {
             golive_vt_encoder_create(

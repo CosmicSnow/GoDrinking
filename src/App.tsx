@@ -4,7 +4,8 @@ import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 
 import "./index.css";
 import "./App.css";
 import logo from "./assets/logo.png";
-import { AUTO_FLOOR_MBPS, BITRATE_MAX_MBPS, BITRATE_MIN_MBPS, FLOOR_MAX_MBPS, FLOOR_MIN_MBPS, collectViewerStats, qualityTargetMbps, type ViewerStats, type ViewerStatsPrev } from "./sessionStats";
+import { APP_VERSION, copy } from "./copy";
+import { autoFloorMbps, BITRATE_MAX_MBPS, BITRATE_MIN_MBPS, FLOOR_MAX_MBPS, FLOOR_MIN_MBPS, collectViewerStats, qualityTargetMbps, type ViewerStats, type ViewerStatsPrev } from "./sessionStats";
 
 type IconName = "grid" | "monitor" | "window" | "game" | "settings" | "help" | "plus" | "copy" | "wifi" | "chevron" | "expand" | "minimize" | "volume" | "volume-off" | "terminal" | "activity";
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
@@ -137,12 +138,10 @@ function App() {
   // Piso custom anti-colapso REMB em Mbps. null = 1 Mbps automático.
   const [minBitrateMbps, setMinBitrateMbps] = useState<number | null>(null);
   // Codec da sessão, fixo no Start (HEVC e H.264 High exigem macOS).
-  const [videoCodec, setVideoCodec] = useState<"h264" | "h264high" | "hevc">("h264");
-  // Backend do encoder no Windows, fixo no Start (Auto = hardware se houver).
+  const [videoCodec, setVideoCodec] = useState<"h264" | "h264high" | "hevc" | "av1">("h264");
   const [videoEncoder, setVideoEncoder] = useState<"auto" | "software" | "hardware">("auto");
   const hevcAvailable = caps?.platform === "macos";
-  // H.264 High foi removido da UI (não conecta; só H.264). HEVC continua
-  // só macOS: não há encoder HEVC no Windows.
+  const av1Available = caps?.av1_encode_supported === true;
   // Resolução/fps explícitos, fixos no Start. "auto" segue o preset de
   // qualidade. A saída respeita o aspecto da fonte e nunca faz upscale.
   const [resolution, setResolution] = useState<"auto" | "480p" | "720p" | "1080p" | "1440p" | "2160p">("auto");
@@ -150,8 +149,19 @@ function App() {
   const resolvedResolution = resolution === "auto" ? qualityPresets[quality].resolution : resolution;
   const resolvedFrameRate = frameFps === "auto" ? qualityPresets[quality].frame_rate : frameFps;
   const [qualityOpen, setQualityOpen] = useState(false);
-  const qualitySummary = `${quality[0].toUpperCase()}${quality.slice(1)} · ${resolvedResolution} · ${resolvedFrameRate.replace("_fps", "fps")} · ${videoCodec === "hevc" ? "HEVC" : videoCodec === "h264high" ? "H.264 High" : "H.264"} · ${videoEncoder === "auto" ? "Auto" : videoEncoder === "hardware" ? "Hardware" : "Software"}`;
-  const effectiveFloorMbps = Math.min(minBitrateMbps ?? AUTO_FLOOR_MBPS, effectiveMbps);
+  const codecLabel = videoCodec === "hevc" ? "HEVC" : videoCodec === "av1" ? "AV1" : videoCodec === "h264high" ? "H.264 High" : "H.264";
+  const qualitySummary = qualityOpen
+    ? `${quality[0].toUpperCase()}${quality.slice(1)} · ${resolvedResolution} · ${resolvedFrameRate.replace("_fps", "fps")} · ${codecLabel}`
+    : `${quality[0].toUpperCase()}${quality.slice(1)} · ${copy.qualityLine[quality].split(" · ").slice(0, 2).join(" · ")}`;
+  const effectiveFloorMbps = Math.min(minBitrateMbps ?? autoFloorMbps(effectiveMbps), effectiveMbps);
+  const applyPreset = (next: "low" | "medium" | "high") => {
+    setQuality(next);
+    setBitrateMbps(null);
+    setMinBitrateMbps(null);
+    setVideoCodec("h264");
+    setResolution("auto");
+    setFrameFps("auto");
+  };
   const [systemAudio, setSystemAudio] = useState(false);
   const [excludedApps, setExcludedApps] = useState<string[]>([]);
   const [appSearch, setAppSearch] = useState("");
@@ -248,9 +258,9 @@ function App() {
   }, [mode, active, connectedRoster]);
   const directAddresses = session?.direct_addresses ?? [];
   const joinModeHelp = {
-    lan: mode === "share" ? "Same network. They type your code." : "Code from the host on your network.",
-    direct: mode === "share" ? "They type your IP and port." : "IP and port the host sent you.",
-    stunar: mode === "share" ? "Internet. They type your code." : "Code from the host. Needs the relay."
+    lan: mode === "share" ? copy.joinLanHost : copy.joinLanWatch,
+    direct: mode === "share" ? copy.joinDirectHost : copy.joinDirectWatch,
+    stunar: mode === "share" ? copy.joinStunarHost : copy.joinStunarWatch
   }[joinMode];
 
   useEffect(() => {
@@ -478,7 +488,7 @@ function App() {
   const startSharing = async () => {
     if (sessionAction !== "idle") return;
     setSessionAction("starting");
-    setNotice("Starting native capture…");
+    setNotice(copy.startHint);
     try {
       const current = await refreshCapabilities();
       const hostCaptureReady = current !== null && (current.platform === "windows" ? current.native_capture_implemented : current.screen_recording_authorization === "granted");
@@ -770,7 +780,7 @@ function App() {
     return true;
   });
   const filteredSources = sources.filter((item) => item.kind === sourceKind);
-  const permissionLabel = caps === null ? "Checking Screen Recording access…" : caps.platform === "windows" ? (caps.native_capture_implemented ? "Native capture ready" : "Native capture unavailable") : caps.screen_recording_authorization === "granted" ? "Screen Recording ready" : caps.screen_recording_authorization === "not_granted" ? "Screen Recording permission needed" : "Native capture unavailable";
+  const permissionLabel = caps === null ? copy.permissionChecking : caps.platform === "windows" ? (caps.native_capture_implemented ? copy.permissionWinReady : copy.permissionUnavailable) : caps.screen_recording_authorization === "granted" ? copy.permissionReady : caps.screen_recording_authorization === "not_granted" ? copy.permissionNeeded : copy.permissionUnavailable;
 
   return (
     <div className={`app-shell${cinema ? " cinema" : ""}`}>
@@ -784,40 +794,40 @@ function App() {
         </div>
         <div className="nav-label">Workspace</div>
         <nav aria-label="Main navigation">
-          <button className={`nav-item ${mode === "share" ? "active" : ""}`} onClick={() => setMode("share")}><Icon name="grid"/> Share screen</button>
-          <button className={`nav-item ${mode === "watch" ? "active" : ""}`} onClick={() => setMode("watch")}><Icon name="monitor"/> Watch{watchStreamActive ? <span className="nav-live"><i/>Live</span> : null}</button>
+          <button className={`nav-item ${mode === "share" ? "active" : ""}`} onClick={() => setMode("share")}><Icon name="grid"/> {copy.shareNav}</button>
+          <button className={`nav-item ${mode === "watch" ? "active" : ""}`} onClick={() => setMode("watch")}><Icon name="monitor"/> {copy.watchNav}{watchStreamActive ? <span className="nav-live"><i/>Live</span> : null}</button>
         </nav>
         <div className="sidebar-spacer"/>
         <div className={`local-card ${lanConnected ? "is-connected" : ""}`}>
           <span className={`status-dot ${lanConnected ? "is-connected" : ""}`}/>
           <div>
-            <strong>{mode === "watch" ? (watchConnected ? "Connected" : "Local network") : connected ? "Peer connected" : "Local network"}</strong>
-            <small>{mode === "watch" ? (watchConnected ? "Watching the host" : "P2P on your LAN") : connected ? "Sharing is live" : "P2P on your LAN"}</small>
+            <strong>{copy.lanCardTitle(mode === "watch", lanConnected)}</strong>
+            <small>{copy.lanCardDetail(mode === "watch", lanConnected, joinMode)}</small>
           </div>
         </div>
         <div className="sidebar-footer">
           <button className="logs-button" onClick={() => void openLogs()} title="View the last 5 session logs"><Icon name="terminal" size={13}/> View logs</button>
-          <div className="version">goDrinking <span>v0.1.0</span></div>
+          <div className="version">goDrinking <span>v{APP_VERSION}</span></div>
         </div>
       </aside>
       <main className="main-content">
         <header className="topbar">
           <div className="breadcrumb"><span>Workspace</span><Icon name="chevron" size={13}/><strong>{mode === "share" ? "New session" : watchConnected ? "Watching" : "Join session"}</strong></div>
-          <div className="top-actions"><span className="secure"><span className="secure-dot"/> Local only</span></div>
+          <div className="top-actions"><span className="secure"><span className="secure-dot"/> {copy.topSecure(joinMode)}</span></div>
         </header>
         <div className="page-heading">
           <div>
-            <div className="eyebrow">{mode === "share" ? "Host a room" : "Watch a room"} <span>•</span> {mode === "share" ? "Native capture" : "Live stream"}</div>
-            <h1>{mode === "share" ? <>Share your screen,<br/><em>stay close.</em></> : watchConnected ? <>Watching <em>{watchLabel}</em></> : <>Enter a code,<br/><em>watch live.</em></>}</h1>
+            <div className="eyebrow">{mode === "share" ? copy.shareEyebrow : copy.watchEyebrow} <span>•</span> {joinMode === "stunar" ? "Stunar" : joinMode === "direct" ? "Direct" : "LAN"}</div>
+            <h1>{mode === "share" ? <>{copy.shareTitle}<br/><em>{copy.shareTitleEm}</em></> : watchConnected ? <>Watching <em>{watchLabel}</em></> : <>{copy.watchTitle}<br/><em>{copy.watchTitleEm}</em></>}</h1>
           </div>
         </div>
         {watchStreamActive || mode === "watch" ? (
           <div className={`${watchConnected ? "watch-live-grid" : "workspace-grid"}${mode === "share" ? " watch-background" : ""}`} aria-hidden={mode === "share" || undefined}>
             {!watchConnected && (
               <section className="panel controls-panel">
-                <div className="panel-title"><div><span className="section-kicker">01 / Join</span><h2>{joinMode === "direct" ? "Host address" : "Session code"}</h2></div></div>
+                <div className="panel-title"><div><span className="section-kicker">{copy.joinKicker}</span><h2>{joinMode === "direct" ? copy.joinHeadingDirect : copy.joinHeadingCode}</h2></div></div>
                 <div className="join-mode-block">
-                  <span>Join mode</span>
+                  <span>{copy.joinMode}</span>
                   <div className="segmented">
                     <button className={joinMode === "lan" ? "selected" : ""} disabled={active} onClick={() => setJoinMode("lan")}>LAN</button>
                     <button className={joinMode === "direct" ? "selected" : ""} disabled={active} onClick={() => setJoinMode("direct")}>Direct</button>
@@ -852,13 +862,13 @@ function App() {
                 <input id="join-password" className="native-source" type="password" value={joinPassword} onChange={(event) => setJoinPassword(event.target.value)} placeholder={joinMode === "stunar" ? "Required" : "Only if the host set one"} maxLength={64}/>
                 <p className="start-hint">{notice}</p>
                 <button className="primary-cta" disabled={sessionAction !== "idle" || !nicknameValid || !stunarJoinPasswordValid} onClick={() => void joinRoom()}>
-                  {sessionAction === "joining" ? "Joining…" : "Join session"}
+                  {sessionAction === "joining" ? copy.joining : copy.joinSession}
                 </button>
               </section>
             )}
             <section className={`panel preview-panel ${watchConnected ? "watch-preview" : ""}`}>
               <div className="panel-title">
-                <div><span className="section-kicker">Preview</span><h2>Incoming stream</h2></div>
+                <div><span className="section-kicker">{copy.incomingKicker}</span><h2>{copy.incomingHeading}</h2></div>
                 <span className="panel-title-actions">
                   <button className="status-button" onClick={() => setStatsOpen(true)} title="Session status: bitrate, resolution, fps, delay"><Icon name="activity" size={13}/> Status</button>
                   <span className={`live-badge ${watchConnected ? "is-live" : ""}`}><i/>{watchConnected ? " Live" : watchIce === "connecting" ? " Waiting" : " Standby"}</span>
@@ -905,106 +915,111 @@ function App() {
         {mode === "share" && (
           <div className="workspace-grid">
             <section className="panel controls-panel">
-              <div className="panel-title"><div><span className="section-kicker">01 / Source</span><h2>What do you want to share?</h2></div></div>
+              <div className="panel-title"><div><span className="section-kicker">{copy.sourceKicker}</span><h2>{copy.sourceHeading}</h2></div></div>
               <div className="permission-strip">
                 <span className={`permission-dot ${captureReady ? "ready" : ""}`}/>
                 <div><strong>{permissionLabel}</strong><small>{caps?.detail ?? "Checking native media capability…"}</small></div>
                 {caps !== null && caps.platform !== "windows" && caps.screen_recording_authorization !== "granted" && <button onClick={() => void requestPermission()}>Check access</button>}
               </div>
               <div className="source-grid" role="radiogroup">
-                <button className={`source-card ${sourceKind === "display" ? "selected" : ""}`} onClick={() => setSourceKind("display")}><span className="source-icon"><Icon name="monitor" size={20}/></span><span className="source-copy"><strong>Whole screen</strong><small>Native display capture</small></span></button>
-                <button className={`source-card ${sourceKind === "window" ? "selected" : ""}`} onClick={() => setSourceKind("window")}><span className="source-icon"><Icon name="window" size={20}/></span><span className="source-copy"><strong>A window</strong><small>Choose a native app window</small></span></button>
+                <button className={`source-card ${sourceKind === "display" ? "selected" : ""}`} onClick={() => setSourceKind("display")}><span className="source-icon"><Icon name="monitor" size={20}/></span><span className="source-copy"><strong>{copy.wholeScreen}</strong><small>{copy.wholeScreenHint}</small></span></button>
+                <button className={`source-card ${sourceKind === "window" ? "selected" : ""}`} onClick={() => setSourceKind("window")}><span className="source-icon"><Icon name="window" size={20}/></span><span className="source-copy"><strong>{copy.aWindow}</strong><small>{copy.aWindowHint}</small></span></button>
               </div>
-              <label className="native-select-label" htmlFor="native-source">Native source</label>
+              <label className="native-select-label" htmlFor="native-source">{copy.nativeSource}</label>
               <select id="native-source" className="native-source" value={sourceId ?? ""} onChange={(event) => setSourceId(Number(event.target.value))} disabled={!filteredSources.length}>
-                <option value="">{filteredSources.length ? "Choose a source" : "No sources available"}</option>
+                <option value="">{filteredSources.length ? copy.chooseSource : copy.noSources}</option>
                 {filteredSources.map((item) => <option key={item.id} value={item.id}>{item.title || item.application_name || `Source ${item.id}`}</option>)}
               </select>
               <div className="quality-options single">
                 <div>
-                  <button className="manual-toggle" aria-expanded={qualityOpen} aria-controls="quality-fields" onClick={() => setQualityOpen((open) => !open)} title="Mostrar/ocultar ajustes de qualidade">
-                    <Icon name="chevron" size={13}/> Quality<span>{qualitySummary}</span>
+                  <span>{copy.quality}</span>
+                  <div className="segmented">
+                    <button className={quality === "low" ? "selected" : ""} onClick={() => applyPreset("low")}>{copy.qualityLow}</button>
+                    <button className={quality === "medium" ? "selected" : ""} onClick={() => applyPreset("medium")}>{copy.qualityMedium}</button>
+                    <button className={quality === "high" ? "selected" : ""} onClick={() => applyPreset("high")}>{copy.qualityHigh}</button>
+                  </div>
+                  <p className="quality-hint">{copy.qualityLine[quality]}</p>
+                  <button className="manual-toggle" aria-expanded={qualityOpen} aria-controls="quality-fields" onClick={() => setQualityOpen((open) => !open)} title={copy.customize}>
+                    <Icon name="chevron" size={13}/> {copy.customize}<span>{qualitySummary}</span>
                   </button>
                   {qualityOpen && (
                   <div id="quality-fields">
-                  <span>Quality</span>
-                  <div className="segmented">
-                    <button className={quality === "low" ? "selected" : ""} onClick={() => { setQuality("low"); setBitrateMbps(null); setMinBitrateMbps(null); }}>Low</button>
-                    <button className={quality === "medium" ? "selected" : ""} onClick={() => { setQuality("medium"); setBitrateMbps(null); setMinBitrateMbps(null); }}>Medium</button>
-                    <button className={quality === "high" ? "selected" : ""} onClick={() => { setQuality("high"); setBitrateMbps(null); setMinBitrateMbps(null); }}>High</button>
-                  </div>
-                  <p className="quality-hint">Low 720p 30 · Medium 1080p 30 · High 1080p 60</p>
                   <div className="bitrate-label-row">
-                    <span>Resolution</span>
+                    <span>{copy.resolution}</span>
                     <code>{resolvedResolution}{resolution === "auto" ? " · preset" : ""}</code>
                   </div>
                   <div className="segmented">
-                    <button className={resolution === "auto" ? "selected" : ""} onClick={() => setResolution("auto")} disabled={active} title="Segue o preset de qualidade">Auto</button>
-                    <button className={resolution === "480p" ? "selected" : ""} onClick={() => setResolution("480p")} disabled={active} title="854x480 ou menor, conforme a fonte">&lt;HD</button>
-                    <button className={resolution === "720p" ? "selected" : ""} onClick={() => setResolution("720p")} disabled={active} title="1280x720 ou menor">HD</button>
-                    <button className={resolution === "1080p" ? "selected" : ""} onClick={() => setResolution("1080p")} disabled={active} title="1920x1080 ou menor">Full HD</button>
-                    <button className={resolution === "1440p" ? "selected" : ""} onClick={() => setResolution("1440p")} disabled={active} title="2560x1440 ou menor">2K</button>
-                    <button className={resolution === "2160p" ? "selected" : ""} onClick={() => setResolution("2160p")} disabled={active} title="3840x2160 ou menor; 4K pede encoder Hardware">4K</button>
+                    <button className={resolution === "auto" ? "selected" : ""} onClick={() => setResolution("auto")} disabled={active} title="Follows the preset">Auto</button>
+                    <button className={resolution === "480p" ? "selected" : ""} onClick={() => setResolution("480p")} disabled={active} title="854×480 or smaller">&lt;HD</button>
+                    <button className={resolution === "720p" ? "selected" : ""} onClick={() => setResolution("720p")} disabled={active} title="1280×720 or smaller">HD</button>
+                    <button className={resolution === "1080p" ? "selected" : ""} onClick={() => setResolution("1080p")} disabled={active} title="1920×1080 or smaller">Full HD</button>
+                    <button className={resolution === "1440p" ? "selected" : ""} onClick={() => setResolution("1440p")} disabled={active} title="2560×1440 or smaller">2K</button>
+                    <button className={resolution === "2160p" ? "selected" : ""} onClick={() => setResolution("2160p")} disabled={active} title="3840×2160 or smaller">4K</button>
                   </div>
                   <div className="bitrate-label-row">
-                    <span>Frame rate</span>
+                    <span>{copy.frameRate}</span>
                     <code>{resolvedFrameRate.replace("_fps", "fps")}{frameFps === "auto" ? " · preset" : ""}</code>
                   </div>
                   <div className="segmented">
-                    <button className={frameFps === "auto" ? "selected" : ""} onClick={() => setFrameFps("auto")} disabled={active} title="Segue o preset de qualidade">Auto</button>
+                    <button className={frameFps === "auto" ? "selected" : ""} onClick={() => setFrameFps("auto")} disabled={active} title="Follows the preset">Auto</button>
                     <button className={frameFps === "30_fps" ? "selected" : ""} onClick={() => setFrameFps("30_fps")} disabled={active}>30</button>
                     <button className={frameFps === "60_fps" ? "selected" : ""} onClick={() => setFrameFps("60_fps")} disabled={active}>60</button>
-                    <button className={frameFps === "120_fps" ? "selected" : ""} onClick={() => setFrameFps("120_fps")} disabled={active} title="120fps exige fonte e rede folgadas">120</button>
+                    <button className={frameFps === "120_fps" ? "selected" : ""} onClick={() => setFrameFps("120_fps")} disabled={active} title="Needs a fast source and a fat pipe">120</button>
                   </div>
-                  <p className="quality-hint">Saída limitada à fonte (sem upscale, mantém o aspecto do ultrawide). Software trava em 1080p; 1440p/4K pedem Hardware.</p>
+                  <p className="quality-hint">{copy.resHint}</p>
                   <div className="bitrate-label-row">
-                    <span>Codec</span>
-                    <code>{videoCodec === "hevc" ? "HEVC/H.265" : "H.264"}{caps?.av1_encode_supported ? " · AV1 HW a caminho" : ""}</code>
+                    <span>{copy.codec}</span>
+                    <code>{codecLabel}</code>
                   </div>
                   <div className="segmented">
-                    <button className={videoCodec === "h264" ? "selected" : ""} onClick={() => setVideoCodec("h264")} disabled={active}>H.264</button>
-                    <button className={videoCodec === "hevc" ? "selected" : ""} onClick={() => setVideoCodec("hevc")} disabled={active || !hevcAvailable} title={hevcAvailable ? "HEVC/H.265 — viewers precisam de browser com H.265" : "HEVC exige macOS"}>HEVC</button>
+                    <button className={videoCodec === "h264" ? "selected" : ""} onClick={() => setVideoCodec("h264")} disabled={active} title={copy.codecH264Hint}>{copy.codecH264}</button>
+                    <button className={videoCodec === "h264high" ? "selected" : ""} onClick={() => setVideoCodec("h264high")} disabled={active} title={copy.codecHighHint}>{copy.codecH264High}</button>
+                    <button className={videoCodec === "hevc" ? "selected" : ""} onClick={() => setVideoCodec("hevc")} disabled={active || !hevcAvailable} title={hevcAvailable ? copy.codecHevcHint : copy.hevcUnavailable}>{copy.codecHevc}</button>
+                    <button className={videoCodec === "av1" ? "selected" : ""} onClick={() => setVideoCodec("av1")} disabled={active || !av1Available} title={av1Available ? copy.codecAv1Hint : copy.codecAv1Unavailable}>{copy.codecAv1}</button>
                   </div>
-                  {videoCodec === "hevc" && <p className="quality-hint">HEVC economiza ~40% de bitrate, mas cada viewer precisa de decode H.265 no browser — se o peer travar em connecting, volte para H.264.</p>}
+                  {videoCodec === "h264" && <p className="quality-hint">{copy.codecH264Hint}</p>}
+                  {videoCodec === "h264high" && <p className="quality-hint">{copy.codecHighHint}</p>}
+                  {videoCodec === "hevc" && <p className="quality-hint">{copy.codecHevcHint}</p>}
+                  {videoCodec === "av1" && <p className="quality-hint">{copy.codecAv1Hint}</p>}
                   {caps?.platform === "windows" && <>
                     <div className="bitrate-label-row">
-                      <span>Encoder</span>
-                      <code>{videoEncoder === "hardware" ? "Hardware (NVENC/AMF/QSV)" : videoEncoder === "software" ? "Software (OpenH264)" : "Auto (hardware se houver)"}</code>
+                      <span>{copy.encoder}</span>
+                      <code>{videoEncoder === "hardware" ? "Hardware (NVENC/AMF/QSV)" : videoEncoder === "software" ? "Software (OpenH264)" : "Auto"}</code>
                     </div>
                     <div className="segmented">
-                      <button className={videoEncoder === "auto" ? "selected" : ""} onClick={() => setVideoEncoder("auto")} disabled={active} title="Tenta hardware, cai para software sozinho">Auto</button>
-                      <button className={videoEncoder === "hardware" ? "selected" : ""} onClick={() => setVideoEncoder("hardware")} disabled={active} title="Só hardware; cai para software com aviso se falhar">Hardware</button>
-                      <button className={videoEncoder === "software" ? "selected" : ""} onClick={() => setVideoEncoder("software")} disabled={active} title="Sempre OpenH264 em CPU">Software</button>
+                      <button className={videoEncoder === "auto" ? "selected" : ""} onClick={() => setVideoEncoder("auto")} disabled={active} title="Hardware if it works, software otherwise">{copy.encoderAuto}</button>
+                      <button className={videoEncoder === "hardware" ? "selected" : ""} onClick={() => setVideoEncoder("hardware")} disabled={active}>{copy.encoderHw}</button>
+                      <button className={videoEncoder === "software" ? "selected" : ""} onClick={() => setVideoEncoder("software")} disabled={active}>{copy.encoderSw}</button>
                       </div>
                     </>}
+                  <div className="bitrate-block">
+                    <div className="bitrate-label-row">
+                      <span>{copy.bitrate}</span>
+                      {bitrateMbps !== null && <button className="bitrate-auto" onClick={() => setBitrateMbps(null)} title="Back to the preset">auto</button>}
+                    </div>
+                    <div className="bitrate-row">
+                      <input type="range" min={BITRATE_MIN_MBPS} max={BITRATE_MAX_MBPS} step={0.5} value={Math.min(BITRATE_MAX_MBPS, Math.max(BITRATE_MIN_MBPS, effectiveMbps))} onChange={(event) => setBitrateMbps(Number(event.target.value))} aria-label="Target bitrate in Mbps"/>
+                      <code>{effectiveMbps} Mbps{bitrateMbps === null ? " · preset" : ""}</code>
+                    </div>
+                    <p className="quality-hint">{copy.bitrateHint}</p>
+                  </div>
+                  <div className="bitrate-block">
+                    <div className="bitrate-label-row">
+                      <span>{copy.floor}</span>
+                      {minBitrateMbps !== null && <button className="bitrate-auto" onClick={() => setMinBitrateMbps(null)} title="Back to ¼ of the target">auto</button>}
+                    </div>
+                    <div className="bitrate-row">
+                      <input type="range" min={FLOOR_MIN_MBPS} max={FLOOR_MAX_MBPS} step={0.25} value={Math.min(FLOOR_MAX_MBPS, Math.max(FLOOR_MIN_MBPS, effectiveFloorMbps))} onChange={(event) => setMinBitrateMbps(Number(event.target.value))} aria-label="Bitrate floor in Mbps"/>
+                      <code>{effectiveFloorMbps} Mbps{minBitrateMbps === null ? " · auto" : ""}</code>
+                    </div>
+                    <p className="quality-hint">{copy.floorHint}</p>
+                  </div>
                   </div>
                   )}
-                  <div className="bitrate-block">
-                    <div className="bitrate-label-row">
-                      <span>Bitrate limite</span>
-                      {bitrateMbps !== null && <button className="bitrate-auto" onClick={() => setBitrateMbps(null)} title="Voltar ao valor do preset">auto</button>}
-                    </div>
-                    <div className="bitrate-row">
-                      <input type="range" min={BITRATE_MIN_MBPS} max={BITRATE_MAX_MBPS} step={0.5} value={Math.min(BITRATE_MAX_MBPS, Math.max(BITRATE_MIN_MBPS, effectiveMbps))} onChange={(event) => setBitrateMbps(Number(event.target.value))} aria-label="Bitrate limite em Mbps"/>
-                      <code>{effectiveMbps} Mbps{bitrateMbps === null ? " · preset" : " · custom"}</code>
-                    </div>
-                    <p className="quality-hint">Teto do encoder — aplica na hora, mesmo com sessão ativa. A rede pode baixar temporariamente.</p>
-                  </div>
-                  <div className="bitrate-block">
-                    <div className="bitrate-label-row">
-                      <span>Bitrate mínimo (piso)</span>
-                      {minBitrateMbps !== null && <button className="bitrate-auto" onClick={() => setMinBitrateMbps(null)} title="Voltar ao piso automático de 1 Mbps">auto</button>}
-                    </div>
-                    <div className="bitrate-row">
-                      <input type="range" min={FLOOR_MIN_MBPS} max={FLOOR_MAX_MBPS} step={0.25} value={Math.min(FLOOR_MAX_MBPS, Math.max(FLOOR_MIN_MBPS, effectiveFloorMbps))} onChange={(event) => setMinBitrateMbps(Number(event.target.value))} aria-label="Bitrate mínimo em Mbps"/>
-                      <code>{effectiveFloorMbps} Mbps{minBitrateMbps === null ? " · auto" : " · custom"}</code>
-                    </div>
-                    <p className="quality-hint">O REMB nunca derruba abaixo disso. Protege contra estimador caçando para baixo.</p>
-                  </div>
                 </div>
               </div>
               <label className={`unsupported-option ${systemAudioSupported ? "" : "is-disabled"}`}>
-                <div><strong>Share system audio</strong><small>{systemAudioSupported ? "Viewers hear your system sound" : "Needs macOS 14.2+ process taps or Windows"}</small></div>
+                <div><strong>{copy.systemAudio}</strong><small>{systemAudioSupported ? copy.systemAudioOn : copy.systemAudioOff}</small></div>
                 <input type="checkbox" checked={systemAudio} onChange={(event) => setSystemAudio(event.target.checked)} disabled={!systemAudioSupported}/>
               </label>
               {systemAudio && systemAudioSupported && !exclusionListAvailable && (
@@ -1012,7 +1027,7 @@ function App() {
               )}
               {systemAudio && exclusionListAvailable && (
                 <>
-                  <p className="native-select-label">Don't share audio from</p>
+                  <p className="native-select-label">{copy.excludeLabel}</p>
                   <div className="exclude-tools">
                     <input className="native-source exclude-search" type="text" value={appSearch} onChange={(event) => setAppSearch(event.target.value)} placeholder="Search apps" aria-label="Search apps"/>
                     <button className={`exclude-filter ${playingOnly ? "on" : ""}`} onClick={() => setPlayingOnly((value) => !value)} aria-pressed={playingOnly} title="Only apps playing sound">Playing only</button>
@@ -1044,13 +1059,13 @@ function App() {
                       })}
                     </div>
                   )}
-                  <p className="exclude-hint">Viewers won't hear the apps you pick here. For example, pick Discord to mute it.{windowsExclusion && !audioExclusion ? " Windows excludes one app per session — the first selection applies." : ""}</p>
+                  <p className="exclude-hint">{copy.excludeHint}{windowsExclusion && !audioExclusion ? copy.excludeHintWin : ""}</p>
                 </>
               )}
-              <label className="native-select-label" htmlFor="share-nickname">Nickname</label>
+              <label className="native-select-label" htmlFor="share-nickname">{copy.nickname}</label>
               <input id="share-nickname" className="native-source" value={nickname} onChange={(event) => setNickname(event.target.value)} placeholder="Your name" maxLength={24}/>
               <div className="join-mode-block">
-                <span>Join mode</span>
+                <span>{copy.joinMode}</span>
                 <div className="segmented">
                   <button className={joinMode === "lan" ? "selected" : ""} disabled={active} onClick={() => setJoinMode("lan")}>LAN</button>
                   <button className={joinMode === "direct" ? "selected" : ""} disabled={active} onClick={() => setJoinMode("direct")}>Direct</button>
@@ -1068,22 +1083,22 @@ function App() {
               )}
               <p className="start-hint">{notice}</p>
               {active ? (
-                <button className="primary-cta" disabled={sessionAction !== "idle"} onClick={() => void stopSharing()}>{sessionAction === "stopping" ? "Stopping…" : "Stop native session"}</button>
+                <button className="primary-cta" disabled={sessionAction !== "idle"} onClick={() => void stopSharing()}>{sessionAction === "stopping" ? copy.stopping : copy.stop}</button>
               ) : (
-                <button className="primary-cta" disabled={!canStart || !nicknameValid || sessionAction !== "idle" || !stunarHostPasswordValid} onClick={() => void startSharing()}>{sessionAction === "starting" ? "Starting…" : "Start native session"}</button>
+                <button className="primary-cta" disabled={!canStart || !nicknameValid || sessionAction !== "idle" || !stunarHostPasswordValid} onClick={() => void startSharing()}>{sessionAction === "starting" ? copy.starting : copy.start}</button>
               )}
             </section>
             <div className="right-column">
               <section className="panel preview-panel">
-                <div className="panel-title"><div><span className="section-kicker">Preview</span><h2>What your peer will see</h2></div><span className="panel-title-actions"><button className="status-button" onClick={() => setStatsOpen(true)} title="Session status: bitrate, resolution, fps, delay"><Icon name="activity" size={13}/> Status</button><span className="live-badge"><i/>{connected ? " Live" : active ? " Capturing" : " Standby"}</span></span></div>
+                <div className="panel-title"><div><span className="section-kicker">{copy.previewKicker}</span><h2>{copy.previewHeading}</h2></div><span className="panel-title-actions"><button className="status-button" onClick={() => setStatsOpen(true)} title="Session status: bitrate, resolution, fps, delay"><Icon name="activity" size={13}/> Status</button><span className="live-badge"><i/>{connected ? " Live" : active ? " Capturing" : " Standby"}</span></span></div>
                 <div className="preview-screen">
                   <div className="preview-grid"/>
                   <canvas ref={canvasRef} className={`native-preview ${active ? "visible" : ""}`} aria-label="Native capture preview"/>
-                  <div className={`preview-center ${active ? "is-hidden" : ""}`}><strong>Preview is ready</strong><small>{captureReady ? "Start a native session to begin" : caps?.platform === "windows" ? "Native capture unavailable on this PC" : "Grant Screen Recording access first"}</small></div>
+                  <div className={`preview-center ${active ? "is-hidden" : ""}`}><strong>{copy.previewReady}</strong><small>{captureReady ? copy.previewStart : caps?.platform === "windows" ? copy.previewWinDown : copy.previewNeedPerm}</small></div>
                 </div>
               </section>
               <section className="panel connect-panel">
-                <div className="panel-title"><div><span className="section-kicker">02 / Connect</span><h2>{joinMode === "direct" ? "Share this address" : "Pass this code"}</h2></div><Icon name="wifi" size={19}/></div>
+                <div className="panel-title"><div><span className="section-kicker">{copy.connectKicker}</span><h2>{joinMode === "direct" ? copy.shareAddress : copy.passCode}</h2></div><Icon name="wifi" size={19}/></div>
                 {joinMode === "lan" && (
                   <div className="signal-block">
                     <label>Session code</label>
@@ -1208,7 +1223,7 @@ function App() {
                     </div>
                   ))}
                 </div>
-                <p className="stats-hint">Alvo do encoder no Host. O bitrate <em>recebido</em> aparece no Status do Viewer — se estiver bem abaixo do alvo, é congestionamento (o encoder baixa via REMB) ou limite da rede, não a configuração.</p>
+                <p className="stats-hint">{copy.statsHostHint}</p>
               </>
             ) : (
               <>
@@ -1226,7 +1241,7 @@ function App() {
                 </div>
                 {!watchConnected && <p className="stats-hint">Sem mídia ainda — os números aparecem após conectar.</p>}
                 {watchConnected && (viewerStats?.bitrateMbps === null || viewerStats?.bitrateMbps === undefined) && <p className="stats-hint">Coletando amostras… aguarde 1–2s.</p>}
-                <p className="stats-hint">Bitrate &lt; 1 Mbps com imagem quadriculada = rede forçando o encoder para baixo. Compare com o alvo do Host (preset {quality}: {qualityTargetMbps[quality]} Mbps).</p>
+                <p className="stats-hint">{copy.statsViewerHint(quality, qualityTargetMbps[quality])}</p>
               </>
             )}
           </div>

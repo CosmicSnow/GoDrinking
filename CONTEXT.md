@@ -87,3 +87,35 @@ _Avoid_: hole punch (é uma tática do ICE, não o nome)
 **TURN**:
 Relay de Media. Fora de âmbito nesta versão.
 _Avoid_: Rendezvous (o Rendezvous não é TURN)
+
+**Broadcast**:
+Modo de Session em que uma pessoa captura e as outras só assistem. É o default. É o modelo actual (1 Host, N Viewers).
+_Avoid_: classic, one-way, presenter mode, webinar
+
+**Sala**:
+Modo de Session em que cada Membro pode capturar (Share slot) e assistir aos outros. O Rendezvous (ou o Master, em LAN) guarda o código enquanto houver gente. Não é a Session inteira — ver Session.
+_Avoid_: room (quando quiseres dizer Broadcast), call, meeting, lobby
+
+**Master**:
+O Membro que pode mudar a Password, a Admission e kickar. Quem abre a Sala começa Master. Se sair, a coroa passa a quem entrou a seguir e ainda está dentro.
+_Avoid_: owner, admin, host (Host continua a ser quem captura), moderator
+
+**Membro**:
+Uma pessoa dentro de uma Sala (capturando ou não). Em Broadcast não se usa: aí há Host e Viewer.
+_Avoid_: participant, peer, user
+
+**Share slot**:
+A captura de um Membro na Sala: parada ou a enviar Media P2P para os outros. Vários slots podem estar Live ao mesmo tempo.
+_Avoid_: stream (os bytes), session (a Session é o contentor), camera
+
+**Customize**:
+Painel fechado por omissão com resolução, fps, codec, encoder e bitrate. Power user. Os presets Low/Medium/High não dependem dele.
+_Avoid_: advanced settings, expert mode, quality panel (quando for o painel extra)
+
+**Benchmark**:
+Medição local do encoder neste PC para recomendar Low, Medium ou High. Não abre Session. Não fala com Viewer nem com o Rendezvous.
+_Avoid_: speed test, network test (é encode, não rede)
+
+**Play Together**:
+Futuro: Viewer manda um comando (XInput) ao PC de quem está a capturar, por DataChannel P2P. Off por omissão. Não implementado.
+_Avoid_: Parsec (é a analogia, não o nome), remote play, netplay

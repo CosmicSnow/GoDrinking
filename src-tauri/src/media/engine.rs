@@ -859,9 +859,9 @@ fn create_in_state(
     // HEVC needs a VideoToolbox encoder: reject it on Windows at Start so
     // the session never begins with an encoder nobody can feed. H.264 High
     // is allowed (Media Foundation / OpenH264 produce it there).
-    if request.codec == VideoCodec::Hevc && cfg!(target_os = "windows") {
+    if matches!(request.codec, VideoCodec::Hevc | VideoCodec::Av1) && cfg!(target_os = "windows") {
         return Err(MediaEngineError::Unsupported(
-            "HEVC is macOS-only for now (no Windows HEVC encoder)".into(),
+            "HEVC and AV1 encode are macOS-only for now (Windows Hosts stay on H.264)".into(),
         ));
     }
     preview.begin_session();

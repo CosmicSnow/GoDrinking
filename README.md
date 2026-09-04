@@ -18,6 +18,7 @@ Dois (ou mais, se a LAN aguentar o drama) Macs na mesma rede. Um compartilha tel
 - Não é um tracker de shots
 - Não é Discord
 - Não é "a gente sobe um TURN e resolve"
+- Não é o Rendezvous a ver o teu ecrã. Nunca.
 - Não é `npm run tauri dev` como veículo de teste de captura (o TCC não gruda nesse binário)
 
 ## como usar
@@ -36,7 +37,7 @@ Isso gera um `.app` debug, tenta assinar, e abre. Screen Recording precisa estar
 1. Share screen
 2. Liga Screen Recording se o macOS ainda não confia em você
 3. Escolhe tela inteira ou janela
-4. Qualidade: Low / Medium / High (720p30, 1080p30, 1080p60)
+4. Qualidade: Low / Medium / High (H.264, 720p30 / 1080p30 / 1080p60). Customize se fores power user (codec, 1440p, bitrate).
 5. System audio se quiser. Chip nos apps que não devem ir na mix (Discord, Spotify, o seu pai no Zoom)
 6. Start. Aparece o picker do macOS. Escolhe a fonte.
 7. Copia o código de 6 letras. Manda no WhatsApp da família. Ou grita.

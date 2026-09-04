@@ -57,15 +57,17 @@ export const qualityTargetMbps: Record<"low" | "medium" | "high", number> = {
 /** Limites do slider de bitrate custom (Mbps). O backend aceita 0.25–100. */
 export const BITRATE_MIN_MBPS = 1;
 export const BITRATE_MAX_MBPS = 50;
-/** Limites do slider do piso (Mbps) e piso automático quando em preset. */
+/** Limites do slider do piso (Mbps). Auto = ¼ do alvo. */
 export const FLOOR_MIN_MBPS = 0.25;
 export const FLOOR_MAX_MBPS = 10;
-export const AUTO_FLOOR_MBPS = 1;
+
+export const autoFloorMbps = (targetMbps: number) =>
+  Math.max(FLOOR_MIN_MBPS, Math.round((targetMbps / 4) * 100) / 100);
 
 export const qualityTargetLabel: Record<"low" | "medium" | "high", string> = {
-  low: "720p · 30fps · alvo 1.5 Mbps",
-  medium: "1080p · 30fps · alvo 4 Mbps",
-  high: "1080p · 60fps · alvo 8 Mbps",
+  low: "720p 30 · 1.5 Mbps · H.264",
+  medium: "1080p 30 · 4 Mbps · H.264",
+  high: "1080p 60 · 8 Mbps · H.264",
 };
 
 export async function collectViewerStats(

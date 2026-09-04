@@ -48,17 +48,35 @@ pub(crate) fn fitted_even_size(
 ) -> (u32, u32) {
     let source_width = source_width.max(1);
     let source_height = source_height.max(1);
-    let scale = (max_width as f64 / source_width as f64)
-        .min(max_height as f64 / source_height as f64)
-        .min(1.0);
-    let width = ((source_width as f64 * scale).round() as u32)
-        .max(2)
-        .min(max_width)
-        & !1;
-    let height = ((source_height as f64 * scale).round() as u32)
-        .max(2)
-        .min(max_height)
-        & !1;
+    let max_width = max_width.max(2);
+    let max_height = max_height.max(2);
+    // Contained sources stay native (no upscale, even dimensions).
+    if source_width <= max_width && source_height <= max_height {
+        return (
+            (source_width & !1).max(2),
+            (source_height & !1).max(2),
+        );
+    }
+    // Pixel-budget fit: use the area of the cap, not a 16:9 letterbox.
+    // A 3440x1440 ultrawide at a 1080p cap stays ~21:9 and wider than 1920.
+    let cap_pixels = (max_width as u64)
+        .saturating_mul(max_height as u64)
+        .max(1);
+    let src_pixels = (source_width as u64)
+        .saturating_mul(source_height as u64)
+        .max(1);
+    let scale = ((cap_pixels as f64) / (src_pixels as f64)).sqrt().min(1.0);
+    let mut width = ((source_width as f64 * scale).round() as u32).max(2) & !1;
+    let mut height = ((source_height as f64 * scale).round() as u32).max(2) & !1;
+    while (width as u64).saturating_mul(height as u64) > cap_pixels && (width > 2 || height > 2) {
+        if width >= height && width > 2 {
+            width -= 2;
+        } else if height > 2 {
+            height -= 2;
+        } else {
+            break;
+        }
+    }
     (width.max(2), height.max(2))
 }
 
@@ -116,19 +134,22 @@ pub(crate) fn resolve_bitrate(quality: TransmissionQuality, override_bps: Option
         .unwrap_or_else(|| quality.bitrate())
 }
 
-/// Default congestion floor: the encoder never follows REMB below this,
-/// so a hunting estimator (300–900 kbps sawtooth on healthy links) cannot
-/// collapse a 1080p picture. 1 Mbps is watchable; real congestion still
-/// shows as loss/jitter and still caps the ceiling via the target.
-pub(crate) const DEFAULT_FLOOR_BPS: u32 = 1_000_000;
+/// Default congestion floor as a fraction of the target, not a flat 1 Mbps.
+/// High (8 Mbps) → 2 Mbps; Low (1.5 Mbps) → 375 kbps. A hunting REMB
+/// estimator can no longer pin every preset to the same megabit.
+pub(crate) fn default_floor_bps(target_bps: u32) -> u32 {
+    let target = target_bps.max(MIN_BITRATE_BPS);
+    (target / 4).max(MIN_BITRATE_BPS).min(target)
+}
 
 /// Effective congestion floor, always within [250 kbps, target].
 pub(crate) fn resolve_floor(target_bps: u32, floor_override_bps: Option<u32>) -> u32 {
+    let target = target_bps.max(MIN_BITRATE_BPS);
     let floor = floor_override_bps
         .filter(|bps| *bps > 0)
         .map(clamp_bitrate_bps)
-        .unwrap_or(DEFAULT_FLOOR_BPS);
-    floor.min(target_bps.max(MIN_BITRATE_BPS))
+        .unwrap_or_else(|| default_floor_bps(target));
+    floor.min(target).max(MIN_BITRATE_BPS)
 }
 
 impl TransmissionQuality {
@@ -157,10 +178,10 @@ fn default_host_nickname() -> String {
     "Host".into()
 }
 
-/// Session video codec. H.264 is universal; HEVC needs a capable host
-/// encoder (VideoToolbox on macOS) and a viewer browser with H.265 WebRTC
-/// decode. Fixed at session start — switching mid-stream needs a
-/// renegotiation cycle the transport does not do yet.
+/// Session video codec. Presets always send H.264 Baseline so mixed
+/// Mac/Windows (GTX 1050 through 40-series, M1+) can decode. HEVC and AV1
+/// are Customize-only: they need a capable Host encoder and a Viewer that
+/// can decode them. Fixed at session start.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VideoCodec {
@@ -168,6 +189,7 @@ pub enum VideoCodec {
     H264,
     H264High,
     Hevc,
+    Av1,
 }
 
 impl VideoCodec {
@@ -175,6 +197,7 @@ impl VideoCodec {
         match self {
             Self::H264 | Self::H264High => "video/H264",
             Self::Hevc => "video/H265",
+            Self::Av1 => "video/AV1",
         }
     }
 
@@ -182,8 +205,8 @@ impl VideoCodec {
     pub(crate) fn h264_profile_level_id(self) -> Option<&'static str> {
         match self {
             Self::H264 => Some("42e02a"),
-            Self::H264High => Some("64002a"),
-            Self::Hevc => None,
+            Self::H264High => Some("640033"),
+            Self::Hevc | Self::Av1 => None,
         }
     }
 }
@@ -520,12 +543,67 @@ impl MediaSessionSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use super::fitted_even_size;
+    use super::{
+        fitted_even_size, resolve_floor, MIN_BITRATE_BPS, TransmissionQuality, VideoCodec,
+    };
+
+    fn aspect(width: u32, height: u32) -> f64 {
+        width as f64 / height as f64
+    }
 
     #[test]
     fn fitted_size_preserves_aspect_instead_of_forcing_1080p() {
-        assert_eq!(fitted_even_size(3024, 1964, 1920, 1080), (1662, 1080));
+        let (width, height) = fitted_even_size(3024, 1964, 1920, 1080);
+        assert_eq!(width % 2, 0);
+        assert_eq!(height % 2, 0);
+        assert!(width * height <= 1920 * 1080);
+        assert!((aspect(width, height) - aspect(3024, 1964)).abs() < 0.02);
         assert_eq!(fitted_even_size(1280, 720, 1920, 1080), (1280, 720));
         assert_eq!(fitted_even_size(1920, 1080, 1920, 1080), (1920, 1080));
+    }
+
+    #[test]
+    fn fitted_size_uses_pixel_budget_on_ultrawide_not_a_16_by_9_box() {
+        // Letterbox into 1920x1080 would be 1920x804 and waste ~25% of the
+        // 1080p budget. Pixel-budget fit keeps the 21:9 picture larger.
+        let (width, height) = fitted_even_size(3440, 1440, 1920, 1080);
+        assert_eq!(width % 2, 0);
+        assert_eq!(height % 2, 0);
+        assert!(width * height <= 1920 * 1080);
+        assert!(width > 1920, "ultrawide may be wider than 1920, got {width}x{height}");
+        assert!(height > 804, "must beat the old letterbox height 804, got {height}");
+        assert!((aspect(width, height) - aspect(3440, 1440)).abs() < 0.02);
+
+        let (uwqhd_w, uwqhd_h) = fitted_even_size(5120, 1440, 1920, 1080);
+        assert!(uwqhd_w * uwqhd_h <= 1920 * 1080);
+        assert!(uwqhd_w > 1920);
+        assert!((aspect(uwqhd_w, uwqhd_h) - aspect(5120, 1440)).abs() < 0.03);
+
+        let (qhd_w, qhd_h) = fitted_even_size(2560, 1440, 1920, 1080);
+        assert_eq!((qhd_w, qhd_h), (1920, 1080));
+    }
+
+    #[test]
+    fn fitted_size_never_upscales() {
+        assert_eq!(fitted_even_size(800, 600, 1920, 1080), (800, 600));
+        assert_eq!(fitted_even_size(854, 480, 1280, 720), (854, 480));
+    }
+
+    #[test]
+    fn auto_floor_is_a_quarter_of_the_target_not_a_flat_megabit() {
+        assert_eq!(resolve_floor(8_000_000, None), 2_000_000);
+        assert_eq!(resolve_floor(4_000_000, None), 1_000_000);
+        assert_eq!(resolve_floor(1_500_000, None), 375_000);
+        assert_eq!(resolve_floor(800_000, None), MIN_BITRATE_BPS);
+        assert_eq!(resolve_floor(8_000_000, Some(3_000_000)), 3_000_000);
+        assert_eq!(resolve_floor(8_000_000, Some(20_000_000)), 8_000_000);
+    }
+
+    #[test]
+    fn quality_presets_stay_on_universal_h264() {
+        assert_eq!(VideoCodec::default(), VideoCodec::H264);
+        assert_eq!(TransmissionQuality::High.bitrate(), 8_000_000);
+        assert_eq!(TransmissionQuality::High.max_dimensions(), (1920, 1080));
+        assert_eq!(TransmissionQuality::Low.max_dimensions(), (1280, 720));
     }
 }

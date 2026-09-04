@@ -1,6 +1,6 @@
 [package]
 name = "godrinking"
-version = "0.1.0"
+version = "0.2.0"
 description = "goDrinking"
 authors = ["you"]
 edition = "2021"
@@ -50,5 +50,5 @@ core-foundation = "0.10"
 objc2-core-media = { version = "=0.3.2", default-features = false, features = ["std", "CMSampleBuffer", "CMTime", "objc2", "objc2-core-video"] }
 objc2-core-video = { version = "=0.3.2", default-features = false, features = ["CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn", "objc2"] }
 objc2-screen-capture-kit = "=0.3.2"
-objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["CGWindow"] }
+objc2-core-graphics = { version = "=0.3.2", default-features = false, features = ["CGWindow", "CGColorSpace"] }
 objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["std", "libc", "NSWorkspace", "NSRunningApplication"] }

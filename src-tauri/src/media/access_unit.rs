@@ -9,9 +9,9 @@ const ANNEX_B_START_CODE: &[u8] = &[0, 0, 0, 1];
 #[allow(dead_code)]
 pub(crate) const H264_PROFILE_LEVEL_ID: &str = "42e02a";
 
-/// BGRA8 to NV12 (BT.601) conversion for hardware encoder input. Only
-/// used on Windows (Media Foundation NV12 path); lives here so the math is
-/// unit-tested on every platform.
+/// BGRA8 to NV12 (BT.709 limited) conversion for hardware encoder input.
+/// Only used on Windows (Media Foundation NV12 path); lives here so the
+/// math is unit-tested on every platform. Viewers expect 709, not 601.
 pub(crate) fn bgra_to_nv12(bgra: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
     let w = width as usize;
     let h = height as usize;
@@ -29,12 +29,14 @@ pub(crate) fn bgra_to_nv12(bgra: &[u8], width: u32, height: u32) -> Option<Vec<u
             let b = bgra[src] as i32;
             let g = bgra[src + 1] as i32;
             let r = bgra[src + 2] as i32;
-            // BT.601 full-range-ish: Y = 16 + 0.257R + 0.504G + 0.098B.
-            let y_val = (16 + ((66 * r + 129 * g + 25 * b + 128) >> 8)).clamp(0, 255) as u8;
+            // BT.709 limited: Y 16–235, Cb/Cr 16–240.
+            let y_val = (16 + ((47 * r + 157 * g + 16 * b + 128) >> 8)).clamp(16, 235) as u8;
             nv12[y * w + x] = y_val;
             if x % 2 == 0 && y % 2 == 0 {
-                let u_val = (128 + ((-38 * r - 74 * g + 112 * b + 128) >> 8)).clamp(0, 255) as u8;
-                let v_val = (128 + ((112 * r - 94 * g - 18 * b + 128) >> 8)).clamp(0, 255) as u8;
+                let u_val =
+                    (128 + ((-26 * r - 87 * g + 112 * b + 128) >> 8)).clamp(16, 240) as u8;
+                let v_val =
+                    (128 + ((112 * r - 102 * g - 10 * b + 128) >> 8)).clamp(16, 240) as u8;
                 let uv = y_size + (y / 2) * w + x;
                 nv12[uv] = u_val;
                 nv12[uv + 1] = v_val;
@@ -527,13 +529,14 @@ mod tests {
 
     #[test]
     fn bgra_to_nv12_converts_solid_colors() {
-        // 2x2 solid red (BGRA 0,0,255): Y plane bright, V high, U low.
+        // 2x2 solid red (BGRA 0,0,255) in BT.709 limited: Y≈63, V high, U low.
         let red = vec![0_u8, 0, 255, 255].repeat(4);
         let nv12 = bgra_to_nv12(&red, 2, 2).expect("2x2 converts");
         assert_eq!(nv12.len(), 6);
-        assert!(nv12[0] > 70 && nv12[0] < 90, "red luma {}", nv12[0]);
+        assert!(nv12[0] >= 60 && nv12[0] <= 68, "red luma {} (want BT.709 ~63, not BT.601 ~81)", nv12[0]);
         assert_eq!(&nv12[0..4], &[nv12[0]; 4]);
-        assert!(nv12[5] > 200, "red V {}", nv12[5]);
+        assert!(nv12[5] > 220, "red Cr {}", nv12[5]);
+        assert!(nv12[4] < 120, "red Cb {}", nv12[4]);
         // 2x2 solid black: Y=16, UV=128.
         let black = vec![0_u8, 0, 0, 255].repeat(4);
         let nv12 = bgra_to_nv12(&black, 2, 2).expect("black converts");

@@ -27,21 +27,8 @@ const ANNEX_B_START_CODE: &[u8] = &[0, 0, 0, 1];
 // Defensive ceiling: capture already downscales to the session size, but a
 // full-res leak must never reach OpenH264 (a 7MP software encode per frame
 // pegs the CPU and the session falls behind forever).
-const MAX_ENCODE_WIDTH: u32 = 1920;
-const MAX_ENCODE_HEIGHT: u32 = 1080;
-
 fn fit_encode_size(width: u32, height: u32) -> (u32, u32) {
-    if width < 2 || height < 2 {
-        return (2, 2);
-    }
-    if width <= MAX_ENCODE_WIDTH && height <= MAX_ENCODE_HEIGHT {
-        return (width, height);
-    }
-    let scale =
-        (MAX_ENCODE_WIDTH as f64 / width as f64).min(MAX_ENCODE_HEIGHT as f64 / height as f64);
-    let fitted_w = ((width as f64 * scale) as u32).max(2) & !1;
-    let fitted_h = ((height as f64 * scale) as u32).max(2) & !1;
-    (fitted_w.max(2), fitted_h.max(2))
+    crate::media::types::fitted_even_size(width, height, 1920, 1080)
 }
 
 fn downscale_bgra_frame(src: &[u8], src_width: u32, src_height: u32, dst_width: u32, dst_height: u32) -> Vec<u8> {
@@ -95,7 +82,7 @@ impl OpenH264Encoder {
                 .profile(if high { Profile::High } else { Profile::Baseline })
                 .complexity(Complexity::Low)
                 .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(fps * 2))
-                .vui(VuiConfig::bt709_full());
+                .vui(VuiConfig::bt709());
             Encoder::with_api_config(OpenH264API::from_source(), config)
         };
         let (encoder, high_profile) = match make(want_high) {

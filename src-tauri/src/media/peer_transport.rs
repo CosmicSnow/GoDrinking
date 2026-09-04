@@ -13,7 +13,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264, MIME_TYPE_HEVC, MIME_TYPE_OPUS};
+use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_AV1, MIME_TYPE_H264, MIME_TYPE_HEVC, MIME_TYPE_OPUS};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::ice::mdns::MulticastDnsMode;
@@ -339,6 +339,7 @@ async fn run_peer(
             h264_codec(video_codec.h264_profile_level_id().unwrap_or("42e02a"))
         }
         VideoCodec::Hevc => hevc_codec(),
+        VideoCodec::Av1 => av1_codec(),
     };
     if let Err(error) = media_engine.register_codec(session_codec.clone(), RTPCodecType::Video) {
         let message = format!("{} codec registration failed: {error}", video_codec.mime_type());
@@ -878,6 +879,33 @@ fn opus_codec() -> RTCRtpCodecParameters {
 /// Session HEVC codec: empty fmtp mirrors the webrtc-rs default
 /// registration; the encoder emits annex-B IRAPs the H265 payloader
 /// packetizes per RFC 7798 SSCH.
+fn av1_codec() -> RTCRtpCodecParameters {
+    RTCRtpCodecParameters {
+        capability: RTCRtpCodecCapability {
+            mime_type: MIME_TYPE_AV1.into(),
+            clock_rate: 90_000,
+            channels: 0,
+            sdp_fmtp_line: "".into(),
+            rtcp_feedback: vec![
+                RTCPFeedback {
+                    typ: "goog-remb".into(),
+                    parameter: "".into(),
+                },
+                RTCPFeedback {
+                    typ: "nack".into(),
+                    parameter: "pli".into(),
+                },
+                RTCPFeedback {
+                    typ: "ccm".into(),
+                    parameter: "fir".into(),
+                },
+            ],
+        },
+        payload_type: 45,
+        ..Default::default()
+    }
+}
+
 fn hevc_codec() -> RTCRtpCodecParameters {
     RTCRtpCodecParameters {
         capability: RTCRtpCodecCapability {

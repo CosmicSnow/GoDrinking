@@ -258,12 +258,30 @@ impl EncoderControl {
         }
     }
 
+    fn has_recent_loss(&self) -> bool {
+        let Ok(loss) = self.last_loss.lock() else {
+            return false;
+        };
+        if loss.0 <= LOSS_FREEZE_FRACTION {
+            return false;
+        }
+        match loss.1 {
+            Some(at) => Instant::now().duration_since(at) < LOSS_WINDOW,
+            None => false,
+        }
+    }
+
     /// Congestion feedback (REMB): may lower the encoder below the target
     /// but never raise it above what the user/preset asked for.
+    /// Downward REMB without recent packet loss is ignored — WKWebView's
+    /// estimator otherwise pins the session to the floor on a healthy path.
     pub(crate) fn set_congestion_bitrate(&self, bitrate: u32) {
         let ceiling = self.target().max(250_000);
         let floor = self.floor().min(ceiling);
         let bitrate = bitrate.clamp(floor, ceiling);
+        if bitrate < self.applied() && !self.has_recent_loss() {
+            return;
+        }
         let decreased = bitrate < self.applied();
         if let Ok(mut congestion) = self.congestion.lock() {
             *congestion = Some(bitrate);
@@ -1113,6 +1131,7 @@ mod tests {
     #[test]
     fn probing_climbs_toward_target_when_path_is_clean() {
         let control = EncoderControl::new(20_000_000, 1_000_000);
+        control.note_loss(20);
         control.set_congestion_bitrate(4_000_000);
         assert_eq!(control.applied(), 4_000_000);
         // Fresh decrease: quiet period holds.
@@ -1127,8 +1146,8 @@ mod tests {
     #[test]
     fn probing_freezes_on_recent_loss_and_caps_at_target() {
         let control = EncoderControl::new(8_000_000, 1_000_000);
-        control.set_congestion_bitrate(4_000_000);
         control.note_loss(20);
+        control.set_congestion_bitrate(4_000_000);
         let later = Instant::now() + Duration::from_secs(4);
         // Quiet (3s) passed but loss window (5s) still holds.
         assert_eq!(control.probe_candidate(later), None);
@@ -1146,12 +1165,32 @@ mod tests {
     #[test]
     fn congestion_respects_floor_and_floor_raise_reasserts() {
         let control = EncoderControl::new(20_000_000, 1_000_000);
+        control.note_loss(20);
         control.set_congestion_bitrate(100_000);
         assert_eq!(control.applied(), 1_000_000);
         assert_eq!(control.congestion_bitrate(), Some(1_000_000));
         control.set_floor(5_000_000);
         assert_eq!(control.floor(), 5_000_000);
         assert_eq!(control.take_bitrate(), Some(5_000_000));
+    }
+
+    #[test]
+    fn remb_without_loss_does_not_pull_the_encoder_off_the_target() {
+        let control = EncoderControl::new(8_000_000, 2_000_000);
+        assert_eq!(control.applied(), 8_000_000);
+        control.set_congestion_bitrate(900_000);
+        assert_eq!(control.applied(), 8_000_000);
+        assert_eq!(control.congestion_bitrate(), None);
+        assert_eq!(control.take_bitrate(), None);
+    }
+
+    #[test]
+    fn remb_with_loss_may_drop_as_far_as_the_floor() {
+        let control = EncoderControl::new(8_000_000, 2_000_000);
+        control.note_loss(20);
+        control.set_congestion_bitrate(900_000);
+        assert_eq!(control.applied(), 2_000_000);
+        assert_eq!(control.congestion_bitrate(), Some(2_000_000));
     }
 
     #[test]

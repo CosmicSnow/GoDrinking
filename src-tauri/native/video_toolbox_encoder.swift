@@ -43,7 +43,14 @@ private final class GoLiveEncoder {
         self.callbackContext = callbackContext
         self.codec = codec
 
-        let codecType: CMVideoCodecType = codec == 1 ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264
+        let codecType: CMVideoCodecType
+        if codec == 1 {
+            codecType = kCMVideoCodecType_HEVC
+        } else if codec == 3 {
+            codecType = kCMVideoCodecType_AV1
+        } else {
+            codecType = kCMVideoCodecType_H264
+        }
         var createdSession: VTCompressionSession?
         let status = VTCompressionSessionCreate(
             allocator: kCFAllocatorDefault,
@@ -66,17 +73,31 @@ private final class GoLiveEncoder {
         // Baseline (H.264) / Main (HEVC) plus disabled frame reordering
         // prevents B-frame latency and is accepted by the low-latency
         // transport profiles.
-        let profileLevel: CFString
-        if codec == 1 {
-            profileLevel = kVTProfileLevel_HEVC_Main_AutoLevel
-        } else if codec == 2 {
-            profileLevel = kVTProfileLevel_H264_High_AutoLevel
-        } else {
-            profileLevel = kVTProfileLevel_H264_Baseline_4_2
+        if codec != 3 {
+            let profileLevel: CFString
+            if codec == 1 {
+                profileLevel = kVTProfileLevel_HEVC_Main_AutoLevel
+            } else if codec == 2 {
+                profileLevel = kVTProfileLevel_H264_High_AutoLevel
+            } else {
+                profileLevel = kVTProfileLevel_H264_Baseline_4_2
+            }
+            try setProperty(
+                kVTCompressionPropertyKey_ProfileLevel,
+                value: profileLevel
+            )
         }
         try setProperty(
-            kVTCompressionPropertyKey_ProfileLevel,
-            value: profileLevel
+            kVTCompressionPropertyKey_ColorPrimaries,
+            value: kCMFormatDescriptionColorPrimaries_ITU_R_709_2
+        )
+        try setProperty(
+            kVTCompressionPropertyKey_TransferFunction,
+            value: kCMFormatDescriptionTransferFunction_ITU_R_709_2
+        )
+        try setProperty(
+            kVTCompressionPropertyKey_YCbCrMatrix,
+            value: kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2
         )
         try setProperty(
             kVTCompressionPropertyKey_AllowFrameReordering,
@@ -337,6 +358,21 @@ private func containsIDR(in data: Data) -> Bool {
     return false
 }
 
+private func sampleBufferIsKeyframe(_ sampleBuffer: CMSampleBuffer) -> Bool {
+    guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [CFDictionary],
+          let first = attachments.first else {
+        return false
+    }
+    let dict = first as NSDictionary
+    if let notSync = dict[kCMSampleAttachmentKey_NotSync] as? Bool {
+        return !notSync
+    }
+    if let depends = dict[kCMSampleAttachmentKey_DependsOnOthers] as? Bool {
+        return !depends
+    }
+    return false
+}
+
 private func goLiveCompressionOutput(
     outputCallbackRefCon: UnsafeMutableRawPointer?,
     sourceFrameRefCon: UnsafeMutableRawPointer?,
@@ -359,8 +395,11 @@ private func goLiveCompressionOutput(
     }
 
     let isHevc = encoder.codec == 1
+    let isAv1 = encoder.codec == 3
     var payload = Data()
-    if let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+    if isAv1 {
+        payload.append(blockData)
+    } else if let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
        let normalized = normalizeAvcc(
            blockData,
            headerLength: h264HeaderLength(formatDescription)
@@ -373,7 +412,14 @@ private func goLiveCompressionOutput(
     }
 
     let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-    let isKeyframe = isHevc ? containsIRAP(in: payload) : containsIDR(in: payload)
+    let isKeyframe: Bool
+    if isAv1 {
+        isKeyframe = sampleBufferIsKeyframe(sampleBuffer)
+    } else if isHevc {
+        isKeyframe = containsIRAP(in: payload)
+    } else {
+        isKeyframe = containsIDR(in: payload)
+    }
     let keyframe: UInt8 = isKeyframe ? 1 : 0
     encoder.callback(
         encoder.callbackContext,

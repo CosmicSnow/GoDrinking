@@ -81,16 +81,7 @@ fn encode_ceiling(resolution: VideoResolution) -> (u32, u32) {
 }
 
 fn fit_within(src_width: u32, src_height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
-    if src_width < 2 || src_height < 2 {
-        return (2, 2);
-    }
-    if src_width <= max_width && src_height <= max_height {
-        return ((src_width & !1).max(2), (src_height & !1).max(2));
-    }
-    let scale = (max_width as f64 / src_width as f64).min(max_height as f64 / src_height as f64);
-    let width = ((src_width as f64 * scale) as u32).max(2) & !1;
-    let height = ((src_height as f64 * scale) as u32).max(2) & !1;
-    (width.max(2), height.max(2))
+    crate::media::types::fitted_even_size(src_width, src_height, max_width, max_height)
 }
 
 // Nearest-neighbor BGRA downscale over a possibly-padded source (row

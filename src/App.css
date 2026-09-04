@@ -63,6 +63,8 @@
 .watch-volume::-moz-range-thumb{width:11px;height:11px;border-radius:50%;background:var(--lime);border:0;cursor:pointer}
 .watch-volume::-moz-range-track{height:3px;border-radius:2px;background:#2b353b}
 .quality-options.single{grid-template-columns:1fr}
+#quality-fields .segmented{flex-wrap:wrap}
+#quality-fields .segmented button{min-width:72px}
 .quality-hint{margin:8px 0 0;font:9px var(--mono);color:#65737a;letter-spacing:.03em}
 .exclude-hint{margin:7px 0 0;color:#69777e;font-size:9px;line-height:1.45}
 .exclude-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:9px}
