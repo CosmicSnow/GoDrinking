@@ -9,6 +9,7 @@
 //! Windows has no mix-minus system-audio tap; per-app audio exclusion is
 //! reported as unsupported by `capabilities.rs`.
 
+use super::logger;
 use super::pipeline::{EncoderCommand, NativeFrame, PreviewDiagnostics};
 use super::types::{
     CaptureSource, CreateMediaSessionRequest, FrameRate, NativeCaptureSource, NativeRunningApp,
@@ -17,7 +18,7 @@ use super::types::{
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame;
@@ -43,6 +44,7 @@ struct CaptureFlags {
     generation: u64,
     target_width: u32,
     target_height: u32,
+    min_frame_interval: Duration,
 }
 
 /// Error type required by `GraphicsCaptureApiHandler`. Frame-handling errors
@@ -159,8 +161,16 @@ struct CaptureHandler {
     generation: u64,
     target_width: u32,
     target_height: u32,
+    min_frame_interval: Duration,
+    last_processed: Option<Instant>,
     sequence: AtomicU64,
     scratch: Vec<u8>,
+    callbacks: u64,
+    paced_out: u64,
+    sent_to_encoder: u64,
+    encoder_full: u64,
+    encoder_gone: u64,
+    slow_frames: u64,
 }
 
 impl GraphicsCaptureApiHandler for CaptureHandler {
@@ -175,8 +185,16 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             generation: context.flags.generation,
             target_width: context.flags.target_width,
             target_height: context.flags.target_height,
+            min_frame_interval: context.flags.min_frame_interval,
+            last_processed: None,
             sequence: AtomicU64::new(0),
             scratch: Vec::new(),
+            callbacks: 0,
+            paced_out: 0,
+            sent_to_encoder: 0,
+            encoder_full: 0,
+            encoder_gone: 0,
+            slow_frames: 0,
         })
     }
 
@@ -185,6 +203,22 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         frame: &mut Frame,
         _capture_control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
+        self.callbacks += 1;
+        // Pace BEFORE any expensive work: giant sources (5120x1440 ultrawide
+        // is 29MB/frame) cost more per callback than the source frame
+        // interval, so unconstrained delivery falls behind forever and the
+        // encoder starves while the preview (cheap thumbnails) looks alive.
+        // Skipping early keeps a stable rate at any resolution.
+        let now = Instant::now();
+        if let Some(last) = self.last_processed {
+            if now.duration_since(last) < self.min_frame_interval {
+                self.paced_out += 1;
+                self.maybe_log_summary();
+                return Ok(());
+            }
+        }
+        self.last_processed = Some(now);
+        let start = Instant::now();
         self.diagnostics
             .callback_count
             .fetch_add(1, Ordering::Relaxed);
@@ -233,14 +267,31 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
 
         // Encoder first: the encoder queue is the latency-critical path.
-        let _ = self.encoder_tx.try_send(EncoderCommand::Video(NativeFrame {
+        match self.encoder_tx.try_send(EncoderCommand::Video(NativeFrame {
             storage: encoded.into(),
             timestamp_micros,
             sequence,
             width: enc_width,
             height: enc_height,
             generation: self.generation,
-        }));
+        })) {
+            Ok(()) => {
+                self.sent_to_encoder += 1;
+            }
+            Err(TrySendError::Full(_)) => {
+                self.encoder_full += 1;
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.encoder_gone += 1;
+                if self.encoder_gone == 1 {
+                    logger::log(
+                        "ERROR",
+                        "capture",
+                        "encoder queue disconnected; frames will not reach the encoder",
+                    );
+                }
+            }
+        }
 
         let result = self.capture_tx.try_send(NativeFrame {
             storage: thumb.into(),
@@ -266,7 +317,42 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
                     .record_error("Native preview queue is disconnected.");
             }
         }
+        let elapsed = start.elapsed();
+        if elapsed > Duration::from_millis(25) {
+            self.slow_frames += 1;
+            logger::log(
+                "WARN",
+                "capture",
+                &format!(
+                    "slow frame ({}ms for {}x{} -> {}x{}); pacing protects the rate",
+                    elapsed.as_millis(),
+                    width,
+                    height,
+                    enc_width,
+                    enc_height
+                ),
+            );
+        }
+        self.maybe_log_summary();
         Ok(())
+    }
+
+    fn maybe_log_summary(&mut self) {
+        if self.callbacks == 1 || self.callbacks % 600 == 0 {
+            logger::log(
+                "INFO",
+                "capture",
+                &format!(
+                    "frames: callbacks={} paced_out={} sent_to_encoder={} encoder_full={} encoder_gone={} slow={}",
+                    self.callbacks,
+                    self.paced_out,
+                    self.sent_to_encoder,
+                    self.encoder_full,
+                    self.encoder_gone,
+                    self.slow_frames
+                ),
+            );
+        }
     }
 
     fn on_closed(&mut self) -> Result<(), Self::Error> {
@@ -303,6 +389,15 @@ impl WindowsCaptureAdapter {
             FrameRate::Fps30 => 30,
         };
         let (target_width, target_height) = encode_ceiling(request.resolution);
+        let min_frame_interval = Duration::from_micros(1_000_000 / fps as u64);
+        logger::log(
+            "INFO",
+            "capture",
+            &format!(
+                "start Windows capture (target {target_width}x{target_height}, {fps}fps, min interval {}ms)",
+                min_frame_interval.as_millis()
+            ),
+        );
         let flags = CaptureFlags {
             capture_tx,
             encoder_tx,
@@ -310,6 +405,7 @@ impl WindowsCaptureAdapter {
             generation,
             target_width,
             target_height,
+            min_frame_interval,
         };
         let control = match resolve_target(request)? {
             CaptureTarget::Monitor(monitor) => {
