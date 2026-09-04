@@ -72,6 +72,15 @@ jobs:
         env:
           # Opus's bundled CMakeLists still declares cmake_minimum_required < 3.5.
           CMAKE_POLICY_VERSION_MINIMUM: 3.5
+      - name: Make portable exe
+        shell: bash
+        run: |
+          version=$(node -p "require('./package.json').version")
+          exe="src-tauri/target/release/godrinking.exe"
+          portable="src-tauri/target/release/bundle/goDrinking-${version}-windows-portable.exe"
+          rm -f "$portable"
+          cp "$exe" "$portable"
+          ls -la "$portable"
       - name: Upload to GitHub Release
         shell: bash
         env:
