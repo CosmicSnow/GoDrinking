@@ -56,7 +56,8 @@ Implementar depois do pacote de qualidade, numa branch própria, release **beta*
 - Cada membro tem um **Share slot**: parado ou a capturar.
 - Quem captura envia Media **P2P** para cada outro membro (fan-out no processo do capturador, como o Host faz hoje com N Viewers).
 - Quem não captura só recebe. O Master também pode assistir a tela de outra pessoa.
-- Vários Share slots ao mesmo tempo: a UI mostra grelha (um palco grande + thumbs). Quem assiste escolhe o palco.
+- Vários Share slots ao mesmo tempo: a UI mostra grelha. Cada pessoa escolhe a quem se liga (Watch/Stop), o tamanho de cada tile, e pode alfinetar uma stream.
+- Host e Watcher têm os mesmos poderes de ver/partilhar. O Host pode abrir a Sala sem transmitir.
 - Áudio de sistema e exclusão por app continuam **por capturador**.
 
 **Done when:** A assiste B e B assiste A ao mesmo tempo; o Rendezvous tcpdump não mostra RTP; Broadcast não quebrou.

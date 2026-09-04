@@ -9,7 +9,8 @@
   },
   "scripts": {
     "start": "node server.mjs",
-    "dev": "node --watch server.mjs"
+    "dev": "node --watch server.mjs",
+    "test": "node test_succession.mjs && node test_room.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"

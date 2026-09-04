@@ -107,3 +107,12 @@ Se `rejected_video_section`, notice: “O outro PC recusou este codec. Volta par
 - Viewer continua JS `RTCPeerConnection`; Host `webrtc-rs`.
 - Sem TURN.
 - Sem mudança de identidade visual (cores, tipografia, layout de painéis).
+
+## Aceite (v0.2.0)
+
+- [x] 3440×1440 no High usa orçamento ~1080p e fica mais largo que 1920.
+- [x] Vermelho BGRA→NV12 tem luma BT.709 (~63), não BT.601 (~81).
+- [x] REMB sem perda não tira o encoder do alvo.
+- [x] Piso automático = ¼ do alvo.
+- [x] Presets Low/Medium/High = H.264. Customize esconde sliders por omissão.
+- [x] Stunar não mostra “Local only”.

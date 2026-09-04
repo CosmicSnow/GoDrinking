@@ -1,6 +1,6 @@
 /** UI copy. Short, in place, no brochure voice. */
 
-export const APP_VERSION = "0.2.0";
+export const APP_VERSION = "0.4.0";
 
 export const copy = {
   shareNav: "Share screen",
@@ -105,4 +105,23 @@ export const copy = {
   statsHostHint: "This is the encoder target. Their Status shows what actually arrived. A drop here means packet loss, not the slider lying.",
   statsViewerHint: (preset: string, mbps: number) =>
     `If this sits far below the host target (${preset}: ${mbps} Mbps) and the picture blocks, the path is losing packets.`,
+  sessionMode: "Session",
+  broadcast: "Broadcast",
+  room: "Sala",
+  broadcastHint: "You share. They watch. That's it.",
+  roomHint: "Opens on the stage. Settings stays one click away.",
+  shareMine: "Share my screen",
+  stopShareMine: "Stop sharing",
+  openRoom: "Open room",
+  leaveRoom: "Leave room",
+  closeRoom: "Close room",
+  backToRoom: "Back to the room",
+  roomSettings: "Settings",
+  watchPerson: "Watch",
+  unwatchPerson: "Stop",
+  pinTile: "Pin",
+  unpinTile: "Unpin",
+  shareWarn: "More than 4 screens at once will hurt. Keep it small.",
+  measurePc: "Measure this PC",
+  measureHint: "Local encoder probe. Nothing goes on the network.",
 } as const;

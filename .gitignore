@@ -13,6 +13,10 @@ dist
 dist-ssr
 *.local
 
+# Portable builds (gerados localmente / no CI, nunca commitados)
+goDrinking-*-portable*.exe
+goDrinking-*-windows-portable*.exe
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

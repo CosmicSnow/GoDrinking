@@ -3,7 +3,7 @@ mod media;
 use media::logger;
 use media::{
     CreateMediaSessionRequest, JoinMode, MediaEngine, MediaSessionSnapshot, NativeCaptureSource,
-    NativeRunningApp, PeerSignal, PreviewFrameEvent, UpdateCredentialsRequest,
+    NativeRunningApp, PeerSignal, PreviewFrameEvent, ProbeReport, UpdateCredentialsRequest,
     UpdateMediaSessionRequest, MediaSessionStats,
 };
 use std::net::IpAddr;
@@ -46,9 +46,18 @@ async fn create_media_session(
 }
 
 /// Stops the active session and releases its native pipeline and stream handles.
+/// Async: ScreenCaptureKit stop must not run on the UI thread (same deadlock
+/// as start — the AppKit run loop has to keep turning).
 #[tauri::command]
-fn stop_media_session(engine: State<'_, MediaEngine>) -> Result<MediaSessionSnapshot, String> {
-    engine.stop_session().map_err(|error| error.to_string())
+async fn stop_media_session(
+    engine: State<'_, MediaEngine>,
+) -> Result<MediaSessionSnapshot, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.stop_session().map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Applies live settings (quality, system audio, exclusions) to the active
@@ -309,6 +318,105 @@ fn stunar_viewer_close(engine: State<'_, MediaEngine>) {
     engine.close_stunar_viewer();
 }
 
+#[tauri::command]
+fn poll_stunar_offers(engine: State<'_, MediaEngine>) -> Vec<media::StunarIncomingOffer> {
+    engine.poll_incoming_offers()
+}
+
+#[derive(serde::Deserialize)]
+struct RoomSignalRequest {
+    to: String,
+    answer: PeerSignal,
+}
+
+#[tauri::command]
+fn send_stunar_room_answer(
+    engine: State<'_, MediaEngine>,
+    request: RoomSignalRequest,
+) -> Result<(), String> {
+    let mut signal = request.answer;
+    signal.id = Some(request.to.clone());
+    engine
+        .send_stunar_signal(&request.to, signal)
+        .map_err(|error| error.to_string())
+}
+
+#[derive(serde::Deserialize)]
+struct RoomOfferSendRequest {
+    to: String,
+    offer: PeerSignal,
+}
+
+#[tauri::command]
+fn send_stunar_room_offer(
+    engine: State<'_, MediaEngine>,
+    request: RoomOfferSendRequest,
+) -> Result<(), String> {
+    engine
+        .send_stunar_signal(&request.to, request.offer)
+        .map_err(|error| error.to_string())
+}
+
+#[derive(serde::Deserialize)]
+struct MemberOfferRequest {
+    id: String,
+    nickname: String,
+}
+
+#[tauri::command]
+fn create_member_offer(
+    engine: State<'_, MediaEngine>,
+    request: MemberOfferRequest,
+) -> Result<PeerSignal, String> {
+    engine
+        .offer_for_member(&request.id, &request.nickname)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn announce_media_share(engine: State<'_, MediaEngine>, start: bool) -> Result<(), String> {
+    engine.announce_share(start).map_err(|error| error.to_string())
+}
+
+#[derive(serde::Deserialize)]
+struct WatchRequest {
+    to: String,
+    start: bool,
+}
+
+#[tauri::command]
+fn stunar_watch(engine: State<'_, MediaEngine>, request: WatchRequest) -> Result<(), String> {
+    engine
+        .request_watch(&request.to, request.start)
+        .map_err(|error| error.to_string())
+}
+
+/// Async like `create_media_session`: ScreenCaptureKit's picker must run on
+/// the AppKit loop. A sync command on the UI thread deadlocks the window.
+#[tauri::command]
+async fn start_media_share(
+    engine: State<'_, MediaEngine>,
+) -> Result<MediaSessionSnapshot, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.start_share().map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn stop_media_share(
+    engine: State<'_, MediaEngine>,
+) -> Result<MediaSessionSnapshot, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.stop_share().map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 /// Returns the last 5 session log files (newest first) for the View logs UI.
 #[tauri::command]
 async fn get_app_logs() -> Vec<media::LogSession> {
@@ -368,6 +476,25 @@ fn update_media_session_credentials(
         .map_err(|error| error.to_string())
 }
 
+/// Local encoder probe. No Session, no Rendezvous, no Media on the wire.
+#[tauri::command]
+fn run_media_benchmark(
+    engine: State<'_, MediaEngine>,
+) -> Result<ProbeReport, String> {
+    let snapshot = engine.snapshot();
+    if snapshot.state == media::MediaLifecycleState::Running
+        || snapshot.native_capture_active
+    {
+        return Err("Stop the session before measuring this PC.".into());
+    }
+    let caps = engine.capabilities();
+    Ok(media::run_local_probe(
+        caps.native_encoder_implemented,
+        caps.av1_encode_supported,
+        cfg!(target_os = "macos"),
+    ))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -398,7 +525,16 @@ pub fn run() {
             get_app_logs,
             clear_app_logs,
             reset_firewall_rules,
-            get_firewall_status
+            get_firewall_status,
+            run_media_benchmark,
+            poll_stunar_offers,
+            send_stunar_room_answer,
+            send_stunar_room_offer,
+            create_member_offer,
+            announce_media_share,
+            stunar_watch,
+            start_media_share,
+            stop_media_share
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

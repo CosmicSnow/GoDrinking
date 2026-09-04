@@ -7,6 +7,7 @@
 //! produces native H.264 access units consumed by the local-only WebRTC peer.
 
 mod access_unit;
+mod benchmark;
 mod capabilities;
 mod engine;
 mod fanout;
@@ -18,6 +19,7 @@ mod rendezvous;
 #[cfg(test)]
 mod stunar_integration_test;
 mod room;
+mod room_mode;
 mod session_gate;
 mod screen_capture_kit;
 mod timestamp;
@@ -36,15 +38,18 @@ pub(crate) mod firewall;
 #[cfg(not(target_os = "windows"))]
 pub(crate) mod firewall;
 
+pub use benchmark::{run_local_probe, ProbeReport, RecommendedPreset};
+pub use rendezvous::StunarIncomingOffer;
 pub use capabilities::MediaCapabilities;
 pub use engine::MediaEngine;
+pub use room_mode::SessionMode;
 pub use logger::{clear, read_sessions, LogSession};
 #[allow(unused_imports)]
 pub use peer_transport::{PeerSignal, PeerSignalKind};
 pub use room::{discover_direct, discover_room, submit_answer as submit_room_answer};
 #[allow(unused_imports)]
 pub use types::{
-    CreateMediaSessionRequest, DirectAddress, JoinMode, MediaSessionSnapshot, NativeCaptureSource,
+    CreateMediaSessionRequest, DirectAddress, JoinMode, MediaLifecycleState, MediaSessionSnapshot, NativeCaptureSource,
     NativeRunningApp, PreviewFrameEvent, StunarState, UpdateCredentialsRequest,
     UpdateMediaSessionRequest, MediaSessionStats, VideoCodec, VideoEncoder, ViewerLinkStats,
 };
