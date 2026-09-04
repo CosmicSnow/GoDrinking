@@ -89,10 +89,13 @@ fn fit_within(src_width: u32, src_height: u32, max_width: u32, max_height: u32) 
     (width.max(2), height.max(2))
 }
 
-// Nearest-neighbor BGRA downscale. Sizes that already match are still
-// resampled (same cost profile, no extra branch in the hot path).
+// Nearest-neighbor BGRA downscale over a possibly-padded source (row
+// stride in bytes, zero-copy friendly). Fixed-point stepping: no division
+// in the hot loop. A 5120x1440 -> 1920x540 resample with per-pixel
+// division cost ~50ms here and starved the encoder on ultrawide.
 fn downscale_bgra(
     src: &[u8],
+    src_stride: usize,
     src_width: u32,
     src_height: u32,
     dst_width: u32,
@@ -105,17 +108,28 @@ fn downscale_bgra(
     if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
         return None;
     }
-    let stride = src_w.checked_mul(4)?;
-    if src.len() < stride.checked_mul(src_h)? {
+    let row_bytes = src_w.checked_mul(4)?;
+    if src_stride < row_bytes {
+        return None;
+    }
+    if src.len() < src_stride.checked_mul(src_h.saturating_sub(1))?.checked_add(row_bytes)? {
         return None;
     }
     let mut dst = vec![0_u8; dst_w.checked_mul(dst_h)?.checked_mul(4)?];
+    let x_step = ((src_w as u64) << 16) / dst_w as u64;
+    let y_step = ((src_h as u64) << 16) / dst_h as u64;
+    let mut src_y_fp = 0u64;
     for y in 0..dst_h {
-        let src_y = y * src_h / dst_h;
+        let src_y = (src_y_fp >> 16) as usize;
+        src_y_fp += y_step;
+        let src_row_start = src_y * src_stride;
+        let dst_row_start = y * dst_w * 4;
+        let mut src_x_fp = 0u64;
         for x in 0..dst_w {
-            let src_x = x * src_w / dst_w;
-            let src_offset = src_y * stride + src_x * 4;
-            let dst_offset = (y * dst_w + x) * 4;
+            let src_x = (src_x_fp >> 16) as usize;
+            src_x_fp += x_step;
+            let src_offset = src_row_start + src_x * 4;
+            let dst_offset = dst_row_start + x * 4;
             dst[dst_offset..dst_offset + 4].copy_from_slice(&src[src_offset..src_offset + 4]);
         }
     }
@@ -124,7 +138,12 @@ fn downscale_bgra(
 
 // Small RGB thumbnail derived from a BGRA source frame for the preview
 // queue. Same nearest-neighbor sampling the macOS path uses.
-fn thumbnail_rgb(src: &[u8], src_width: u32, src_height: u32) -> Option<Vec<u8>> {
+fn thumbnail_rgb(
+    src: &[u8],
+    src_stride: usize,
+    src_width: u32,
+    src_height: u32,
+) -> Option<Vec<u8>> {
     let src_w = src_width as usize;
     let src_h = src_height as usize;
     let dst_w = PREVIEW_WIDTH as usize;
@@ -132,17 +151,28 @@ fn thumbnail_rgb(src: &[u8], src_width: u32, src_height: u32) -> Option<Vec<u8>>
     if src_w == 0 || src_h == 0 {
         return None;
     }
-    let stride = src_w.checked_mul(4)?;
-    if src.len() < stride.checked_mul(src_h)? {
+    let row_bytes = src_w.checked_mul(4)?;
+    if src_stride < row_bytes {
+        return None;
+    }
+    if src.len() < src_stride.checked_mul(src_h.saturating_sub(1))?.checked_add(row_bytes)? {
         return None;
     }
     let mut dst = vec![0_u8; dst_w * dst_h * 3];
+    let x_step = ((src_w as u64) << 16) / dst_w as u64;
+    let y_step = ((src_h as u64) << 16) / dst_h as u64;
+    let mut src_y_fp = 0u64;
     for y in 0..dst_h {
-        let src_y = y * src_h / dst_h;
+        let src_y = (src_y_fp >> 16) as usize;
+        src_y_fp += y_step;
+        let src_row_start = src_y * src_stride;
+        let dst_row_start = y * dst_w * 3;
+        let mut src_x_fp = 0u64;
         for x in 0..dst_w {
-            let src_x = x * src_w / dst_w;
-            let src_offset = src_y * stride + src_x * 4;
-            let dst_offset = (y * dst_w + x) * 3;
+            let src_x = (src_x_fp >> 16) as usize;
+            src_x_fp += x_step;
+            let src_offset = src_row_start + src_x * 4;
+            let dst_offset = dst_row_start + x * 3;
             dst[dst_offset] = src[src_offset + 2];
             dst[dst_offset + 1] = src[src_offset + 1];
             dst[dst_offset + 2] = src[src_offset];
@@ -164,7 +194,6 @@ struct CaptureHandler {
     min_frame_interval: Duration,
     last_processed: Option<Instant>,
     sequence: AtomicU64,
-    scratch: Vec<u8>,
     callbacks: u64,
     paced_out: u64,
     sent_to_encoder: u64,
@@ -188,7 +217,6 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             min_frame_interval: context.flags.min_frame_interval,
             last_processed: None,
             sequence: AtomicU64::new(0),
-            scratch: Vec::new(),
             callbacks: 0,
             paced_out: 0,
             sent_to_encoder: 0,
@@ -235,32 +263,35 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
 
         // Downscale before the Arc: a 5120x1440 ultrawide frame is 29MB and
         // must never reach the queues (1.7GB/s of garbage at 60fps froze the
-        // whole app). The borrowed source pixels are resampled into a
-        // session-size BGRA frame plus a small RGB preview thumbnail.
+        // whole app). The mapped source pixels are resampled in place into a
+        // session-size BGRA frame plus a small RGB preview thumbnail, with
+        // no full-frame copy (stride-aware, zero-copy even with padding).
         let (enc_width, enc_height) = fit_within(width, height, self.target_width, self.target_height);
-        let mut scratch = std::mem::take(&mut self.scratch);
-        let downsized = match frame.buffer() {
-            Ok(buffer) => {
-                let source = buffer.as_nopadding_buffer(&mut scratch);
-                let encoded = downscale_bgra(source, width, height, enc_width, enc_height);
-                let thumb = thumbnail_rgb(source, width, height);
-                match (encoded, thumb) {
-                    (Some(encoded), Some(thumb)) => Some((encoded, thumb)),
-                    _ => {
-                        self.diagnostics.record_error(
-                            "Windows capture downscale failed: undersized frame buffer.",
-                        );
-                        None
-                    }
-                }
-            }
+        let t_buf_start = Instant::now();
+        let mut fb = match frame.buffer() {
+            Ok(fb) => fb,
             Err(error) => {
                 self.diagnostics
                     .record_error(format!("Windows capture buffer read failed: {error}"));
+                return Ok(());
+            }
+        };
+        let buf_ms = t_buf_start.elapsed().as_millis();
+        let src_stride = fb.row_pitch() as usize;
+        let t_conv_start = Instant::now();
+        let source = fb.as_raw_buffer();
+        let encoded = downscale_bgra(source, src_stride, width, height, enc_width, enc_height);
+        let thumb = thumbnail_rgb(source, src_stride, width, height);
+        let conv_ms = t_conv_start.elapsed().as_millis();
+        let downsized = match (encoded, thumb) {
+            (Some(encoded), Some(thumb)) => Some((encoded, thumb)),
+            _ => {
+                self.diagnostics.record_error(
+                    "Windows capture downscale failed: undersized frame buffer.",
+                );
                 None
             }
         };
-        self.scratch = scratch;
         let Some((encoded, thumb)) = downsized else {
             return Ok(());
         };
@@ -327,8 +358,10 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
                 "WARN",
                 "capture",
                 &format!(
-                    "slow frame ({}ms for {}x{} -> {}x{}); pacing protects the rate",
+                    "slow frame ({}ms = buf {}ms + conv {}ms for {}x{} -> {}x{}); pacing protects the rate",
                     elapsed.as_millis(),
+                    buf_ms,
+                    conv_ms,
                     width,
                     height,
                     enc_width,
