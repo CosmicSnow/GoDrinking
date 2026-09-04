@@ -318,7 +318,10 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             }
         }
         let elapsed = start.elapsed();
-        if elapsed > Duration::from_millis(25) {
+        // Threshold at 100ms: ultrawide frames cost ~50ms here, which is
+        // expected (not spam-worthy); only real stalls get a line, the rest
+        // is counted in `slow` for the periodic summary.
+        if elapsed > Duration::from_millis(100) {
             self.slow_frames += 1;
             logger::log(
                 "WARN",
