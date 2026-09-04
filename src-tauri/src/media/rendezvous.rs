@@ -1070,6 +1070,7 @@ pub(crate) fn discover_stunar_room(
                             hb_token,
                         )
                         .await;
+                        logger::log("INFO", "stunar ws", "viewer worker stopped");
                     }
                     Err(error) => {
                         let _ = ready_tx.send(Err(error));

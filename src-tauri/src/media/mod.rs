@@ -43,7 +43,7 @@ pub use rendezvous::StunarIncomingOffer;
 pub use capabilities::MediaCapabilities;
 pub use engine::MediaEngine;
 pub use room_mode::SessionMode;
-pub use logger::{clear, read_sessions, LogSession};
+pub use logger::{clear, logs_dir_string, read_sessions, LogSession};
 #[allow(unused_imports)]
 pub use peer_transport::{PeerSignal, PeerSignalKind};
 pub use room::{discover_direct, discover_room, submit_answer as submit_room_answer};

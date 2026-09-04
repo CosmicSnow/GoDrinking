@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import "./index.css";
 import "./App.css";
@@ -8,7 +9,7 @@ import { APP_VERSION, detectLocale, dictionaries, type Copy, type Locale } from 
 import { RoomStage } from "./RoomStage";
 import { autoFloorMbps, BITRATE_MAX_MBPS, BITRATE_MIN_MBPS, FLOOR_MAX_MBPS, FLOOR_MIN_MBPS, collectViewerStats, qualityTargetMbps, type ViewerStats, type ViewerStatsPrev } from "./sessionStats";
 
-type IconName = "grid" | "monitor" | "window" | "game" | "settings" | "help" | "plus" | "copy" | "wifi" | "chevron" | "expand" | "minimize" | "volume" | "volume-off" | "terminal" | "activity";
+type IconName = "grid" | "monitor" | "window" | "game" | "settings" | "help" | "plus" | "copy" | "wifi" | "chevron" | "expand" | "minimize" | "volume" | "volume-off" | "terminal" | "activity" | "folder";
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
   const paths: Record<IconName, ReactNode> = {
     grid: <><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></>,
@@ -26,7 +27,8 @@ function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
     volume: <><path d="M11 5 6 9H2v6h4l5 4V5Z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.8 5.8a9 9 0 0 1 0 12.4"/></>,
     "volume-off": <><path d="M11 5 6 9H2v6h4l5 4V5Z"/><path d="m22 9-6 6"/><path d="m16 9 6 6"/></>,
     terminal: <><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></>,
-    activity: <><path d="M3 12h4l3 8 4-16 3 8h4"/></>
+    activity: <><path d="M3 12h4l3 8 4-16 3 8h4"/></>,
+    folder: <><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/></>
   };
   return <svg className="icon" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
 }
@@ -525,10 +527,10 @@ function App() {
     if (!active || !session?.session_id) { liveSettingsApplied.current = false; return; }
     if (sessionAction !== "idle") return;
     if (!liveSettingsApplied.current) { liveSettingsApplied.current = true; return; }
-    void invokeMedia<Snapshot | null>("update_media_session", { request: { quality, bitrate_bps: bitrateMbps !== null ? Math.round(bitrateMbps * 1_000_000) : null, min_bitrate_bps: minBitrateMbps !== null ? Math.round(minBitrateMbps * 1_000_000) : null, codec: videoCodec, encoder: videoEncoder, system_audio: systemAudio, excluded_apps: excludedApps } })
+    void invokeMedia<Snapshot | null>("update_media_session", { request: { quality, bitrate_bps: bitrateMbps !== null ? Math.round(bitrateMbps * 1_000_000) : null, min_bitrate_bps: minBitrateMbps !== null ? Math.round(minBitrateMbps * 1_000_000) : null, resolution: resolution === "auto" ? null : resolution, frame_rate: frameFps === "auto" ? null : frameFps, codec: videoCodec, encoder: videoEncoder, system_audio: systemAudio, excluded_apps: excludedApps } })
       .then((next) => { if (next) setSession(next); })
       .catch((error) => setNotice(`Could not apply the change: ${diagnosticError(error, "unknown error")}`));
-  }, [quality, bitrateMbps, minBitrateMbps, systemAudio, excludedApps, active, sessionAction]);
+  }, [quality, bitrateMbps, minBitrateMbps, resolution, frameFps, systemAudio, excludedApps, active, sessionAction]);
   useEffect(() => () => {
     peerRef.current?.close();
     void invokeMedia("close_media_peer_transport").catch(() => undefined).then(() => invokeMedia("stop_media_session").catch(() => undefined));
@@ -938,18 +940,48 @@ function App() {
     try {
       const next = await invokeMedia<LogSession[]>("get_app_logs");
       setLogs(next);
-      setActiveLog(0);
+      // Preserve the selected tab across refreshes (newest session stays
+      // tab 0, so a clamp keeps the reader where they were).
+      setActiveLog((prev) => Math.max(0, Math.min(prev, Math.max(0, next.length - 1))));
     } catch { /* keep the last list */ }
   };
   const openLogs = async () => {
     setLogsOpen(true);
+    setActiveLog(0);
     await loadLogs();
   };
   const closeLogs = () => setLogsOpen(false);
+  useEffect(() => {
+    if (!logsOpen) return undefined;
+    const timer = window.setInterval(() => void loadLogs(), 2000);
+    return () => window.clearInterval(timer);
+  }, [logsOpen]);
   const copyActiveLog = async () => {
     const active = logs[activeLog];
     if (!active) return;
     await copyText(active.lines.join("\n"));
+  };
+  // One paste covers the whole investigation: diagnostics header plus every
+  // session (newest first), so host and viewer logs travel together.
+  const copyAllLogs = async () => {
+    const header = [
+      `goDrinking diagnostics · ${APP_VERSION}`,
+      `join mode: ${joinMode}`,
+      `rendezvous: ${rendezvousUrl || "—"}`,
+      `last error: ${lastError || "—"}`,
+      `sessions: ${logs.length}`,
+    ].join("\n");
+    const body = logs.map((entry) => `===== ${entry.session} (${entry.timestamp}) =====\n${entry.lines.join("\n")}`).join("\n\n");
+    await copyText(`${header}\n\n${body}`);
+  };
+  const openLogsFolder = async () => {
+    try {
+      const dir = await invokeMedia<string | null>("get_logs_dir");
+      if (!dir) { setNotice("Could not locate the logs folder."); return; }
+      await revealItemInDir(dir);
+    } catch (error) {
+      setNotice(diagnosticError(error, "Could not open the logs folder."));
+    }
   };
   const clearLogs = async () => {
     try {
@@ -1584,6 +1616,8 @@ function App() {
                 </div>
                 <div className="logs-actions">
                   <button onClick={() => void copyActiveLog()} disabled={!logs[activeLog]}><Icon name="copy" size={12}/> Copy</button>
+                  <button onClick={() => void copyAllLogs()} disabled={logs.length === 0}><Icon name="copy" size={12}/> Copy all</button>
+                  <button onClick={() => void openLogsFolder()}><Icon name="folder" size={12}/> Folder</button>
                   <button onClick={() => void loadLogs()}>Refresh</button>
                   <button className="is-danger" onClick={() => void clearLogs()}>Clear all</button>
                 </div>

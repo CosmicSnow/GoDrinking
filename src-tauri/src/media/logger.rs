@@ -1,10 +1,12 @@
 //! Lightweight session file logger for debugging join failures.
 //!
 //! One file per session attempt (Host start or Viewer join) is written to
-//! `{data_dir}/godrinking/logs/session-{timestamp}-{role}-{mode}.log` and the
-//! last 5 files are kept. Passwords are never written; raw Rendezvous error
-//! codes are, so a generic "Could not join." can be traced back to
-//! denied/full/busy/invalid/unreachable in seconds.
+//! `{data_dir}/godrinking/logs/session-{timestamp}-{role}-{mode}-p{pid}.log`
+//! and the last 30 files are kept. The pid suffix keeps two local instances
+//! (e.g. a dev Host plus a portable Viewer on the same machine) from
+//! sharing one file when they start in the same second. Passwords are never
+//! written; raw Rendezvous error codes are, so a generic "Could not join."
+//! can be traced back to denied/full/busy/invalid/unreachable in seconds.
 //!
 //! Thread-safe via a global `Mutex<Option<LoggerState>>`; every write is
 //! flushed so a crash never loses the last line.
@@ -15,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const MAX_SESSIONS: usize = 5;
+const MAX_SESSIONS: usize = 30;
 
 struct LoggerState {
     file: Option<File>,
@@ -78,7 +80,8 @@ fn prune(dir: &std::path::Path) {
 }
 
 /// Opens a fresh session file (Host start or Viewer join attempt) and prunes
-/// old files beyond the last 5. The previous file, if any, is closed.
+/// old files beyond the last 30. The previous file, if any, is closed. The
+/// pid suffix keeps concurrent local instances on separate files.
 pub fn begin_session(role: &str, mode: &str) {
     let Some(dir) = logs_dir() else {
         return;
@@ -88,7 +91,11 @@ pub fn begin_session(role: &str, mode: &str) {
     }
     prune(&dir);
     let (secs, _) = now_parts();
-    let name = format!("session-{}-{role}-{mode}.log", stamp(secs));
+    let name = format!(
+        "session-{}-{role}-{mode}-p{}.log",
+        stamp(secs),
+        std::process::id()
+    );
     let file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -116,9 +123,11 @@ pub fn log(level: &str, event: &str, details: &str) {
         };
         if fs::create_dir_all(&dir).is_err() {
             return;
-        }
+        };
+        // Same pid suffix as sessions: early logs from two local instances
+        // must not share a file either.
         let (secs, _) = now_parts();
-        let name = format!("session-{}-app-app.log", stamp(secs));
+        let name = format!("session-{}-app-app-p{}.log", stamp(secs), std::process::id());
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -210,6 +219,11 @@ pub fn clear() {
     if let Some(state) = guard.as_mut() {
         state.file = None;
     }
+}
+
+/// Absolute path of the logs directory, for the "open folder" UI action.
+pub fn logs_dir_string() -> Option<String> {
+    logs_dir().map(|dir| dir.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
