@@ -131,6 +131,12 @@ a:hover {
   height: 32px;
 }
 
+.header-end {
+  display: flex;
+  align-items: center;
+  gap: var(--space);
+}
+
 .nav {
   display: flex;
   align-items: center;
@@ -145,6 +151,12 @@ a:hover {
 
 .nav a:hover {
   text-decoration: underline;
+}
+
+.nav .github-mark {
+  text-decoration: none;
+  flex: none;
+  margin-left: 0.15rem;
 }
 
 /* Buttons */
@@ -937,6 +949,10 @@ summary:hover {
 
   .nav {
     display: none;
+  }
+
+  .header-end {
+    gap: 0;
   }
 }
 
