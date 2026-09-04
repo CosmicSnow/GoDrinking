@@ -67,33 +67,48 @@
 .room-thumbs{position:absolute;right:10px;top:12px;z-index:5;display:flex;flex-direction:column;gap:6px}
 .room-thumb{padding:5px 8px;border:1px solid #2b353b;border-radius:5px;background:#0d1216d9;color:#9fb0a6;font:9px var(--mono)}
 .room-thumb.selected{border-color:#4b5e3c;color:var(--lime);background:#273322}
-.preview-screen.is-room,.watch-stage.is-room{height:min(68vh,720px);display:flex;align-items:stretch;padding:0;place-items:stretch}
-.room-stage{position:absolute;inset:0;display:grid;grid-template-columns:minmax(0,1fr) 200px;min-height:0;z-index:2}
-.room-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));grid-auto-rows:minmax(120px,1fr);gap:8px;padding:10px;overflow:auto;align-content:stretch}
-.room-grid.is-pinned{grid-template-columns:1fr;grid-auto-rows:1fr}
-.room-tile{position:relative;grid-column:span var(--tile-span,1);min-height:110px;border:1px solid #2b353b;border-radius:6px;background:#0b0e11;overflow:hidden}
-.room-tile.is-pinned-tile{grid-column:1/-1}
+.app-shell.room-live{background:#0b0e11}
+.app-shell.room-live .sidebar,.app-shell.room-live .topbar,.app-shell.room-live .page-heading{display:none}
+.app-shell.room-live .main-content{max-width:none;width:100%;padding:0;margin:0}
+.room-live-shell{position:fixed;inset:0;z-index:20;display:flex;flex-direction:column;background:#0b0e11}
+.room-live-bar{height:52px;flex:none;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 16px;border-bottom:1px solid #243038;background:#12181d}
+.room-live-ident{display:flex;flex-direction:column;gap:2px;min-width:0}
+.room-live-kicker{font:9px var(--mono);letter-spacing:.12em;text-transform:uppercase;color:#7d8c84}
+.room-live-ident strong{font:13px var(--mono);color:var(--lime);letter-spacing:.06em}
+.room-live-bar-actions{display:flex;gap:8px}
+.room-bar-btn{padding:7px 12px;border-radius:6px;background:#1c2429;border:1px solid #2b353b;color:#c5d0c8;font-size:12px;font-weight:600}
+.room-bar-btn:hover{border-color:#4b5e3c;color:var(--lime)}
+.room-bar-btn.is-leave{background:#241b1a;border-color:#654437;color:#f4c3a8}
+.room-live-body{flex:1;display:grid;grid-template-columns:minmax(0,1fr) 260px;min-height:0}
+.room-live-stage{display:flex;flex-direction:column;gap:8px;min-width:0;min-height:0;padding:12px}
+.room-discord-grid{flex:1;display:grid;gap:10px;min-height:0}
+.room-discord-grid.is-spotlight{grid-template-columns:1fr !important;grid-template-rows:1fr !important}
+.room-tile{position:relative;min-width:0;min-height:0;border-radius:8px;background:#11161b;border:1px solid #243038;overflow:hidden}
 .room-video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#0b0e11}
-.room-tile-hud{position:absolute;left:0;right:0;bottom:0;z-index:3;display:flex;justify-content:space-between;gap:8px;padding:6px 8px;background:linear-gradient(transparent,#0d1216e6);font:10px var(--mono);color:#c5d0c8}
+.room-tile-hud{position:absolute;left:0;right:0;bottom:0;z-index:3;display:flex;justify-content:space-between;gap:8px;padding:8px 10px;background:linear-gradient(transparent,#0d1216ee);font:11px var(--sans);color:#d5ded9}
 .room-tile-actions{display:flex;gap:4px}
-.room-tile-actions button{padding:3px 7px;border-radius:4px;background:#1c2429;color:#b9c5c0;font:9px var(--mono)}
+.room-tile-actions button{padding:4px 8px;border-radius:4px;background:#1c2429cc;color:#b9c5c0;font:10px var(--mono)}
 .room-tile-actions button:hover{color:var(--lime)}
-.room-tile-actions button:disabled{opacity:.35}
-.room-empty{grid-column:1/-1;display:grid;place-items:center;align-content:center;gap:6px;color:#8fa096;text-align:center}
-.room-empty strong{font-size:12px;color:#d5ded9}
-.room-empty small{font-size:10px;color:#65737a}
-.room-people{border-left:1px solid #2b353b;padding:10px 10px 12px;overflow:auto;background:#10151ad9}
-.room-people-head{display:flex;flex-direction:column;gap:8px;margin-bottom:10px;font:9px var(--mono);color:#829097;letter-spacing:.08em;text-transform:uppercase}
-.room-share-btn{width:100%;padding:7px 8px;border-radius:5px;background:#273322;border:1px solid #4b5e3c;color:var(--lime);font:10px var(--sans);font-weight:700;text-transform:none;letter-spacing:0}
+.room-empty{grid-column:1/-1;grid-row:1/-1;display:grid;place-items:center;align-content:center;gap:6px;color:#8fa096;text-align:center}
+.room-empty strong{font-size:15px;color:#d5ded9}
+.room-empty small{font-size:12px;color:#65737a}
+.room-filmstrip{display:flex;gap:8px;flex:none;height:92px}
+.room-thumb-tile{position:relative;width:148px;flex:none;border-radius:6px;overflow:hidden;background:#11161b;border:1px solid #243038;padding:0;color:#c5d0c8}
+.room-thumb-video{width:100%;height:72px;object-fit:contain;background:#0b0e11;display:block}
+.room-thumb-tile span{display:block;padding:2px 6px;font:9px var(--mono);text-align:left}
+.room-live-rail{border-left:1px solid #243038;background:#141a20;padding:14px 12px;overflow:auto}
+.room-rail-label{margin:14px 0 6px;font:9px var(--mono);color:#829097;letter-spacing:.08em;text-transform:uppercase}
+.room-share-btn{width:100%;padding:9px 8px;border-radius:6px;background:#273322;border:1px solid #4b5e3c;color:var(--lime);font:12px var(--sans);font-weight:700}
 .room-share-btn.is-live{background:#241b1a;border-color:#654437;color:#f4c3a8}
 .room-share-btn:disabled{opacity:.45}
-.room-person{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 0;border-top:1px solid #252e34;font-size:11px}
+.room-person{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 0;border-top:1px solid #252e34;font-size:12px}
+.room-person.is-you{border-top:0;padding-top:4px}
 .room-person span{display:flex;flex-direction:column;min-width:0}
-.room-person small{color:#75877d;font-size:9px;margin-top:2px}
-.room-watch{flex:none;padding:5px 8px;border-radius:4px;background:#273135;color:#b9c5c0;font:9px var(--mono)}
+.room-person small{color:#75877d;font-size:10px;margin-top:2px}
+.room-watch{flex:none;padding:5px 8px;border-radius:4px;background:#273135;color:#b9c5c0;font:10px var(--mono)}
 .room-watch.is-on{background:#273322;color:var(--lime);border:1px solid #4b5e3c}
 .room-watch:disabled{opacity:.4}
-@media(max-width:650px){.room-stage{grid-template-columns:1fr}.room-people{border-left:0;border-top:1px solid #2b353b}}
+@media(max-width:800px){.room-live-body{grid-template-columns:1fr}.room-live-rail{border-left:0;border-top:1px solid #243038;max-height:34vh}}
 #quality-fields .segmented{flex-wrap:wrap}
 #quality-fields .segmented button{min-width:72px}
 .quality-hint{margin:8px 0 0;font:9px var(--mono);color:#65737a;letter-spacing:.03em}

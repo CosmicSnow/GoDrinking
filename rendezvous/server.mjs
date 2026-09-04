@@ -384,7 +384,7 @@ async function handleOpen(ip, json, res) {
       joinedAt: now,
       heartbeatAt: now,
       ws: null,
-      share: true,
+      share: false,
       role: "host",
     });
   }

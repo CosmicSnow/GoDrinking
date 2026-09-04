@@ -25,6 +25,16 @@ pub fn auto_mint_on_accept(mode: SessionMode) -> bool {
     matches!(mode, SessionMode::Broadcast)
 }
 
+/// Broadcast drops unanswered links missing from the accepted roster.
+/// Sala only drops them when the Roster is known and the member is gone —
+/// an empty Roster must not kill a just-minted offer.
+pub fn drop_unanswered_link(mode: SessionMode, roster_known: bool, in_roster: bool) -> bool {
+    match mode {
+        SessionMode::Broadcast => !in_roster,
+        SessionMode::Room => roster_known && !in_roster,
+    }
+}
+
 /// Viewer handshake events from the Rendezvous WS.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HandshakeEvent {
@@ -108,6 +118,15 @@ mod tests {
     fn sala_does_not_auto_mint_to_everyone() {
         assert!(!super::auto_mint_on_accept(super::SessionMode::Room));
         assert!(super::auto_mint_on_accept(super::SessionMode::Broadcast));
+    }
+
+    #[test]
+    fn sala_keeps_a_fresh_offer_when_the_roster_has_not_arrived() {
+        use super::{drop_unanswered_link, SessionMode};
+        assert!(!drop_unanswered_link(SessionMode::Room, false, false));
+        assert!(drop_unanswered_link(SessionMode::Room, true, false));
+        assert!(!drop_unanswered_link(SessionMode::Room, true, true));
+        assert!(drop_unanswered_link(SessionMode::Broadcast, false, false));
     }
 
     #[test]

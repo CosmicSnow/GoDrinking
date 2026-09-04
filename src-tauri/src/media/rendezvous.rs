@@ -441,12 +441,15 @@ impl StunarHost {
             .unwrap_or_default()
     }
 
-    pub(crate) fn take_watch_requests(&self) -> (Vec<String>, Vec<String>) {
-        let watch = self
-            .watch_from
-            .lock()
-            .map(|mut list| std::mem::take(&mut *list))
-            .unwrap_or_default();
+    pub(crate) fn take_watch_requests(&self, take_watch: bool) -> (Vec<String>, Vec<String>) {
+        let watch = if take_watch {
+            self.watch_from
+                .lock()
+                .map(|mut list| std::mem::take(&mut *list))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let unwatch = self
             .unwatch_from
             .lock()
@@ -578,6 +581,25 @@ async fn post_heartbeat(
             "stunar heartbeat",
             &format!("status={}", response.status()),
         );
+        Err("Stunar is unreachable.".into())
+    }
+}
+
+async fn post_member_heartbeat(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+) -> Result<(), String> {
+    let base = normalize_base(base);
+    let response = client
+        .post(format!("{base}/v1/member/heartbeat"))
+        .json(&json!({ "token": token }))
+        .send()
+        .await
+        .map_err(|_| "Stunar is unreachable.".to_owned())?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
         Err("Stunar is unreachable.".into())
     }
 }
@@ -913,12 +935,15 @@ impl StunarViewer {
             .unwrap_or_default()
     }
 
-    pub(crate) fn take_watch_requests(&self) -> (Vec<String>, Vec<String>) {
-        let watch = self
-            .watch_from
-            .lock()
-            .map(|mut list| std::mem::take(&mut *list))
-            .unwrap_or_default();
+    pub(crate) fn take_watch_requests(&self, take_watch: bool) -> (Vec<String>, Vec<String>) {
+        let watch = if take_watch {
+            self.watch_from
+                .lock()
+                .map(|mut list| std::mem::take(&mut *list))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let unwatch = self
             .unwatch_from
             .lock()
@@ -1029,6 +1054,7 @@ pub(crate) fn discover_stunar_room(
                 .await
                 {
                     Ok((token, offer, ws, member_id, mode)) => {
+                        let hb_token = token.clone();
                         let _ = ready_tx.send(Ok((token, offer, member_id, mode)));
                         viewer_worker(
                             ws,
@@ -1040,6 +1066,8 @@ pub(crate) fn discover_stunar_room(
                             worker_master,
                             worker_shutdown,
                             outgoing_rx,
+                            worker_base,
+                            hb_token,
                         )
                         .await;
                     }
@@ -1267,7 +1295,24 @@ async fn viewer_worker(
     master_id: Arc<Mutex<Option<String>>>,
     shutdown: Arc<AtomicBool>,
     mut outgoing: UnboundedReceiver<Outgoing>,
+    hb_base: String,
+    hb_token: String,
 ) {
+    let hb_shutdown = Arc::clone(&shutdown);
+    let heartbeat = tokio::spawn(async move {
+        let Ok(client) = http_client() else {
+            return;
+        };
+        let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            if hb_shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            let _ = post_member_heartbeat(&client, &hb_base, &hb_token).await;
+        }
+    });
     while !shutdown.load(Ordering::Acquire) {
         tokio::select! {
             incoming = ws.next() => {
@@ -1335,12 +1380,14 @@ async fn viewer_worker(
                     }
                     Some(Outgoing::Close) | None => {
                         let _ = ws.close(None).await;
+                        heartbeat.abort();
                         return;
                     }
                 }
             }
         }
     }
+    heartbeat.abort();
 }
 
 /// Sends the answer signal over the Viewer WS. The inbox stays open.

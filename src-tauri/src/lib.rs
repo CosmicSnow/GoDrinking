@@ -382,14 +382,30 @@ fn stunar_watch(engine: State<'_, MediaEngine>, request: WatchRequest) -> Result
         .map_err(|error| error.to_string())
 }
 
+/// Async like `create_media_session`: ScreenCaptureKit's picker must run on
+/// the AppKit loop. A sync command on the UI thread deadlocks the window.
 #[tauri::command]
-fn start_media_share(engine: State<'_, MediaEngine>) -> Result<MediaSessionSnapshot, String> {
-    engine.start_share().map_err(|error| error.to_string())
+async fn start_media_share(
+    engine: State<'_, MediaEngine>,
+) -> Result<MediaSessionSnapshot, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.start_share().map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-fn stop_media_share(engine: State<'_, MediaEngine>) -> Result<MediaSessionSnapshot, String> {
-    engine.stop_share().map_err(|error| error.to_string())
+async fn stop_media_share(
+    engine: State<'_, MediaEngine>,
+) -> Result<MediaSessionSnapshot, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.stop_share().map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Returns the last 5 session log files (newest first) for the View logs UI.

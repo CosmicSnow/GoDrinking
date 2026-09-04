@@ -252,6 +252,11 @@ impl MediaEngine {
                 return;
             };
             let accepted = stunar.accepted_roster();
+            let room_ids: HashSet<String> = stunar
+                .room_roster()
+                .into_iter()
+                .map(|(id, _, _, _)| id)
+                .collect();
             let self_id = stunar.self_id.clone();
             let accepted_ids: HashSet<&str> =
                 accepted.iter().map(|(id, _)| id.as_str()).collect();
@@ -269,11 +274,17 @@ impl MediaEngine {
             let mut to_resend: Vec<(String, PeerSignal)> = Vec::new();
             let mut dropped_ids = Vec::new();
             let now = Instant::now();
+            let roster_known = !room_ids.is_empty() || !accepted_ids.is_empty();
             for (id, link) in session.viewers.iter_mut() {
                 if link.peer.status().state == PeerTransportState::Connected {
                     continue;
                 }
-                if !accepted_ids.contains(id.as_str()) {
+                let in_roster = accepted_ids.contains(id.as_str()) || room_ids.contains(id);
+                if super::room_mode::drop_unanswered_link(
+                    session.request.session_mode,
+                    roster_known,
+                    in_roster,
+                ) {
                     dropped_ids.push(id.clone());
                 } else if link.peer.status().state == PeerTransportState::New {
                     if let Some(signal) = link.last_offer.clone() {
@@ -327,9 +338,14 @@ impl MediaEngine {
             };
             let mut watch = Vec::new();
             let mut unwatch = Vec::new();
+            let capturing = guard
+                .session
+                .as_ref()
+                .map(|session| session.native_capture_active)
+                .unwrap_or(false);
             if let Some(session) = guard.session.as_ref() {
                 if let Some(host) = session.stunar.as_ref() {
-                    let (w, u) = host.take_watch_requests();
+                    let (w, u) = host.take_watch_requests(capturing);
                     watch.extend(w);
                     unwatch.extend(u);
                 }
@@ -350,14 +366,13 @@ impl MediaEngine {
                 })
                 .unwrap_or_default();
             if let Some(viewer) = guard.stunar_viewer.as_ref() {
-                let (w, u) = viewer.take_watch_requests();
+                let (w, u) = viewer.take_watch_requests(capturing);
                 watch.extend(w);
                 unwatch.extend(u);
             }
             let Some(session) = guard.session.as_mut() else {
                 return;
             };
-            let capturing = session.native_capture_active;
             let self_id = session
                 .stunar
                 .as_ref()
@@ -922,9 +937,11 @@ impl MediaEngine {
                 response: response_tx,
             })
             .map_err(|_| MediaEngineError::QueueClosed)?;
-        response_rx
+        let snapshot = response_rx
             .recv()
-            .map_err(|_| MediaEngineError::QueueClosed)?
+            .map_err(|_| MediaEngineError::QueueClosed)??;
+        self.apply_stunar_watches();
+        Ok(snapshot)
     }
 
     pub fn stop_share(&self) -> Result<MediaSessionSnapshot, MediaEngineError> {
@@ -1356,17 +1373,21 @@ fn update_credentials_in_state(
 fn start_share_in_state(
     state: &Arc<Mutex<EngineState>>,
 ) -> Result<MediaSessionSnapshot, MediaEngineError> {
-    let mut guard = state.lock().map_err(|_| MediaEngineError::StatePoisoned)?;
-    let capabilities = guard.capabilities.clone();
-    let session = guard
-        .session
-        .as_mut()
-        .ok_or(MediaEngineError::NoActiveSession)?;
+    // Take the session out of the lock: the macOS picker blocks until the
+    // user picks a display, and snapshot()/IPC must keep answering.
+    let (mut session, capabilities) = {
+        let mut guard = state.lock().map_err(|_| MediaEngineError::StatePoisoned)?;
+        let session = guard
+            .session
+            .take()
+            .ok_or(MediaEngineError::NoActiveSession)?;
+        (session, guard.capabilities.clone())
+    };
     if session.native_capture_active {
         if let Some(host) = session.stunar.as_ref() {
             let _ = host.send_share(true);
         }
-        drop(guard);
+        restore_session(state, session)?;
         announce_viewer_share(state, true);
         let guard = state.lock().map_err(|_| MediaEngineError::StatePoisoned)?;
         return Ok(snapshot_from_state(&guard));
@@ -1385,6 +1406,7 @@ fn start_share_in_state(
             diagnostics,
             generation,
         ) {
+            restore_session(state, session)?;
             return Err(MediaEngineError::NativeCapture(error.to_string()));
         }
     }
@@ -1397,6 +1419,7 @@ fn start_share_in_state(
             diagnostics,
             generation,
         ) {
+            restore_session(state, session)?;
             return Err(MediaEngineError::NativeCapture(error));
         }
     }
@@ -1405,44 +1428,54 @@ fn start_share_in_state(
     if let Some(host) = session.stunar.as_ref() {
         let _ = host.send_share(true);
     }
-    drop(guard);
+    restore_session(state, session)?;
     announce_viewer_share(state, true);
     let guard = state.lock().map_err(|_| MediaEngineError::StatePoisoned)?;
     Ok(snapshot_from_state(&guard))
 }
 
+fn restore_session(
+    state: &Arc<Mutex<EngineState>>,
+    session: SessionRecord,
+) -> Result<(), MediaEngineError> {
+    let mut guard = state.lock().map_err(|_| MediaEngineError::StatePoisoned)?;
+    guard.session = Some(session);
+    Ok(())
+}
+
 fn stop_share_in_state(
     state: &Arc<Mutex<EngineState>>,
 ) -> Result<MediaSessionSnapshot, MediaEngineError> {
-    let mut dropped = Vec::new();
-    {
+    let mut session = {
         let mut guard = state.lock().map_err(|_| MediaEngineError::StatePoisoned)?;
-        let session = guard
+        guard
             .session
-            .as_mut()
-            .ok_or(MediaEngineError::NoActiveSession)?;
-        #[cfg(target_os = "macos")]
-        if session.native_capture_active {
-            let _ = session.adapter.stop_capture(session.generation);
+            .take()
+            .ok_or(MediaEngineError::NoActiveSession)?
+    };
+    #[cfg(target_os = "macos")]
+    if session.native_capture_active {
+        let _ = session.adapter.stop_capture(session.generation);
+    }
+    #[cfg(target_os = "windows")]
+    if session.native_capture_active {
+        let _ = session.adapter.stop_capture();
+    }
+    session.native_capture_active = false;
+    let mut dropped = Vec::new();
+    let ids: Vec<String> = session.viewers.keys().cloned().collect();
+    for id in ids {
+        if let Some(fanout) = session.fanout.as_ref() {
+            fanout.unsubscribe(&id);
         }
-        #[cfg(target_os = "windows")]
-        if session.native_capture_active {
-            let _ = session.adapter.stop_capture();
-        }
-        session.native_capture_active = false;
-        let ids: Vec<String> = session.viewers.keys().cloned().collect();
-        for id in ids {
-            if let Some(fanout) = session.fanout.as_ref() {
-                fanout.unsubscribe(&id);
-            }
-            if let Some(link) = session.viewers.remove(&id) {
-                dropped.push(link);
-            }
-        }
-        if let Some(host) = session.stunar.as_ref() {
-            let _ = host.send_share(false);
+        if let Some(link) = session.viewers.remove(&id) {
+            dropped.push(link);
         }
     }
+    if let Some(host) = session.stunar.as_ref() {
+        let _ = host.send_share(false);
+    }
+    restore_session(state, session)?;
     drop(dropped);
     announce_viewer_share(state, false);
     let guard = state.lock().map_err(|_| MediaEngineError::StatePoisoned)?;
@@ -1887,7 +1920,7 @@ mod tests {
         VideoResolution,
     };
 use super::{
-    create_in_state, refresh_native_state, snapshot_from_state, stop_in_state,
+    create_in_state, refresh_native_state, snapshot_from_state, start_share_in_state, stop_in_state,
     update_credentials_in_state, update_in_state, EngineState, MediaEngineError,
 };
     use std::sync::{Arc, Mutex};
@@ -1972,6 +2005,18 @@ use super::{
         let created = create_in_state(&state, open).expect("open room");
         assert_eq!(created.state, MediaLifecycleState::Running);
         assert!(!created.native_capture_active);
+    }
+
+    #[test]
+    fn sala_share_later_keeps_the_room() {
+        let state = test_state();
+        let mut open = request();
+        open.session_mode = super::super::room_mode::SessionMode::Room;
+        open.share_on_start = false;
+        let created = create_in_state(&state, open).expect("open room");
+        let shared = start_share_in_state(&state).expect("share later");
+        assert_eq!(shared.session_id, created.session_id);
+        assert_eq!(shared.state, MediaLifecycleState::Running);
     }
 
     #[test]

@@ -93,6 +93,7 @@ try {
   const masterId = open3.json.member_id;
   const hostWs = new WebSocket(`ws://127.0.0.1:${PORT}/v1/ws?role=host&token=${open3.json.host_token}`);
   const hostMsgs = [];
+  hostWs.on("message", (data) => hostMsgs.push(JSON.parse(String(data))));
   await new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("host ws timeout")), 4000);
     hostWs.on("open", () => {
@@ -101,7 +102,11 @@ try {
     });
     hostWs.on("error", reject);
   });
-  hostWs.on("message", (data) => hostMsgs.push(JSON.parse(String(data))));
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  const firstRoster = hostMsgs.find((msg) => msg.t === "roster");
+  assert.ok(firstRoster, "host should get a roster");
+  const masterEntry = firstRoster.entries.find((entry) => entry.id === masterId);
+  assert.equal(masterEntry.share, false, "host must not look like they are sharing until they start");
   const bob = await post("/v1/viewer/ask", { code: code3, nickname: "Bob", password: "secret1" });
   const bobWs = new WebSocket(`ws://127.0.0.1:${PORT}/v1/ws?role=viewer&token=${bob.json.viewer_token}`);
   await new Promise((resolve, reject) => {

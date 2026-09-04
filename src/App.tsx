@@ -179,9 +179,9 @@ function App() {
   const [watching, setWatching] = useState<Set<string>>(() => new Set());
   const watchingRef = useRef<Set<string>>(new Set());
   watchingRef.current = watching;
-  const [tileSizes, setTileSizes] = useState<Record<string, number>>({});
   const [pinned, setPinned] = useState<string | null>(null);
   const [roomJoined, setRoomJoined] = useState(false);
+  const [roomDesk, setRoomDesk] = useState(false);
   const seenOffers = useRef<Set<string>>(new Set());
   const [joinMode, setJoinMode] = useState<"lan" | "direct" | "stunar">(() => {
     const saved = localStorage.getItem("godrinking.join_mode");
@@ -249,12 +249,14 @@ function App() {
   const stunarJoinPasswordValid = joinMode !== "stunar" || passwordValid(joinPassword);
   const canOpenRoom = nicknameValid && (joinMode !== "stunar" || (Boolean(rendezvousUrl.trim()) && stunarHostPasswordValid));
   const inSala = session?.session_mode === "room" || roomJoined || (sessionMode === "room" && Boolean(session));
+  const onStage = inSala && !roomDesk;
   const roster = session?.roster ?? [];
   const pendingRoster = roster.filter((entry) => entry.state === "pending");
   const connectedRoster = roster.filter((entry) => entry.state !== "pending" && entry.id !== session?.self_id);
+  const roomPeople = roster.filter((entry) => entry.state !== "pending");
   const roomTiles = [
     ...(session?.native_capture_active ? [{ id: "local", nickname: nickname.trim() || "You", stream: null as MediaStream | null, local: true }] : []),
-    ...remoteIds.filter((id) => id !== "local").map((id) => {
+    ...remoteIds.filter((id) => id !== "local" && id !== session?.self_id).map((id) => {
       const slot = remotesRef.current.get(id);
       const person = roster.find((entry) => entry.id === id);
       return {
@@ -557,7 +559,7 @@ function App() {
           frame_rate: resolvedFrameRate,
           system_audio: systemAudio,
           excluded_apps: excludedApps,
-          password: hostPassword,
+          password: joinPassword || hostPassword,
           nickname: nickname.trim() || "Host",
           admission: hostAdmission,
           join_mode: joinMode,
@@ -652,7 +654,10 @@ function App() {
         }
       });
       setSession(next);
-      if (sessionMode === "room") setRoomJoined(true);
+      if (sessionMode === "room") {
+        setRoomJoined(true);
+        setRoomDesk(false);
+      }
       setNotice(next.session_code ? (sessionMode === "room" ? `Room ${next.session_code} is open. Share if you want.` : `Session ${next.session_code} is live. Share that code.`) : next.detail);
     } catch (error) {
       const recovered = await invokeMedia<Snapshot>("get_media_session_state").catch(() => null);
@@ -674,6 +679,7 @@ function App() {
       await invokeMedia("stop_media_session");
       setSession(null);
       setRoomJoined(false);
+      setRoomDesk(false);
       setWatching(new Set());
       watchingRef.current = new Set();
       setPinned(null);
@@ -723,6 +729,7 @@ function App() {
     setRemoteIds([]);
     setStageId("host");
     setRoomJoined(false);
+    setRoomDesk(false);
     setWatching(new Set());
     watchingRef.current = new Set();
     setPinned(null);
@@ -828,6 +835,7 @@ function App() {
         setRoomJoined(true);
         setSessionMode("room");
         setWatchIce("connected");
+        setRoomDesk(false);
         const snap = await invokeMedia<Snapshot>("get_media_session_state").catch(() => null);
         if (snap) setSession(snap);
         setNotice(`In the room ${displayLabel}. Watch who you want.`);
@@ -986,7 +994,7 @@ function App() {
   const permissionLabel = caps === null ? copy.permissionChecking : caps.platform === "windows" ? (caps.native_capture_implemented ? copy.permissionWinReady : copy.permissionUnavailable) : caps.screen_recording_authorization === "granted" ? copy.permissionReady : caps.screen_recording_authorization === "not_granted" ? copy.permissionNeeded : copy.permissionUnavailable;
 
   return (
-    <div className={`app-shell${cinema ? " cinema" : ""}`}>
+    <div className={`app-shell${cinema ? " cinema" : ""}${onStage ? " room-live" : ""}`}>
       <aside className="sidebar">
         <div className="brand">
           <img className="brand-logo" src={logo} alt=""/>
@@ -1024,9 +1032,30 @@ function App() {
             <h1>{mode === "share" ? <>{copy.shareTitle}<br/><em>{copy.shareTitleEm}</em></> : watchConnected ? <>Watching <em>{watchLabel}</em></> : <>{copy.watchTitle}<br/><em>{copy.watchTitleEm}</em></>}</h1>
           </div>
         </div>
-        {watchStreamActive || mode === "watch" ? (
+        {onStage && (
+          <RoomStage
+            tiles={roomTiles}
+            people={roomPeople}
+            selfId={session?.self_id}
+            watching={watching}
+            pinned={pinned}
+            sharing={Boolean(session?.native_capture_active)}
+            shareBusy={sessionAction !== "idle"}
+            canShare={canStart}
+            roomLabel={session?.session_code || watchLabel}
+            onWatch={(id) => void watchMember(id)}
+            onUnwatch={(id) => void unwatchMember(id)}
+            onPin={setPinned}
+            onShare={() => void startRoomShare()}
+            onStopShare={() => void stopRoomShare()}
+            onSettings={() => setRoomDesk(true)}
+            onLeave={() => { if (mode === "watch") disconnectWatch(); else void stopSharing(); }}
+            localCanvas={canvasRef}
+          />
+        )}
+        {(watchStreamActive || mode === "watch") && !onStage ? (
           <div className={`${watchConnected ? "watch-live-grid" : "workspace-grid"}${mode === "share" ? " watch-background" : ""}`} aria-hidden={mode === "share" || undefined}>
-            {!watchConnected && (
+            {(!watchConnected || (inSala && roomDesk)) && (
               <section className="panel controls-panel">
                 <div className="panel-title"><div><span className="section-kicker">{copy.joinKicker}</span><h2>{joinMode === "direct" ? copy.joinHeadingDirect : copy.joinHeadingCode}</h2></div></div>
                 <div className="join-mode-block">
@@ -1064,15 +1093,20 @@ function App() {
                 <label className="native-select-label" htmlFor="join-password">Password {joinMode === "stunar" ? "(required)" : "(optional)"}</label>
                 <input id="join-password" className="native-source" type="password" value={joinPassword} onChange={(event) => setJoinPassword(event.target.value)} placeholder={joinMode === "stunar" ? "Required" : "Only if the host set one"} maxLength={64}/>
                 <p className="start-hint">{notice}</p>
-                <button className="primary-cta" disabled={sessionAction !== "idle" || !nicknameValid || !stunarJoinPasswordValid} onClick={() => void joinRoom()}>
-                  {sessionAction === "joining" ? copy.joining : copy.joinSession}
-                </button>
-                {inSala && (
-                  <button className="copy-button" style={{marginTop: 10, width: "100%"}} disabled={sessionAction !== "idle"} onClick={() => void (session?.native_capture_active ? stopRoomShare() : startRoomShare())}>{session?.native_capture_active ? copy.stopShareMine : copy.shareMine}</button>
+                {inSala && roomDesk ? (
+                  <>
+                    <button className="primary-cta" onClick={() => setRoomDesk(false)}>{copy.backToRoom}</button>
+                    <button className="copy-button" style={{marginTop: 10, width: "100%"}} disabled={sessionAction !== "idle"} onClick={() => void (session?.native_capture_active ? stopRoomShare() : startRoomShare())}>{session?.native_capture_active ? copy.stopShareMine : copy.shareMine}</button>
+                    <button className="watch-disconnect" style={{marginTop: 10, width: "100%"}} onClick={disconnectWatch}>{copy.leaveRoom}</button>
+                  </>
+                ) : (
+                  <button className="primary-cta" disabled={sessionAction !== "idle" || !nicknameValid || !stunarJoinPasswordValid} onClick={() => void joinRoom()}>
+                    {sessionAction === "joining" ? copy.joining : copy.joinSession}
+                  </button>
                 )}
               </section>
             )}
-            <section className={`panel preview-panel ${watchConnected ? "watch-preview" : ""}`}>
+            {!inSala && <section className={`panel preview-panel ${watchConnected ? "watch-preview" : ""}`}>
               <div className="panel-title">
                 <div><span className="section-kicker">{copy.incomingKicker}</span><h2>{copy.incomingHeading}</h2></div>
                 <span className="panel-title-actions">
@@ -1080,34 +1114,11 @@ function App() {
                   <span className={`live-badge ${watchConnected ? "is-live" : ""}`}><i/>{watchConnected ? " Live" : watchIce === "connecting" ? " Waiting" : " Standby"}</span>
                 </span>
               </div>
-              <div className={`preview-screen ${watchConnected || inSala ? "watch-stage" : ""} ${inSala ? "is-room" : ""}`} style={!inSala && watchConnected ? ({ "--watch-zoom": watchZoom } as CSSProperties) : undefined}>
-                {inSala ? (
-                  <RoomStage
-                    tiles={roomTiles}
-                    people={connectedRoster}
-                    selfId={session?.self_id}
-                    watching={watching}
-                    sizes={tileSizes}
-                    pinned={pinned}
-                    sharing={Boolean(session?.native_capture_active)}
-                    shareBusy={sessionAction !== "idle"}
-                    canShare={canStart}
-                    onWatch={(id) => void watchMember(id)}
-                    onUnwatch={(id) => void unwatchMember(id)}
-                    onPin={setPinned}
-                    onSize={(id, delta) => setTileSizes((current) => ({ ...current, [id]: Math.min(3, Math.max(1, (current[id] ?? 1) + delta)) }))}
-                    onShare={() => void startRoomShare()}
-                    onStopShare={() => void stopRoomShare()}
-                    localCanvas={canvasRef}
-                  />
-                ) : (
-                  <>
+              <div className={`preview-screen ${watchConnected ? "watch-stage" : ""}`} style={watchConnected ? ({ "--watch-zoom": watchZoom } as CSSProperties) : undefined}>
                 <video ref={remoteRef} className="remote-preview visible" autoPlay playsInline data-slot="host" style={stageId !== "host" ? { opacity: 0, pointerEvents: "none" } : undefined} />
                 {[...remotesRef.current.entries()].filter(([id]) => id !== "host").map(([id, slot]) => (
                   <video key={id} data-slot={id} className="remote-preview visible" autoPlay playsInline ref={(el) => { if (el && slot.stream && el.srcObject !== slot.stream) el.srcObject = slot.stream; }} style={stageId !== id ? { opacity: 0, pointerEvents: "none" } : undefined} />
                 ))}
-                  </>
-                )}
                 {watchConnected && !inSala && (
                   <>
                     <div className="watch-hud">
@@ -1138,13 +1149,13 @@ function App() {
               {(watchConnected || watchIce === "connecting") && (
                 <div className="watch-status-row">
                   {watchConnected && <p className="watch-status-line">{notice}</p>}
-                  <button className="watch-disconnect" onClick={disconnectWatch}>{inSala ? copy.leaveRoom : "Disconnect"}</button>
+                  <button className="watch-disconnect" onClick={disconnectWatch}>Disconnect</button>
                 </div>
               )}
-            </section>
+            </section>}
           </div>
         ) : null}
-        {mode === "share" && (
+        {mode === "share" && !onStage && (
           <div className="workspace-grid">
             <section className="panel controls-panel">
               <div className="panel-title"><div><span className="section-kicker">{copy.sourceKicker}</span><h2>{copy.sourceHeading}</h2></div></div>
@@ -1327,6 +1338,9 @@ function App() {
                 </>
               )}
               <p className="start-hint">{notice}</p>
+              {inSala && roomDesk && (
+                <button className="primary-cta" style={{marginBottom: 8}} onClick={() => setRoomDesk(false)}>{copy.backToRoom}</button>
+              )}
               {active ? (
                 <>
                   {inSala && (
@@ -1343,33 +1357,10 @@ function App() {
             <div className="right-column">
               <section className="panel preview-panel">
                 <div className="panel-title"><div><span className="section-kicker">{copy.previewKicker}</span><h2>{copy.previewHeading}</h2></div><span className="panel-title-actions"><button className="status-button" onClick={() => setStatsOpen(true)} title="Session status: bitrate, resolution, fps, delay"><Icon name="activity" size={13}/> Status</button><span className="live-badge"><i/>{connected ? " Live" : active ? " Capturing" : " Standby"}</span></span></div>
-                <div className={`preview-screen ${inSala ? "watch-stage is-room" : ""}`}>
-                  {inSala ? (
-                    <RoomStage
-                      tiles={roomTiles}
-                      people={connectedRoster}
-                      selfId={session?.self_id}
-                      watching={watching}
-                      sizes={tileSizes}
-                      pinned={pinned}
-                      sharing={Boolean(session?.native_capture_active)}
-                      shareBusy={sessionAction !== "idle"}
-                      canShare={canStart}
-                      onWatch={(id) => void watchMember(id)}
-                      onUnwatch={(id) => void unwatchMember(id)}
-                      onPin={setPinned}
-                      onSize={(id, delta) => setTileSizes((current) => ({ ...current, [id]: Math.min(3, Math.max(1, (current[id] ?? 1) + delta)) }))}
-                      onShare={() => void startRoomShare()}
-                      onStopShare={() => void stopRoomShare()}
-                      localCanvas={canvasRef}
-                    />
-                  ) : (
-                    <>
+                <div className="preview-screen">
                   <div className="preview-grid"/>
-                  <canvas ref={canvasRef} className={`native-preview ${active ? "visible" : ""}`} aria-label="Native capture preview"/>
+                  <canvas ref={canvasRef} className={`native-preview ${active && !onStage ? "visible" : ""}`} aria-label="Native capture preview"/>
                   <div className={`preview-center ${active ? "is-hidden" : ""}`}><strong>{copy.previewReady}</strong><small>{captureReady ? copy.previewStart : caps?.platform === "windows" ? copy.previewWinDown : copy.previewNeedPerm}</small></div>
-                    </>
-                  )}
                 </div>
               </section>
               <section className="panel connect-panel">
