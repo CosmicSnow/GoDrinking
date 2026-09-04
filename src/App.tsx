@@ -182,6 +182,7 @@ function App() {
   const [pinned, setPinned] = useState<string | null>(null);
   const [roomJoined, setRoomJoined] = useState(false);
   const [roomDesk, setRoomDesk] = useState(false);
+  const salaAliveRef = useRef(false);
   const seenOffers = useRef<Set<string>>(new Set());
   const [joinMode, setJoinMode] = useState<"lan" | "direct" | "stunar">(() => {
     const saved = localStorage.getItem("godrinking.join_mode");
@@ -248,7 +249,7 @@ function App() {
   const stunarHostPasswordValid = joinMode !== "stunar" || passwordValid(hostPassword);
   const stunarJoinPasswordValid = joinMode !== "stunar" || passwordValid(joinPassword);
   const canOpenRoom = nicknameValid && (joinMode !== "stunar" || (Boolean(rendezvousUrl.trim()) && stunarHostPasswordValid));
-  const inSala = session?.session_mode === "room" || roomJoined || (sessionMode === "room" && Boolean(session));
+  const inSala = salaAliveRef.current && (roomJoined || session?.session_mode === "room");
   const onStage = inSala && !roomDesk;
   const roster = session?.roster ?? [];
   const pendingRoster = roster.filter((entry) => entry.state === "pending");
@@ -256,12 +257,12 @@ function App() {
   const roomPeople = roster.filter((entry) => entry.state !== "pending");
   const roomTiles = [
     ...(session?.native_capture_active ? [{ id: "local", nickname: nickname.trim() || "You", stream: null as MediaStream | null, local: true }] : []),
-    ...remoteIds.filter((id) => id !== "local" && id !== session?.self_id).map((id) => {
+    ...remoteIds.filter((id) => id !== "local" && id !== session?.self_id && watching.has(id)).map((id) => {
       const slot = remotesRef.current.get(id);
       const person = roster.find((entry) => entry.id === id);
       return {
         id,
-        nickname: person?.nickname || (id === "host" ? (watchHostName || "Host") : id.slice(0, 6)),
+        nickname: person?.nickname || id.slice(0, 8),
         stream: slot?.stream ?? null,
         local: false
       };
@@ -473,7 +474,9 @@ function App() {
     if (!active && !roomJoined) return undefined;
     const poll = async () => {
       try {
+        if (!salaAliveRef.current) return;
         const next = await invokeMedia<Snapshot>("get_media_session_state");
+        if (!salaAliveRef.current) return;
         setSession(next);
         if (next.preview_error) setNotice(`Native preview: ${next.preview_error}`);
         const frame = await invokeMedia<{ width: number; height: number; encoding: string; payload: number[] } | null>("get_media_preview");
@@ -581,7 +584,6 @@ function App() {
     }
   };
   const stopRoomShare = async () => {
-    if (sessionAction !== "idle") return;
     setSessionAction("stopping");
     try {
       const next = await invokeMedia<Snapshot>("stop_media_share");
@@ -655,6 +657,7 @@ function App() {
       });
       setSession(next);
       if (sessionMode === "room") {
+        salaAliveRef.current = true;
         setRoomJoined(true);
         setRoomDesk(false);
       }
@@ -669,20 +672,49 @@ function App() {
       setSessionAction("idle");
     }
   };
+  const clearSalaUi = () => {
+    salaAliveRef.current = false;
+    joinSeqRef.current += 1;
+    peerRef.current?.close();
+    peerRef.current = null;
+    remoteStreamRef.current = null;
+    if (remoteRef.current) remoteRef.current.srcObject = null;
+    remotesRef.current.forEach((slot) => slot.pc.close());
+    remotesRef.current.clear();
+    seenOffers.current.clear();
+    setRemoteIds([]);
+    setStageId("host");
+    setRoomJoined(false);
+    setRoomDesk(false);
+    setWatching(new Set());
+    watchingRef.current = new Set();
+    setPinned(null);
+    setSession(null);
+    setWatchIce("idle");
+    setWatchCode("");
+    setWatchHostName("");
+    setWatchZoom(1);
+    setSessionAction("idle");
+    leaveImmersive();
+  };
+  const leaveSala = () => {
+    clearSalaUi();
+    setNotice("Left the room.");
+    const cleanup = () => invokeMedia("close_media_peer_transport").catch(() => undefined)
+      .then(() => invokeMedia("stunar_viewer_close").catch(() => undefined))
+      .then(() => invokeMedia("stop_media_session").catch(() => undefined));
+    void cleanup().then(() => {
+      if (salaAliveRef.current) return;
+      window.setTimeout(() => { if (!salaAliveRef.current) void cleanup(); }, 1200);
+    });
+  };
   const stopSharing = async () => {
-    if (sessionAction !== "idle") return;
+    clearSalaUi();
     setSessionAction("stopping");
     try {
-      peerRef.current?.close();
-      peerRef.current = null;
       await invokeMedia("close_media_peer_transport").catch(() => undefined);
+      await invokeMedia("stunar_viewer_close").catch(() => undefined);
       await invokeMedia("stop_media_session");
-      setSession(null);
-      setRoomJoined(false);
-      setRoomDesk(false);
-      setWatching(new Set());
-      watchingRef.current = new Set();
-      setPinned(null);
       setNotice("Session stopped.");
     } catch (error) {
       setNotice(diagnosticError(error, "Native session could not stop."));
@@ -718,29 +750,7 @@ function App() {
     }).catch(() => undefined);
   };
   const disconnectWatch = () => {
-    joinSeqRef.current += 1;
-    peerRef.current?.close();
-    peerRef.current = null;
-    remoteStreamRef.current = null;
-    if (remoteRef.current) remoteRef.current.srcObject = null;
-    remotesRef.current.forEach((slot) => slot.pc.close());
-    remotesRef.current.clear();
-    seenOffers.current.clear();
-    setRemoteIds([]);
-    setStageId("host");
-    setRoomJoined(false);
-    setRoomDesk(false);
-    setWatching(new Set());
-    watchingRef.current = new Set();
-    setPinned(null);
-    void invokeMedia("stunar_viewer_close").catch(() => undefined);
-    setWatchIce("idle");
-    setWatchCode("");
-    setWatchHostName("");
-    setWatchZoom(1);
-    leaveImmersive();
-    setSessionAction("idle");
-    setNotice("Disconnected.");
+    leaveSala();
   };
   const acceptIncomingOffer = async (incoming: IncomingOffer) => {
     if (inSala && !watchingRef.current.has(incoming.from)) return;
@@ -754,7 +764,7 @@ function App() {
       event.streams[0]?.getTracks().forEach((track) => stream.addTrack(track));
       if (!event.streams[0] && event.track) stream.addTrack(event.track);
       remotesRef.current.set(incoming.from, { pc, stream });
-      setRemoteIds(["host", ...[...remotesRef.current.keys()].filter((id) => id !== "host")].filter((id, index, all) => all.indexOf(id) === index));
+      setRemoteIds([...remotesRef.current.keys()].filter((id, index, all) => all.indexOf(id) === index));
       if (stageId === "host" && incoming.from !== "host") setStageId(incoming.from);
       const el = document.querySelector<HTMLVideoElement>(`video[data-slot="${incoming.from}"]`);
       if (el && el.srcObject !== stream) el.srcObject = stream;
@@ -832,12 +842,13 @@ function App() {
       if (!offer.sdp) {
         setWatchCode(targetLabel);
         setWatchHostName(hostName.trim() || "");
+        salaAliveRef.current = true;
         setRoomJoined(true);
         setSessionMode("room");
         setWatchIce("connected");
         setRoomDesk(false);
         const snap = await invokeMedia<Snapshot>("get_media_session_state").catch(() => null);
-        if (snap) setSession(snap);
+        if (salaAliveRef.current && snap) setSession(snap);
         setNotice(`In the room ${displayLabel}. Watch who you want.`);
         return;
       }
@@ -1049,7 +1060,7 @@ function App() {
             onShare={() => void startRoomShare()}
             onStopShare={() => void stopRoomShare()}
             onSettings={() => setRoomDesk(true)}
-            onLeave={() => { if (mode === "watch") disconnectWatch(); else void stopSharing(); }}
+            onLeave={leaveSala}
             localCanvas={canvasRef}
           />
         )}
@@ -1097,7 +1108,7 @@ function App() {
                   <>
                     <button className="primary-cta" onClick={() => setRoomDesk(false)}>{copy.backToRoom}</button>
                     <button className="copy-button" style={{marginTop: 10, width: "100%"}} disabled={sessionAction !== "idle"} onClick={() => void (session?.native_capture_active ? stopRoomShare() : startRoomShare())}>{session?.native_capture_active ? copy.stopShareMine : copy.shareMine}</button>
-                    <button className="watch-disconnect" style={{marginTop: 10, width: "100%"}} onClick={disconnectWatch}>{copy.leaveRoom}</button>
+                    <button className="watch-disconnect" style={{marginTop: 10, width: "100%"}} onClick={() => leaveSala()}>{copy.leaveRoom}</button>
                   </>
                 ) : (
                   <button className="primary-cta" disabled={sessionAction !== "idle" || !nicknameValid || !stunarJoinPasswordValid} onClick={() => void joinRoom()}>
@@ -1348,7 +1359,7 @@ function App() {
                       {session?.native_capture_active ? copy.stopShareMine : copy.shareMine}
                     </button>
                   )}
-                  <button className="primary-cta" disabled={sessionAction !== "idle"} onClick={() => void stopSharing()}>{sessionAction === "stopping" ? copy.stopping : inSala ? copy.closeRoom : copy.stop}</button>
+                  <button className="primary-cta" onClick={() => { if (inSala) leaveSala(); else void stopSharing(); }}>{sessionAction === "stopping" ? copy.stopping : inSala ? copy.closeRoom : copy.stop}</button>
                 </>
               ) : (
                 <button className="primary-cta" disabled={(sessionMode === "room" ? !canOpenRoom : (!canStart || !stunarHostPasswordValid)) || !nicknameValid || sessionAction !== "idle"} onClick={() => void startSharing()}>{sessionAction === "starting" ? copy.starting : sessionMode === "room" ? copy.openRoom : copy.start}</button>

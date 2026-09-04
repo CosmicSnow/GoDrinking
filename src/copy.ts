@@ -1,6 +1,6 @@
 /** UI copy. Short, in place, no brochure voice. */
 
-export const APP_VERSION = "0.3.0-beta.1";
+export const APP_VERSION = "0.4.0";
 
 export const copy = {
   shareNav: "Share screen",

@@ -46,9 +46,18 @@ async fn create_media_session(
 }
 
 /// Stops the active session and releases its native pipeline and stream handles.
+/// Async: ScreenCaptureKit stop must not run on the UI thread (same deadlock
+/// as start — the AppKit run loop has to keep turning).
 #[tauri::command]
-fn stop_media_session(engine: State<'_, MediaEngine>) -> Result<MediaSessionSnapshot, String> {
-    engine.stop_session().map_err(|error| error.to_string())
+async fn stop_media_session(
+    engine: State<'_, MediaEngine>,
+) -> Result<MediaSessionSnapshot, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        engine.stop_session().map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Applies live settings (quality, system audio, exclusions) to the active

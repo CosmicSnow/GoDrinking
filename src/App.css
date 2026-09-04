@@ -84,11 +84,19 @@
 .room-discord-grid{flex:1;display:grid;gap:10px;min-height:0}
 .room-discord-grid.is-spotlight{grid-template-columns:1fr !important;grid-template-rows:1fr !important}
 .room-tile{position:relative;min-width:0;min-height:0;border-radius:8px;background:#11161b;border:1px solid #243038;overflow:hidden}
-.room-video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#0b0e11}
-.room-tile-hud{position:absolute;left:0;right:0;bottom:0;z-index:3;display:flex;justify-content:space-between;gap:8px;padding:8px 10px;background:linear-gradient(transparent,#0d1216ee);font:11px var(--sans);color:#d5ded9}
-.room-tile-actions{display:flex;gap:4px}
+.room-video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#0b0e11;transform-origin:center;transition:transform .15s ease}
+.room-tile-hud{position:absolute;left:0;right:0;bottom:0;z-index:3;display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 10px;background:linear-gradient(transparent,#0d1216ee);font:11px var(--sans);color:#d5ded9}
+.room-tile-actions{display:flex;flex-wrap:wrap;align-items:center;gap:4px;justify-content:flex-end}
 .room-tile-actions button{padding:4px 8px;border-radius:4px;background:#1c2429cc;color:#b9c5c0;font:10px var(--mono)}
 .room-tile-actions button:hover{color:var(--lime)}
+.room-tile-actions button:disabled{opacity:.35}
+.room-tile-vol{-webkit-appearance:none;appearance:none;width:72px;height:3px;margin:0 2px;border-radius:2px;background:#2b353b;outline:none;cursor:pointer}
+.room-tile-vol::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:10px;height:10px;border-radius:50%;background:var(--lime);border:0;cursor:pointer}
+.room-live-shell.is-cinema .room-live-bar,.room-live-shell.is-cinema .room-live-rail,.room-live-shell.is-cinema .room-filmstrip{display:none}
+.room-live-shell.is-cinema .room-live-body{grid-template-columns:1fr}
+.room-live-shell.is-cinema .room-live-stage{padding:0}
+.room-live-shell.is-cinema .room-discord-grid{gap:0}
+.room-live-shell.is-cinema .room-tile{border:0;border-radius:0}
 .room-empty{grid-column:1/-1;grid-row:1/-1;display:grid;place-items:center;align-content:center;gap:6px;color:#8fa096;text-align:center}
 .room-empty strong{font-size:15px;color:#d5ded9}
 .room-empty small{font-size:12px;color:#65737a}
