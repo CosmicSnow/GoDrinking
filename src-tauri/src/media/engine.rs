@@ -1324,7 +1324,7 @@ fn mint_viewer_offer(
             .as_ref()
             .ok_or_else(|| "peer transport is unavailable".to_owned())?;
         let (video_rx, audio_rx) = fanout.subscribe(id);
-        let frame_rate = session.request.effective_frame_rate().hertz();
+        let frame_rate = u64::from(session.request.effective_frame_rate().hertz());
         (
             video_rx,
             audio_rx,
