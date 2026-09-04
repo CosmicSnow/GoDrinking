@@ -1102,6 +1102,7 @@ function App() {
                 <div className="stats-grid">
                   <div><span>Encoder target</span><code>{session?.bitrate_bps ? `${Math.round(session.bitrate_bps / 1e5) / 10} Mbps aplicados` : `${qualityTargetMbps[quality]} Mbps (preset)`} · {qualityTargetLabel[quality]}{bitrateMbps !== null ? " · custom" : ""}</code></div>
                   <div><span>Session / peer</span><code>{session?.state ?? "idle"} / {session?.peer_state ?? "—"}</code></div>
+                  {session?.detail ? <div><span>Session detail</span><code className={session?.state === "failed" ? "is-error" : ""} title={session.detail}>{session.detail}</code></div> : null}
                   <div><span>Viewers connected</span><code>{connectedRoster.length}{pendingRoster.length > 0 ? " (+" + pendingRoster.length + " waiting)" : ""}</code></div>
                   <div><span>Join mode</span><code>{joinMode}{session?.session_code ? " · " + session.session_code : ""}</code></div>
                   <div><span>Capture active</span><code>{session?.native_capture_active ? "yes" : active ? "starting…" : "no"}</code></div>

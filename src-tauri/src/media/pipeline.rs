@@ -16,6 +16,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::access_unit::{AccessUnitQueue, AccessUnitReceiver};
+#[cfg(target_os = "windows")]
+use super::logger;
 use super::types::PreviewFrameEvent;
 use super::types::{FrameRate, TransmissionQuality, VideoCodec, VideoEncoder, VideoResolution};
 
@@ -834,15 +836,29 @@ fn encoder_worker_loop(
         };
         let software_or_fail = |error: String| {
             if backend == VideoEncoder::Hardware {
+                logger::log("ERROR", "encoder", &format!("explicit Hardware failed: {error}"));
                 state.fail(error);
                 None
             } else {
                 eprintln!(
                     "[goDrinking] hardware encoder unavailable ({error}); using OpenH264 software"
                 );
+                logger::log(
+                    "WARN",
+                    "encoder",
+                    &format!("hardware encoder unavailable ({error}); using OpenH264 software"),
+                );
                 match software() {
-                    Ok(encoder) => Some(WindowsVideoEncoder::Software(encoder)),
+                    Ok(encoder) => {
+                        logger::log("INFO", "encoder", "engaged OpenH264 software encoder");
+                        Some(WindowsVideoEncoder::Software(encoder))
+                    }
                     Err(error) => {
+                        logger::log(
+                            "ERROR",
+                            "encoder",
+                            &format!("OpenH264 initialization failed: {error}"),
+                        );
                         state.fail(format!("OpenH264 initialization failed: {error}"));
                         None
                     }
@@ -851,8 +867,16 @@ fn encoder_worker_loop(
         };
         match backend {
             VideoEncoder::Software => match software() {
-                Ok(encoder) => Some(WindowsVideoEncoder::Software(encoder)),
+                Ok(encoder) => {
+                    logger::log("INFO", "encoder", "engaged OpenH264 software encoder");
+                    Some(WindowsVideoEncoder::Software(encoder))
+                }
                 Err(error) => {
+                    logger::log(
+                        "ERROR",
+                        "encoder",
+                        &format!("OpenH264 initialization failed: {error}"),
+                    );
                     state.fail(format!("OpenH264 initialization failed: {error}"));
                     None
                 }
@@ -876,10 +900,13 @@ fn encoder_worker_loop(
                         // the software encoder (Auto) rather than a black
                         // stream. Explicit Hardware fails loudly instead.
                         if encoder.is_high_profile() != want_high {
-                            eprintln!(
-                                "[goDrinking] hardware encoder negotiated {} profile for a {} session; {}",
+                            let message = format!(
+                                "hardware encoder negotiated {} profile for a {} session",
                                 if encoder.is_high_profile() { "High" } else { "Baseline" },
                                 if want_high { "H.264 High" } else { "H.264" },
+                            );
+                            eprintln!(
+                                "[goDrinking] {message}; {}",
                                 if backend == VideoEncoder::Hardware {
                                     "explicit Hardware cannot satisfy it"
                                 } else {
@@ -887,19 +914,41 @@ fn encoder_worker_loop(
                                 }
                             );
                             if backend == VideoEncoder::Hardware {
+                                logger::log("ERROR", "encoder", &message);
                                 state.fail(
                                     "hardware encoder cannot produce the session profile; use Auto or Software".to_owned(),
                                 );
                                 return None;
                             }
+                            logger::log(
+                                "WARN",
+                                "encoder",
+                                &format!("{message}; using OpenH264 software"),
+                            );
                             return match software() {
-                                Ok(encoder) => Some(WindowsVideoEncoder::Software(encoder)),
+                                Ok(encoder) => {
+                                    logger::log("INFO", "encoder", "engaged OpenH264 software encoder");
+                                    Some(WindowsVideoEncoder::Software(encoder))
+                                }
                                 Err(error) => {
+                                    logger::log(
+                                        "ERROR",
+                                        "encoder",
+                                        &format!("OpenH264 initialization failed: {error}"),
+                                    );
                                     state.fail(format!("OpenH264 initialization failed: {error}"));
                                     None
                                 }
                             };
                         }
+                        logger::log(
+                            "INFO",
+                            "encoder",
+                            &format!(
+                                "engaged MF hardware encoder ({} profile)",
+                                if encoder.is_high_profile() { "High" } else { "Baseline" }
+                            ),
+                        );
                         Some(encoder)
                     }
                     Err(error) => software_or_fail(error),
@@ -909,6 +958,7 @@ fn encoder_worker_loop(
     }
 
     let mut encoder: Option<WindowsVideoEncoder> = None;
+    let mut frames_accepted = 0u64;
     let mut pending_output = Some(output);
     // Stashed control command seen while coalescing video frames. A plain
     // try_recv drain would swallow it, so it is replayed at the top of the
@@ -998,9 +1048,25 @@ fn encoder_worker_loop(
                 let Some(active) = encoder.as_mut() else {
                     continue;
                 };
-                if let Err(error) = active.encode(&frame) {
-                    eprintln!("[goDrinking] OpenH264 encode skipped: {error}");
-                    control.request_keyframe();
+                match active.encode(&frame) {
+                    Ok(()) => {
+                        frames_accepted += 1;
+                        if frames_accepted == 1 {
+                            logger::log(
+                                "INFO",
+                                "encoder",
+                                &format!(
+                                    "first frame accepted ({}x{})",
+                                    frame.width, frame.height
+                                ),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("[goDrinking] encode skipped: {error}");
+                        logger::log("WARN", "encoder", &format!("encode skipped: {error}"));
+                        control.request_keyframe();
+                    }
                 }
             }
             EncoderCommand::Flush => {}

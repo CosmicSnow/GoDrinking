@@ -10,8 +10,13 @@
 // retry budget (no B-frames, so output follows input within milliseconds).
 // A synthetic gray frame self-test at construction proves the whole path
 // before the session starts; Auto mode falls back to software when it fails.
+// The self-test validates decodability (SPS profile compatible with the
+// session codec plus an IDR), not just byte output: a "working" MFT with
+// the wrong profile would otherwise black-screen viewers while the host
+// preview looks fine.
 
 use super::access_unit::{bgra_to_nv12, AccessUnitPushResult, AccessUnitQueue};
+use super::logger;
 use super::pipeline::{EncoderControl, NativeFrame, PipelineState};
 use super::types::VideoCodec;
 use super::windows_encoder::AnnexBConverter;
@@ -245,13 +250,53 @@ impl MfH264Encoder {
         };
         let units = encoder.encode_bytes(&test_pixels, 0)?;
         if units.is_empty() {
-            return Err("MF encoder self-test produced no output".into());
+            let message = "MF encoder self-test produced no output".to_owned();
+            logger::log("WARN", "mf encoder", &format!("{message}; falling back to software"));
+            return Err(message);
         }
+        // Validate decodability, not just byte output: the transport drops
+        // every sample whose SPS profile disagrees with the session codec
+        // and waits for a keyframe before sending anything. A hardware MFT
+        // that "succeeds" with the wrong profile (or never emits SPS/IDR)
+        // would black-screen every viewer while the host preview looks
+        // fine, with no error anywhere. Fail the self-test instead so Auto
+        // falls back to OpenH264.
+        let want_high = matches!(video_codec, VideoCodec::H264High);
+        let mut saw_keyframe = false;
+        let mut profile: Option<String> = None;
+        for sample in &units {
+            if let Some(unit) = encoder.converter.convert(sample, 0, false) {
+                saw_keyframe = saw_keyframe || unit.keyframe;
+                if profile.is_none() {
+                    profile = unit.profile_level_id.clone();
+                }
+            }
+        }
+        let profile_ok = profile.as_deref().is_some_and(|id| {
+            let id = id.to_ascii_lowercase();
+            id.len() == 6 && (id.starts_with("42") || (want_high && id.starts_with("64")))
+        });
         eprintln!(
-            "[goDrinking] MF encoder self-test ok ({} byte first sample, nv12={})",
+            "[goDrinking] MF encoder self-test ok ({} byte first sample, nv12={}, profile={:?}, keyframe={})",
             units[0].len(),
-            use_nv12
+            use_nv12,
+            profile,
+            saw_keyframe
         );
+        logger::log(
+            "INFO",
+            "mf encoder",
+            &format!(
+                "self-test ok ({friendly_name}, nv12={use_nv12}, profile={profile:?}, keyframe={saw_keyframe})"
+            ),
+        );
+        if !profile_ok || !saw_keyframe {
+            let message = format!(
+                "MF encoder self-test failed decodability check (profile={profile:?} want_high={want_high}, keyframe={saw_keyframe})"
+            );
+            logger::log("WARN", "mf encoder", &format!("{message}; falling back to software"));
+            return Err(message);
+        }
         Ok(encoder)
     }
 

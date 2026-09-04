@@ -572,7 +572,23 @@ async fn run_peer(
     let sample_worker = tokio::spawn(async move {
         let mut awaiting_keyframe = true;
         let mut previous_timestamp = None;
+        let mut units_seen = 0u64;
+        let mut dropped_awaiting = 0u64;
+        let mut wrote_first = false;
         while let Some(unit) = sample_rx.recv().await {
+            units_seen += 1;
+            if units_seen == 1 {
+                super::logger::log(
+                    "INFO",
+                    "pump",
+                    &format!(
+                        "first access unit received (keyframe={}, {} bytes, profile={:?})",
+                        unit.keyframe,
+                        unit.data.len(),
+                        unit.profile_level_id
+                    ),
+                );
+            }
             if !is_connected(&sample_status) {
                 awaiting_keyframe = true;
                 previous_timestamp = None;
@@ -580,9 +596,20 @@ async fn run_peer(
             }
             if awaiting_keyframe {
                 if !unit.keyframe {
+                    dropped_awaiting += 1;
+                    if dropped_awaiting % 300 == 0 {
+                        super::logger::log(
+                            "WARN",
+                            "pump",
+                            &format!(
+                                "still waiting for first keyframe (dropped {dropped_awaiting} non-keyframe units)"
+                            ),
+                        );
+                    }
                     continue;
                 }
                 awaiting_keyframe = false;
+                super::logger::log("INFO", "pump", "first keyframe seen, starting stream");
             }
             let profile_ok = unit.profile_level_id.as_deref().map_or(true, |profile| {
                 super::access_unit::is_baseline_profile(profile)
@@ -608,6 +635,7 @@ async fn run_peer(
             let duration =
                 duration_from_90khz(previous_timestamp, unit.timestamp_90khz, frame_duration);
             previous_timestamp = Some(unit.timestamp_90khz);
+            let unit_len = unit.data.len();
             let sample = Sample {
                 data: unit.data.into(),
                 timestamp,
@@ -624,6 +652,14 @@ async fn run_peer(
                 );
                 sample_encoder_control.request_stop();
                 break;
+            }
+            if !wrote_first {
+                wrote_first = true;
+                super::logger::log(
+                    "INFO",
+                    "pump",
+                    &format!("first sample written ({unit_len} bytes)"),
+                );
             }
         }
     });

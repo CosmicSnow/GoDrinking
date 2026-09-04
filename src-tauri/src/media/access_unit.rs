@@ -355,6 +355,14 @@ impl AccessUnitQueue {
         AccessUnitPushResult::Enqueued
     }
 
+    /// Explicit shutdown only. Never close on drop: the queue is
+    /// reference-counted (`Clone` shares the inner state), so a dropped
+    /// short-lived clone would poison every other owner. That is exactly
+    /// what black-screened Windows sessions: `create_windows_encoder`
+    /// cloned the session queue into the encoder and the dropped parameter
+    /// closed the shared state, so every `try_push` returned `Closed` and
+    /// no viewer ever received a frame (connected ICE, zero stats, working
+    /// host preview). Threads exit via shutdown flags and this call.
     pub(crate) fn close(&self) {
         if let Ok(mut state) = self.inner.state.lock() {
             state.closed = true;
@@ -364,11 +372,7 @@ impl AccessUnitQueue {
     }
 }
 
-impl Drop for AccessUnitQueue {
-    fn drop(&mut self) {
-        self.close();
-    }
-}
+/// NOTE: no `Drop` impl on purpose (see `close`).
 
 #[allow(dead_code)]
 impl AccessUnitReceiver {
