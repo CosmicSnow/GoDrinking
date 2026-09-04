@@ -10,13 +10,34 @@ pub enum CaptureSource {
 }
 
 /// Native capture target dimensions. These are configuration values, not
-/// evidence that a native capture stream has been created.
+/// evidence that a native capture stream has been created. The source is
+/// fit inside preserving aspect ratio and never upscaled, so picking above
+/// the source size just captures at native size.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum VideoResolution {
+    #[serde(rename = "2160p")]
+    P2160,
+    #[serde(rename = "1440p")]
+    P1440,
     #[serde(rename = "1080p")]
     P1080,
     #[serde(rename = "720p")]
     P720,
+    #[serde(rename = "480p")]
+    P480,
+}
+
+impl VideoResolution {
+    /// Encode ceiling (width, height) for the variant.
+    pub(crate) fn max_dimensions(self) -> (u32, u32) {
+        match self {
+            Self::P2160 => (3840, 2160),
+            Self::P1440 => (2560, 1440),
+            Self::P1080 => (1920, 1080),
+            Self::P720 => (1280, 720),
+            Self::P480 => (854, 480),
+        }
+    }
 }
 
 pub(crate) fn fitted_even_size(
@@ -43,10 +64,22 @@ pub(crate) fn fitted_even_size(
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum FrameRate {
+    #[serde(rename = "120_fps")]
+    Fps120,
     #[serde(rename = "60_fps")]
     Fps60,
     #[serde(rename = "30_fps")]
     Fps30,
+}
+
+impl FrameRate {
+    pub(crate) fn hertz(self) -> u32 {
+        match self {
+            Self::Fps120 => 120,
+            Self::Fps60 => 60,
+            Self::Fps30 => 30,
+        }
+    }
 }
 
 /// Transmission quality presets. When present, the preset wins over
@@ -107,14 +140,6 @@ impl TransmissionQuality {
             Self::Low => (1280, 720),
             Self::Medium => (1920, 1080),
             Self::High => (1920, 1080),
-        }
-    }
-
-    pub(crate) fn frame_rate(self) -> FrameRate {
-        match self {
-            Self::Low => FrameRate::Fps30,
-            Self::Medium => FrameRate::Fps30,
-            Self::High => FrameRate::Fps60,
         }
     }
 
@@ -249,16 +274,18 @@ pub struct CreateMediaSessionRequest {
 }
 
 impl CreateMediaSessionRequest {
-    /// Capture cap (max dimensions) for the session. The quality preset wins
-    /// over `resolution` when present.
+    /// Capture cap (max dimensions) for the session. The explicit
+    /// `resolution` wins; the UI resolves "auto" to the quality preset
+    /// before sending, so callers that only set quality must also send
+    /// the preset-mapped resolution.
     pub(crate) fn capture_cap(&self) -> (u32, u32) {
-        self.quality.max_dimensions()
+        self.resolution.max_dimensions()
     }
 
-    /// Effective frame rate for the session. The quality preset wins over
-    /// `frame_rate` when present.
+    /// Effective frame rate for the session. The explicit `frame_rate`
+    /// wins (same auto-resolution rule as `capture_cap`).
     pub(crate) fn effective_frame_rate(&self) -> FrameRate {
-        self.quality.frame_rate()
+        self.frame_rate
     }
 }
 

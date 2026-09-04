@@ -948,10 +948,10 @@ fn update_in_state(
         return Err(MediaEngineError::NoActiveSession);
     };
 
-    // 1. Quality/bitrate: live bitrate + keyframe. The stored request (and
-    // its derived resolution/frame_rate) follow the preset so snapshots
-    // reflect the effective settings. An explicit bitrate override wins
-    // over the preset for the encoder target.
+    // 1. Quality/bitrate: live bitrate + keyframe. Resolution/frame_rate
+    // are fixed at Start (like codec/encoder) and never rewritten here,
+    // so an explicit choice survives live bitrate tweaks. An explicit
+    // bitrate override wins over the preset for the encoder target.
     let target_changed = session.request.quality != request.quality
         || session.request.bitrate_bps != request.bitrate_bps;
     let target = super::types::resolve_bitrate(request.quality, request.bitrate_bps);
@@ -961,14 +961,6 @@ fn update_in_state(
         let _ = session._pipeline.force_keyframe();
         session.request.quality = request.quality;
         session.request.bitrate_bps = request.bitrate_bps;
-        session.request.resolution = match request.quality {
-            TransmissionQuality::Low => VideoResolution::P720,
-            TransmissionQuality::Medium | TransmissionQuality::High => VideoResolution::P1080,
-        };
-        session.request.frame_rate = match request.quality {
-            TransmissionQuality::High => FrameRate::Fps60,
-            TransmissionQuality::Low | TransmissionQuality::Medium => FrameRate::Fps30,
-        };
     }
     if session.request.min_bitrate_bps != request.min_bitrate_bps {
         // A raised floor re-asserts the encoder immediately so a collapsed
@@ -1332,10 +1324,7 @@ fn mint_viewer_offer(
             .as_ref()
             .ok_or_else(|| "peer transport is unavailable".to_owned())?;
         let (video_rx, audio_rx) = fanout.subscribe(id);
-        let frame_rate = match session.request.effective_frame_rate() {
-            FrameRate::Fps60 => 60,
-            FrameRate::Fps30 => 30,
-        };
+        let frame_rate = session.request.effective_frame_rate().hertz();
         (
             video_rx,
             audio_rx,
@@ -1590,9 +1579,10 @@ use super::{
         .expect("update should succeed");
         assert_eq!(snapshot.state, MediaLifecycleState::Running);
         assert!(snapshot.session_id.is_some());
-        // Quality preset is reflected in the derived resolution/frame_rate.
-        assert_eq!(snapshot.resolution, Some(VideoResolution::P720));
-        assert_eq!(snapshot.frame_rate, Some(FrameRate::Fps30));
+        // Resolution/frame_rate are fixed at Start: a live quality update
+        // must not rewrite them (the request() helper starts P1080/Fps60).
+        assert_eq!(snapshot.resolution, Some(VideoResolution::P1080));
+        assert_eq!(snapshot.frame_rate, Some(FrameRate::Fps60));
         assert_eq!(
             snapshot.excluded_apps,
             vec!["Discord".to_string(), "com.hnc.Discord".to_string()]
@@ -1633,9 +1623,10 @@ use super::{
         .expect("update should not fail the session");
         assert_eq!(snapshot.state, MediaLifecycleState::Running);
         assert!(snapshot.detail.contains("cannot be added mid-session"));
-        // Quality still applied even though audio could not be added.
+        // Quality still applied even though audio could not be added;
+        // resolution/frame_rate stay at the Start values (P1080/Fps60).
         assert_eq!(snapshot.resolution, Some(VideoResolution::P1080));
-        assert_eq!(snapshot.frame_rate, Some(FrameRate::Fps30));
+        assert_eq!(snapshot.frame_rate, Some(FrameRate::Fps60));
     }
 
     #[test]

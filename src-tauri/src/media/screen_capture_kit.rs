@@ -1423,6 +1423,7 @@ mod native {
             requested_height,
         );
         let interval = match request.effective_frame_rate() {
+            FrameRate::Fps120 => unsafe { CMTime::new(1, 120) },
             FrameRate::Fps60 => unsafe { CMTime::new(1, 60) },
             FrameRate::Fps30 => unsafe { CMTime::new(1, 30) },
         };

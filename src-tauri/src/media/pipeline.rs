@@ -410,7 +410,7 @@ impl NativePipeline {
     pub(crate) fn new(
         preview: Arc<PreviewState>,
         resolution: VideoResolution,
-        _frame_rate: FrameRate,
+        frame_rate: FrameRate,
         quality: TransmissionQuality,
         bitrate_bps: Option<u32>,
         min_bitrate_bps: Option<u32>,
@@ -443,15 +443,10 @@ impl NativePipeline {
         let preview_shutdown = Arc::clone(&shutdown);
         let encoder_completion_worker = Arc::clone(&encoder_completion);
         let preview_completion_worker = Arc::clone(&preview_completion);
-        let (width, height) = match resolution {
-            VideoResolution::P1080 => (1920, 1080),
-            VideoResolution::P720 => (1280, 720),
-        };
-        // The quality preset wins over `frame_rate` for the encoder fps.
-        let fps = match quality.frame_rate() {
-            FrameRate::Fps60 => 60,
-            FrameRate::Fps30 => 30,
-        };
+        let (width, height) = resolution.max_dimensions();
+        // The explicit request frame rate wins over the quality preset
+        // (the UI resolves "auto" to the preset before sending).
+        let fps = frame_rate.hertz();
         let encoder_worker = thread::Builder::new()
             .name("godrinking-media-encoder".into())
             .spawn(move || {

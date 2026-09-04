@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 
 import "./index.css";
 import "./App.css";
 import logo from "./assets/logo.png";
-import { AUTO_FLOOR_MBPS, BITRATE_MAX_MBPS, BITRATE_MIN_MBPS, FLOOR_MAX_MBPS, FLOOR_MIN_MBPS, collectViewerStats, qualityTargetLabel, qualityTargetMbps, type ViewerStats, type ViewerStatsPrev } from "./sessionStats";
+import { AUTO_FLOOR_MBPS, BITRATE_MAX_MBPS, BITRATE_MIN_MBPS, FLOOR_MAX_MBPS, FLOOR_MIN_MBPS, collectViewerStats, qualityTargetMbps, type ViewerStats, type ViewerStatsPrev } from "./sessionStats";
 
 type IconName = "grid" | "monitor" | "window" | "game" | "settings" | "help" | "plus" | "copy" | "wifi" | "chevron" | "expand" | "minimize" | "volume" | "volume-off" | "terminal" | "activity";
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
@@ -34,7 +34,7 @@ type RunningApp = { name: string; bundle_id?: string | null; pid: number; emitti
 type Capabilities = { platform?: string; supported: boolean; native_capture_implemented: boolean; screen_capture_kit: boolean; source_enumeration_available: boolean; screen_recording_authorization: "granted" | "not_granted" | "unsupported"; app_audio_exclusion: "enhanced" | "best_effort" | "unsupported"; av1_encode_supported?: boolean; detail: string };
 type RosterEntry = { id: string; nickname: string; state: string };
 type DirectAddress = { ip: string; port: number; version: number; kind: string; copy: string };
-type Snapshot = { state: string; session_id: string | null; source_id: number | null; bitrate_bps: number | null; native_capture_active: boolean; preview_callback_count: number; preview_frame_count: number; preview_dropped_count: number; preview_error: string | null; detail: string; peer_state: string; peer_detail: string; session_code: string | null; lan_addresses: string[]; lan_port: number | null; roster?: RosterEntry[]; password_set?: boolean; admission?: boolean; join_mode?: string; direct_listen_port?: number | null; direct_addresses?: DirectAddress[]; direct_mapping?: boolean; stunar_state?: string | null };
+type Snapshot = { state: string; session_id: string | null; source_id: number | null; bitrate_bps: number | null; native_capture_active: boolean; preview_callback_count: number; preview_frame_count: number; preview_dropped_count: number; preview_error: string | null; detail: string; peer_state: string; peer_detail: string; session_code: string | null; lan_addresses: string[]; lan_port: number | null; roster?: RosterEntry[]; password_set?: boolean; admission?: boolean; join_mode?: string; direct_listen_port?: number | null; direct_addresses?: DirectAddress[]; direct_mapping?: boolean; stunar_state?: string | null; resolution?: string | null; frame_rate?: string | null };
 type Signal = { type: "offer" | "answer"; sdp: string; id?: string };
 type LogSession = { session: string; timestamp: string; lines: string[] };
 type ViewerLinkStats = { id: string; nickname: string; state: string; rtt_ms: number | null };
@@ -119,9 +119,14 @@ function App() {
   // Backend do encoder no Windows, fixo no Start (Auto = hardware se houver).
   const [videoEncoder, setVideoEncoder] = useState<"auto" | "software" | "hardware">("auto");
   const hevcAvailable = caps?.platform === "macos";
-  // H.264 High funciona no Windows (Media Foundation / OpenH264) e no macOS
-  // (VideoToolbox). HEVC continua só macOS: não há encoder HEVC no Windows.
-  const h264HighAvailable = caps?.platform === "macos" || caps?.platform === "windows";
+  // H.264 High foi removido da UI (não conecta; só H.264). HEVC continua
+  // só macOS: não há encoder HEVC no Windows.
+  // Resolução/fps explícitos, fixos no Start. "auto" segue o preset de
+  // qualidade. A saída respeita o aspecto da fonte e nunca faz upscale.
+  const [resolution, setResolution] = useState<"auto" | "480p" | "720p" | "1080p" | "1440p" | "2160p">("auto");
+  const [frameFps, setFrameFps] = useState<"auto" | "30_fps" | "60_fps" | "120_fps">("auto");
+  const resolvedResolution = resolution === "auto" ? qualityPresets[quality].resolution : resolution;
+  const resolvedFrameRate = frameFps === "auto" ? qualityPresets[quality].frame_rate : frameFps;
   const effectiveFloorMbps = Math.min(minBitrateMbps ?? AUTO_FLOOR_MBPS, effectiveMbps);
   const [systemAudio, setSystemAudio] = useState(false);
   const [excludedApps, setExcludedApps] = useState<string[]>([]);
@@ -432,7 +437,6 @@ function App() {
       if (!nicknameValid) throw new Error("Enter a nickname (2–24 letters, numbers, spaces, _ - .).");
       if (joinMode === "stunar" && !rendezvousUrl.trim()) throw new Error("Set the Stunar URL in settings.");
       if (joinMode === "stunar" && !passwordValid(hostPassword)) throw new Error("Stunar requires a password (4–64 characters).");
-      const preset = qualityPresets[quality];
       const next = await invokeMedia<Snapshot>("create_media_session", {
         request: {
           source: sourceKind === "display" ? "screen" : "window",
@@ -442,8 +446,8 @@ function App() {
           min_bitrate_bps: minBitrateMbps !== null ? Math.round(minBitrateMbps * 1_000_000) : null,
           codec: videoCodec,
           encoder: videoEncoder,
-          resolution: preset.resolution,
-          frame_rate: preset.frame_rate,
+          resolution: resolvedResolution,
+          frame_rate: resolvedFrameRate,
           system_audio: systemAudio,
           excluded_apps: excludedApps,
           password: hostPassword,
@@ -876,15 +880,37 @@ function App() {
                   </div>
                   <p className="quality-hint">Low 720p 30 · Medium 1080p 30 · High 1080p 60</p>
                   <div className="bitrate-label-row">
+                    <span>Resolution</span>
+                    <code>{resolvedResolution}{resolution === "auto" ? " · preset" : ""}</code>
+                  </div>
+                  <div className="segmented">
+                    <button className={resolution === "auto" ? "selected" : ""} onClick={() => setResolution("auto")} disabled={active} title="Segue o preset de qualidade">Auto</button>
+                    <button className={resolution === "480p" ? "selected" : ""} onClick={() => setResolution("480p")} disabled={active} title="854x480 ou menor, conforme a fonte">&lt;HD</button>
+                    <button className={resolution === "720p" ? "selected" : ""} onClick={() => setResolution("720p")} disabled={active} title="1280x720 ou menor">HD</button>
+                    <button className={resolution === "1080p" ? "selected" : ""} onClick={() => setResolution("1080p")} disabled={active} title="1920x1080 ou menor">Full HD</button>
+                    <button className={resolution === "1440p" ? "selected" : ""} onClick={() => setResolution("1440p")} disabled={active} title="2560x1440 ou menor">2K</button>
+                    <button className={resolution === "2160p" ? "selected" : ""} onClick={() => setResolution("2160p")} disabled={active} title="3840x2160 ou menor; 4K pede encoder Hardware">4K</button>
+                  </div>
+                  <div className="bitrate-label-row">
+                    <span>Frame rate</span>
+                    <code>{resolvedFrameRate.replace("_fps", "fps")}{frameFps === "auto" ? " · preset" : ""}</code>
+                  </div>
+                  <div className="segmented">
+                    <button className={frameFps === "auto" ? "selected" : ""} onClick={() => setFrameFps("auto")} disabled={active} title="Segue o preset de qualidade">Auto</button>
+                    <button className={frameFps === "30_fps" ? "selected" : ""} onClick={() => setFrameFps("30_fps")} disabled={active}>30</button>
+                    <button className={frameFps === "60_fps" ? "selected" : ""} onClick={() => setFrameFps("60_fps")} disabled={active}>60</button>
+                    <button className={frameFps === "120_fps" ? "selected" : ""} onClick={() => setFrameFps("120_fps")} disabled={active} title="120fps exige fonte e rede folgadas">120</button>
+                  </div>
+                  <p className="quality-hint">Saída limitada à fonte (sem upscale, mantém o aspecto do ultrawide). Software trava em 1080p; 1440p/4K pedem Hardware.</p>
+                  <div className="bitrate-label-row">
                     <span>Codec</span>
-                    <code>{videoCodec === "hevc" ? "HEVC/H.265" : videoCodec === "h264high" ? "H.264 High" : "H.264"}{caps?.av1_encode_supported ? " · AV1 HW a caminho" : ""}</code>
+                    <code>{videoCodec === "hevc" ? "HEVC/H.265" : "H.264"}{caps?.av1_encode_supported ? " · AV1 HW a caminho" : ""}</code>
                   </div>
                   <div className="segmented">
                     <button className={videoCodec === "h264" ? "selected" : ""} onClick={() => setVideoCodec("h264")} disabled={active}>H.264</button>
-                    <button className={videoCodec === "h264high" ? "selected" : ""} onClick={() => setVideoCodec("h264high")} disabled={active || !h264HighAvailable} title={h264HighAvailable ? "H.264 High — melhor qualidade no mesmo bitrate, qualquer browser abre" : "H.264 High exige macOS ou Windows"}>H.264 High</button>
                     <button className={videoCodec === "hevc" ? "selected" : ""} onClick={() => setVideoCodec("hevc")} disabled={active || !hevcAvailable} title={hevcAvailable ? "HEVC/H.265 — viewers precisam de browser com H.265" : "HEVC exige macOS"}>HEVC</button>
                   </div>
-                  {videoCodec === "hevc" && <p className="quality-hint">HEVC economiza ~40% de bitrate, mas cada viewer precisa de decode H.265 no browser — se o peer travar em connecting, volte para H.264 High.</p>}
+                  {videoCodec === "hevc" && <p className="quality-hint">HEVC economiza ~40% de bitrate, mas cada viewer precisa de decode H.265 no browser — se o peer travar em connecting, volte para H.264.</p>}
                   {caps?.platform === "windows" && <>
                     <div className="bitrate-label-row">
                       <span>Encoder</span>
@@ -1100,7 +1126,7 @@ function App() {
             {mode === "share" ? (
               <>
                 <div className="stats-grid">
-                  <div><span>Encoder target</span><code>{session?.bitrate_bps ? `${Math.round(session.bitrate_bps / 1e5) / 10} Mbps aplicados` : `${qualityTargetMbps[quality]} Mbps (preset)`} · {qualityTargetLabel[quality]}{bitrateMbps !== null ? " · custom" : ""}</code></div>
+                  <div><span>Encoder target</span><code>{session?.bitrate_bps ? `${Math.round(session.bitrate_bps / 1e5) / 10} Mbps aplicados` : `${qualityTargetMbps[quality]} Mbps (preset)`} · {(session?.resolution ?? resolvedResolution)} · {(session?.frame_rate ?? resolvedFrameRate).replace("_fps", "fps")}{bitrateMbps !== null ? " · custom" : ""}</code></div>
                   <div><span>Session / peer</span><code>{session?.state ?? "idle"} / {session?.peer_state ?? "—"}</code></div>
                   {session?.detail ? <div><span>Session detail</span><code className={session?.state === "failed" ? "is-error" : ""} title={session.detail}>{session.detail}</code></div> : null}
                   <div><span>Viewers connected</span><code>{connectedRoster.length}{pendingRoster.length > 0 ? " (+" + pendingRoster.length + " waiting)" : ""}</code></div>
@@ -1140,7 +1166,7 @@ function App() {
                 </div>
                 {!watchConnected && <p className="stats-hint">Sem mídia ainda — os números aparecem após conectar.</p>}
                 {watchConnected && (viewerStats?.bitrateMbps === null || viewerStats?.bitrateMbps === undefined) && <p className="stats-hint">Coletando amostras… aguarde 1–2s.</p>}
-                <p className="stats-hint">Bitrate &lt; 1 Mbps com imagem quadriculada = rede forçando o encoder para baixo. Compare com o alvo do Host ({qualityTargetLabel[quality]}).</p>
+                <p className="stats-hint">Bitrate &lt; 1 Mbps com imagem quadriculada = rede forçando o encoder para baixo. Compare com o alvo do Host (preset {quality}: {qualityTargetMbps[quality]} Mbps).</p>
               </>
             )}
           </div>

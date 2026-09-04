@@ -71,8 +71,11 @@ const PREVIEW_HEIGHT: u32 = 90;
 // becomes 1920x540 at High), always even for the encoder.
 fn encode_ceiling(resolution: VideoResolution) -> (u32, u32) {
     match resolution {
+        VideoResolution::P2160 => (3840, 2160),
+        VideoResolution::P1440 => (2560, 1440),
         VideoResolution::P1080 => (1920, 1080),
         VideoResolution::P720 => (1280, 720),
+        VideoResolution::P480 => (854, 480),
     }
 }
 
@@ -422,10 +425,7 @@ impl WindowsCaptureAdapter {
         if self.capture.is_some() {
             return Err("Windows capture is already active".into());
         }
-        let fps = match request.effective_frame_rate() {
-            FrameRate::Fps60 => 60,
-            FrameRate::Fps30 => 30,
-        };
+        let fps = request.effective_frame_rate().hertz();
         let (target_width, target_height) = encode_ceiling(request.resolution);
         let min_frame_interval = Duration::from_micros(1_000_000 / fps as u64);
         logger::log(
