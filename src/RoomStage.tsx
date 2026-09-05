@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type PointerEvent, type RefObject } from "react";
-import { collectViewerStats, type ViewerStatsPrev } from "./sessionStats";
+import { collectViewerStats, startVideoPlayback, type ViewerStatsPrev } from "./sessionStats";
 import type { Copy } from "./copy";
 
 export type RoomPerson = {
@@ -138,6 +138,9 @@ function TileVideo({
             if (tile.stream && el.srcObject !== tile.stream) el.srcObject = tile.stream;
             el.muted = ctl.muted;
             el.volume = ctl.muted ? 0 : ctl.volume / 100;
+            // Caught play() pattern (phase-2C): autoplay rejections stay
+            // silent playback-blocked outcomes, never unhandled rejections.
+            void startVideoPlayback(el).catch(() => undefined);
           }}
         />
       )}
@@ -320,15 +323,16 @@ export function RoomStage({
                   {tile.local ? (
                     <canvas className="room-thumb-video" aria-hidden="true"/>
                   ) : (
-                    <video
-                      className="room-thumb-video"
-                      autoPlay
-                      playsInline
-                      muted
-                      ref={(el) => {
-                        if (el && tile.stream && el.srcObject !== tile.stream) el.srcObject = tile.stream;
-                      }}
-                    />
+                      <video
+                        className="room-thumb-video"
+                        autoPlay
+                        playsInline
+                        muted
+                        ref={(el) => {
+                          if (el && tile.stream && el.srcObject !== tile.stream) el.srcObject = tile.stream;
+                          if (el) void startVideoPlayback(el).catch(() => undefined);
+                        }}
+                      />
                   )}
                   <span>{tile.nickname}</span>
                 </button>

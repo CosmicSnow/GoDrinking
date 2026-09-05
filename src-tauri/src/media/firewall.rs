@@ -42,7 +42,13 @@ pub fn reset_firewall_rules() -> Result<String, String> {
     if out == "ok" || (ps.status.success() && err.is_empty()) {
         // Tenta limpar também via netsh (best-effort, silencioso)
         let _ = Command::new("netsh")
-            .args(["advfirewall", "firewall", "delete", "rule", "name=goDrinking"])
+            .args([
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
+                "name=goDrinking",
+            ])
             .output();
         Ok("regras goDrinking removidas (se existiam). Na próxima vez que iniciar Direct/LAN como Host, o Windows deve mostrar o prompt de Firewall — sem precisar rodar o app como Admin.".into())
     } else {

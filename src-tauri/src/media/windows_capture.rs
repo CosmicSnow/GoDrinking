@@ -15,12 +15,16 @@ use super::types::{
     CaptureSource, CreateMediaSessionRequest, FrameRate, NativeCaptureSource, NativeRunningApp,
     NativeSourceKind, VideoCodec, VideoResolution,
 };
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
+use windows_capture::capture::{
+    CaptureControl, Context, GraphicsCaptureApiError, GraphicsCaptureApiHandler,
+};
 use windows_capture::frame::Frame;
 use windows_capture::graphics_capture_api::{GraphicsCaptureApi, InternalCaptureControl};
 use windows_capture::monitor::Monitor;
@@ -29,6 +33,72 @@ use windows_capture::settings::{
     GraphicsCaptureItemType, MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
 use windows_capture::window::Window;
+
+/// Cancellation shared by native Start and Stop callers.
+#[derive(Clone, Debug, Default)]
+pub struct CaptureCancellationToken(Arc<AtomicBool>);
+
+impl CaptureCancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_atomic(flag: Arc<AtomicBool>) -> Self {
+        Self(flag)
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl From<Arc<AtomicBool>> for CaptureCancellationToken {
+    fn from(flag: Arc<AtomicBool>) -> Self {
+        Self::from_atomic(flag)
+    }
+}
+
+pub type StartCancellationToken = CaptureCancellationToken;
+
+pub(crate) type CaptureShutdownStatus = super::process_tap::ShutdownStatus;
+
+fn shutdown_quiescent() -> CaptureShutdownStatus {
+    CaptureShutdownStatus {
+        quiesced: true,
+        pending: Vec::new(),
+        errors: Vec::new(),
+    }
+}
+
+fn shutdown_pending(component: &'static str) -> CaptureShutdownStatus {
+    CaptureShutdownStatus {
+        quiesced: false,
+        pending: vec![component],
+        errors: Vec::new(),
+    }
+}
+
+fn shutdown_error(error: impl Into<String>) -> CaptureShutdownStatus {
+    CaptureShutdownStatus {
+        quiesced: false,
+        pending: Vec::new(),
+        errors: vec![error.into()],
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureLifecycle {
+    Idle,
+    Starting,
+    Running,
+    Stopping,
+    Failed,
+    CleanupPending,
+}
 
 /// A capture source resolved from a session request.
 enum CaptureTarget {
@@ -47,6 +117,7 @@ struct CaptureFlags {
     target_height: u32,
     baseline_cap: bool,
     min_frame_interval: Duration,
+    cancellation: CaptureCancellationToken,
 }
 
 /// Error type required by `GraphicsCaptureApiHandler`. Frame-handling errors
@@ -115,7 +186,11 @@ fn downscale_bgra(
     if src_stride < row_bytes {
         return None;
     }
-    if src.len() < src_stride.checked_mul(src_h.saturating_sub(1))?.checked_add(row_bytes)? {
+    if src.len()
+        < src_stride
+            .checked_mul(src_h.saturating_sub(1))?
+            .checked_add(row_bytes)?
+    {
         return None;
     }
     let mut dst = vec![0_u8; dst_w.checked_mul(dst_h)?.checked_mul(4)?];
@@ -140,7 +215,9 @@ fn downscale_bgra(
 }
 
 // Small RGB thumbnail derived from a BGRA source frame for the preview
-// queue. Same nearest-neighbor sampling the macOS path uses.
+// queue. Same nearest-neighbor sampling the macOS path uses. Host
+// convenience only: this RGB thumbnail is never proof of viewer color
+// correctness (the canonical path is NV12 BT.709 limited into the encoder).
 fn thumbnail_rgb(
     src: &[u8],
     src_stride: usize,
@@ -158,7 +235,11 @@ fn thumbnail_rgb(
     if src_stride < row_bytes {
         return None;
     }
-    if src.len() < src_stride.checked_mul(src_h.saturating_sub(1))?.checked_add(row_bytes)? {
+    if src.len()
+        < src_stride
+            .checked_mul(src_h.saturating_sub(1))?
+            .checked_add(row_bytes)?
+    {
         return None;
     }
     let mut dst = vec![0_u8; dst_w * dst_h * 3];
@@ -196,6 +277,7 @@ struct CaptureHandler {
     target_height: u32,
     baseline_cap: bool,
     min_frame_interval: Duration,
+    cancellation: CaptureCancellationToken,
     last_processed: Option<Instant>,
     sequence: AtomicU64,
     callbacks: u64,
@@ -220,6 +302,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             target_height: context.flags.target_height,
             baseline_cap: context.flags.baseline_cap,
             min_frame_interval: context.flags.min_frame_interval,
+            cancellation: context.flags.cancellation,
             last_processed: None,
             sequence: AtomicU64::new(0),
             callbacks: 0,
@@ -236,6 +319,10 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         frame: &mut Frame,
         _capture_control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
+        if self.cancellation.is_cancelled() {
+            _capture_control.stop();
+            return Ok(());
+        }
         self.callbacks += 1;
         // Pace BEFORE any expensive work: giant sources (5120x1440 ultrawide
         // is 29MB/frame) cost more per callback than the source frame
@@ -297,9 +384,8 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         let downsized = match (encoded, thumb) {
             (Some(encoded), Some(thumb)) => Some((encoded, thumb)),
             _ => {
-                self.diagnostics.record_error(
-                    "Windows capture downscale failed: undersized frame buffer.",
-                );
+                self.diagnostics
+                    .record_error("Windows capture downscale failed: undersized frame buffer.");
                 None
             }
         };
@@ -345,9 +431,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         });
         match result {
             Ok(()) => {
-                self.diagnostics
-                    .frame_count
-                    .fetch_add(1, Ordering::Relaxed);
+                self.diagnostics.frame_count.fetch_add(1, Ordering::Relaxed);
             }
             Err(TrySendError::Full(_)) => {
                 self.diagnostics
@@ -414,12 +498,113 @@ impl CaptureHandler {
 /// Owns the active WGC capture session. Dropping the adapter stops the capture
 /// thread, so a session that is never explicitly stopped cannot leak.
 pub(crate) struct WindowsCaptureAdapter {
-    capture: Option<CaptureControl<CaptureHandler, CaptureError>>,
+    capture: Option<WindowsCaptureWorker>,
+    lifecycle: CaptureLifecycle,
+}
+
+type CaptureThreadResult = Result<(), GraphicsCaptureApiError<CaptureError>>;
+
+/// Owns both halves of the windows-capture worker. The upstream
+/// `CaptureControl::stop` consumes its control before reporting a posting
+/// error, so retaining these handles here lets us report Pending and retry
+/// without detaching a COM-affine thread.
+struct WindowsCaptureWorker {
+    thread: Option<JoinHandle<CaptureThreadResult>>,
+    halt: Arc<AtomicBool>,
+}
+
+impl WindowsCaptureWorker {
+    fn from_control(control: CaptureControl<CaptureHandler, CaptureError>) -> Self {
+        let halt = control.halt_handle();
+        let thread = control.into_thread_handle();
+        Self {
+            thread: Some(thread),
+            halt,
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.thread.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    fn request_stop(&self) -> Result<(), String> {
+        use std::os::windows::prelude::AsRawHandle;
+        use windows::Win32::Foundation::{ERROR_INVALID_THREAD_ID, HANDLE, LPARAM, WPARAM};
+        use windows::Win32::System::Threading::GetThreadId;
+        use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
+
+        self.halt.store(true, std::sync::atomic::Ordering::Release);
+        let Some(thread) = self.thread.as_ref() else {
+            return Ok(());
+        };
+        if thread.is_finished() {
+            return Ok(());
+        }
+        let thread_id = unsafe { GetThreadId(HANDLE(thread.as_raw_handle())) };
+        if thread_id == 0 {
+            return Err("Windows capture worker thread id is unavailable".into());
+        }
+        loop {
+            match unsafe {
+                PostThreadMessageW(thread_id, WM_QUIT, WPARAM::default(), LPARAM::default())
+            } {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if error.code()
+                        == windows::core::HRESULT::from_win32(ERROR_INVALID_THREAD_ID.0) =>
+                {
+                    if thread.is_finished() {
+                        return Ok(());
+                    }
+                    thread::yield_now();
+                }
+                Err(error) => return Err(format!("failed to post worker shutdown: {error}")),
+            }
+        }
+    }
+
+    fn wait(&mut self, timeout: Duration) -> CaptureShutdownStatus {
+        let deadline = Instant::now() + timeout;
+        while !self.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        if !self.is_finished() {
+            return shutdown_pending("windows capture worker");
+        }
+        let Some(thread) = self.thread.take() else {
+            return shutdown_quiescent();
+        };
+        match thread.join() {
+            Ok(Ok(())) => shutdown_quiescent(),
+            Ok(Err(error)) => shutdown_error(error.to_string()),
+            Err(_) => shutdown_error("Windows capture worker panicked"),
+        }
+    }
+}
+
+impl Drop for WindowsCaptureWorker {
+    fn drop(&mut self) {
+        if self.thread.is_some() {
+            let _ = self.request_stop();
+            // A worker owns WinRT/COM objects and must not be detached.
+            let _ = self.wait(Duration::from_secs(10));
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
 }
 
 impl WindowsCaptureAdapter {
     pub(crate) fn new() -> Self {
-        Self { capture: None }
+        Self {
+            capture: None,
+            lifecycle: CaptureLifecycle::Idle,
+        }
+    }
+
+    pub(crate) fn lifecycle(&self) -> CaptureLifecycle {
+        self.lifecycle
     }
 
     pub(crate) fn start_capture(
@@ -430,10 +615,42 @@ impl WindowsCaptureAdapter {
         diagnostics: Arc<PreviewDiagnostics>,
         generation: u64,
     ) -> Result<(), String> {
+        self.start_capture_with_cancellation(
+            request,
+            capture_tx,
+            encoder_tx,
+            diagnostics,
+            generation,
+            CaptureCancellationToken::new(),
+        )
+    }
+
+    pub(crate) fn start_capture_with_cancellation(
+        &mut self,
+        request: &CreateMediaSessionRequest,
+        capture_tx: SyncSender<NativeFrame>,
+        encoder_tx: SyncSender<EncoderCommand>,
+        diagnostics: Arc<PreviewDiagnostics>,
+        generation: u64,
+        cancellation: CaptureCancellationToken,
+    ) -> Result<(), String> {
         if self.capture.is_some() {
             return Err("Windows capture is already active".into());
         }
+        if cancellation.is_cancelled() {
+            self.lifecycle = CaptureLifecycle::Idle;
+            return Err("Windows capture start was cancelled".into());
+        }
+        // 60 fps envelope, rejected before acquisition (the Share slot never
+        // starts, so no restart semantics are involved).
         let fps = request.effective_frame_rate().hertz();
+        if !super::pipeline::fps_within_envelope(fps) {
+            self.lifecycle = CaptureLifecycle::Idle;
+            return Err(format!(
+                "frame rate {fps} fps exceeds the 60 fps product envelope"
+            ));
+        }
+        self.lifecycle = CaptureLifecycle::Starting;
         let (target_width, target_height) = encode_ceiling(request.resolution);
         // Baseline sessions encode at most 1920 wide: fit straight to the
         // final size here so the encoder never re-scales (and the MFT gets
@@ -457,28 +674,84 @@ impl WindowsCaptureAdapter {
             target_height,
             baseline_cap,
             min_frame_interval,
+            cancellation: cancellation.clone(),
         };
-        let control = match resolve_target(request)? {
-            CaptureTarget::Monitor(monitor) => {
-                start_free_threaded(monitor, flags, fps)?
+        let control = match resolve_target(request).and_then(|target| {
+            if cancellation.is_cancelled() {
+                return Err("Windows capture start was cancelled".into());
             }
-            CaptureTarget::Window(window) => start_free_threaded(window, flags, fps)?,
+            match target {
+                CaptureTarget::Monitor(monitor) => start_free_threaded(monitor, flags, fps),
+                CaptureTarget::Window(window) => start_free_threaded(window, flags, fps),
+            }
+        }) {
+            Ok(control) => control,
+            Err(error) => {
+                self.lifecycle = CaptureLifecycle::Idle;
+                return Err(error);
+            }
         };
+        let worker = WindowsCaptureWorker::from_control(control);
+        if cancellation.is_cancelled() {
+            self.capture = Some(worker);
+            let _ = self.stop_capture_with_timeout(Duration::from_secs(10));
+            return Err("Windows capture start was cancelled".into());
+        }
         eprintln!(
             "[goDrinking] starting Windows Graphics Capture source={:?} source_id={:?}",
             request.source, request.source_id
         );
-        self.capture = Some(control);
+        self.capture = Some(worker);
+        self.lifecycle = CaptureLifecycle::Running;
         Ok(())
     }
 
     pub(crate) fn stop_capture(&mut self) -> Result<(), String> {
-        if let Some(control) = self.capture.take() {
-            control
-                .stop()
-                .map_err(|error| format!("Windows capture stop failed: {error}"))?;
+        let status = self.stop_capture_with_timeout(Duration::from_secs(10));
+        if status.quiesced {
+            Ok(())
+        } else if status.errors.is_empty() {
+            Err("Windows capture stop is pending".into())
+        } else {
+            Err(format!(
+                "Windows capture stop failed: {}",
+                status.errors.join("; ")
+            ))
         }
-        Ok(())
+    }
+
+    pub(crate) fn stop_capture_with_timeout(&mut self, timeout: Duration) -> CaptureShutdownStatus {
+        let Some(worker) = self.capture.as_mut() else {
+            self.lifecycle = CaptureLifecycle::Idle;
+            return shutdown_quiescent();
+        };
+        self.lifecycle = CaptureLifecycle::Stopping;
+        if let Err(error) = worker.request_stop() {
+            self.lifecycle = if worker.is_finished() {
+                CaptureLifecycle::Failed
+            } else {
+                CaptureLifecycle::CleanupPending
+            };
+            return shutdown_error(error);
+        }
+        let result = worker.wait(timeout);
+        match &result {
+            status if status.quiesced => {
+                self.capture = None;
+                self.lifecycle = CaptureLifecycle::Idle;
+            }
+            status if status.errors.is_empty() => self.lifecycle = CaptureLifecycle::CleanupPending,
+            _ => self.lifecycle = CaptureLifecycle::Failed,
+        }
+        result
+    }
+
+    pub(crate) fn shutdown(&mut self) -> CaptureShutdownStatus {
+        self.shutdown_with_timeout(Duration::from_secs(10))
+    }
+
+    pub(crate) fn shutdown_with_timeout(&mut self, timeout: Duration) -> CaptureShutdownStatus {
+        self.stop_capture_with_timeout(timeout)
     }
 
     pub(crate) fn enumerate_sources() -> Result<Vec<NativeCaptureSource>, String> {
@@ -488,10 +761,7 @@ impl WindowsCaptureAdapter {
         for (index, monitor) in monitors.iter().enumerate() {
             let width = monitor.width().ok().map(u64::from);
             let height = monitor.height().ok().map(u64::from);
-            let title = monitor
-                .name()
-                .ok()
-                .or_else(|| monitor.device_string().ok());
+            let title = monitor.name().ok().or_else(|| monitor.device_string().ok());
             sources.push(NativeCaptureSource {
                 id: (index + 1) as u64,
                 kind: NativeSourceKind::Display,
@@ -538,7 +808,11 @@ impl WindowsCaptureAdapter {
                 });
             }
         }
-        apps.sort_by(|left, right| left.name.to_ascii_lowercase().cmp(&right.name.to_ascii_lowercase()));
+        apps.sort_by(|left, right| {
+            left.name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase())
+        });
         apps.dedup_by(|left, right| left.pid == right.pid);
         Ok(apps)
     }
@@ -546,9 +820,7 @@ impl WindowsCaptureAdapter {
 
 impl Drop for WindowsCaptureAdapter {
     fn drop(&mut self) {
-        if let Some(control) = self.capture.take() {
-            let _ = control.stop();
-        }
+        let _ = self.shutdown();
     }
 }
 
@@ -605,8 +877,7 @@ where
         GraphicsCaptureApi::is_minimum_update_interval_supported().unwrap_or(true);
     // The system draws a colored border around the captured item; users find
     // it ugly, so turn it off where the OS allows (same probe-and-fallback).
-    let borderless_supported =
-        GraphicsCaptureApi::is_border_settings_supported().unwrap_or(true);
+    let borderless_supported = GraphicsCaptureApi::is_border_settings_supported().unwrap_or(true);
     if !borderless_supported {
         logger::log(
             "WARN",
@@ -658,8 +929,7 @@ where
         Err(error) => {
             let message = error.to_string();
             let interval_fallback = custom_supported && is_min_interval_unsupported(&message);
-            let border_fallback =
-                borderless_supported && message.to_lowercase().contains("border");
+            let border_fallback = borderless_supported && message.to_lowercase().contains("border");
             if interval_fallback || border_fallback {
                 logger::log(
                     "WARN",
@@ -697,4 +967,59 @@ fn monotonic_micros() -> u64 {
         .elapsed()
         .as_micros()
         .min(u64::MAX as u128) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fit_within, CaptureCancellationToken, CaptureLifecycle};
+
+    #[test]
+    fn encode_fit_applies_baseline_cap_and_preserves_aspect() {
+        // 5120x1440 ultrawide arrives as 1920x528 Baseline, never 16:9.
+        assert_eq!(fit_within(5120, 1440, 1920, 1080, true), (1920, 528));
+        let (w, h) = fit_within(3440, 1440, 1920, 1080, true);
+        assert_eq!(w, 1920);
+        assert_eq!((w % 16, h % 16), (0, 0));
+        assert!(((w as f64) / (h as f64) - 3440.0 / 1440.0).abs() < 0.03);
+        // Non-Baseline keeps the wider pixel-budget fit.
+        let (w, h) = fit_within(5120, 1440, 1920, 1080, false);
+        assert!(w * h <= 1920 * 1080);
+        assert_eq!((w % 16, h % 16), (0, 0));
+        // Broadcast sizes pass through untouched.
+        assert_eq!(fit_within(1920, 1080, 1920, 1080, true), (1920, 1080));
+        assert_eq!(fit_within(1280, 720, 1920, 1080, true), (1280, 720));
+    }
+
+    #[test]
+    fn sixty_fps_envelope_is_checked_before_acquisition() {
+        use super::super::pipeline::fps_within_envelope;
+        assert!(fps_within_envelope(30));
+        assert!(fps_within_envelope(60));
+        assert!(!fps_within_envelope(120));
+    }
+
+    #[test]
+    fn start_cancellation_token_is_observed_by_all_clones() {
+        let token = CaptureCancellationToken::new();
+        let clone = token.clone();
+        assert!(!clone.is_cancelled());
+        token.cancel();
+        assert!(clone.is_cancelled());
+    }
+
+    #[test]
+    fn shutdown_status_distinguishes_quiescent_pending_and_error() {
+        let quiescent = super::shutdown_quiescent();
+        assert!(quiescent.quiesced);
+        let pending = super::shutdown_pending("worker");
+        assert!(!pending.quiesced);
+        assert_eq!(pending.pending, vec!["worker"]);
+        let error = super::shutdown_error("worker failure");
+        assert!(!error.quiesced);
+        assert_eq!(error.errors, vec!["worker failure"]);
+        assert_eq!(
+            CaptureLifecycle::CleanupPending,
+            CaptureLifecycle::CleanupPending
+        );
+    }
 }

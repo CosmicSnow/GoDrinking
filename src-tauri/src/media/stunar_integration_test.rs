@@ -64,6 +64,172 @@ mod stunar_integration {
         }
     }
 
+    fn prepare_protocol_up(base: &str) -> bool {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let client = reqwest::Client::new();
+            let response = client
+                .post(format!("{base}/v1/host/prepare"))
+                .json(&serde_json::json!({ "password": "probe", "nickname": "Probe" }))
+                .send()
+                .await
+                .ok();
+            let Some(response) = response else {
+                return false;
+            };
+            if !response.status().is_success() {
+                return false;
+            }
+            let json: serde_json::Value = response.json().await.unwrap_or_default();
+            let Some(token) = json["prepare_token"].as_str() else {
+                return false;
+            };
+            let _ = client
+                .post(format!("{base}/v1/host/abort"))
+                .json(&serde_json::json!({ "prepare_token": token }))
+                .send()
+                .await;
+            true
+        })
+    }
+
+    #[test]
+    fn prepared_stunar_session_is_inert_until_commit_and_abortable() {
+        let base = "http://127.0.0.1:8787";
+        if !prepare_protocol_up(base) {
+            eprintln!("SKIP: rendezvous prepare protocol not running on {base}");
+            return;
+        }
+        let host = StunarHost::start_inactive(
+            base,
+            "senha",
+            "Ana",
+            false,
+            super::super::room_mode::SessionMode::Broadcast,
+        )
+        .expect("prepare");
+        let code = host.code();
+        assert!(!host.ingress_active());
+        assert!(host.accepted_roster().is_empty());
+        assert!(host
+            .send_signal(
+                "viewer",
+                &PeerSignal {
+                    kind: PeerSignalKind::Offer,
+                    sdp: "v=0\r\n".into(),
+                    id: Some("viewer".into()),
+                },
+            )
+            .is_err());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let undiscoverable = runtime.block_on(async {
+            let response = reqwest::Client::new()
+                .post(format!("{base}/v1/viewer/ask"))
+                .json(&serde_json::json!({
+                    "code": code,
+                    "password": "senha",
+                    "nickname": "Joao",
+                }))
+                .send()
+                .await
+                .unwrap();
+            response.status() == reqwest::StatusCode::NOT_FOUND
+        });
+        assert!(undiscoverable);
+        host.abort().expect("abort prepare");
+    }
+
+    #[test]
+    fn prepared_stunar_session_commits_before_viewer_admission() {
+        let base = "http://127.0.0.1:8787";
+        if !prepare_protocol_up(base) {
+            eprintln!("SKIP: rendezvous prepare protocol not running on {base}");
+            return;
+        }
+        let host = StunarHost::start_inactive(
+            base,
+            "senha",
+            "Ana",
+            false,
+            super::super::room_mode::SessionMode::Broadcast,
+        )
+        .expect("prepare");
+        let code = host.code();
+        host.commit().expect("commit");
+        assert!(host.ingress_active());
+        let accepted = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let response = reqwest::Client::new()
+                    .post(format!("{base}/v1/viewer/ask"))
+                    .json(&serde_json::json!({
+                        "code": code,
+                        "password": "senha",
+                        "nickname": "Joao",
+                    }))
+                    .send()
+                    .await
+                    .unwrap();
+                response.status().is_success()
+            });
+        assert!(accepted);
+        host.close();
+    }
+
+    #[test]
+    fn prepared_commit_retry_is_idempotent_and_keeps_one_room() {
+        let base = "http://127.0.0.1:8787";
+        if !prepare_protocol_up(base) {
+            eprintln!("SKIP: rendezvous prepare protocol not running on {base}");
+            return;
+        }
+        let host = StunarHost::start_inactive(
+            base,
+            "senha",
+            "Ana",
+            false,
+            super::super::room_mode::SessionMode::Broadcast,
+        )
+        .expect("prepare");
+        let code = host.code();
+        host.commit().expect("commit");
+        // Lost-response retry: committing again is safe and keeps the same
+        // Room code instead of creating a second Room.
+        host.commit().expect("commit retry");
+        assert!(host.ingress_active());
+        assert_eq!(host.code(), code);
+        let admitted = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let response = reqwest::Client::new()
+                    .post(format!("{base}/v1/viewer/ask"))
+                    .json(&serde_json::json!({
+                        "code": code,
+                        "password": "senha",
+                        "nickname": "Joao",
+                    }))
+                    .send()
+                    .await
+                    .unwrap();
+                response.status().is_success()
+            });
+        assert!(admitted, "committed Room must admit Viewers");
+        // A committed Session can no longer be aborted.
+        assert!(host.abort().is_err());
+        host.close();
+    }
+
     #[test]
     fn stunar_signal_path_with_admission() {
         let base = "http://127.0.0.1:8787";
@@ -71,7 +237,14 @@ mod stunar_integration {
             eprintln!("SKIP: rendezvous not running on {base}");
             return;
         }
-        let host = StunarHost::start(base, "senha", "Ana", true, super::super::room_mode::SessionMode::Broadcast).expect("open");
+        let host = StunarHost::start(
+            base,
+            "senha",
+            "Ana",
+            true,
+            super::super::room_mode::SessionMode::Broadcast,
+        )
+        .expect("open");
         let code = host.code();
         assert_eq!(code.len(), 6);
         assert!(code.chars().all(|ch| ch.is_ascii_alphanumeric()));
@@ -101,7 +274,8 @@ mod stunar_integration {
         )
         .expect("send offer");
 
-        let (token, offer, viewer_ws) = viewer.join().expect("viewer thread").expect("viewer offer");
+        let (token, offer, viewer_ws) =
+            viewer.join().expect("viewer thread").expect("viewer offer");
         assert!(!token.is_empty());
         assert_eq!(offer.sdp, "v=0\r\n");
 
@@ -116,8 +290,8 @@ mod stunar_integration {
         )
         .expect("submit answer");
         let answer = wait_for(|| host.take_answers().into_iter().next(), "host answer");
-        assert_eq!(answer.id.as_deref(), Some(id.as_str()));
-        assert_eq!(answer.sdp, "v=0\r\n");
+        assert_eq!(answer.signal.id.as_deref(), Some(id.as_str()));
+        assert_eq!(answer.signal.sdp, "v=0\r\n");
 
         // Close removes the room: a fresh ask is denied.
         host.close();
@@ -129,7 +303,9 @@ mod stunar_integration {
         let denied = runtime.block_on(async {
             let response = reqwest::Client::new()
                 .post(format!("{base}/v1/viewer/ask"))
-                .json(&serde_json::json!({ "code": code, "password": "senha", "nickname": "Outro" }))
+                .json(
+                    &serde_json::json!({ "code": code, "password": "senha", "nickname": "Outro" }),
+                )
                 .send()
                 .await
                 .unwrap();
@@ -145,7 +321,14 @@ mod stunar_integration {
             eprintln!("SKIP: rendezvous not running on {base}");
             return;
         }
-        let host = StunarHost::start(base, "senha", "Ana", false, super::super::room_mode::SessionMode::Broadcast).expect("open");
+        let host = StunarHost::start(
+            base,
+            "senha",
+            "Ana",
+            false,
+            super::super::room_mode::SessionMode::Broadcast,
+        )
+        .expect("open");
         let code = host.code();
 
         // Viewer asks; admission off => accepted immediately, no pending step.
@@ -171,7 +354,8 @@ mod stunar_integration {
         )
         .expect("send offer");
 
-        let (_token, offer, _viewer_ws) = viewer.join().expect("viewer thread").expect("viewer offer");
+        let (_token, offer, _viewer_ws) =
+            viewer.join().expect("viewer thread").expect("viewer offer");
         assert_eq!(offer.sdp, "v=0\r\n");
         host.close();
     }
@@ -183,7 +367,14 @@ mod stunar_integration {
             eprintln!("SKIP: rendezvous not running on {base}");
             return;
         }
-        let host = StunarHost::start(base, "senha", "Ana", false, super::super::room_mode::SessionMode::Broadcast).expect("open");
+        let host = StunarHost::start(
+            base,
+            "senha",
+            "Ana",
+            false,
+            super::super::room_mode::SessionMode::Broadcast,
+        )
+        .expect("open");
         let code = host.code();
         assert_eq!(code.len(), 6);
 

@@ -56,7 +56,9 @@ fn logs_dir() -> Option<PathBuf> {
 }
 
 fn state() -> std::sync::MutexGuard<'static, Option<LoggerState>> {
-    LOGGER.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    LOGGER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Keeps only the newest `MAX_SESSIONS` log files. File names sort
@@ -105,7 +107,11 @@ pub fn begin_session(role: &str, mode: &str) {
         let mut guard = state();
         *guard = Some(LoggerState { file });
     }
-    log("INFO", "session", &format!("log file opened ({role}/{mode})"));
+    log(
+        "INFO",
+        "session",
+        &format!("log file opened ({role}/{mode})"),
+    );
 }
 
 /// Writes `[HH:MM:SS.mmm] LEVEL event: details` to the current session file.
@@ -127,7 +133,11 @@ pub fn log(level: &str, event: &str, details: &str) {
         // Same pid suffix as sessions: early logs from two local instances
         // must not share a file either.
         let (secs, _) = now_parts();
-        let name = format!("session-{}-app-app-p{}.log", stamp(secs), std::process::id());
+        let name = format!(
+            "session-{}-app-app-p{}.log",
+            stamp(secs),
+            std::process::id()
+        );
         let file = OpenOptions::new()
             .create(true)
             .append(true)

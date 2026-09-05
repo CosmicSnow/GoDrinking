@@ -8,8 +8,12 @@
 //! waits on the WS for accepted + offer (up to 65s), then sends the answer
 //! signal. Media never touches the Rendezvous.
 
+use super::control_plane::{
+    EpochFence, FencedPeerSignal, OfferEpochFence, SessionEpoch, ShareEpoch,
+};
 use super::logger;
 use super::peer_transport::{PeerSignal, PeerSignalKind};
+use super::room::{offer_fence_summary, IngressGate};
 use super::types::StunarState;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
@@ -28,6 +32,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const WS_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const VIEWER_WAIT_TIMEOUT: Duration = Duration::from_secs(65);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
+const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -55,7 +60,9 @@ fn ws_url(base: &str, role: &str, token: &str) -> Result<String, String> {
 }
 
 async fn connect_ws(url: &str) -> Result<WsStream, String> {
-    let (ws, _) = connect_async(url).await.map_err(|error| error.to_string())?;
+    let (ws, _) = connect_async(url)
+        .await
+        .map_err(|error| error.to_string())?;
     Ok(ws)
 }
 
@@ -84,10 +91,93 @@ enum Outgoing {
     Close,
 }
 
+struct WorkerCompletion {
+    done: Mutex<bool>,
+    wake: std::sync::Condvar,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShutdownStatus {
+    pub(crate) quiesced: bool,
+    pub(crate) pending: Vec<&'static str>,
+    pub(crate) errors: Vec<String>,
+}
+
+fn mark_worker_complete(completion: &WorkerCompletion) {
+    if let Ok(mut done) = completion.done.lock() {
+        *done = true;
+        completion.wake.notify_all();
+    }
+}
+
+struct CompletionGuard(Arc<WorkerCompletion>);
+
+impl Drop for CompletionGuard {
+    fn drop(&mut self) {
+        mark_worker_complete(&self.0);
+    }
+}
+
+fn join_rendezvous_worker(
+    worker: &mut Option<JoinHandle<()>>,
+    completion: &Arc<WorkerCompletion>,
+    timeout: Duration,
+    component: &'static str,
+) -> ShutdownStatus {
+    let mut status = ShutdownStatus {
+        quiesced: true,
+        pending: Vec::new(),
+        errors: Vec::new(),
+    };
+    let Some(handle) = worker.as_ref() else {
+        return status;
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    let Ok(mut done) = completion.done.lock() else {
+        status.quiesced = false;
+        status
+            .errors
+            .push(format!("{component} completion state is poisoned"));
+        return status;
+    };
+    if !*done {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            status.quiesced = false;
+            status.pending.push(component);
+            return status;
+        }
+        let Ok((next, _)) = completion.wake.wait_timeout(done, remaining) else {
+            status.quiesced = false;
+            status
+                .errors
+                .push(format!("{component} completion wait failed"));
+            return status;
+        };
+        done = next;
+    }
+    if !*done || !handle.is_finished() {
+        status.quiesced = false;
+        status.pending.push(component);
+        return status;
+    }
+    drop(done);
+    let handle = worker
+        .take()
+        .expect("Rendezvous worker handle still present");
+    if handle.join().is_err() {
+        status.quiesced = false;
+        status.errors.push(format!("{component} panicked"));
+    }
+    status
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct StunarIncomingOffer {
     pub from: String,
     pub sdp: String,
+    #[serde(default)]
+    pub fence: Option<OfferEpochFence>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -95,6 +185,7 @@ struct WsInbox {
     roster: Option<HashMap<String, RosterViewer>>,
     master_id: Option<String>,
     answers: Vec<PeerSignal>,
+    answer_fences: Vec<Option<OfferEpochFence>>,
     offers: Vec<StunarIncomingOffer>,
     watch_from: Vec<String>,
     unwatch_from: Vec<String>,
@@ -171,10 +262,18 @@ fn apply_ws_message(text: &str, inbox: &mut WsInbox) {
                         Some(from.to_owned())
                     },
                 });
+                inbox.answer_fences.push(
+                    payload
+                        .get("fence")
+                        .and_then(|fence| serde_json::from_value(fence.clone()).ok()),
+                );
             } else if kind == Some("offer") && !from.is_empty() {
                 inbox.offers.push(StunarIncomingOffer {
                     from: from.to_owned(),
                     sdp: sdp.to_owned(),
+                    fence: payload
+                        .get("fence")
+                        .and_then(|fence| serde_json::from_value(fence.clone()).ok()),
                 });
             }
         }
@@ -206,7 +305,10 @@ pub(crate) struct StunarHost {
     /// viewer_id -> (nickname, "pending" | "accepted"), synced from the
     /// Rendezvous roster (authoritative) and the pending/decide messages.
     roster: Arc<Mutex<HashMap<String, RosterViewer>>>,
-    answers: Arc<Mutex<Vec<PeerSignal>>>,
+    answers: Arc<Mutex<Vec<FencedPeerSignal>>>,
+    exact_answers: Arc<Mutex<Vec<(PeerSignal, OfferEpochFence)>>>,
+    offer_fences: Arc<Mutex<HashMap<String, EpochFence>>>,
+    exact_offer_fences: Arc<Mutex<HashMap<String, OfferEpochFence>>>,
     incoming_offers: Arc<Mutex<Vec<StunarIncomingOffer>>>,
     watch_from: Arc<Mutex<Vec<String>>>,
     unwatch_from: Arc<Mutex<Vec<String>>>,
@@ -214,7 +316,13 @@ pub(crate) struct StunarHost {
     pub(crate) self_id: Option<String>,
     outgoing: UnboundedSender<Outgoing>,
     shutdown: Arc<AtomicBool>,
-    _worker: Option<JoinHandle<()>>,
+    ingress: IngressGate,
+    /// False while the server-side prepare lease is unadvertised. This is
+    /// separate from ingress so a failed commit cannot accidentally publish
+    /// local roster or signaling effects.
+    committed: AtomicBool,
+    completion: Arc<WorkerCompletion>,
+    worker: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone, Debug)]
@@ -236,6 +344,41 @@ impl StunarHost {
         admission: bool,
         session_mode: super::room_mode::SessionMode,
     ) -> Result<Self, String> {
+        Self::start_with_ingress(
+            base,
+            password,
+            nickname,
+            admission,
+            session_mode,
+            IngressGate::active(),
+        )
+    }
+
+    pub(crate) fn start_inactive(
+        base: &str,
+        password: &str,
+        nickname: &str,
+        admission: bool,
+        session_mode: super::room_mode::SessionMode,
+    ) -> Result<Self, String> {
+        Self::start_with_ingress(
+            base,
+            password,
+            nickname,
+            admission,
+            session_mode,
+            IngressGate::inactive(),
+        )
+    }
+
+    fn start_with_ingress(
+        base: &str,
+        password: &str,
+        nickname: &str,
+        admission: bool,
+        session_mode: super::room_mode::SessionMode,
+        ingress: IngressGate,
+    ) -> Result<Self, String> {
         logger::begin_session("host", "stunar");
         logger::log(
             "INFO",
@@ -244,31 +387,62 @@ impl StunarHost {
         );
         let runtime = current_thread_runtime()?;
         let client = http_client()?;
-        let (host_token, code, self_id) =
-            runtime.block_on(host_open(&client, base, password, nickname, admission, session_mode))?;
+        let committed = ingress.is_active();
+        let (host_token, code, self_id) = if committed {
+            runtime.block_on(host_open(
+                &client,
+                base,
+                password,
+                nickname,
+                admission,
+                session_mode,
+            ))?
+        } else {
+            runtime.block_on(host_prepare(
+                &client,
+                base,
+                password,
+                nickname,
+                admission,
+                session_mode,
+            ))?
+        };
         let state = Arc::new(Mutex::new(StunarState::Calling));
         let roster = Arc::new(Mutex::new(HashMap::new()));
         let answers = Arc::new(Mutex::new(Vec::new()));
+        let exact_answers = Arc::new(Mutex::new(Vec::new()));
+        let offer_fences = Arc::new(Mutex::new(HashMap::new()));
+        let exact_offer_fences = Arc::new(Mutex::new(HashMap::new()));
         let incoming_offers = Arc::new(Mutex::new(Vec::new()));
         let watch_from = Arc::new(Mutex::new(Vec::new()));
         let unwatch_from = Arc::new(Mutex::new(Vec::new()));
         let master_id = Arc::new(Mutex::new(None));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let completion = Arc::new(WorkerCompletion {
+            done: Mutex::new(false),
+            wake: std::sync::Condvar::new(),
+        });
         let (outgoing_tx, outgoing_rx) = unbounded_channel();
         let worker_base = base.to_owned();
         let worker_token = host_token.clone();
         let worker_state = Arc::clone(&state);
         let worker_roster = Arc::clone(&roster);
         let worker_answers = Arc::clone(&answers);
+        let worker_exact_answers = Arc::clone(&exact_answers);
+        let worker_offer_fences = Arc::clone(&offer_fences);
+        let worker_exact_offer_fences = Arc::clone(&exact_offer_fences);
         let worker_offers = Arc::clone(&incoming_offers);
         let worker_watch = Arc::clone(&watch_from);
         let worker_unwatch = Arc::clone(&unwatch_from);
         let worker_master = Arc::clone(&master_id);
         let worker_shutdown = Arc::clone(&shutdown);
+        let worker_ingress = ingress.clone();
+        let worker_completion = Arc::clone(&completion);
         let worker = thread::Builder::new()
             .name("godrinking-stunar-host".into())
             .spawn(move || {
                 let Ok(runtime) = current_thread_runtime() else {
+                    mark_worker_complete(&worker_completion);
                     return;
                 };
                 let _ = runtime.block_on(host_worker(
@@ -277,15 +451,45 @@ impl StunarHost {
                     worker_state,
                     worker_roster,
                     worker_answers,
+                    worker_exact_answers,
+                    worker_offer_fences,
+                    worker_exact_offer_fences,
                     worker_offers,
                     worker_watch,
                     worker_unwatch,
                     worker_master,
                     worker_shutdown,
+                    worker_ingress,
+                    worker_completion,
                     outgoing_rx,
                 ));
-            })
-            .map_err(|error| error.to_string())?;
+            });
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(error) => {
+                let cleanup_action = if committed { "close" } else { "abort" };
+                let cleanup = match (current_thread_runtime(), http_client()) {
+                    (Ok(runtime), Ok(client)) if committed => {
+                        runtime.block_on(post_close(&client, base, &host_token))
+                    }
+                    (Ok(runtime), Ok(client)) => {
+                        runtime.block_on(post_abort(&client, base, &host_token))
+                    }
+                    (Err(runtime_error), _) => {
+                        Err(format!("could not create cleanup runtime: {runtime_error}"))
+                    }
+                    (_, Err(client_error)) => {
+                        Err(format!("could not create cleanup client: {client_error}"))
+                    }
+                };
+                return Err(match cleanup {
+                    Ok(()) => error.to_string(),
+                    Err(cleanup_error) => format!(
+                        "{error}; failed to {cleanup_action} Stunar start transaction: {cleanup_error}"
+                    ),
+                });
+            }
+        };
         Ok(Self {
             base: base.to_owned(),
             code: Mutex::new(code),
@@ -293,6 +497,9 @@ impl StunarHost {
             state,
             roster,
             answers,
+            exact_answers,
+            offer_fences,
+            exact_offer_fences,
             incoming_offers,
             watch_from,
             unwatch_from,
@@ -300,7 +507,10 @@ impl StunarHost {
             self_id,
             outgoing: outgoing_tx,
             shutdown,
-            _worker: Some(worker),
+            ingress,
+            committed: AtomicBool::new(committed),
+            completion,
+            worker: Some(worker),
         })
     }
 
@@ -318,14 +528,109 @@ impl StunarHost {
             .unwrap_or(StunarState::Unreachable)
     }
 
-    pub(crate) fn take_answers(&self) -> Vec<PeerSignal> {
+    pub(crate) fn take_answers(&self) -> Vec<FencedPeerSignal> {
         self.answers
             .lock()
             .map(|mut answers| std::mem::take(&mut *answers))
             .unwrap_or_default()
     }
 
+    pub(crate) fn take_exact_answers(&self) -> Vec<(PeerSignal, OfferEpochFence)> {
+        self.exact_answers
+            .lock()
+            .map(|mut answers| std::mem::take(&mut *answers))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn activate(&self) -> Result<(), String> {
+        self.commit()
+    }
+
+    /// Publishes a prepared Stunar Session. The server Room remains
+    /// undiscoverable until this call succeeds.
+    pub(crate) fn commit(&self) -> Result<(), String> {
+        if self.committed.load(Ordering::Acquire) {
+            self.ingress.activate();
+            return Ok(());
+        }
+        let runtime = current_thread_runtime()?;
+        let client = http_client()?;
+        runtime.block_on(post_commit(&client, &self.base, &self.host_token))?;
+        self.committed.store(true, Ordering::Release);
+        self.ingress.activate();
+        // Retrying commit after a lost response is safe: the server returns
+        // the same Room instead of creating a second one.
+        logger::log(
+            "INFO",
+            "stunar commit",
+            &format!("prepared Session activated code={}", self.code()),
+        );
+        Ok(())
+    }
+
+    /// Aborts an uncommitted Stunar prepare lease. It is safe to call during
+    /// rollback; the worker and its JoinHandle remain owned for cleanup retry.
+    pub(crate) fn abort(&self) -> Result<(), String> {
+        self.ingress.deactivate();
+        self.shutdown.store(true, Ordering::Release);
+        let _ = self.outgoing.send(Outgoing::Close);
+        if self.committed.load(Ordering::Acquire) {
+            return Err("Stunar Session is already committed".into());
+        }
+        let runtime = current_thread_runtime()?;
+        let client = http_client()?;
+        let result = runtime.block_on(post_abort(&client, &self.base, &self.host_token));
+        if result.is_ok() {
+            logger::log("INFO", "stunar abort", "prepared Session aborted");
+        }
+        result
+    }
+
+    pub(crate) fn deactivate(&self) {
+        self.ingress.deactivate();
+    }
+
+    pub(crate) fn ingress_active(&self) -> bool {
+        self.ingress.is_active()
+    }
+
+    pub(crate) fn remember_offer_fence(&self, id: &str, fence: EpochFence) {
+        if let Ok(mut fences) = self.offer_fences.lock() {
+            fences.insert(id.to_owned(), fence);
+        }
+    }
+
+    /// Records the exact fence for one offer attempt. A replacement link
+    /// overwrites the previous attempt, so delayed answers to the replaced
+    /// link are rejected on arrival without side effects.
+    pub(crate) fn remember_exact_offer_fence(&self, id: &str, fence: OfferEpochFence) {
+        if let Ok(mut fences) = self.exact_offer_fences.lock() {
+            if let Some(previous) = fences.insert(id.to_owned(), fence) {
+                if previous != fence {
+                    logger::log(
+                        "INFO",
+                        "stunar offer",
+                        &format!(
+                            "viewer={id} replaced {} with {}",
+                            offer_fence_summary(&previous),
+                            offer_fence_summary(&fence),
+                        ),
+                    );
+                }
+            } else {
+                logger::log(
+                    "INFO",
+                    "stunar offer",
+                    &format!("viewer={id} minted {}", offer_fence_summary(&fence)),
+                );
+            }
+        }
+    }
+
     pub(crate) fn pending_roster(&self) -> Vec<(String, String)> {
+        if !self.ingress.is_active() {
+            return Vec::new();
+        }
         self.roster
             .lock()
             .map(|roster| {
@@ -342,14 +647,15 @@ impl StunarHost {
     /// for any of these that does not have a ViewerLink yet (Admission off
     /// accepts immediately, so there is no pending step to trigger the mint).
     pub(crate) fn accepted_roster(&self) -> Vec<(String, String)> {
+        if !self.ingress.is_active() {
+            return Vec::new();
+        }
         self.roster
             .lock()
             .map(|roster| {
                 roster
                     .iter()
-                    .filter(|(_, viewer)| {
-                        viewer.state == "accepted" || viewer.state == "sharing"
-                    })
+                    .filter(|(_, viewer)| viewer.state == "accepted" || viewer.state == "sharing")
                     .map(|(id, viewer)| (id.clone(), viewer.nickname.clone()))
                     .collect()
             })
@@ -357,6 +663,9 @@ impl StunarHost {
     }
 
     pub(crate) fn pending_nickname(&self, id: &str) -> Option<String> {
+        if !self.ingress.is_active() {
+            return None;
+        }
         self.roster.lock().ok().and_then(|roster| {
             roster
                 .get(id)
@@ -369,11 +678,24 @@ impl StunarHost {
     /// roster entry moves to accepted (or disappears); the engine mints the
     /// offer for accepted ones.
     pub(crate) fn decide(&self, id: &str, accept: bool) -> Result<(), String> {
+        if !self.ingress.is_active() {
+            return Err("Stunar Session is prepared but not committed.".to_owned());
+        }
         let action = if accept { "accept" } else { "reject" };
-        logger::log("INFO", "stunar decide", &format!("viewer={id} action={action}"));
+        logger::log(
+            "INFO",
+            "stunar decide",
+            &format!("viewer={id} action={action}"),
+        );
         let runtime = current_thread_runtime()?;
         let client = http_client()?;
-        runtime.block_on(post_decide(&client, &self.base, &self.host_token, id, action))?;
+        runtime.block_on(post_decide(
+            &client,
+            &self.base,
+            &self.host_token,
+            id,
+            action,
+        ))?;
         if let Ok(mut roster) = self.roster.lock() {
             if accept {
                 if let Some(viewer) = roster.get_mut(id) {
@@ -387,16 +709,28 @@ impl StunarHost {
     }
 
     pub(crate) fn kick(&self, id: &str) -> Result<(), String> {
+        if !self.ingress.is_active() {
+            return Err("Stunar Session is prepared but not committed.".to_owned());
+        }
         logger::log("INFO", "stunar kick", &format!("viewer={id}"));
         let runtime = current_thread_runtime()?;
         let client = http_client()?;
-        runtime.block_on(post_decide(&client, &self.base, &self.host_token, id, "kick"))
+        runtime.block_on(post_decide(
+            &client,
+            &self.base,
+            &self.host_token,
+            id,
+            "kick",
+        ))
     }
 
     /// Rotates the Password on the Rendezvous. `None` keeps the current
     /// value. The Room code is server-owned and never rotates. Connected
     /// Viewers keep their tokens; the WS is not touched.
     pub(crate) fn rotate(&self, password: Option<&str>) -> Result<(), String> {
+        if !self.ingress.is_active() {
+            return Err("Stunar Session is prepared but not committed.".to_owned());
+        }
         logger::log("INFO", "stunar rotate", "password rotated");
         let runtime = current_thread_runtime()?;
         let client = http_client()?;
@@ -405,6 +739,18 @@ impl StunarHost {
 
     /// Sends an offer signal to an accepted Viewer over the WS.
     pub(crate) fn send_signal(&self, viewer_id: &str, signal: &PeerSignal) -> Result<(), String> {
+        if !self.ingress.is_active() {
+            return Err("Stunar Session is prepared but not committed.".to_owned());
+        }
+        if signal.kind == PeerSignalKind::Offer {
+            if let Ok(mut fences) = self.offer_fences.lock() {
+                fences.entry(viewer_id.to_owned()).or_insert(EpochFence {
+                    session: SessionEpoch(0),
+                    share: ShareEpoch(0),
+                    link: None,
+                });
+            }
+        }
         let kind = match signal.kind {
             PeerSignalKind::Offer => "offer",
             PeerSignalKind::Answer => "answer",
@@ -419,13 +765,50 @@ impl StunarHost {
             .map_err(|_| "Stunar is unreachable.".to_owned())
     }
 
+    pub(crate) fn send_signal_with_offer_fence(
+        &self,
+        viewer_id: &str,
+        signal: &PeerSignal,
+        fence: OfferEpochFence,
+    ) -> Result<(), String> {
+        if !self.ingress.is_active() {
+            return Err("Stunar ingress is not active; retry after activation.".to_owned());
+        }
+        if signal.kind != PeerSignalKind::Offer {
+            return Err("exact offer fences are only valid for offers".to_owned());
+        }
+        self.remember_exact_offer_fence(viewer_id, fence);
+        logger::log(
+            "INFO",
+            "stunar offer",
+            &format!("viewer={viewer_id} sending {}", offer_fence_summary(&fence)),
+        );
+        self.outgoing
+            .send(Outgoing::Signal {
+                viewer_id: viewer_id.to_owned(),
+                to: Some(viewer_id.to_owned()),
+                payload: json!({
+                    "type": "offer",
+                    "sdp": signal.sdp,
+                    "fence": fence,
+                }),
+            })
+            .map_err(|_| "Stunar is unreachable.".to_owned())
+    }
+
     pub(crate) fn send_share(&self, start: bool) -> Result<(), String> {
+        if !self.ingress.is_active() {
+            return Err("Stunar Session is prepared but not committed.".to_owned());
+        }
         self.outgoing
             .send(Outgoing::Share { start })
             .map_err(|_| "Stunar is unreachable.".to_owned())
     }
 
     pub(crate) fn send_watch(&self, to: &str, start: bool) -> Result<(), String> {
+        if !self.ingress.is_active() {
+            return Err("Stunar Session is prepared but not committed.".to_owned());
+        }
         self.outgoing
             .send(Outgoing::Watch {
                 to: to.to_owned(),
@@ -459,6 +842,9 @@ impl StunarHost {
     }
 
     pub(crate) fn nickname_of(&self, id: &str) -> Option<String> {
+        if !self.ingress.is_active() {
+            return None;
+        }
         self.roster
             .lock()
             .ok()
@@ -466,10 +852,16 @@ impl StunarHost {
     }
 
     pub(crate) fn master_id(&self) -> Option<String> {
+        if !self.ingress.is_active() {
+            return None;
+        }
         self.master_id.lock().ok().and_then(|id| id.clone())
     }
 
     pub(crate) fn room_roster(&self) -> Vec<(String, String, bool, bool)> {
+        if !self.ingress.is_active() {
+            return Vec::new();
+        }
         self.roster
             .lock()
             .map(|roster| {
@@ -491,20 +883,102 @@ impl StunarHost {
     /// Closes the room on the Rendezvous and stops the worker.
     pub(crate) fn close(&self) {
         logger::log("INFO", "stunar close", "room closed");
+        self.ingress.deactivate();
         self.shutdown.store(true, Ordering::Release);
         let _ = self.outgoing.send(Outgoing::Close);
         if let Ok(runtime) = current_thread_runtime() {
             if let Ok(client) = http_client() {
-                let _ = runtime.block_on(post_close(&client, &self.base, &self.host_token));
+                if self.committed.load(Ordering::Acquire) {
+                    let _ = runtime.block_on(post_close(&client, &self.base, &self.host_token));
+                } else {
+                    let _ = runtime.block_on(post_abort(&client, &self.base, &self.host_token));
+                }
             }
         }
+    }
+
+    /// Signals the Rendezvous close and joins the host WS/heartbeat worker.
+    /// A timed-out worker remains owned here for a later retry.
+    pub(crate) fn shutdown_and_join(&mut self, timeout: Duration) -> ShutdownStatus {
+        self.ingress.deactivate();
+        self.shutdown.store(true, Ordering::Release);
+        let _ = self.outgoing.send(Outgoing::Close);
+        let mut status = ShutdownStatus {
+            quiesced: true,
+            pending: Vec::new(),
+            errors: Vec::new(),
+        };
+        let deadline = std::time::Instant::now() + timeout;
+        if let Ok(runtime) = current_thread_runtime() {
+            if let Ok(client) = http_client() {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    status.quiesced = false;
+                    status.pending.push("Stunar close request");
+                } else {
+                    let close_result = if self.committed.load(Ordering::Acquire) {
+                        runtime.block_on(tokio::time::timeout(
+                            remaining,
+                            post_close(&client, &self.base, &self.host_token),
+                        ))
+                    } else {
+                        runtime.block_on(tokio::time::timeout(
+                            remaining,
+                            post_abort(&client, &self.base, &self.host_token),
+                        ))
+                    };
+                    match close_result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => status.errors.push(error),
+                        Err(_) => {
+                            status.quiesced = false;
+                            status.pending.push("Stunar close request");
+                        }
+                    }
+                }
+            } else {
+                status
+                    .errors
+                    .push("Stunar close client could not be created".into());
+            }
+        } else {
+            status
+                .errors
+                .push("Stunar close runtime could not be created".into());
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let worker_status = join_rendezvous_worker(
+            &mut self.worker,
+            &self.completion,
+            remaining,
+            "Stunar host worker",
+        );
+        status.quiesced &= worker_status.quiesced;
+        status.pending.extend(worker_status.pending);
+        status.errors.extend(worker_status.errors);
+        status
     }
 }
 
 impl Drop for StunarHost {
     fn drop(&mut self) {
+        self.ingress.deactivate();
         self.shutdown.store(true, Ordering::Release);
         let _ = self.outgoing.send(Outgoing::Close);
+        if !self.committed.load(Ordering::Acquire) {
+            if let (Ok(runtime), Ok(client)) = (current_thread_runtime(), http_client()) {
+                let _ = runtime.block_on(post_abort(&client, &self.base, &self.host_token));
+            }
+        }
+        let status = join_rendezvous_worker(
+            &mut self.worker,
+            &self.completion,
+            WORKER_SHUTDOWN_TIMEOUT,
+            "Stunar host worker",
+        );
+        if !status.quiesced {
+            eprintln!("[goDrinking] Stunar host cleanup incomplete: {status:?}");
+        }
     }
 }
 
@@ -522,7 +996,8 @@ async fn host_open(
         super::room_mode::SessionMode::Room => "room",
         super::room_mode::SessionMode::Broadcast => "broadcast",
     };
-    let body = json!({ "password": password, "nickname": nickname, "admission": admission, "mode": mode });
+    let body =
+        json!({ "password": password, "nickname": nickname, "admission": admission, "mode": mode });
     let response = client
         .post(format!("{base}/v1/host/open"))
         .json(&body)
@@ -557,6 +1032,100 @@ async fn host_open(
             "stunar open response",
             &format!("status={status} error={raw}"),
         );
+        Err("Stunar is unreachable.".into())
+    }
+}
+
+/// Reserves a Stunar Room without advertising it to Viewers. The server
+/// returns the same opaque Host token and server-owned Room code as open, but
+/// only commit can move the bundle into the live-room table.
+async fn host_prepare(
+    client: &reqwest::Client,
+    base: &str,
+    password: &str,
+    nickname: &str,
+    admission: bool,
+    session_mode: super::room_mode::SessionMode,
+) -> Result<(String, String, Option<String>), String> {
+    let base = normalize_base(base);
+    let mode = match session_mode {
+        super::room_mode::SessionMode::Room => "room",
+        super::room_mode::SessionMode::Broadcast => "broadcast",
+    };
+    let body =
+        json!({ "password": password, "nickname": nickname, "admission": admission, "mode": mode });
+    let response = client
+        .post(format!("{base}/v1/host/prepare"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| "Stunar is unreachable.".to_owned())?;
+    let status = response.status();
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|_| "Stunar is unreachable.".to_owned())?;
+    if status.is_success() && json["ok"] == true {
+        let host_token = json["host_token"]
+            .as_str()
+            .or_else(|| json["prepare_token"].as_str())
+            .map(str::to_owned)
+            .ok_or_else(|| "Stunar is unreachable.".to_owned())?;
+        let code = json["code"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| "Stunar is unreachable.".to_owned())?;
+        let member_id = json["member_id"].as_str().map(str::to_owned);
+        logger::log(
+            "INFO",
+            "stunar prepare response",
+            &format!("status={status} code={code}"),
+        );
+        Ok((host_token, code, member_id))
+    } else {
+        logger::log(
+            "ERROR",
+            "stunar prepare response",
+            &format!(
+                "status={status} error={}",
+                json["error"].as_str().unwrap_or("unknown")
+            ),
+        );
+        Err("Stunar is unreachable.".into())
+    }
+}
+
+async fn post_commit(client: &reqwest::Client, base: &str, host_token: &str) -> Result<(), String> {
+    let base = normalize_base(base);
+    let response = client
+        .post(format!("{base}/v1/host/commit"))
+        .json(&json!({ "host_token": host_token }))
+        .send()
+        .await
+        .map_err(|_| "Stunar is unreachable.".to_owned())?;
+    let status = response.status();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|_| "Stunar is unreachable.".to_owned())?;
+    if status.is_success() && body["ok"] == true && body["status"] == "active" {
+        Ok(())
+    } else {
+        Err("Stunar is unreachable.".into())
+    }
+}
+
+async fn post_abort(client: &reqwest::Client, base: &str, host_token: &str) -> Result<(), String> {
+    let base = normalize_base(base);
+    let response = client
+        .post(format!("{base}/v1/host/abort"))
+        .json(&json!({ "host_token": host_token }))
+        .send()
+        .await
+        .map_err(|_| "Stunar is unreachable.".to_owned())?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
         Err("Stunar is unreachable.".into())
     }
 }
@@ -606,7 +1175,11 @@ async fn post_member_heartbeat(
 
 /// Best-effort explicit leave so the roster drops this viewer immediately
 /// instead of lingering as a ghost until the heartbeat TTL sweeps it.
-async fn post_member_leave(client: &reqwest::Client, base: &str, token: &str) -> Result<(), String> {
+async fn post_member_leave(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+) -> Result<(), String> {
     let base = normalize_base(base);
     let response = client
         .post(format!("{base}/v1/member/leave"))
@@ -686,19 +1259,26 @@ async fn host_worker(
     host_token: String,
     state: Arc<Mutex<StunarState>>,
     roster: Arc<Mutex<HashMap<String, RosterViewer>>>,
-    answers: Arc<Mutex<Vec<PeerSignal>>>,
+    answers: Arc<Mutex<Vec<FencedPeerSignal>>>,
+    exact_answers: Arc<Mutex<Vec<(PeerSignal, OfferEpochFence)>>>,
+    offer_fences: Arc<Mutex<HashMap<String, EpochFence>>>,
+    exact_offer_fences: Arc<Mutex<HashMap<String, OfferEpochFence>>>,
     incoming_offers: Arc<Mutex<Vec<StunarIncomingOffer>>>,
     watch_from: Arc<Mutex<Vec<String>>>,
     unwatch_from: Arc<Mutex<Vec<String>>>,
     master_id: Arc<Mutex<Option<String>>>,
     shutdown: Arc<AtomicBool>,
+    ingress: IngressGate,
+    completion: Arc<WorkerCompletion>,
     mut outgoing: UnboundedReceiver<Outgoing>,
 ) {
+    let _completion_guard = CompletionGuard(completion);
     let client = http_client().ok();
     let hb_base = base.clone();
     let hb_token = host_token.clone();
     let hb_state = Arc::clone(&state);
     let hb_shutdown = Arc::clone(&shutdown);
+    let hb_ingress = ingress.clone();
     let heartbeat = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
         ticker.tick().await; // skip the immediate first tick
@@ -706,6 +1286,9 @@ async fn host_worker(
             ticker.tick().await;
             if hb_shutdown.load(Ordering::Acquire) {
                 break;
+            }
+            if !hb_ingress.is_active() {
+                continue;
             }
             let ok = match &client {
                 Some(client) => post_heartbeat(client, &hb_base, &hb_token).await.is_ok(),
@@ -715,7 +1298,11 @@ async fn host_worker(
                 if let Ok(mut state) = hb_state.lock() {
                     *state = StunarState::Unreachable;
                 }
-                logger::log("WARN", "stunar heartbeat", "failed; relay marked unreachable");
+                logger::log(
+                    "WARN",
+                    "stunar heartbeat",
+                    "failed; relay marked unreachable",
+                );
             }
         }
     });
@@ -727,6 +1314,12 @@ async fn host_worker(
         }
     };
     while !shutdown.load(Ordering::Acquire) {
+        // A prepared Host has no WebSocket authorization yet. Waiting here
+        // also makes the worker inert if a commit is delayed or fails.
+        if !ingress.is_active() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        }
         match connect_ws(&ws_url).await {
             Ok(mut ws) => {
                 logger::log("INFO", "stunar ws", "connected (host inbox)");
@@ -742,10 +1335,14 @@ async fn host_worker(
                                         &text,
                                         &roster,
                                         &answers,
+                                        &exact_answers,
+                                        &offer_fences,
+                                        &exact_offer_fences,
                                         &incoming_offers,
                                         &watch_from,
                                         &unwatch_from,
                                         &master_id,
+                                        &ingress,
                                     );
                                 }
                                 Some(Ok(Message::Ping(_))) => {
@@ -758,6 +1355,9 @@ async fn host_worker(
                         outgoing = outgoing.recv() => {
                             match outgoing {
                                 Some(Outgoing::Signal { viewer_id, to, payload }) => {
+                                    if !ingress.is_active() {
+                                        continue;
+                                    }
                                     let mut body = json!({
                                         "t": "signal",
                                         "viewer_id": viewer_id,
@@ -771,6 +1371,9 @@ async fn host_worker(
                                     }
                                 }
                                 Some(Outgoing::Share { start }) => {
+                                    if !ingress.is_active() {
+                                        continue;
+                                    }
                                     let text = json!({
                                         "t": if start { "share-start" } else { "share-stop" },
                                     })
@@ -780,6 +1383,9 @@ async fn host_worker(
                                     }
                                 }
                                 Some(Outgoing::Watch { to, start }) => {
+                                    if !ingress.is_active() {
+                                        continue;
+                                    }
                                     let text = json!({
                                         "t": if start { "watch" } else { "unwatch" },
                                         "to": to,
@@ -805,8 +1411,10 @@ async fn host_worker(
             }
             Err(error) => {
                 logger::log("WARN", "stunar ws", &format!("connect failed: {error}"));
-                if let Ok(mut state) = state.lock() {
-                    *state = StunarState::Unreachable;
+                if ingress.is_active() {
+                    if let Ok(mut state) = state.lock() {
+                        *state = StunarState::Unreachable;
+                    }
                 }
             }
         }
@@ -819,16 +1427,27 @@ async fn host_worker(
     heartbeat.abort();
 }
 
-fn apply_inbox_side_effects(
+fn apply_common_inbox(
     inbox: WsInbox,
     roster: &Arc<Mutex<HashMap<String, RosterViewer>>>,
-    answers: &Arc<Mutex<Vec<PeerSignal>>>,
     incoming_offers: &Arc<Mutex<Vec<StunarIncomingOffer>>>,
     watch_from: &Arc<Mutex<Vec<String>>>,
     unwatch_from: &Arc<Mutex<Vec<String>>>,
     master_id: &Arc<Mutex<Option<String>>>,
-) {
-    if let Some(next) = inbox.roster {
+) -> Vec<PeerSignal> {
+    let WsInbox {
+        roster: next_roster,
+        master_id: next_master_id,
+        answers: inbox_answers,
+        answer_fences: _,
+        offers: inbox_offers,
+        watch_from: inbox_watch,
+        unwatch_from: inbox_unwatch,
+        you_are_master: _,
+        gone,
+        kicked: _,
+    } = inbox;
+    if let Some(next) = next_roster {
         logger::log(
             "INFO",
             "stunar ws message",
@@ -838,43 +1457,39 @@ fn apply_inbox_side_effects(
             *roster = next;
         }
     }
-    if inbox.master_id.is_some() {
+    if next_master_id.is_some() {
         if let Ok(mut slot) = master_id.lock() {
-            *slot = inbox.master_id;
+            *slot = next_master_id;
         }
     }
-    if !inbox.answers.is_empty() {
-        if let Ok(mut answers) = answers.lock() {
-            answers.extend(inbox.answers);
-        }
-    }
-    if !inbox.offers.is_empty() {
+    if !inbox_offers.is_empty() {
         logger::log(
             "INFO",
             "stunar ws message",
-            &format!("incoming offers={}", inbox.offers.len()),
+            &format!("incoming offers={}", inbox_offers.len()),
         );
         if let Ok(mut offers) = incoming_offers.lock() {
-            offers.extend(inbox.offers);
+            offers.extend(inbox_offers);
         }
     }
-    if !inbox.watch_from.is_empty() {
+    if !inbox_watch.is_empty() {
         if let Ok(mut list) = watch_from.lock() {
-            list.extend(inbox.watch_from);
+            list.extend(inbox_watch);
         }
     }
-    if !inbox.unwatch_from.is_empty() {
+    if !inbox_unwatch.is_empty() {
         if let Ok(mut list) = unwatch_from.lock() {
-            list.extend(inbox.unwatch_from);
+            list.extend(inbox_unwatch);
         }
     }
-    if inbox.gone {
+    if gone {
         logger::log("WARN", "stunar ws message", "gone (room died)");
     }
+    inbox_answers
 }
 
-fn handle_host_message(
-    text: &str,
+fn apply_inbox_side_effects(
+    inbox: WsInbox,
     roster: &Arc<Mutex<HashMap<String, RosterViewer>>>,
     answers: &Arc<Mutex<Vec<PeerSignal>>>,
     incoming_offers: &Arc<Mutex<Vec<StunarIncomingOffer>>>,
@@ -882,12 +1497,149 @@ fn handle_host_message(
     unwatch_from: &Arc<Mutex<Vec<String>>>,
     master_id: &Arc<Mutex<Option<String>>>,
 ) {
+    let inbox_answers = apply_common_inbox(
+        inbox,
+        roster,
+        incoming_offers,
+        watch_from,
+        unwatch_from,
+        master_id,
+    );
+    if let Ok(mut answers) = answers.lock() {
+        answers.extend(inbox_answers);
+    }
+}
+
+fn apply_host_inbox_side_effects(
+    inbox: WsInbox,
+    roster: &Arc<Mutex<HashMap<String, RosterViewer>>>,
+    answers: &Arc<Mutex<Vec<FencedPeerSignal>>>,
+    exact_answers: &Arc<Mutex<Vec<(PeerSignal, OfferEpochFence)>>>,
+    offer_fences: &Arc<Mutex<HashMap<String, EpochFence>>>,
+    exact_offer_fences: &Arc<Mutex<HashMap<String, OfferEpochFence>>>,
+    incoming_offers: &Arc<Mutex<Vec<StunarIncomingOffer>>>,
+    watch_from: &Arc<Mutex<Vec<String>>>,
+    unwatch_from: &Arc<Mutex<Vec<String>>>,
+    master_id: &Arc<Mutex<Option<String>>>,
+) {
+    let answer_fences = inbox.answer_fences.clone();
+    let inbox_answers = apply_common_inbox(
+        inbox,
+        roster,
+        incoming_offers,
+        watch_from,
+        unwatch_from,
+        master_id,
+    );
+    let exact_inbox_answers = inbox_answers.clone();
+    if let (Ok(mut answers), Ok(fences)) = (answers.lock(), offer_fences.lock()) {
+        let mut accepted = 0;
+        let mut dropped = Vec::new();
+        for signal in inbox_answers {
+            match signal.id.as_deref() {
+                Some(id) => match fences.get(id).copied() {
+                    Some(fence) => {
+                        answers.push(FencedPeerSignal { fence, signal });
+                        accepted += 1;
+                    }
+                    None => dropped.push(id.to_owned()),
+                },
+                None => dropped.push(String::new()),
+            }
+        }
+        if accepted > 0 || !dropped.is_empty() {
+            logger::log(
+                "INFO",
+                "stunar answer",
+                &format!("accepted legacy={accepted} dropped={}", dropped.len()),
+            );
+        }
+    }
+    if let Ok(mut exact_answers) = exact_answers.lock() {
+        if let Ok(fences) = exact_offer_fences.lock() {
+            let mut accepted = Vec::new();
+            let mut dropped = Vec::new();
+            for (signal, received) in exact_inbox_answers
+                .into_iter()
+                .zip(answer_fences.into_iter())
+            {
+                let id = signal.id.clone().unwrap_or_default();
+                match received {
+                    Some(fence) if fences.get(&id).copied() == Some(fence) => {
+                        accepted.push((signal, fence));
+                    }
+                    Some(fence) => {
+                        // Stale answer to a replaced link (or a late join for
+                        // a previous Share): rejected without side effects.
+                        logger::log(
+                            "WARN",
+                            "stunar answer",
+                            &format!("viewer={id} dropped stale {}", offer_fence_summary(&fence)),
+                        );
+                        dropped.push(id);
+                    }
+                    None => {
+                        logger::log(
+                            "WARN",
+                            "stunar answer",
+                            &format!("viewer={id} dropped answer (missing fence)"),
+                        );
+                        dropped.push(id);
+                    }
+                }
+            }
+            if !accepted.is_empty() || !dropped.is_empty() {
+                for (signal, fence) in &accepted {
+                    logger::log(
+                        "INFO",
+                        "stunar answer",
+                        &format!(
+                            "viewer={} accepted {}",
+                            signal.id.as_deref().unwrap_or_default(),
+                            offer_fence_summary(fence),
+                        ),
+                    );
+                }
+                logger::log(
+                    "INFO",
+                    "stunar answer",
+                    &format!(
+                        "accepted exact={} dropped={}",
+                        accepted.len(),
+                        dropped.len()
+                    ),
+                );
+            }
+            exact_answers.extend(accepted);
+        }
+    }
+}
+
+fn handle_host_message(
+    text: &str,
+    roster: &Arc<Mutex<HashMap<String, RosterViewer>>>,
+    answers: &Arc<Mutex<Vec<FencedPeerSignal>>>,
+    exact_answers: &Arc<Mutex<Vec<(PeerSignal, OfferEpochFence)>>>,
+    offer_fences: &Arc<Mutex<HashMap<String, EpochFence>>>,
+    exact_offer_fences: &Arc<Mutex<HashMap<String, OfferEpochFence>>>,
+    incoming_offers: &Arc<Mutex<Vec<StunarIncomingOffer>>>,
+    watch_from: &Arc<Mutex<Vec<String>>>,
+    unwatch_from: &Arc<Mutex<Vec<String>>>,
+    master_id: &Arc<Mutex<Option<String>>>,
+    ingress: &IngressGate,
+) {
+    if !ingress.is_active() {
+        return;
+    }
     let mut inbox = WsInbox::default();
     apply_ws_message(text, &mut inbox);
-    apply_inbox_side_effects(
+    apply_host_inbox_side_effects(
         inbox,
         roster,
         answers,
+        exact_answers,
+        offer_fences,
+        exact_offer_fences,
         incoming_offers,
         watch_from,
         unwatch_from,
@@ -903,16 +1655,19 @@ pub(crate) struct StunarViewer {
     outgoing: UnboundedSender<Outgoing>,
     incoming_offers: Arc<Mutex<Vec<StunarIncomingOffer>>>,
     answers: Arc<Mutex<Vec<PeerSignal>>>,
+    offer_fences: Arc<Mutex<HashMap<String, EpochFence>>>,
     roster: Arc<Mutex<HashMap<String, RosterViewer>>>,
     watch_from: Arc<Mutex<Vec<String>>>,
     unwatch_from: Arc<Mutex<Vec<String>>>,
     master_id: Arc<Mutex<Option<String>>>,
     shutdown: Arc<AtomicBool>,
+    completion: Arc<WorkerCompletion>,
     base: String,
     pub(crate) token: String,
     pub(crate) member_id: Option<String>,
     pub(crate) mode: String,
-    _worker: Option<JoinHandle<()>>,
+    pub(crate) initial_offer_fence: Option<OfferEpochFence>,
+    worker: Option<JoinHandle<()>>,
 }
 
 impl StunarViewer {
@@ -925,8 +1680,47 @@ impl StunarViewer {
         self.outgoing
             .send(Outgoing::Signal {
                 viewer_id: to.to_owned(),
-                to: if to.is_empty() { None } else { Some(to.to_owned()) },
+                to: if to.is_empty() {
+                    None
+                } else {
+                    Some(to.to_owned())
+                },
                 payload,
+            })
+            .map_err(|_| "Stunar is unreachable.".to_owned())
+    }
+
+    pub(crate) fn send_signal_with_offer_fence(
+        &self,
+        to: &str,
+        signal: &PeerSignal,
+        fence: OfferEpochFence,
+    ) -> Result<(), String> {
+        let kind = match signal.kind {
+            PeerSignalKind::Offer => "offer",
+            PeerSignalKind::Answer => "answer",
+        };
+        if signal.kind == PeerSignalKind::Offer {
+            if let Ok(mut fences) = self.offer_fences.lock() {
+                fences.insert(
+                    to.to_owned(),
+                    EpochFence {
+                        session: fence.epoch.session,
+                        share: fence.epoch.share,
+                        link: fence.epoch.link,
+                    },
+                );
+            }
+        }
+        self.outgoing
+            .send(Outgoing::Signal {
+                viewer_id: to.to_owned(),
+                to: if to.is_empty() {
+                    None
+                } else {
+                    Some(to.to_owned())
+                },
+                payload: json!({ "type": kind, "sdp": signal.sdp, "fence": fence }),
             })
             .map_err(|_| "Stunar is unreachable.".to_owned())
     }
@@ -951,6 +1745,10 @@ impl StunarViewer {
             .lock()
             .map(|mut offers| std::mem::take(&mut *offers))
             .unwrap_or_default()
+    }
+
+    pub(crate) fn initial_offer_fence(&self) -> Option<OfferEpochFence> {
+        self.initial_offer_fence
     }
 
     pub(crate) fn take_watch_requests(&self, take_watch: bool) -> (Vec<String>, Vec<String>) {
@@ -996,11 +1794,27 @@ impl StunarViewer {
             .unwrap_or_default()
     }
 
-    pub(crate) fn take_answers(&self) -> Vec<PeerSignal> {
-        self.answers
+    pub(crate) fn take_answers(&self) -> Vec<FencedPeerSignal> {
+        let answers = self
+            .answers
             .lock()
             .map(|mut answers| std::mem::take(&mut *answers))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let fences = self.offer_fences.lock().ok();
+        answers
+            .into_iter()
+            .filter_map(|signal| {
+                let id = signal.id.as_ref()?;
+                let fence = fences.as_ref()?.get(id).copied()?;
+                Some(FencedPeerSignal { fence, signal })
+            })
+            .collect()
+    }
+
+    pub(crate) fn remember_offer_fence(&self, id: &str, fence: EpochFence) {
+        if let Ok(mut fences) = self.offer_fences.lock() {
+            fences.insert(id.to_owned(), fence);
+        }
     }
 
     /// Explicit disconnect: tells the Rendezvous to drop this viewer from
@@ -1016,12 +1830,74 @@ impl StunarViewer {
             }
         }
     }
+
+    /// Requests viewer leave and joins the Stunar WS/heartbeat worker. A
+    /// timeout is returned as pending while the JoinHandle stays owned here.
+    pub(crate) fn shutdown_and_join(&mut self, timeout: Duration) -> ShutdownStatus {
+        self.shutdown.store(true, Ordering::Release);
+        let _ = self.outgoing.send(Outgoing::Close);
+        let mut status = ShutdownStatus {
+            quiesced: true,
+            pending: Vec::new(),
+            errors: Vec::new(),
+        };
+        let deadline = std::time::Instant::now() + timeout;
+        if let Ok(runtime) = current_thread_runtime() {
+            if let Ok(client) = http_client() {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    status.quiesced = false;
+                    status.pending.push("Stunar member leave request");
+                } else {
+                    match runtime.block_on(tokio::time::timeout(
+                        remaining,
+                        post_member_leave(&client, &self.base, &self.token),
+                    )) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => status.errors.push(error),
+                        Err(_) => {
+                            status.quiesced = false;
+                            status.pending.push("Stunar member leave request");
+                        }
+                    }
+                }
+            } else {
+                status
+                    .errors
+                    .push("Stunar leave client could not be created".into());
+            }
+        } else {
+            status
+                .errors
+                .push("Stunar leave runtime could not be created".into());
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let worker_status = join_rendezvous_worker(
+            &mut self.worker,
+            &self.completion,
+            remaining,
+            "Stunar viewer worker",
+        );
+        status.quiesced &= worker_status.quiesced;
+        status.pending.extend(worker_status.pending);
+        status.errors.extend(worker_status.errors);
+        status
+    }
 }
 
 impl Drop for StunarViewer {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
         let _ = self.outgoing.send(Outgoing::Close);
+        let status = join_rendezvous_worker(
+            &mut self.worker,
+            &self.completion,
+            WORKER_SHUTDOWN_TIMEOUT,
+            "Stunar viewer worker",
+        );
+        if !status.quiesced {
+            eprintln!("[goDrinking] Stunar viewer cleanup incomplete: {status:?}");
+        }
     }
 }
 
@@ -1042,11 +1918,16 @@ pub(crate) fn discover_stunar_room(
     );
     let incoming_offers = Arc::new(Mutex::new(Vec::new()));
     let answers = Arc::new(Mutex::new(Vec::new()));
+    let offer_fences = Arc::new(Mutex::new(HashMap::new()));
     let roster = Arc::new(Mutex::new(HashMap::new()));
     let watch_from = Arc::new(Mutex::new(Vec::new()));
     let unwatch_from = Arc::new(Mutex::new(Vec::new()));
     let master_id = Arc::new(Mutex::new(None));
     let shutdown = Arc::new(AtomicBool::new(false));
+    let completion = Arc::new(WorkerCompletion {
+        done: Mutex::new(false),
+        wake: std::sync::Condvar::new(),
+    });
     let (outgoing_tx, outgoing_rx) = unbounded_channel();
     let (ready_tx, ready_rx) = sync_channel(1);
     let worker_offers = Arc::clone(&incoming_offers);
@@ -1056,6 +1937,7 @@ pub(crate) fn discover_stunar_room(
     let worker_unwatch = Arc::clone(&unwatch_from);
     let worker_master = Arc::clone(&master_id);
     let worker_shutdown = Arc::clone(&shutdown);
+    let worker_completion = Arc::clone(&completion);
     let worker_base = base.clone();
     let worker_code = code.to_owned();
     let worker_password = password.to_owned();
@@ -1063,6 +1945,7 @@ pub(crate) fn discover_stunar_room(
     let worker = thread::Builder::new()
         .name("godrinking-stunar-viewer".into())
         .spawn(move || {
+            let _completion_guard = CompletionGuard(Arc::clone(&worker_completion));
             let runtime = match current_thread_runtime() {
                 Ok(runtime) => runtime,
                 Err(error) => {
@@ -1085,9 +1968,9 @@ pub(crate) fn discover_stunar_room(
                 )
                 .await
                 {
-                    Ok((token, offer, ws, member_id, mode)) => {
+                    Ok((token, offer, offer_fence, ws, member_id, mode)) => {
                         let hb_token = token.clone();
-                        let _ = ready_tx.send(Ok((token, offer, member_id, mode)));
+                        let _ = ready_tx.send(Ok((token, offer, offer_fence, member_id, mode)));
                         viewer_worker(
                             ws,
                             worker_roster,
@@ -1111,12 +1994,44 @@ pub(crate) fn discover_stunar_room(
             });
         })
         .map_err(|error| error.to_string())?;
-    let (token, offer, member_id, mode) = ready_rx
-        .recv_timeout(VIEWER_WAIT_TIMEOUT + HTTP_TIMEOUT + Duration::from_secs(5))
-        .map_err(|_| {
-            logger::log("ERROR", "stunar ask", "timed out waiting for the viewer handshake");
-            "Stunar is unreachable.".to_owned()
-        })??;
+    let mut worker = Some(worker);
+    let ready = ready_rx.recv_timeout(VIEWER_WAIT_TIMEOUT + HTTP_TIMEOUT + Duration::from_secs(5));
+    let (token, offer, offer_fence, member_id, mode) = match ready {
+        Ok(Ok(values)) => values,
+        Ok(Err(error)) => {
+            shutdown.store(true, Ordering::Release);
+            let _ = outgoing_tx.send(Outgoing::Close);
+            let status = join_rendezvous_worker(
+                &mut worker,
+                &completion,
+                WORKER_SHUTDOWN_TIMEOUT,
+                "Stunar viewer worker",
+            );
+            if !status.quiesced {
+                logger::log("WARN", "stunar cleanup", &format!("{status:?}"));
+            }
+            return Err(error);
+        }
+        Err(_) => {
+            logger::log(
+                "ERROR",
+                "stunar ask",
+                "timed out waiting for the viewer handshake",
+            );
+            shutdown.store(true, Ordering::Release);
+            let _ = outgoing_tx.send(Outgoing::Close);
+            let status = join_rendezvous_worker(
+                &mut worker,
+                &completion,
+                WORKER_SHUTDOWN_TIMEOUT,
+                "Stunar viewer worker",
+            );
+            if !status.quiesced {
+                logger::log("WARN", "stunar cleanup", &format!("{status:?}"));
+            }
+            return Err("Stunar is unreachable.".to_owned());
+        }
+    };
     return Ok((
         token.clone(),
         offer,
@@ -1124,16 +2039,19 @@ pub(crate) fn discover_stunar_room(
             outgoing: outgoing_tx,
             incoming_offers,
             answers,
+            offer_fences,
             roster,
             watch_from,
             unwatch_from,
             master_id,
             shutdown,
+            completion,
             base: base.clone(),
             token,
             member_id,
             mode,
-            _worker: Some(worker),
+            initial_offer_fence: offer_fence,
+            worker,
         },
     ));
 }
@@ -1149,7 +2067,17 @@ async fn viewer_handshake(
     watch_from: &Arc<Mutex<Vec<String>>>,
     unwatch_from: &Arc<Mutex<Vec<String>>>,
     master_id: &Arc<Mutex<Option<String>>>,
-) -> Result<(String, PeerSignal, WsStream, Option<String>, String), String> {
+) -> Result<
+    (
+        String,
+        PeerSignal,
+        Option<OfferEpochFence>,
+        WsStream,
+        Option<String>,
+        String,
+    ),
+    String,
+> {
     let client = http_client()?;
     let body = json!({ "code": code, "password": password, "nickname": nickname });
     let response = client
@@ -1185,7 +2113,11 @@ async fn viewer_handshake(
             _ => "Could not join.".into(),
         });
     }
-    logger::log("INFO", "stunar ask response", "accepted; viewer token issued");
+    logger::log(
+        "INFO",
+        "stunar ask response",
+        "accepted; viewer token issued",
+    );
     let token = json["viewer_token"]
         .as_str()
         .ok_or_else(|| "Could not join.".to_owned())?
@@ -1280,9 +2212,10 @@ async fn viewer_handshake(
                     sdp: String::new(),
                     id: None,
                 };
-                return Ok((token, offer, ws, member_id, mode));
+                return Ok((token, offer, None, ws, member_id, mode));
             }
             super::room_mode::HandshakeOutcome::ReadyWithOffer => {
+                let offer_fence = inbox.offers.first().and_then(|offer| offer.fence);
                 inbox.offers.clear();
                 apply_inbox_side_effects(
                     inbox,
@@ -1303,7 +2236,7 @@ async fn viewer_handshake(
                             sdp: sdp.to_owned(),
                             id: from,
                         };
-                        return Ok((token, offer, ws, member_id, mode));
+                        return Ok((token, offer, offer_fence, ws, member_id, mode));
                     }
                 }
             }
@@ -1425,16 +2358,44 @@ async fn viewer_worker(
 }
 
 /// Sends the answer signal over the Viewer WS. The inbox stays open.
-pub(crate) fn submit_stunar_answer(viewer: &StunarViewer, answer: &PeerSignal) -> Result<(), String> {
+pub(crate) fn submit_stunar_answer(
+    viewer: &StunarViewer,
+    answer: &PeerSignal,
+) -> Result<(), String> {
     logger::log("INFO", "stunar answer", "sending answer signal");
     let to = answer.id.clone().unwrap_or_default();
     viewer.send_signal(if to.is_empty() { "" } else { &to }, answer)?;
     Ok(())
 }
 
+pub(crate) fn submit_stunar_answer_exact(
+    viewer: &StunarViewer,
+    answer: &PeerSignal,
+    fence: OfferEpochFence,
+) -> Result<(), String> {
+    logger::log(
+        "INFO",
+        "stunar answer",
+        "sending exact-fenced answer signal",
+    );
+    let to = answer.id.clone().unwrap_or_default();
+    viewer.send_signal_with_offer_fence(if to.is_empty() { "" } else { &to }, answer, fence)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{apply_ws_message, WsInbox};
+    use super::{
+        apply_ws_message, handle_host_message, join_rendezvous_worker, IngressGate, StunarHost,
+        WorkerCompletion, WsInbox,
+    };
+    use crate::media::control_plane::{
+        EpochFence, FencedPeerSignal, LinkId, OfferEpochFence, SessionEpoch, ShareEpoch,
+    };
+    use crate::media::peer_transport::PeerSignal;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn room_offer_from_a_member_is_an_incoming_offer_not_an_answer() {
@@ -1461,6 +2422,36 @@ mod tests {
     }
 
     #[test]
+    fn stunar_signal_preserves_exact_offer_fence() {
+        let fence = OfferEpochFence {
+            epoch: EpochFence {
+                session: SessionEpoch(4),
+                share: ShareEpoch(7),
+                link: Some(LinkId(9)),
+            },
+            attempt: serde_json::from_value(serde_json::json!(12)).expect("attempt"),
+        };
+        let message = serde_json::json!({
+            "t": "signal",
+            "from": "bob",
+            "payload": { "type": "offer", "sdp": "v=0", "fence": fence }
+        });
+        let mut inbox = WsInbox::default();
+        apply_ws_message(&message.to_string(), &mut inbox);
+        assert_eq!(inbox.offers.len(), 1);
+        assert_eq!(inbox.offers[0].fence, Some(fence));
+
+        let answer = serde_json::json!({
+            "t": "signal",
+            "viewer_id": "bob",
+            "payload": { "type": "answer", "sdp": "v=0", "fence": fence }
+        });
+        apply_ws_message(&answer.to_string(), &mut inbox);
+        assert_eq!(inbox.answers.len(), 1);
+        assert_eq!(inbox.answer_fences, vec![Some(fence)]);
+    }
+
+    #[test]
     fn roster_carries_master_and_share() {
         let mut inbox = WsInbox::default();
         apply_ws_message(
@@ -1480,5 +2471,373 @@ mod tests {
         assert_eq!(inbox.watch_from, vec!["bob".to_string()]);
         apply_ws_message(r#"{"t":"unwatch","from":"bob","to":"ada"}"#, &mut inbox);
         assert_eq!(inbox.unwatch_from, vec!["bob".to_string()]);
+    }
+
+    #[test]
+    fn inactive_stunar_worker_ignores_roster_and_signaling_effects() {
+        let ingress = IngressGate::inactive();
+        let roster = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let answers = Arc::new(Mutex::new(Vec::new()));
+        let exact_answers = Arc::new(Mutex::new(Vec::new()));
+        let offer_fences = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let exact_offer_fences = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let incoming_offers = Arc::new(Mutex::new(Vec::new()));
+        let watch_from = Arc::new(Mutex::new(Vec::new()));
+        let unwatch_from = Arc::new(Mutex::new(Vec::new()));
+        let master_id = Arc::new(Mutex::new(None));
+        let message =
+            r#"{"t":"roster","entries":[{"id":"bob","nickname":"Bob","state":"accepted"}]}"#;
+
+        handle_host_message(
+            message,
+            &roster,
+            &answers,
+            &exact_answers,
+            &offer_fences,
+            &exact_offer_fences,
+            &incoming_offers,
+            &watch_from,
+            &unwatch_from,
+            &master_id,
+            &ingress,
+        );
+
+        assert!(roster.lock().expect("roster").is_empty());
+        assert!(answers.lock().expect("answers").is_empty());
+        assert!(exact_answers.lock().expect("exact answers").is_empty());
+    }
+
+    #[test]
+    fn commit_failure_is_returned_without_activating_ingress() {
+        let ingress = IngressGate::inactive();
+        let completion = Arc::new(WorkerCompletion {
+            done: Mutex::new(false),
+            wake: std::sync::Condvar::new(),
+        });
+        let (outgoing, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let host = StunarHost {
+            base: "not-a-rendezvous-url".into(),
+            code: Mutex::new("ABC123".into()),
+            host_token: "prepared-token".into(),
+            state: Arc::new(Mutex::new(crate::media::types::StunarState::Calling)),
+            roster: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            answers: Arc::new(Mutex::new(Vec::new())),
+            exact_answers: Arc::new(Mutex::new(Vec::new())),
+            offer_fences: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            exact_offer_fences: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            incoming_offers: Arc::new(Mutex::new(Vec::new())),
+            watch_from: Arc::new(Mutex::new(Vec::new())),
+            unwatch_from: Arc::new(Mutex::new(Vec::new())),
+            master_id: Arc::new(Mutex::new(None)),
+            self_id: None,
+            outgoing,
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ingress,
+            committed: std::sync::atomic::AtomicBool::new(false),
+            completion,
+            worker: None,
+        };
+
+        assert!(host.activate().is_err());
+        assert!(!host.ingress_active());
+        assert!(!host.committed.load(Ordering::Acquire));
+    }
+
+    fn exact_fence(session: u64, share: u64, link: u64, attempt: u64) -> OfferEpochFence {
+        OfferEpochFence {
+            epoch: EpochFence {
+                session: SessionEpoch(session),
+                share: ShareEpoch(share),
+                link: Some(LinkId(link)),
+            },
+            attempt: serde_json::from_value(serde_json::json!(attempt)).expect("attempt"),
+        }
+    }
+
+    fn host_answer_message(viewer: &str, fence: OfferEpochFence) -> String {
+        serde_json::json!({
+            "t": "signal",
+            "viewer_id": viewer,
+            "payload": { "type": "answer", "sdp": "v=0", "fence": fence },
+        })
+        .to_string()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn host_fixtures(
+        current: &[(&str, OfferEpochFence)],
+    ) -> (
+        Arc<Mutex<std::collections::HashMap<String, super::RosterViewer>>>,
+        Arc<Mutex<Vec<FencedPeerSignal>>>,
+        Arc<Mutex<Vec<(PeerSignal, OfferEpochFence)>>>,
+        Arc<Mutex<std::collections::HashMap<String, EpochFence>>>,
+        Arc<Mutex<std::collections::HashMap<String, OfferEpochFence>>>,
+        Arc<Mutex<Vec<super::StunarIncomingOffer>>>,
+        Arc<Mutex<Vec<String>>>,
+        Arc<Mutex<Vec<String>>>,
+        Arc<Mutex<Option<String>>>,
+        IngressGate,
+    ) {
+        let fences: std::collections::HashMap<String, OfferEpochFence> = current
+            .iter()
+            .map(|(id, fence)| ((*id).to_owned(), *fence))
+            .collect();
+        (
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(std::collections::HashMap::new())),
+            Arc::new(Mutex::new(fences)),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(None)),
+            IngressGate::active(),
+        )
+    }
+
+    #[test]
+    fn stale_answer_to_replacement_link_is_rejected_without_side_effects() {
+        let current = exact_fence(4, 7, 9, 12);
+        let stale = exact_fence(4, 7, 9, 11);
+        let (
+            roster,
+            answers,
+            exact_answers,
+            fences,
+            exact_fences,
+            offers,
+            watch,
+            unwatch,
+            master,
+            ingress,
+        ) = host_fixtures(&[("bob", current)]);
+        super::handle_host_message(
+            &host_answer_message("bob", stale),
+            &roster,
+            &answers,
+            &exact_answers,
+            &fences,
+            &exact_fences,
+            &offers,
+            &watch,
+            &unwatch,
+            &master,
+            &ingress,
+        );
+        assert!(exact_answers.lock().expect("answers").is_empty());
+        super::handle_host_message(
+            &host_answer_message("bob", current),
+            &roster,
+            &answers,
+            &exact_answers,
+            &fences,
+            &exact_fences,
+            &offers,
+            &watch,
+            &unwatch,
+            &master,
+            &ingress,
+        );
+        let stored = exact_answers.lock().expect("answers");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].1, current);
+        assert_eq!(stored[0].0.id.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn late_join_after_share_replacement_uses_current_fence() {
+        let old_share = exact_fence(4, 7, 9, 12);
+        let new_share = exact_fence(4, 8, 10, 13);
+        let (
+            roster,
+            answers,
+            exact_answers,
+            fences,
+            exact_fences,
+            offers,
+            watch,
+            unwatch,
+            master,
+            ingress,
+        ) = host_fixtures(&[("late", new_share)]);
+        super::handle_host_message(
+            &host_answer_message("late", old_share),
+            &roster,
+            &answers,
+            &exact_answers,
+            &fences,
+            &exact_fences,
+            &offers,
+            &watch,
+            &unwatch,
+            &master,
+            &ingress,
+        );
+        assert!(exact_answers.lock().expect("answers").is_empty());
+        super::handle_host_message(
+            &host_answer_message("late", new_share),
+            &roster,
+            &answers,
+            &exact_answers,
+            &fences,
+            &exact_fences,
+            &offers,
+            &watch,
+            &unwatch,
+            &master,
+            &ingress,
+        );
+        let stored = exact_answers.lock().expect("answers");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].1, new_share);
+    }
+
+    #[test]
+    fn one_viewer_failure_does_not_stop_others() {
+        let ada = exact_fence(4, 7, 9, 12);
+        let bob = exact_fence(4, 7, 10, 14);
+        let bob_stale = exact_fence(4, 7, 10, 13);
+        let (
+            roster,
+            answers,
+            exact_answers,
+            fences,
+            exact_fences,
+            offers,
+            watch,
+            unwatch,
+            master,
+            ingress,
+        ) = host_fixtures(&[("ada", ada), ("bob", bob)]);
+        super::handle_host_message(
+            &host_answer_message("bob", bob_stale),
+            &roster,
+            &answers,
+            &exact_answers,
+            &fences,
+            &exact_fences,
+            &offers,
+            &watch,
+            &unwatch,
+            &master,
+            &ingress,
+        );
+        super::handle_host_message(
+            &host_answer_message("ada", ada),
+            &roster,
+            &answers,
+            &exact_answers,
+            &fences,
+            &exact_fences,
+            &offers,
+            &watch,
+            &unwatch,
+            &master,
+            &ingress,
+        );
+        let stored = exact_answers.lock().expect("answers");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].0.id.as_deref(), Some("ada"));
+        assert_eq!(stored[0].1, ada);
+    }
+
+    #[test]
+    fn answer_without_fence_is_dropped_without_side_effects() {
+        let current = exact_fence(4, 7, 9, 12);
+        let (
+            roster,
+            answers,
+            exact_answers,
+            fences,
+            exact_fences,
+            offers,
+            watch,
+            unwatch,
+            master,
+            ingress,
+        ) = host_fixtures(&[("bob", current)]);
+        super::handle_host_message(
+            r#"{"t":"signal","viewer_id":"bob","payload":{"type":"answer","sdp":"v=0"}}"#,
+            &roster,
+            &answers,
+            &exact_answers,
+            &fences,
+            &exact_fences,
+            &offers,
+            &watch,
+            &unwatch,
+            &master,
+            &ingress,
+        );
+        assert!(exact_answers.lock().expect("answers").is_empty());
+    }
+
+    #[test]
+    fn commit_is_idempotent_once_activated_without_network() {
+        let ingress = IngressGate::inactive();
+        let completion = Arc::new(WorkerCompletion {
+            done: Mutex::new(false),
+            wake: std::sync::Condvar::new(),
+        });
+        let (outgoing, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let host = StunarHost {
+            base: "http://127.0.0.1:9".into(),
+            code: Mutex::new("ABC123".into()),
+            host_token: "already-committed".into(),
+            state: Arc::new(Mutex::new(crate::media::types::StunarState::Calling)),
+            roster: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            answers: Arc::new(Mutex::new(Vec::new())),
+            exact_answers: Arc::new(Mutex::new(Vec::new())),
+            offer_fences: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            exact_offer_fences: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            incoming_offers: Arc::new(Mutex::new(Vec::new())),
+            watch_from: Arc::new(Mutex::new(Vec::new())),
+            unwatch_from: Arc::new(Mutex::new(Vec::new())),
+            master_id: Arc::new(Mutex::new(None)),
+            self_id: None,
+            outgoing,
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ingress,
+            committed: std::sync::atomic::AtomicBool::new(true),
+            completion,
+            worker: None,
+        };
+        // Lost-response retry after commit never touches the network.
+        assert!(host.commit().is_ok());
+        assert!(host.commit().is_ok());
+        assert!(host.ingress_active());
+        // A committed Session can no longer be aborted.
+        assert!(host.abort().is_err());
+    }
+
+    #[test]
+    fn shutdown_reports_pending_stunar_worker_and_allows_retry() {
+        let completion = Arc::new(WorkerCompletion {
+            done: Mutex::new(false),
+            wake: std::sync::Condvar::new(),
+        });
+        let worker_completion = Arc::clone(&completion);
+        let mut worker = Some(thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            super::mark_worker_complete(&worker_completion);
+        }));
+        let status = join_rendezvous_worker(
+            &mut worker,
+            &completion,
+            Duration::from_millis(1),
+            "Stunar host worker",
+        );
+        assert!(!status.quiesced);
+        assert_eq!(status.pending, vec!["Stunar host worker"]);
+        assert!(worker.is_some());
+        let status = join_rendezvous_worker(
+            &mut worker,
+            &completion,
+            Duration::from_secs(1),
+            "Stunar host worker",
+        );
+        assert!(status.quiesced, "Stunar shutdown status: {status:?}");
+        assert!(worker.is_none());
     }
 }

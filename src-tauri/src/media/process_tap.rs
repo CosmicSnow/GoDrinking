@@ -7,12 +7,12 @@ use std::ffi::c_void;
 #[cfg(target_os = "macos")]
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(target_os = "windows")]
-use std::sync::OnceLock;
+use std::sync::mpsc::SyncSender;
 #[cfg(target_os = "macos")]
 use std::sync::mpsc::{sync_channel, Receiver};
-use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
+#[cfg(target_os = "windows")]
+use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -27,9 +27,9 @@ use core_foundation::dictionary::CFDictionary;
 #[cfg(target_os = "macos")]
 use core_foundation::string::CFString;
 #[cfg(target_os = "macos")]
-use objc2::runtime::AnyObject;
-#[cfg(target_os = "macos")]
 use objc2::msg_send;
+#[cfg(target_os = "macos")]
+use objc2::runtime::AnyObject;
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSArray, NSNumber, NSString, NSUUID};
 
@@ -46,6 +46,23 @@ pub(crate) struct ProcessTap {
     _native: Option<NativeTap>,
     #[cfg(target_os = "windows")]
     _native: Option<WindowsAudioTap>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShutdownStatus {
+    pub(crate) quiesced: bool,
+    pub(crate) pending: Vec<&'static str>,
+    pub(crate) errors: Vec<String>,
+}
+
+impl ShutdownStatus {
+    fn complete() -> Self {
+        Self {
+            quiesced: true,
+            pending: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -92,17 +109,16 @@ impl ProcessTap {
             start_macos(excluded_bundle_ids, audio_tx)
         }
     }
-}
 
-impl Drop for ProcessTap {
-    fn drop(&mut self) {
+    /// Requests capture shutdown, releases native audio resources, and joins
+    /// the Opus/capture worker within `timeout`. A pending worker is kept in
+    /// this object so a later call can finish the join; it is never silently
+    /// reported as quiescent.
+    pub(crate) fn shutdown_and_join(&mut self, timeout: Duration) -> ShutdownStatus {
         self.shutdown.store(true, Ordering::Release);
-        #[cfg(target_os = "windows")]
-        if let Some(native) = self._native.take() {
-            if let Some(thread) = native.thread {
-                let _ = thread.join();
-            }
-        }
+        let deadline = std::time::Instant::now() + timeout;
+        let mut status = ShutdownStatus::complete();
+
         #[cfg(target_os = "macos")]
         if let Some(native) = self._native.take() {
             unsafe {
@@ -114,7 +130,54 @@ impl Drop for ProcessTap {
                 AudioHardwareDestroyProcessTap(native.tap_id);
             }
         }
+
+        #[cfg(target_os = "windows")]
+        if let Some(native) = self._native.as_mut() {
+            if !join_worker_until(&mut native.thread, deadline, "audio capture", &mut status) {
+                status.quiesced = false;
+            }
+        }
+
+        if !join_worker_until(&mut self._capture, deadline, "audio encoder", &mut status) {
+            status.quiesced = false;
+        }
+        status
     }
+}
+
+impl Drop for ProcessTap {
+    fn drop(&mut self) {
+        let status = self.shutdown_and_join(Duration::from_secs(3));
+        if !status.quiesced {
+            eprintln!("[goDrinking] audio cleanup incomplete: {status:?}");
+        }
+    }
+}
+
+fn join_worker_until(
+    worker: &mut Option<JoinHandle<()>>,
+    deadline: std::time::Instant,
+    component: &'static str,
+    status: &mut ShutdownStatus,
+) -> bool {
+    let Some(handle) = worker.as_ref() else {
+        return true;
+    };
+    while !handle.is_finished() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            status.pending.push(component);
+            return false;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(2)));
+    }
+    let handle = worker.take().expect("worker handle still present");
+    if handle.join().is_err() {
+        status.quiesced = false;
+        status.errors.push(format!("{component} worker panicked"));
+        return false;
+    }
+    true
 }
 
 #[cfg(target_os = "macos")]
@@ -143,11 +206,16 @@ fn start_macos(
     let aggregate = aggregate_description(&tap_uid)?;
     let mut aggregate_id = 0_u32;
     let status = unsafe {
-        AudioHardwareCreateAggregateDevice(aggregate.as_concrete_TypeRef().cast(), &mut aggregate_id)
+        AudioHardwareCreateAggregateDevice(
+            aggregate.as_concrete_TypeRef().cast(),
+            &mut aggregate_id,
+        )
     };
     if status != 0 {
         unsafe { AudioHardwareDestroyProcessTap(tap_id) };
-        return Err(format!("AudioHardwareCreateAggregateDevice failed ({status})"));
+        return Err(format!(
+            "AudioHardwareCreateAggregateDevice failed ({status})"
+        ));
     }
 
     let (pcm_tx, pcm_rx) = sync_channel::<Vec<f32>>(8);
@@ -202,8 +270,7 @@ pub(crate) fn is_process_loopback_supported() -> bool {
     static SUPPORTED: OnceLock<bool> = OnceLock::new();
     *SUPPORTED.get_or_init(|| {
         let _ = wasapi::initialize_mta();
-        wasapi::AudioClient::new_application_loopback_client(std::process::id(), true)
-            .is_ok()
+        wasapi::AudioClient::new_application_loopback_client(std::process::id(), true).is_ok()
     })
 }
 
@@ -252,15 +319,21 @@ fn resolve_exclusion_root(excluded_apps: &[String]) -> Option<(String, u32)> {
             || token.eq_ignore_ascii_case(exe.strip_suffix(".exe").unwrap_or(exe))
     };
     let mut first: Option<(String, u32)> = None;
-    for token in excluded_apps.iter().map(|item| item.trim()).filter(|item| !item.is_empty()) {
+    for token in excluded_apps
+        .iter()
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+    {
         let mut pids: Vec<(u32, u32)> = snapshot
             .iter()
-            .filter(|(_, _, exe)| matches_token(exe, token) )
+            .filter(|(_, _, exe)| matches_token(exe, token))
             .map(|(pid, ppid, _)| (*pid, *ppid))
             .filter(|(pid, _)| *pid != own_pid)
             .collect();
         if pids.is_empty() {
-            eprintln!("[goDrinking] audio exclusion '{token}' matches no running process; skipping");
+            eprintln!(
+                "[goDrinking] audio exclusion '{token}' matches no running process; skipping"
+            );
             continue;
         }
         pids.sort_unstable();
@@ -411,7 +484,8 @@ fn wasapi_loop(
     // Voip application mode keeps latency low for 20 ms stereo 48 kHz frames.
     // An init failure must not fail the session: the worker simply exits and
     // the tap keeps running without encoded output.
-    let Ok(mut encoder) = opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Voip)
+    let Ok(mut encoder) =
+        opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Voip)
     else {
         eprintln!("[goDrinking] Opus encoder init failed; system audio continues without encoding");
         return;
@@ -476,7 +550,8 @@ fn opus_loop(
     // Voip application mode keeps latency low for 20 ms stereo 48 kHz frames.
     // An init failure must not fail the session: the worker simply exits and
     // the tap keeps running without encoded output.
-    let Ok(mut encoder) = opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Voip)
+    let Ok(mut encoder) =
+        opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Voip)
     else {
         eprintln!("[goDrinking] Opus encoder init failed; system audio continues without encoding");
         return;
@@ -564,9 +639,18 @@ fn aggregate_description(tap_uid: &CFString) -> Result<CFDictionary<CFString, CF
     Ok(CFDictionary::from_CFType_pairs(&[
         (CFString::new("name"), name.as_CFType()),
         (CFString::new("uid"), uid.as_CFType()),
-        (CFString::new("private"), CFBoolean::true_value().as_CFType()),
-        (CFString::new("stacked"), CFBoolean::false_value().as_CFType()),
-        (CFString::new("tapautostart"), CFBoolean::true_value().as_CFType()),
+        (
+            CFString::new("private"),
+            CFBoolean::true_value().as_CFType(),
+        ),
+        (
+            CFString::new("stacked"),
+            CFBoolean::false_value().as_CFType(),
+        ),
+        (
+            CFString::new("tapautostart"),
+            CFBoolean::true_value().as_CFType(),
+        ),
         (CFString::new("taps"), taps.as_CFType()),
     ]))
 }
@@ -654,9 +738,7 @@ fn audio_process_objects() -> Vec<(u32, i32)> {
         scope: 0,
         element: 0,
     };
-    let status = unsafe {
-        AudioObjectGetPropertyDataSize(1, &address, 0, ptr::null(), &mut size)
-    };
+    let status = unsafe { AudioObjectGetPropertyDataSize(1, &address, 0, ptr::null(), &mut size) };
     if status != 0 || size == 0 {
         eprintln!("[goDrinking] ProcessObjectList size failed ({status}) size={size}");
         return Vec::new();
@@ -748,7 +830,9 @@ fn translate_pid(pid: i32) -> Result<u32, String> {
         )
     };
     if status != 0 || object_id == 0 {
-        return Err(format!("no Core Audio process object for pid {pid} ({status})"));
+        return Err(format!(
+            "no Core Audio process object for pid {pid} ({status})"
+        ));
     }
     Ok(object_id)
 }
@@ -772,7 +856,9 @@ fn audio_get<T>(object: u32, selector: u32, value: &mut T) -> Result<(), String>
         )
     };
     if status != 0 {
-        return Err(format!("AudioObjectGetPropertyData {selector:#x} failed ({status})"));
+        return Err(format!(
+            "AudioObjectGetPropertyData {selector:#x} failed ({status})"
+        ));
     }
     Ok(())
 }
@@ -918,11 +1004,16 @@ fn collect_tap_pcm(excluded_tokens: &[String], duration: Duration) -> Result<Vec
     let aggregate = aggregate_description(&tap_uid)?;
     let mut aggregate_id = 0_u32;
     let status = unsafe {
-        AudioHardwareCreateAggregateDevice(aggregate.as_concrete_TypeRef().cast(), &mut aggregate_id)
+        AudioHardwareCreateAggregateDevice(
+            aggregate.as_concrete_TypeRef().cast(),
+            &mut aggregate_id,
+        )
     };
     if status != 0 {
         unsafe { AudioHardwareDestroyProcessTap(tap_id) };
-        return Err(format!("AudioHardwareCreateAggregateDevice failed ({status})"));
+        return Err(format!(
+            "AudioHardwareCreateAggregateDevice failed ({status})"
+        ));
     }
     let (pcm_tx, pcm_rx) = sync_channel::<Vec<f32>>(64);
     let context = Box::into_raw(Box::new(pcm_tx));
@@ -1017,31 +1108,93 @@ fn write_tone_wav(path: &std::path::Path, freq: f32, seconds: f32) -> std::io::R
 #[cfg(test)]
 mod tests {
     use super::app_excluded_by_token;
+    use std::time::Duration;
 
     #[test]
     fn discord_name_and_helper_bundles_all_match() {
         // Selected by display name.
         assert!(app_excluded_by_token("Discord", None, "Discord"));
-        assert!(app_excluded_by_token("Discord Helper (Renderer)", None, "Discord"));
+        assert!(app_excluded_by_token(
+            "Discord Helper (Renderer)",
+            None,
+            "Discord"
+        ));
         // Selected by bundle id.
-        assert!(app_excluded_by_token("Discord", Some("com.hnc.Discord"), "com.hnc.Discord"));
+        assert!(app_excluded_by_token(
+            "Discord",
+            Some("com.hnc.Discord"),
+            "com.hnc.Discord"
+        ));
         assert!(app_excluded_by_token(
             "Discord Helper",
             Some("com.hnc.Discord.helper"),
             "com.hnc.Discord"
         ));
         // Case-insensitive on both sides.
-        assert!(app_excluded_by_token("discord", Some("COM.HNC.DISCORD"), "Discord"));
-        assert!(app_excluded_by_token("Discord Helper", Some("com.hnc.Discord.helper"), "discord"));
+        assert!(app_excluded_by_token(
+            "discord",
+            Some("COM.HNC.DISCORD"),
+            "Discord"
+        ));
+        assert!(app_excluded_by_token(
+            "Discord Helper",
+            Some("com.hnc.Discord.helper"),
+            "discord"
+        ));
     }
 
     #[test]
     fn unrelated_apps_do_not_match() {
-        assert!(!app_excluded_by_token("Safari", Some("com.apple.Safari"), "Discord"));
-        assert!(!app_excluded_by_token("Google Chrome", Some("com.google.Chrome"), "discord"));
-        assert!(!app_excluded_by_token("Slack", Some("com.tinyspeck.slackmacgap"), "Discord"));
-        assert!(!app_excluded_by_token("Discord", Some("com.hnc.Discord"), ""));
-        assert!(!app_excluded_by_token("Discord", Some("com.hnc.Discord"), "   "));
+        assert!(!app_excluded_by_token(
+            "Safari",
+            Some("com.apple.Safari"),
+            "Discord"
+        ));
+        assert!(!app_excluded_by_token(
+            "Google Chrome",
+            Some("com.google.Chrome"),
+            "discord"
+        ));
+        assert!(!app_excluded_by_token(
+            "Slack",
+            Some("com.tinyspeck.slackmacgap"),
+            "Discord"
+        ));
+        assert!(!app_excluded_by_token(
+            "Discord",
+            Some("com.hnc.Discord"),
+            ""
+        ));
+        assert!(!app_excluded_by_token(
+            "Discord",
+            Some("com.hnc.Discord"),
+            "   "
+        ));
+    }
+
+    #[test]
+    fn shutdown_reports_pending_audio_worker_and_allows_retry() {
+        let mut worker = Some(std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(20));
+        }));
+        let mut status = super::ShutdownStatus::complete();
+        let deadline = std::time::Instant::now() + Duration::from_millis(1);
+        assert!(!super::join_worker_until(
+            &mut worker,
+            deadline,
+            "audio encoder",
+            &mut status
+        ));
+        assert_eq!(status.pending, vec!["audio encoder"]);
+        std::thread::sleep(Duration::from_millis(30));
+        let mut retry = super::ShutdownStatus::complete();
+        assert!(super::join_worker_until(
+            &mut worker,
+            std::time::Instant::now() + Duration::from_secs(1),
+            "audio encoder",
+            &mut retry
+        ));
+        assert!(retry.quiesced);
     }
 
     #[cfg(target_os = "macos")]

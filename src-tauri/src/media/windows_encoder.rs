@@ -12,8 +12,8 @@ use super::logger;
 use super::pipeline::{EncoderControl, NativeFrame, PipelineState};
 use super::types::VideoCodec;
 use openh264::encoder::{
-    BitRate, Complexity, Encoder, EncoderConfig, FrameRate as OpenH264FrameRate, FrameType, Profile,
-    RateControlMode, UsageType, VuiConfig,
+    BitRate, Complexity, Encoder, EncoderConfig, FrameRate as OpenH264FrameRate, FrameType,
+    Profile, RateControlMode, UsageType, VuiConfig,
 };
 use openh264::formats::{BgraSliceU8, YUVBuffer};
 use openh264::OpenH264API;
@@ -43,7 +43,13 @@ fn fit_baseline_size(width: u32, height: u32) -> (u32, u32) {
 // Nearest-neighbor BGRA downscale with fixed-point stepping: no division
 // in the hot loop. Mirrors the capture-side resampler: the per-pixel
 // division version cost tens of ms per frame and starved the encoder.
-fn downscale_bgra_frame(src: &[u8], src_width: u32, src_height: u32, dst_width: u32, dst_height: u32) -> Vec<u8> {
+fn downscale_bgra_frame(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+) -> Vec<u8> {
     let src_w = src_width as usize;
     let src_h = src_height as usize;
     let dst_w = dst_width as usize;
@@ -93,41 +99,34 @@ impl OpenH264Encoder {
         _height: u32,
         bitrate: u32,
         fps: u32,
-        video_codec: VideoCodec,
+        _video_codec: VideoCodec,
         output: AccessUnitQueue,
         _state: Arc<PipelineState>,
         control: Arc<EncoderControl>,
     ) -> Result<Self, String> {
-        // The software encoder must match the session codec: the SDP offer
-        // advertises Baseline (42e02a) for H.264 and High (64002a) for
-        // H.264 High, and the transport drops samples whose SPS disagrees.
-        let want_high = matches!(video_codec, VideoCodec::H264High);
-        let make = |high: bool| {
-            let config = EncoderConfig::new()
-                .bitrate(BitRate::from_bps(bitrate))
-                .max_frame_rate(OpenH264FrameRate::from_hz(fps as f32))
-                .usage_type(UsageType::ScreenContentRealTime)
-                .rate_control_mode(RateControlMode::Bitrate)
-                .profile(if high { Profile::High } else { Profile::Baseline })
-                .complexity(Complexity::Low)
-                .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(fps * 2))
-                .vui(VuiConfig::bt709());
-            Encoder::with_api_config(OpenH264API::from_source(), config)
-        };
-        let (encoder, high_profile) = match make(want_high) {
-            Ok(encoder) => (encoder, want_high),
-            Err(error) if want_high => {
-                eprintln!(
-                    "[goDrinking] OpenH264 High profile unavailable ({error}); falling back to Baseline"
-                );
-                (
-                    make(false)
-                        .map_err(|fallback| format!("OpenH264 initialization failed: {fallback}"))?,
-                    false,
-                )
-            }
-            Err(error) => return Err(format!("OpenH264 initialization failed: {error}")),
-        };
+        // Phase-2B product codec: H.264 Constrained Baseline only (SDP
+        // 42e02a), identical to the VideoToolbox and Media Foundation arms.
+        // The session codec is validated to H264 before acquisition; the
+        // request value is ignored on purpose so a High/HEVC/AV1 request can
+        // never emit a bitstream the transport drops (viewer black-screen
+        // while the host preview looks fine). Baseline implies single-slice
+        // CAVLC in OpenH264 (no CABAC, no slice-split options at this API
+        // level); bt709 VUI tags the canonical color contract; intra every
+        // fps*2 frames bounds recovery to ~2s on top of explicit IDR forcing.
+        let config = EncoderConfig::new()
+            .bitrate(BitRate::from_bps(bitrate))
+            .max_frame_rate(OpenH264FrameRate::from_hz(fps as f32))
+            .usage_type(UsageType::ScreenContentRealTime)
+            .rate_control_mode(RateControlMode::Bitrate)
+            .profile(Profile::Baseline)
+            .complexity(Complexity::Low)
+            .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(
+                fps.saturating_mul(2).max(1),
+            ))
+            .vui(VuiConfig::bt709());
+        let encoder = Encoder::with_api_config(OpenH264API::from_source(), config)
+            .map_err(|error| format!("OpenH264 initialization failed: {error}"))?;
+        let high_profile = false;
         Ok(Self {
             encoder,
             high_profile,
@@ -145,10 +144,10 @@ impl OpenH264Encoder {
         self.high_profile
     }
 
-    /// Encode size for this encoder instance: Baseline output additionally
-    /// honors the decoder-safe 1920-wide ceiling (ultrawide 2714x764
-    /// black-screens Mac viewers; 1920x528 does not). High keeps the
-    /// pixel-budget fit.
+    /// Encode size for this encoder instance: Baseline output honors the
+    /// decoder-safe 1920-wide ceiling (ultrawide 2714x764 black-screens Mac
+    /// viewers; 1920x528 does not). The `high_profile` branch is retained
+    /// for API compatibility but never taken: this encoder is Baseline-only.
     fn fit_for_encoder(&self, width: u32, height: u32) -> (u32, u32) {
         if self.high_profile {
             fit_encode_size(width, height)
@@ -266,9 +265,10 @@ impl OpenH264Encoder {
 
     pub(crate) fn set_bitrate(&mut self, bitrate: u32) -> Result<(), String> {
         unsafe {
-            self.encoder
-                .raw_api()
-                .set_option(ENCODER_OPTION_BITRATE, (&bitrate as *const u32).cast_mut().cast());
+            self.encoder.raw_api().set_option(
+                ENCODER_OPTION_BITRATE,
+                (&bitrate as *const u32).cast_mut().cast(),
+            );
         }
         Ok(())
     }
@@ -304,9 +304,7 @@ impl AnnexBConverter {
                 _ => {}
             }
         }
-        let contains_idr = nals
-            .iter()
-            .any(|nal| !nal.is_empty() && nal[0] & 0x1f == 5);
+        let contains_idr = nals.iter().any(|nal| !nal.is_empty() && nal[0] & 0x1f == 5);
         let is_keyframe = keyframe || contains_idr;
         let profile_level_id = self.sps.as_deref().and_then(sps_profile_level_id);
         let mut out = Vec::with_capacity(data.len() + 64);
@@ -399,6 +397,24 @@ mod tests {
     }
 
     #[test]
+    fn baseline_fit_preserves_arbitrary_aspect_and_aligns() {
+        // 3440x1440 (21:9) must stay 21:9, within the 1920 Baseline cap and
+        // macroblock-aligned, never forced to 16:9.
+        let (w, h) = fit_baseline_size(3440, 1440);
+        assert_eq!(w, 1920);
+        assert_eq!((w % 16, h % 16), (0, 0));
+        assert!((w as u64) * (h as u64) <= 1920 * 1080);
+        let source_aspect = 3440.0 / 1440.0;
+        assert!(((w as f64) / (h as f64) - source_aspect).abs() < 0.03);
+        // Idempotent: re-fitting a final size changes nothing.
+        assert_eq!(fit_baseline_size(w, h), (w, h));
+        assert_eq!(fit_baseline_size(1920, 528), (1920, 528));
+        // Odd source dimensions still come out even.
+        let (w, h) = fit_baseline_size(1921, 1081);
+        assert_eq!((w % 2, h % 2), (0, 0));
+    }
+
+    #[test]
     fn splits_annex_b_with_three_and_four_byte_start_codes() {
         let data = [
             0, 0, 0, 1, 0x67, 1, 2, 0, 0, 0, 1, 0x68, 3, 0, 0, 1, 0x65, 4,
@@ -423,9 +439,7 @@ mod tests {
         assert!(unit.keyframe);
         assert_eq!(
             unit.data,
-            vec![
-                0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x2a, 1, 0, 0, 0, 1, 0x68, 2, 0, 0, 0, 1, 0x65, 3,
-            ]
+            vec![0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x2a, 1, 0, 0, 0, 1, 0x68, 2, 0, 0, 0, 1, 0x65, 3,]
         );
         assert_eq!(unit.profile_level_id.as_deref(), Some("42e02a"));
     }
@@ -434,7 +448,11 @@ mod tests {
     fn non_keyframes_do_not_repeat_parameter_sets() {
         let mut converter = AnnexBConverter::default();
         converter
-            .convert(&[0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x2a, 1, 0, 0, 0, 1, 0x68, 2], 0, false)
+            .convert(
+                &[0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x2a, 1, 0, 0, 0, 1, 0x68, 2],
+                0,
+                false,
+            )
             .expect("parameter sets");
         let unit = converter
             .convert(&[0, 0, 0, 1, 0x41, 9], 3_000, false)

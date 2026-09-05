@@ -22,3 +22,49 @@ export function rejectedVideoLine(sdp: string): string | null {
   }
   return null;
 }
+
+// --- Phase-3B Stunar offer dedupe + opaque attempt echo -------------------
+// Dedupe key is from + offer_attempt (never SDP contents). The answer echoes
+// offer_attempt back opaquely so the Host can match the attempt without
+// parsing SDP. Pure helpers so the contract is testable without DOM/Tauri.
+
+/** Dedupe key for an incoming Stunar offer (sender + attempt only). */
+export function offerDedupeKey(from: string, offerAttempt: string): string {
+  return JSON.stringify([from, offerAttempt]);
+}
+
+/**
+ * Once-per-attempt offer gate. Returns true when the offer should be
+ * handled; records it in `seen` so redelivered polls stay silent.
+ * A failed attempt must delete its key (allow retry on the next poll).
+ */
+export function shouldAcceptOffer(
+  seen: Set<string>,
+  from: string,
+  offerAttempt: string,
+): boolean {
+  const key = offerDedupeKey(from, offerAttempt);
+  if (seen.has(key)) return false;
+  seen.add(key);
+  return true;
+}
+
+/** Release a dedupe key so the next poll can retry the same attempt. */
+export function releaseOfferKey(
+  seen: Set<string>,
+  from: string,
+  offerAttempt: string,
+): void {
+  seen.delete(offerDedupeKey(from, offerAttempt));
+}
+
+/**
+ * Build an answer envelope that echoes the offer attempt opaquely.
+ * The attempt string is never interpreted — it is round-tripped verbatim.
+ */
+export function answerWithAttempt<T extends Record<string, unknown>>(
+  answer: T,
+  offerAttempt: string,
+): T & { offer_attempt: string } {
+  return { ...answer, offer_attempt: offerAttempt };
+}

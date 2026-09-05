@@ -21,6 +21,18 @@ mod tests {
     }
 
     #[test]
+    fn one_sixtieth_of_a_second_is_1500_ticks() {
+        // 60fps frame duration in the 90kHz RTP clock: 90_000 / 60.
+        assert_eq!(to_90khz(1, 60), Some(1_500));
+        assert_eq!(to_90khz(1, 30), Some(3_000));
+        // Monotonic source ticks stay monotonic after conversion.
+        let a = to_90khz(100, 60).expect("a converts");
+        let b = to_90khz(101, 60).expect("b converts");
+        assert!(b > a);
+        assert_eq!(b - a, 1_500);
+    }
+
+    #[test]
     fn rejects_invalid_or_overflowing_timestamps() {
         assert_eq!(to_90khz(-1, 90_000), None);
         assert_eq!(to_90khz(1, 0), None);

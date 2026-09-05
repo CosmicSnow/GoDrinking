@@ -21,9 +21,6 @@ private final class GoLiveEncoder {
     let callback: GoLiveEncodedCallback
     let errorCallback: GoLiveEncoderErrorCallback
     let callbackContext: UnsafeMutableRawPointer?
-    /// 0 = H.264, 1 = HEVC. Selects the codec type, profile and the
-    /// Annex-B post-processing variant in the output callback.
-    let codec: Int32
     var session: VTCompressionSession?
     var forceNextKeyframe = false
     var closed = false
@@ -33,7 +30,7 @@ private final class GoLiveEncoder {
         height: Int32,
         bitrate: Int32,
         frameRate: Int32,
-        codec: Int32,
+        _ codec: Int32,
         callback: GoLiveEncodedCallback,
         errorCallback: GoLiveEncoderErrorCallback,
         callbackContext: UnsafeMutableRawPointer?
@@ -41,16 +38,13 @@ private final class GoLiveEncoder {
         self.callback = callback
         self.errorCallback = errorCallback
         self.callbackContext = callbackContext
-        self.codec = codec
 
-        let codecType: CMVideoCodecType
-        if codec == 1 {
-            codecType = kCMVideoCodecType_HEVC
-        } else if codec == 3 {
-            codecType = kCMVideoCodecType_AV1
-        } else {
-            codecType = kCMVideoCodecType_H264
-        }
+        // goDrinking product codec: H.264 Constrained Baseline only (SDP
+        // 42e02a, packetization-mode 1). Non-zero codec flags (HEVC/High/AV1)
+        // are rejected by the Rust seam before this point; fail loudly here
+        // rather than emitting a bitstream no Viewer can decode.
+        guard codec == 0 else { throw GoLiveEncoderError.unavailable }
+        let codecType: CMVideoCodecType = kCMVideoCodecType_H264
         var createdSession: VTCompressionSession?
         let status = VTCompressionSessionCreate(
             allocator: kCFAllocatorDefault,
@@ -70,23 +64,22 @@ private final class GoLiveEncoder {
         session = createdSession
 
         try setProperty(kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-        // Baseline (H.264) / Main (HEVC) plus disabled frame reordering
-        // prevents B-frame latency and is accepted by the low-latency
-        // transport profiles.
-        if codec != 3 {
-            let profileLevel: CFString
-            if codec == 1 {
-                profileLevel = kVTProfileLevel_HEVC_Main_AutoLevel
-            } else if codec == 2 {
-                profileLevel = kVTProfileLevel_H264_High_AutoLevel
-            } else {
-                profileLevel = kVTProfileLevel_H264_Baseline_4_2
-            }
-            try setProperty(
-                kVTCompressionPropertyKey_ProfileLevel,
-                value: profileLevel
-            )
-        }
+        // Constrained Baseline contract, identical to the MF/OpenH264 arms:
+        // Baseline AutoLevel (level follows dimensions), no B-frames
+        // (AllowFrameReordering=false below), CAVLC entropy coding (Baseline
+        // forbids CABAC; set explicitly so a driver default can never drift),
+        // GOP ~= 1s (MaxKeyFrameInterval=fps + duration 1.0), and BT.709
+        // color (primaries/transfer/matrix). Input pixel buffers are 32BGRA
+        // from ScreenCaptureKit; the 709 properties govern the conversion.
+        try setProperty(
+            kVTCompressionPropertyKey_ProfileLevel,
+            value: kVTProfileLevel_H264_Baseline_AutoLevel
+        )
+        // Best-effort: Baseline already implies CAVLC, this only pins it.
+        try? setProperty(
+            kVTCompressionPropertyKey_H264EntropyMode,
+            value: kVTH264EntropyMode_CAVLC
+        )
         try setProperty(
             kVTCompressionPropertyKey_ColorPrimaries,
             value: kCMFormatDescriptionColorPrimaries_ITU_R_709_2
@@ -294,55 +287,6 @@ private func normalizeAvcc(_ data: Data, headerLength: Int) -> Data? {
     return result.isEmpty ? nil : result
 }
 
-private func containsIRAP(in data: Data) -> Bool {
-    var offset = 0
-    while data.count - offset >= 4 {
-        let length = Int(UInt32(data[offset]) << 24)
-            | Int(UInt32(data[offset + 1]) << 16)
-            | Int(UInt32(data[offset + 2]) << 8)
-            | Int(UInt32(data[offset + 3]))
-        offset += 4
-        guard length > 0, data.count - offset >= length else { return false }
-        let nalUnitType = (data[offset] >> 1) & 0x3f
-        if (16...23).contains(nalUnitType) { return true }
-        offset += length
-    }
-    return false
-}
-
-private func hevcParameterSets(_ format: CMFormatDescription) -> Data {
-    var count = 0
-    var headerLength: Int32 = 4
-    guard CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
-        format,
-        parameterSetIndex: 0,
-        parameterSetPointerOut: nil,
-        parameterSetSizeOut: nil,
-        parameterSetCountOut: &count,
-        nalUnitHeaderLengthOut: &headerLength
-    ) == noErr else { return Data() }
-
-    var result = Data()
-    for index in 0..<count {
-        var parameterSet: UnsafePointer<UInt8>?
-        var size = 0
-        var setCount = 0
-        guard CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
-            format,
-            parameterSetIndex: index,
-            parameterSetPointerOut: &parameterSet,
-            parameterSetSizeOut: &size,
-            parameterSetCountOut: &setCount,
-            nalUnitHeaderLengthOut: &headerLength
-        ) == noErr, let parameterSet else { continue }
-        result.append(contentsOf: withUnsafeBytes(of: UInt32(size).bigEndian) {
-            $0.bindMemory(to: UInt8.self)
-        })
-        result.append(parameterSet, count: size)
-    }
-    return result
-}
-
 private func containsIDR(in data: Data) -> Bool {
     var offset = 0
     while data.count - offset >= 4 {
@@ -354,21 +298,6 @@ private func containsIDR(in data: Data) -> Bool {
         guard length > 0, data.count - offset >= length else { return false }
         if data[offset] & 0x1f == 5 { return true }
         offset += length
-    }
-    return false
-}
-
-private func sampleBufferIsKeyframe(_ sampleBuffer: CMSampleBuffer) -> Bool {
-    guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [CFDictionary],
-          let first = attachments.first else {
-        return false
-    }
-    let dict = first as NSDictionary
-    if let notSync = dict[kCMSampleAttachmentKey_NotSync] as? Bool {
-        return !notSync
-    }
-    if let depends = dict[kCMSampleAttachmentKey_DependsOnOthers] as? Bool {
-        return !depends
     }
     return false
 }
@@ -394,17 +323,16 @@ private func goLiveCompressionOutput(
         return
     }
 
-    let isHevc = encoder.codec == 1
-    let isAv1 = encoder.codec == 3
+    // H.264 Constrained Baseline only: normalize the AVCC sample to
+    // Annex-B and prepend the cached SPS/PPS so every IDR is decodable
+    // from a late join or queue-overflow recovery.
     var payload = Data()
-    if isAv1 {
-        payload.append(blockData)
-    } else if let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+    if let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
        let normalized = normalizeAvcc(
            blockData,
            headerLength: h264HeaderLength(formatDescription)
        ) {
-        payload.append(isHevc ? hevcParameterSets(formatDescription) : parameterSets(formatDescription))
+        payload.append(parameterSets(formatDescription))
         payload.append(normalized)
     } else {
         reportError(encoder, -1)
@@ -412,14 +340,7 @@ private func goLiveCompressionOutput(
     }
 
     let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-    let isKeyframe: Bool
-    if isAv1 {
-        isKeyframe = sampleBufferIsKeyframe(sampleBuffer)
-    } else if isHevc {
-        isKeyframe = containsIRAP(in: payload)
-    } else {
-        isKeyframe = containsIDR(in: payload)
-    }
+    let isKeyframe = containsIDR(in: payload)
     let keyframe: UInt8 = isKeyframe ? 1 : 0
     encoder.callback(
         encoder.callbackContext,
@@ -448,7 +369,7 @@ public func golive_vt_encoder_create(
             height: height,
             bitrate: bitrate,
             frameRate: frameRate,
-            codec: codec,
+            codec,
             callback: callback,
             errorCallback: errorCallback,
             callbackContext: callbackContext
