@@ -8,6 +8,7 @@ import logo from "./assets/logo.png";
 import { APP_VERSION, detectLocale, dictionaries, type Copy, type Locale } from "./copy";
 import { RoomStage } from "./RoomStage";
 import { autoFloorMbps, BITRATE_MAX_MBPS, BITRATE_MIN_MBPS, FLOOR_MAX_MBPS, FLOOR_MIN_MBPS, collectViewerStats, qualityTargetMbps, type ViewerStats, type ViewerStatsPrev } from "./sessionStats";
+import { videoSectionRejected } from "./sdp";
 
 type IconName = "grid" | "monitor" | "window" | "game" | "settings" | "help" | "plus" | "copy" | "wifi" | "chevron" | "expand" | "minimize" | "volume" | "volume-off" | "terminal" | "activity" | "folder";
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
@@ -192,6 +193,7 @@ function App() {
   const [roomDesk, setRoomDesk] = useState(false);
   const salaAliveRef = useRef(false);
   const seenOffers = useRef<Set<string>>(new Set());
+  const rejectCountRef = useRef<Map<string, number>>(new Map());
   const [joinMode, setJoinMode] = useState<"lan" | "direct" | "stunar">(() => {
     const saved = localStorage.getItem("godrinking.join_mode");
     return saved === "direct" || saved === "stunar" ? saved : "lan";
@@ -783,28 +785,56 @@ function App() {
   };
   const acceptIncomingOffer = async (incoming: IncomingOffer) => {
     if (inSala && !watchingRef.current.has(incoming.from)) return;
-    if (seenOffers.current.has(incoming.from + incoming.sdp.slice(0, 24))) return;
-    seenOffers.current.add(incoming.from + incoming.sdp.slice(0, 24));
+    const offerKey = incoming.from + incoming.sdp.slice(0, 24);
+    if (seenOffers.current.has(offerKey)) return;
+    seenOffers.current.add(offerKey);
+    // A failed attempt must be retryable on the next poll: without this,
+    // one throw leaves the viewer stuck on "incoming offers" forever with
+    // no error anywhere (the Mac-viewer symptom of the Windows incident).
+    const allowRetry = () => { seenOffers.current.delete(offerKey); };
     const existing = remotesRef.current.get(incoming.from);
-    existing?.pc.close();
-    const pc = new RTCPeerConnection({ iceServers: iceServersFor(joinMode) });
-    const stream = new MediaStream();
-    pc.ontrack = (event) => {
-      event.streams[0]?.getTracks().forEach((track) => stream.addTrack(track));
-      if (!event.streams[0] && event.track) stream.addTrack(event.track);
+    try {
+      existing?.pc.close();
+      const pc = new RTCPeerConnection({ iceServers: iceServersFor(joinMode) });
+      const stream = new MediaStream();
+      pc.ontrack = (event) => {
+        event.streams[0]?.getTracks().forEach((track) => stream.addTrack(track));
+        if (!event.streams[0] && event.track) stream.addTrack(event.track);
+        remotesRef.current.set(incoming.from, { pc, stream });
+        setRemoteIds([...remotesRef.current.keys()].filter((id, index, all) => all.indexOf(id) === index));
+        if (stageId === "host" && incoming.from !== "host") setStageId(incoming.from);
+        const el = document.querySelector<HTMLVideoElement>(`video[data-slot="${incoming.from}"]`);
+        if (el && el.srcObject !== stream) el.srcObject = stream;
+      };
       remotesRef.current.set(incoming.from, { pc, stream });
-      setRemoteIds([...remotesRef.current.keys()].filter((id, index, all) => all.indexOf(id) === index));
-      if (stageId === "host" && incoming.from !== "host") setStageId(incoming.from);
-      const el = document.querySelector<HTMLVideoElement>(`video[data-slot="${incoming.from}"]`);
-      if (el && el.srcObject !== stream) el.srcObject = stream;
-    };
-    remotesRef.current.set(incoming.from, { pc, stream });
-    await pc.setRemoteDescription({ type: "offer", sdp: incoming.sdp });
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    await waitIce(pc);
-    if (!pc.localDescription?.sdp) return;
-    await invokeMedia("send_stunar_room_answer", { request: { to: incoming.from, answer: { type: "answer", sdp: pc.localDescription.sdp, id: incoming.from } } });
+      await pc.setRemoteDescription({ type: "offer", sdp: incoming.sdp });
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      await waitIce(pc);
+      const localSdp = pc.localDescription?.sdp;
+      if (!localSdp) {
+        pc.close();
+        allowRetry();
+        return;
+      }
+      // Never ship a dead answer: a browser with no decoder for the session
+      // codec answers m=video 0, which only fails loudly on the host while
+      // this viewer stays silent. Surface it here and retry (bounded: the
+      // poll dedups after two consecutive rejections of the same offer).
+      if (videoSectionRejected(localSdp)) {
+        pc.close();
+        const rejects = (rejectCountRef.current.get(offerKey) ?? 0) + 1;
+        rejectCountRef.current.set(offerKey, rejects);
+        if (rejects < 2) allowRetry();
+        setNotice("This browser could not use the session video (no common decoder).");
+        return;
+      }
+      rejectCountRef.current.delete(offerKey);
+      await invokeMedia("send_stunar_room_answer", { request: { to: incoming.from, answer: { type: "answer", sdp: localSdp, id: incoming.from } } });
+    } catch (error) {
+      allowRetry();
+      setNotice(diagnosticError(error, "Could not answer the session."));
+    }
   };
   useEffect(() => {
     if (!watchConnected && !active && !roomJoined) return;
@@ -901,6 +931,9 @@ function App() {
       await waitIce(pc);
       const local = pc.localDescription;
       if (!local?.sdp) throw new Error("The viewer could not create an answer.");
+      if (videoSectionRejected(local.sdp)) {
+        throw new Error("This browser refused the session video (no common decoder — try another browser).");
+      }
       const handleIce = () => {
         if (peerRef.current !== pc) return;
         const state = pc.iceConnectionState;

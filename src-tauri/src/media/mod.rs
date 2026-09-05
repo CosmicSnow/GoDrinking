@@ -18,6 +18,8 @@ mod process_tap;
 mod rendezvous;
 #[cfg(test)]
 mod stunar_integration_test;
+#[cfg(test)]
+mod win_stunar_repro;
 mod room;
 mod room_mode;
 mod session_gate;

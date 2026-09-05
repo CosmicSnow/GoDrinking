@@ -575,6 +575,7 @@ async fn run_peer(
         let mut previous_timestamp = None;
         let mut units_seen = 0u64;
         let mut dropped_awaiting = 0u64;
+        let mut dropped_profile_mismatch = 0u64;
         let mut wrote_first = false;
         while let Some(unit) = sample_rx.recv().await {
             units_seen += 1;
@@ -619,16 +620,26 @@ async fn run_peer(
                 awaiting_keyframe = false;
                 super::logger::log("INFO", "pump", "first keyframe seen, starting stream");
             }
-            let profile_ok = unit.profile_level_id.as_deref().map_or(true, |profile| {
-                super::access_unit::is_baseline_profile(profile)
-                    || (allow_high_profile && super::access_unit::is_high_profile(profile))
-            });
+            let profile_ok = sample_profile_accepted(
+                unit.profile_level_id.as_deref(),
+                allow_high_profile,
+            );
             if !profile_ok {
-                eprintln!(
-                    "[goDrinking] skipping H.264 sample with profile {:?} (session {})",
-                    unit.profile_level_id,
-                    if allow_high_profile { "H.264 High" } else { "H.264" },
-                );
+                // Was a silent `eprintln!` (outside the session file): a
+                // profile mismatch black-screened viewers while the host log
+                // looked healthy (incident: 640c2a in a Baseline session).
+                // Now it lands in the session file, throttled: first drop
+                // plus every 600th, so the cause is one grep away.
+                dropped_profile_mismatch += 1;
+                if dropped_profile_mismatch == 1 || dropped_profile_mismatch % 600 == 0 {
+                    let message = format!(
+                        "dropping H.264 sample with SPS profile {:?} (session {}; dropped {dropped_profile_mismatch} total)",
+                        unit.profile_level_id,
+                        if allow_high_profile { "H.264 High" } else { "H.264" },
+                    );
+                    eprintln!("[goDrinking] {message}");
+                    super::logger::log("WARN", "pump", &message);
+                }
                 continue;
             }
             let Some(timestamp) = timestamp_from_90khz(unit.timestamp_90khz) else {
@@ -1043,6 +1054,20 @@ async fn set_answer(peer: &Arc<RTCPeerConnection>, answer: PeerSignal) -> Result
     .map_err(|error| format!("set remote answer failed: {error}"))
 }
 
+/// Sample gate predicate, extracted pure so it is unit-tested directly
+/// instead of only via mirrors: Baseline sessions accept `42*` SPS only;
+/// H.264 High sessions also accept `64*` (Baseline decodes everywhere).
+/// `None` (no SPS seen yet) is accepted — same as the old inline `map_or`.
+pub(crate) fn sample_profile_accepted(
+    profile_level_id: Option<&str>,
+    allow_high_profile: bool,
+) -> bool {
+    profile_level_id.map_or(true, |profile| {
+        super::access_unit::is_baseline_profile(profile)
+            || (allow_high_profile && super::access_unit::is_high_profile(profile))
+    })
+}
+
 /// Inspects an SDP answer: returns the video m-line when its port is 0
 /// (stream rejected — no common codec), None when video was accepted.
 fn rejected_video_section(sdp: &str) -> Option<String> {
@@ -1255,14 +1280,42 @@ mod tests {
     }
 
     #[test]
+    fn sample_gate_accepts_only_the_session_profile() {
+        // Baseline sessions (the default): every 42* SPS passes, anything
+        // else (incident: 640c2a) is dropped so the browser never gets an
+        // undecodable stream.
+        for profile in ["42e02a", "42c02a", "42c01e", "42c028", "42C02A"] {
+            assert!(
+                super::sample_profile_accepted(Some(profile), false),
+                "Baseline session must accept {profile}"
+            );
+        }
+        for profile in ["640c2a", "64002a", "640c29", "4d002a", "", "42e02"] {
+            assert!(
+                !super::sample_profile_accepted(Some(profile), false),
+                "Baseline session must drop {profile:?}"
+            );
+        }
+        // H.264 High sessions additionally accept High SPS (Baseline still
+        // decodes everywhere, so it stays accepted).
+        assert!(super::sample_profile_accepted(Some("640c2a"), true));
+        assert!(super::sample_profile_accepted(Some("42e02a"), true));
+        assert!(!super::sample_profile_accepted(Some("4d002a"), true));
+        // No SPS parsed yet: let it through (keyframe wait still applies).
+        assert!(super::sample_profile_accepted(None, false));
+        assert!(super::sample_profile_accepted(None, true));
+    }
+
+    #[test]
     fn h264_codec_advertises_low_latency_feedback() {
         let codec = h264_codec("42e02a");
         assert_eq!(codec.capability.mime_type, "video/H264");
         assert_eq!(codec.capability.clock_rate, 90_000);
-        assert!(codec
-            .capability
-            .sdp_fmtp_line
-            .contains("profile-level-id=42e02a"));
+        assert_eq!(codec.payload_type, 102);
+        assert_eq!(
+            codec.capability.sdp_fmtp_line,
+            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e02a"
+        );
         assert!(codec
             .capability
             .rtcp_feedback
