@@ -1,6 +1,6 @@
 /** UI copy. English and Brazilian Portuguese. Short, in place. */
 
-export const APP_VERSION = "0.4.0";
+export const APP_VERSION = "0.5.0";
 
 export type Locale = "en" | "pt-BR";
 
