@@ -7,9 +7,7 @@
 #[cfg(target_os = "macos")]
 use super::pipeline::NativeEncoderFrame;
 use super::pipeline::{EncoderCommand, NativeFrame, PreviewDiagnostics};
-use super::types::{
-    CaptureSource, CreateMediaSessionRequest, FrameRate, NativeCaptureSource,
-};
+use super::types::{CaptureSource, CreateMediaSessionRequest, FrameRate, NativeCaptureSource};
 use serde::Serialize;
 use std::fmt::{Display, Formatter};
 use std::marker::PhantomData;
@@ -219,8 +217,8 @@ mod native {
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
     use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass};
-    use objc2_core_media::{CMSampleBuffer, CMTime};
     use objc2_core_graphics::kCGColorSpaceITUR_709;
+    use objc2_core_media::{CMSampleBuffer, CMTime};
     use objc2_core_video::{
         kCVPixelFormatType_32BGRA, kCVReturnSuccess, CVPixelBuffer, CVPixelBufferGetBaseAddress,
         CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType,
@@ -229,9 +227,9 @@ mod native {
     };
     use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
     use objc2_screen_capture_kit::{
-        SCContentFilter, SCContentSharingPicker, SCContentSharingPickerObserver, SCShareableContent,
-        SCShareableContentStyle, SCStream, SCStreamConfiguration, SCStreamDelegate, SCStreamOutput,
-        SCStreamOutputType, SCWindow,
+        SCContentFilter, SCContentSharingPicker, SCContentSharingPickerObserver,
+        SCShareableContent, SCShareableContentStyle, SCStream, SCStreamConfiguration,
+        SCStreamDelegate, SCStreamOutput, SCStreamOutputType, SCWindow,
     };
     use std::slice;
     use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -573,21 +571,22 @@ mod native {
                     Retained::retain(filter as *const SCContentFilter as *mut SCContentFilter)
                 };
                 if let Some(filter) = retained {
-                    let _ = self.ivars().tx.send(PickerEvent::Selected(SendFilter(filter)));
-                } else {
                     let _ = self
                         .ivars()
                         .tx
-                        .send(PickerEvent::Failed("picker returned an empty filter".into()));
+                        .send(PickerEvent::Selected(SendFilter(filter)));
+                } else {
+                    let _ = self.ivars().tx.send(PickerEvent::Failed(
+                        "picker returned an empty filter".into(),
+                    ));
                 }
             }
 
             #[unsafe(method(contentSharingPickerStartDidFailWithError:))]
             unsafe fn content_sharing_picker_start_did_fail_with_error(&self, error: &NSError) {
-                let _ = self
-                    .ivars()
-                    .tx
-                    .send(PickerEvent::Failed(error.localizedDescription().to_string()));
+                let _ = self.ivars().tx.send(PickerEvent::Failed(
+                    error.localizedDescription().to_string(),
+                ));
             }
         }
     );
@@ -1084,7 +1083,8 @@ mod native {
         Ok(Vec::new())
     }
 
-    pub(crate) fn enumerate_running_apps() -> Result<Vec<crate::media::types::NativeRunningApp>, ScreenCaptureKitError> {
+    pub(crate) fn enumerate_running_apps(
+    ) -> Result<Vec<crate::media::types::NativeRunningApp>, ScreenCaptureKitError> {
         // NSWorkspace runningApplications carries name, pid, and bundle id so
         // audio exclusion can match helper processes (e.g. Discord). The
         // window list remains a fallback for names/pids. Neither path calls
@@ -2066,7 +2066,11 @@ fn dedupe_apps_by_pid(
         }
     }
     let mut result: Vec<_> = by_pid.into_values().collect();
-    result.sort_by(|left, right| left.name.to_ascii_lowercase().cmp(&right.name.to_ascii_lowercase()));
+    result.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+    });
     result
 }
 
@@ -2216,7 +2220,13 @@ mod tests {
         let (encoder_tx, _encoder_rx) = sync_channel::<EncoderCommand>(1);
         let diagnostics = super::super::pipeline::PreviewDiagnostics::new();
         assert!(adapter
-            .start_capture(&request, capture_tx.clone(), encoder_tx.clone(), Arc::clone(&diagnostics), 1)
+            .start_capture(
+                &request,
+                capture_tx.clone(),
+                encoder_tx.clone(),
+                Arc::clone(&diagnostics),
+                1
+            )
             .is_err());
         assert_eq!(adapter.lifecycle(), CaptureLifecycle::Idle);
         assert!(adapter

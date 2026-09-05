@@ -245,11 +245,7 @@ impl EncoderControl {
     /// Live floor update: re-asserts the encoder at the raised floor so a
     /// previously collapsed stream recovers without waiting for REMB.
     pub(crate) fn set_floor(&self, floor: u32) {
-        let (floor, target, current) = (
-            floor,
-            self.target(),
-            self.congestion_bitrate(),
-        );
+        let (floor, target, current) = (floor, self.target(), self.congestion_bitrate());
         let floor = floor.min(target);
         if let Ok(mut slot) = self.floor.lock() {
             *slot = floor;
@@ -317,11 +313,19 @@ impl EncoderControl {
     }
 
     pub(crate) fn floor(&self) -> u32 {
-        self.floor.lock().ok().map(|floor| *floor).unwrap_or(250_000)
+        self.floor
+            .lock()
+            .ok()
+            .map(|floor| *floor)
+            .unwrap_or(250_000)
     }
 
     pub(crate) fn applied(&self) -> u32 {
-        self.applied.lock().ok().map(|applied| *applied).unwrap_or(0)
+        self.applied
+            .lock()
+            .ok()
+            .map(|applied| *applied)
+            .unwrap_or(0)
     }
 
     /// Records the rate actually programmed into a fresh encoder (e.g. the
@@ -390,7 +394,10 @@ impl EncoderControl {
     }
 
     pub(crate) fn congestion_bitrate(&self) -> Option<u32> {
-        self.congestion.lock().ok().and_then(|congestion| *congestion)
+        self.congestion
+            .lock()
+            .ok()
+            .and_then(|congestion| *congestion)
     }
 
     pub(crate) fn request_stop(&self) {
@@ -864,7 +871,11 @@ fn encoder_worker_loop(
         };
         let software_or_fail = |error: String| {
             if backend == VideoEncoder::Hardware {
-                logger::log("ERROR", "encoder", &format!("explicit Hardware failed: {error}"));
+                logger::log(
+                    "ERROR",
+                    "encoder",
+                    &format!("explicit Hardware failed: {error}"),
+                );
                 state.fail(error);
                 None
             } else {
@@ -930,7 +941,11 @@ fn encoder_worker_loop(
                         if encoder.is_high_profile() != want_high {
                             let message = format!(
                                 "hardware encoder negotiated {} profile for a {} session",
-                                if encoder.is_high_profile() { "High" } else { "Baseline" },
+                                if encoder.is_high_profile() {
+                                    "High"
+                                } else {
+                                    "Baseline"
+                                },
                                 if want_high { "H.264 High" } else { "H.264" },
                             );
                             eprintln!(
@@ -955,7 +970,11 @@ fn encoder_worker_loop(
                             );
                             return match software() {
                                 Ok(encoder) => {
-                                    logger::log("INFO", "encoder", "engaged OpenH264 software encoder");
+                                    logger::log(
+                                        "INFO",
+                                        "encoder",
+                                        "engaged OpenH264 software encoder",
+                                    );
                                     Some(WindowsVideoEncoder::Software(encoder))
                                 }
                                 Err(error) => {
@@ -974,7 +993,11 @@ fn encoder_worker_loop(
                             "encoder",
                             &format!(
                                 "engaged MF hardware encoder ({} profile)",
-                                if encoder.is_high_profile() { "High" } else { "Baseline" }
+                                if encoder.is_high_profile() {
+                                    "High"
+                                } else {
+                                    "Baseline"
+                                }
                             ),
                         );
                         Some(encoder)
@@ -1086,10 +1109,7 @@ fn encoder_worker_loop(
                             logger::log(
                                 "INFO",
                                 "encoder",
-                                &format!(
-                                    "first frame accepted ({}x{})",
-                                    frame.width, frame.height
-                                ),
+                                &format!("first frame accepted ({}x{})", frame.width, frame.height),
                             );
                         }
                     }
@@ -1140,7 +1160,9 @@ fn encoder_worker_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::{FrameRate, TransmissionQuality, VideoCodec, VideoEncoder, VideoResolution};
+    use super::super::types::{
+        FrameRate, TransmissionQuality, VideoCodec, VideoEncoder, VideoResolution,
+    };
     use super::{EncoderCommand, EncoderControl, NativeFrame, NativePipeline, PreviewState};
     use std::sync::Arc;
     use std::time::{Duration, Instant};

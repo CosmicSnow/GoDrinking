@@ -52,16 +52,11 @@ pub(crate) fn fitted_even_size(
     let max_height = max_height.max(2);
     // Contained sources stay native (no upscale, even dimensions).
     if source_width <= max_width && source_height <= max_height {
-        return (
-            (source_width & !1).max(2),
-            (source_height & !1).max(2),
-        );
+        return ((source_width & !1).max(2), (source_height & !1).max(2));
     }
     // Pixel-budget fit: use the area of the cap, not a 16:9 letterbox.
     // A 3440x1440 ultrawide at a 1080p cap stays ~21:9 and wider than 1920.
-    let cap_pixels = (max_width as u64)
-        .saturating_mul(max_height as u64)
-        .max(1);
+    let cap_pixels = (max_width as u64).saturating_mul(max_height as u64).max(1);
     let src_pixels = (source_width as u64)
         .saturating_mul(source_height as u64)
         .max(1);
@@ -577,7 +572,7 @@ impl MediaSessionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::{
-        fitted_even_size, resolve_floor, MIN_BITRATE_BPS, TransmissionQuality, VideoCodec,
+        fitted_even_size, resolve_floor, TransmissionQuality, VideoCodec, MIN_BITRATE_BPS,
     };
 
     fn aspect(width: u32, height: u32) -> f64 {
@@ -603,8 +598,14 @@ mod tests {
         assert_eq!(width % 2, 0);
         assert_eq!(height % 2, 0);
         assert!(width * height <= 1920 * 1080);
-        assert!(width > 1920, "ultrawide may be wider than 1920, got {width}x{height}");
-        assert!(height > 804, "must beat the old letterbox height 804, got {height}");
+        assert!(
+            width > 1920,
+            "ultrawide may be wider than 1920, got {width}x{height}"
+        );
+        assert!(
+            height > 804,
+            "must beat the old letterbox height 804, got {height}"
+        );
         assert!((aspect(width, height) - aspect(3440, 1440)).abs() < 0.02);
 
         let (uwqhd_w, uwqhd_h) = fitted_even_size(5120, 1440, 1920, 1080);

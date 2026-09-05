@@ -2,12 +2,16 @@ mod media;
 
 use media::logger;
 use media::{
-    CreateMediaSessionRequest, JoinMode, MediaEngine, MediaSessionSnapshot, NativeCaptureSource,
-    NativeRunningApp, PeerSignal, PreviewFrameEvent, ProbeReport, UpdateCredentialsRequest,
-    UpdateMediaSessionRequest, MediaSessionStats,
+    CreateMediaSessionRequest, JoinMode, MediaEngine, MediaSessionSnapshot, MediaSessionStats,
+    NativeCaptureSource, NativeRunningApp, PeerSignal, PreviewFrameEvent, ProbeReport,
+    UpdateCredentialsRequest, UpdateMediaSessionRequest,
 };
-use std::net::IpAddr;
 use tauri::State;
+
+#[inline]
+fn str_err<E: ToString>(error: E) -> String {
+    error.to_string()
+}
 
 /// Returns the native media APIs known to be available on this platform.
 ///
@@ -33,12 +37,10 @@ async fn create_media_session(
 ) -> Result<MediaSessionSnapshot, String> {
     let engine = engine.inner().clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        engine
-            .create_session(request)
-            .map_err(|error| error.to_string())
+        engine.create_session(request).map_err(str_err)
     })
     .await
-    .map_err(|error| error.to_string())?;
+    .map_err(str_err)?;
     result.map_err(|error| {
         logger::log("ERROR", "create session failed", &error);
         error
@@ -53,11 +55,9 @@ async fn stop_media_session(
     engine: State<'_, MediaEngine>,
 ) -> Result<MediaSessionSnapshot, String> {
     let engine = engine.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        engine.stop_session().map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|error| error.to_string())?
+    tauri::async_runtime::spawn_blocking(move || engine.stop_session().map_err(str_err))
+        .await
+        .map_err(str_err)?
 }
 
 /// Applies live settings (quality, system audio, exclusions) to the active
@@ -67,9 +67,7 @@ fn update_media_session(
     engine: State<'_, MediaEngine>,
     request: UpdateMediaSessionRequest,
 ) -> Result<MediaSessionSnapshot, String> {
-    engine
-        .update_session(request)
-        .map_err(|error| error.to_string())
+    engine.update_session(request).map_err(str_err)
 }
 
 /// Reads the current native media state without moving frames over IPC.
@@ -86,7 +84,7 @@ async fn get_media_session_stats(
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.viewer_link_stats())
         .await
-        .map_err(|error| error.to_string())
+        .map_err(str_err)
 }
 
 /// Enumerates display and window metadata without exposing native handles or
@@ -95,9 +93,7 @@ async fn get_media_session_stats(
 fn get_media_capture_sources(
     engine: State<'_, MediaEngine>,
 ) -> Result<Vec<NativeCaptureSource>, String> {
-    engine
-        .enumerate_sources()
-        .map_err(|error| error.to_string())
+    engine.enumerate_sources().map_err(str_err)
 }
 
 /// Requests Screen Recording access and returns the refreshed capability state.
@@ -117,9 +113,7 @@ fn get_media_preview(engine: State<'_, MediaEngine>) -> Option<PreviewFrameEvent
 
 #[tauri::command]
 fn create_media_peer_offer(engine: State<'_, MediaEngine>) -> Result<PeerSignal, String> {
-    engine
-        .create_peer_offer()
-        .map_err(|error| error.to_string())
+    engine.create_peer_offer().map_err(str_err)
 }
 
 #[tauri::command]
@@ -127,47 +121,30 @@ fn accept_media_peer_offer(
     engine: State<'_, MediaEngine>,
     offer: PeerSignal,
 ) -> Result<PeerSignal, String> {
-    engine
-        .accept_peer_offer(offer)
-        .map_err(|error| error.to_string())
+    engine.accept_peer_offer(offer).map_err(str_err)
 }
 
 #[tauri::command]
 fn set_media_peer_answer(engine: State<'_, MediaEngine>, answer: PeerSignal) -> Result<(), String> {
-    engine
-        .set_peer_answer(answer)
-        .map_err(|error| error.to_string())
+    engine.set_peer_answer(answer).map_err(str_err)
 }
 
 #[tauri::command]
 fn close_media_peer_transport(engine: State<'_, MediaEngine>) -> Result<(), String> {
-    engine
-        .close_peer_transport()
-        .map_err(|error| error.to_string())
-}
-
-#[derive(serde::Deserialize)]
-struct KickViewerRequest {
-    id: String,
+    engine.close_peer_transport().map_err(str_err)
 }
 
 #[tauri::command]
 fn kick_media_viewer(
     engine: State<'_, MediaEngine>,
-    request: KickViewerRequest,
+    id: String,
 ) -> Result<MediaSessionSnapshot, String> {
-    engine
-        .kick_viewer(&request.id)
-        .map_err(|error| error.to_string())
+    engine.kick_viewer(&id).map_err(str_err)
 }
 
 #[tauri::command]
-fn get_media_running_apps(
-    engine: State<'_, MediaEngine>,
-) -> Result<Vec<NativeRunningApp>, String> {
-    engine
-        .running_applications()
-        .map_err(|error| error.to_string())
+fn get_media_running_apps(engine: State<'_, MediaEngine>) -> Result<Vec<NativeRunningApp>, String> {
+    engine.running_applications().map_err(str_err)
 }
 
 #[derive(serde::Deserialize)]
@@ -193,24 +170,6 @@ struct JoinRoomRequest {
     rendezvous_url: Option<String>,
 }
 
-/// Parses `1.2.3.4:41234`, `[2001:db8::1]:41234`, or a bare IPv6 with a
-/// trailing port. Only IP literals; anything else is `invalid_address`.
-fn parse_direct_host(input: &str) -> Result<std::net::SocketAddr, String> {
-    let invalid = || "Could not reach that address.".to_owned();
-    let input = input.trim();
-    if let Some(rest) = input.strip_prefix('[') {
-        let (ip, port) = rest.split_once(']').ok_or_else(invalid)?;
-        let port = port.strip_prefix(':').ok_or_else(invalid)?.parse::<u16>().map_err(|_| invalid())?;
-        let ip: IpAddr = ip.parse().map_err(|_| invalid())?;
-        Ok(std::net::SocketAddr::new(ip, port))
-    } else {
-        let (ip, port) = input.rsplit_once(':').ok_or_else(invalid)?;
-        let port = port.parse::<u16>().map_err(|_| invalid())?;
-        let ip: IpAddr = ip.parse().map_err(|_| invalid())?;
-        Ok(std::net::SocketAddr::new(ip, port))
-    }
-}
-
 #[tauri::command]
 async fn discover_media_room(
     engine: State<'_, MediaEngine>,
@@ -233,13 +192,15 @@ async fn discover_media_room(
                     if raw_host.is_empty() {
                         return Err("Could not reach that address.".to_owned());
                     }
-                    // O Viewer agora manda IP:porta tudo junto em `host`
+                    // O Viewer manda IP:porta tudo junto em `host`
                     // (ex. 192.168.1.10:41234 ou [2001:db8::1]:41234).
-                    // Mantemos compat com clientes antigos que separavam host/port.
-                    let addr = if let Ok(addr) = parse_direct_host(raw_host) {
+                    // `port` é compat com clientes antigos que separavam host/port.
+                    let addr: std::net::SocketAddr = if let Ok(addr) = raw_host.parse() {
                         addr
                     } else if let Some(port) = request.port {
-                        parse_direct_host(&format!("{raw_host}:{port}"))?
+                        format!("{raw_host}:{port}")
+                            .parse()
+                            .map_err(|_| "Could not reach that address.".to_owned())?
                     } else {
                         return Err("Could not reach that address.".to_owned());
                     };
@@ -250,7 +211,7 @@ async fn discover_media_room(
                 JoinMode::Stunar => unreachable!("stunar handled outside spawn_blocking"),
             })
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(str_err)?
         }
         JoinMode::Stunar => {
             let engine = engine.inner().clone();
@@ -262,10 +223,10 @@ async fn discover_media_room(
                 engine
                     .discover_stunar(&base, &request.code, &request.password, &request.nickname)
                     .map(|(token, offer)| (token, offer, String::new()))
-                    .map_err(|error| error.to_string())
+                    .map_err(str_err)
             })
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(str_err)?
         }
     };
     result.map_err(|error| {
@@ -291,24 +252,20 @@ async fn submit_media_room_answer(
         JoinMode::Stunar => {
             let engine = engine.inner().clone();
             tauri::async_runtime::spawn_blocking(move || {
-                engine
-                    .submit_stunar_answer(request.answer)
-                    .map_err(|error| error.to_string())
+                engine.submit_stunar_answer(request.answer).map_err(str_err)
             })
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(str_err)?
         }
-        JoinMode::Lan | JoinMode::Direct => {
-            tauri::async_runtime::spawn_blocking(move || {
-                let host = request
-                    .host
-                    .parse()
-                    .map_err(|_| "invalid room host address".to_owned())?;
-                media::submit_room_answer(host, &request.answer)
-            })
-            .await
-            .map_err(|error| error.to_string())?
-        }
+        JoinMode::Lan | JoinMode::Direct => tauri::async_runtime::spawn_blocking(move || {
+            let host = request
+                .host
+                .parse()
+                .map_err(|_| "invalid room host address".to_owned())?;
+            media::submit_room_answer(host, &request.answer)
+        })
+        .await
+        .map_err(str_err)?,
     }
 }
 
@@ -338,7 +295,7 @@ fn send_stunar_room_answer(
     signal.id = Some(request.to.clone());
     engine
         .send_stunar_signal(&request.to, signal)
-        .map_err(|error| error.to_string())
+        .map_err(str_err)
 }
 
 #[derive(serde::Deserialize)]
@@ -354,7 +311,7 @@ fn send_stunar_room_offer(
 ) -> Result<(), String> {
     engine
         .send_stunar_signal(&request.to, request.offer)
-        .map_err(|error| error.to_string())
+        .map_err(str_err)
 }
 
 #[derive(serde::Deserialize)]
@@ -370,51 +327,35 @@ fn create_member_offer(
 ) -> Result<PeerSignal, String> {
     engine
         .offer_for_member(&request.id, &request.nickname)
-        .map_err(|error| error.to_string())
+        .map_err(str_err)
 }
 
 #[tauri::command]
 fn announce_media_share(engine: State<'_, MediaEngine>, start: bool) -> Result<(), String> {
-    engine.announce_share(start).map_err(|error| error.to_string())
-}
-
-#[derive(serde::Deserialize)]
-struct WatchRequest {
-    to: String,
-    start: bool,
+    engine.announce_share(start).map_err(str_err)
 }
 
 #[tauri::command]
-fn stunar_watch(engine: State<'_, MediaEngine>, request: WatchRequest) -> Result<(), String> {
-    engine
-        .request_watch(&request.to, request.start)
-        .map_err(|error| error.to_string())
+fn stunar_watch(engine: State<'_, MediaEngine>, to: String, start: bool) -> Result<(), String> {
+    engine.request_watch(&to, start).map_err(str_err)
 }
 
 /// Async like `create_media_session`: ScreenCaptureKit's picker must run on
 /// the AppKit loop. A sync command on the UI thread deadlocks the window.
 #[tauri::command]
-async fn start_media_share(
-    engine: State<'_, MediaEngine>,
-) -> Result<MediaSessionSnapshot, String> {
+async fn start_media_share(engine: State<'_, MediaEngine>) -> Result<MediaSessionSnapshot, String> {
     let engine = engine.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        engine.start_share().map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|error| error.to_string())?
+    tauri::async_runtime::spawn_blocking(move || engine.start_share().map_err(str_err))
+        .await
+        .map_err(str_err)?
 }
 
 #[tauri::command]
-async fn stop_media_share(
-    engine: State<'_, MediaEngine>,
-) -> Result<MediaSessionSnapshot, String> {
+async fn stop_media_share(engine: State<'_, MediaEngine>) -> Result<MediaSessionSnapshot, String> {
     let engine = engine.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        engine.stop_share().map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|error| error.to_string())?
+    tauri::async_runtime::spawn_blocking(move || engine.stop_share().map_err(str_err))
+        .await
+        .map_err(str_err)?
 }
 
 /// Returns the last 30 session log files (newest first) for the View logs UI.
@@ -447,29 +388,20 @@ fn get_firewall_status() -> String {
     crate::media::firewall::check_firewall_status()
 }
 
-#[derive(serde::Deserialize)]
-struct ViewerDecisionRequest {
-    id: String,
-}
-
 #[tauri::command]
 fn admit_media_viewer(
     engine: State<'_, MediaEngine>,
-    request: ViewerDecisionRequest,
+    id: String,
 ) -> Result<MediaSessionSnapshot, String> {
-    engine
-        .admit_viewer(&request.id)
-        .map_err(|error| error.to_string())
+    engine.admit_viewer(&id).map_err(str_err)
 }
 
 #[tauri::command]
 fn reject_media_viewer(
     engine: State<'_, MediaEngine>,
-    request: ViewerDecisionRequest,
+    id: String,
 ) -> Result<MediaSessionSnapshot, String> {
-    engine
-        .reject_viewer(&request.id)
-        .map_err(|error| error.to_string())
+    engine.reject_viewer(&id).map_err(str_err)
 }
 
 #[tauri::command]
@@ -477,20 +409,14 @@ fn update_media_session_credentials(
     engine: State<'_, MediaEngine>,
     request: UpdateCredentialsRequest,
 ) -> Result<MediaSessionSnapshot, String> {
-    engine
-        .update_session_credentials(request)
-        .map_err(|error| error.to_string())
+    engine.update_session_credentials(request).map_err(str_err)
 }
 
 /// Local encoder probe. No Session, no Rendezvous, no Media on the wire.
 #[tauri::command]
-fn run_media_benchmark(
-    engine: State<'_, MediaEngine>,
-) -> Result<ProbeReport, String> {
+fn run_media_benchmark(engine: State<'_, MediaEngine>) -> Result<ProbeReport, String> {
     let snapshot = engine.snapshot();
-    if snapshot.state == media::MediaLifecycleState::Running
-        || snapshot.native_capture_active
-    {
+    if snapshot.state == media::MediaLifecycleState::Running || snapshot.native_capture_active {
         return Err("Stop the session before measuring this PC.".into());
     }
     let caps = engine.capabilities();

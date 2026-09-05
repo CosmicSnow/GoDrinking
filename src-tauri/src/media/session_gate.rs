@@ -70,7 +70,11 @@ impl SessionGate {
         };
         if let Some(until) = ignore.until.get(&ip).copied() {
             if Instant::now() < until {
-                logger::log("WARN", "ignore list", &format!("{ip} refused (on ignore list)"));
+                logger::log(
+                    "WARN",
+                    "ignore list",
+                    &format!("{ip} refused (on ignore list)"),
+                );
                 return true;
             }
             ignore.until.remove(&ip);
@@ -107,7 +111,13 @@ impl SessionGate {
     pub(crate) fn register_pending(&self, id: String, nickname: String) -> Receiver<bool> {
         let (tx, rx) = sync_channel(1);
         if let Ok(mut pending) = self.pending.lock() {
-            pending.insert(id, PendingSlot { nickname, decision: tx });
+            pending.insert(
+                id,
+                PendingSlot {
+                    nickname,
+                    decision: tx,
+                },
+            );
         }
         rx
     }
@@ -140,7 +150,6 @@ impl SessionGate {
             })
             .unwrap_or_default()
     }
-
 }
 
 pub(crate) fn passwords_match(expected: &str, got: &str) -> bool {

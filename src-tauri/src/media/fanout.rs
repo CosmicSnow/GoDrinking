@@ -116,7 +116,10 @@ fn push_video(subs: &Mutex<HashMap<String, AccessUnitQueue>>, unit: &EncodedAcce
     }
 }
 
-fn push_audio(subs: &Mutex<HashMap<String, SyncSender<EncodedAudioPacket>>>, packet: &EncodedAudioPacket) {
+fn push_audio(
+    subs: &Mutex<HashMap<String, SyncSender<EncodedAudioPacket>>>,
+    packet: &EncodedAudioPacket,
+) {
     let Ok(subs) = subs.lock() else {
         return;
     };

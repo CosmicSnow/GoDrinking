@@ -55,7 +55,9 @@ fn ws_url(base: &str, role: &str, token: &str) -> Result<String, String> {
 }
 
 async fn connect_ws(url: &str) -> Result<WsStream, String> {
-    let (ws, _) = connect_async(url).await.map_err(|error| error.to_string())?;
+    let (ws, _) = connect_async(url)
+        .await
+        .map_err(|error| error.to_string())?;
     Ok(ws)
 }
 
@@ -244,8 +246,14 @@ impl StunarHost {
         );
         let runtime = current_thread_runtime()?;
         let client = http_client()?;
-        let (host_token, code, self_id) =
-            runtime.block_on(host_open(&client, base, password, nickname, admission, session_mode))?;
+        let (host_token, code, self_id) = runtime.block_on(host_open(
+            &client,
+            base,
+            password,
+            nickname,
+            admission,
+            session_mode,
+        ))?;
         let state = Arc::new(Mutex::new(StunarState::Calling));
         let roster = Arc::new(Mutex::new(HashMap::new()));
         let answers = Arc::new(Mutex::new(Vec::new()));
@@ -347,9 +355,7 @@ impl StunarHost {
             .map(|roster| {
                 roster
                     .iter()
-                    .filter(|(_, viewer)| {
-                        viewer.state == "accepted" || viewer.state == "sharing"
-                    })
+                    .filter(|(_, viewer)| viewer.state == "accepted" || viewer.state == "sharing")
                     .map(|(id, viewer)| (id.clone(), viewer.nickname.clone()))
                     .collect()
             })
@@ -370,10 +376,20 @@ impl StunarHost {
     /// offer for accepted ones.
     pub(crate) fn decide(&self, id: &str, accept: bool) -> Result<(), String> {
         let action = if accept { "accept" } else { "reject" };
-        logger::log("INFO", "stunar decide", &format!("viewer={id} action={action}"));
+        logger::log(
+            "INFO",
+            "stunar decide",
+            &format!("viewer={id} action={action}"),
+        );
         let runtime = current_thread_runtime()?;
         let client = http_client()?;
-        runtime.block_on(post_decide(&client, &self.base, &self.host_token, id, action))?;
+        runtime.block_on(post_decide(
+            &client,
+            &self.base,
+            &self.host_token,
+            id,
+            action,
+        ))?;
         if let Ok(mut roster) = self.roster.lock() {
             if accept {
                 if let Some(viewer) = roster.get_mut(id) {
@@ -390,7 +406,13 @@ impl StunarHost {
         logger::log("INFO", "stunar kick", &format!("viewer={id}"));
         let runtime = current_thread_runtime()?;
         let client = http_client()?;
-        runtime.block_on(post_decide(&client, &self.base, &self.host_token, id, "kick"))
+        runtime.block_on(post_decide(
+            &client,
+            &self.base,
+            &self.host_token,
+            id,
+            "kick",
+        ))
     }
 
     /// Rotates the Password on the Rendezvous. `None` keeps the current
@@ -522,7 +544,8 @@ async fn host_open(
         super::room_mode::SessionMode::Room => "room",
         super::room_mode::SessionMode::Broadcast => "broadcast",
     };
-    let body = json!({ "password": password, "nickname": nickname, "admission": admission, "mode": mode });
+    let body =
+        json!({ "password": password, "nickname": nickname, "admission": admission, "mode": mode });
     let response = client
         .post(format!("{base}/v1/host/open"))
         .json(&body)
@@ -606,7 +629,11 @@ async fn post_member_heartbeat(
 
 /// Best-effort explicit leave so the roster drops this viewer immediately
 /// instead of lingering as a ghost until the heartbeat TTL sweeps it.
-async fn post_member_leave(client: &reqwest::Client, base: &str, token: &str) -> Result<(), String> {
+async fn post_member_leave(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+) -> Result<(), String> {
     let base = normalize_base(base);
     let response = client
         .post(format!("{base}/v1/member/leave"))
@@ -715,7 +742,11 @@ async fn host_worker(
                 if let Ok(mut state) = hb_state.lock() {
                     *state = StunarState::Unreachable;
                 }
-                logger::log("WARN", "stunar heartbeat", "failed; relay marked unreachable");
+                logger::log(
+                    "WARN",
+                    "stunar heartbeat",
+                    "failed; relay marked unreachable",
+                );
             }
         }
     });
@@ -925,7 +956,11 @@ impl StunarViewer {
         self.outgoing
             .send(Outgoing::Signal {
                 viewer_id: to.to_owned(),
-                to: if to.is_empty() { None } else { Some(to.to_owned()) },
+                to: if to.is_empty() {
+                    None
+                } else {
+                    Some(to.to_owned())
+                },
                 payload,
             })
             .map_err(|_| "Stunar is unreachable.".to_owned())
@@ -1114,7 +1149,11 @@ pub(crate) fn discover_stunar_room(
     let (token, offer, member_id, mode) = ready_rx
         .recv_timeout(VIEWER_WAIT_TIMEOUT + HTTP_TIMEOUT + Duration::from_secs(5))
         .map_err(|_| {
-            logger::log("ERROR", "stunar ask", "timed out waiting for the viewer handshake");
+            logger::log(
+                "ERROR",
+                "stunar ask",
+                "timed out waiting for the viewer handshake",
+            );
             "Stunar is unreachable.".to_owned()
         })??;
     return Ok((
@@ -1185,7 +1224,11 @@ async fn viewer_handshake(
             _ => "Could not join.".into(),
         });
     }
-    logger::log("INFO", "stunar ask response", "accepted; viewer token issued");
+    logger::log(
+        "INFO",
+        "stunar ask response",
+        "accepted; viewer token issued",
+    );
     let token = json["viewer_token"]
         .as_str()
         .ok_or_else(|| "Could not join.".to_owned())?
@@ -1425,7 +1468,10 @@ async fn viewer_worker(
 }
 
 /// Sends the answer signal over the Viewer WS. The inbox stays open.
-pub(crate) fn submit_stunar_answer(viewer: &StunarViewer, answer: &PeerSignal) -> Result<(), String> {
+pub(crate) fn submit_stunar_answer(
+    viewer: &StunarViewer,
+    answer: &PeerSignal,
+) -> Result<(), String> {
     logger::log("INFO", "stunar answer", "sending answer signal");
     let to = answer.id.clone().unwrap_or_default();
     viewer.send_signal(if to.is_empty() { "" } else { &to }, answer)?;

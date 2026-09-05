@@ -7,12 +7,12 @@ use std::ffi::c_void;
 #[cfg(target_os = "macos")]
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(target_os = "windows")]
-use std::sync::OnceLock;
+use std::sync::mpsc::SyncSender;
 #[cfg(target_os = "macos")]
 use std::sync::mpsc::{sync_channel, Receiver};
-use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
+#[cfg(target_os = "windows")]
+use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -27,9 +27,9 @@ use core_foundation::dictionary::CFDictionary;
 #[cfg(target_os = "macos")]
 use core_foundation::string::CFString;
 #[cfg(target_os = "macos")]
-use objc2::runtime::AnyObject;
-#[cfg(target_os = "macos")]
 use objc2::msg_send;
+#[cfg(target_os = "macos")]
+use objc2::runtime::AnyObject;
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSArray, NSNumber, NSString, NSUUID};
 
@@ -143,11 +143,16 @@ fn start_macos(
     let aggregate = aggregate_description(&tap_uid)?;
     let mut aggregate_id = 0_u32;
     let status = unsafe {
-        AudioHardwareCreateAggregateDevice(aggregate.as_concrete_TypeRef().cast(), &mut aggregate_id)
+        AudioHardwareCreateAggregateDevice(
+            aggregate.as_concrete_TypeRef().cast(),
+            &mut aggregate_id,
+        )
     };
     if status != 0 {
         unsafe { AudioHardwareDestroyProcessTap(tap_id) };
-        return Err(format!("AudioHardwareCreateAggregateDevice failed ({status})"));
+        return Err(format!(
+            "AudioHardwareCreateAggregateDevice failed ({status})"
+        ));
     }
 
     let (pcm_tx, pcm_rx) = sync_channel::<Vec<f32>>(8);
@@ -202,8 +207,7 @@ pub(crate) fn is_process_loopback_supported() -> bool {
     static SUPPORTED: OnceLock<bool> = OnceLock::new();
     *SUPPORTED.get_or_init(|| {
         let _ = wasapi::initialize_mta();
-        wasapi::AudioClient::new_application_loopback_client(std::process::id(), true)
-            .is_ok()
+        wasapi::AudioClient::new_application_loopback_client(std::process::id(), true).is_ok()
     })
 }
 
@@ -252,15 +256,21 @@ fn resolve_exclusion_root(excluded_apps: &[String]) -> Option<(String, u32)> {
             || token.eq_ignore_ascii_case(exe.strip_suffix(".exe").unwrap_or(exe))
     };
     let mut first: Option<(String, u32)> = None;
-    for token in excluded_apps.iter().map(|item| item.trim()).filter(|item| !item.is_empty()) {
+    for token in excluded_apps
+        .iter()
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+    {
         let mut pids: Vec<(u32, u32)> = snapshot
             .iter()
-            .filter(|(_, _, exe)| matches_token(exe, token) )
+            .filter(|(_, _, exe)| matches_token(exe, token))
             .map(|(pid, ppid, _)| (*pid, *ppid))
             .filter(|(pid, _)| *pid != own_pid)
             .collect();
         if pids.is_empty() {
-            eprintln!("[goDrinking] audio exclusion '{token}' matches no running process; skipping");
+            eprintln!(
+                "[goDrinking] audio exclusion '{token}' matches no running process; skipping"
+            );
             continue;
         }
         pids.sort_unstable();
@@ -411,7 +421,8 @@ fn wasapi_loop(
     // Voip application mode keeps latency low for 20 ms stereo 48 kHz frames.
     // An init failure must not fail the session: the worker simply exits and
     // the tap keeps running without encoded output.
-    let Ok(mut encoder) = opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Voip)
+    let Ok(mut encoder) =
+        opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Voip)
     else {
         eprintln!("[goDrinking] Opus encoder init failed; system audio continues without encoding");
         return;
@@ -476,7 +487,8 @@ fn opus_loop(
     // Voip application mode keeps latency low for 20 ms stereo 48 kHz frames.
     // An init failure must not fail the session: the worker simply exits and
     // the tap keeps running without encoded output.
-    let Ok(mut encoder) = opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Voip)
+    let Ok(mut encoder) =
+        opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Voip)
     else {
         eprintln!("[goDrinking] Opus encoder init failed; system audio continues without encoding");
         return;
@@ -564,9 +576,18 @@ fn aggregate_description(tap_uid: &CFString) -> Result<CFDictionary<CFString, CF
     Ok(CFDictionary::from_CFType_pairs(&[
         (CFString::new("name"), name.as_CFType()),
         (CFString::new("uid"), uid.as_CFType()),
-        (CFString::new("private"), CFBoolean::true_value().as_CFType()),
-        (CFString::new("stacked"), CFBoolean::false_value().as_CFType()),
-        (CFString::new("tapautostart"), CFBoolean::true_value().as_CFType()),
+        (
+            CFString::new("private"),
+            CFBoolean::true_value().as_CFType(),
+        ),
+        (
+            CFString::new("stacked"),
+            CFBoolean::false_value().as_CFType(),
+        ),
+        (
+            CFString::new("tapautostart"),
+            CFBoolean::true_value().as_CFType(),
+        ),
         (CFString::new("taps"), taps.as_CFType()),
     ]))
 }
@@ -654,9 +675,7 @@ fn audio_process_objects() -> Vec<(u32, i32)> {
         scope: 0,
         element: 0,
     };
-    let status = unsafe {
-        AudioObjectGetPropertyDataSize(1, &address, 0, ptr::null(), &mut size)
-    };
+    let status = unsafe { AudioObjectGetPropertyDataSize(1, &address, 0, ptr::null(), &mut size) };
     if status != 0 || size == 0 {
         eprintln!("[goDrinking] ProcessObjectList size failed ({status}) size={size}");
         return Vec::new();
@@ -748,7 +767,9 @@ fn translate_pid(pid: i32) -> Result<u32, String> {
         )
     };
     if status != 0 || object_id == 0 {
-        return Err(format!("no Core Audio process object for pid {pid} ({status})"));
+        return Err(format!(
+            "no Core Audio process object for pid {pid} ({status})"
+        ));
     }
     Ok(object_id)
 }
@@ -772,7 +793,9 @@ fn audio_get<T>(object: u32, selector: u32, value: &mut T) -> Result<(), String>
         )
     };
     if status != 0 {
-        return Err(format!("AudioObjectGetPropertyData {selector:#x} failed ({status})"));
+        return Err(format!(
+            "AudioObjectGetPropertyData {selector:#x} failed ({status})"
+        ));
     }
     Ok(())
 }
@@ -918,11 +941,16 @@ fn collect_tap_pcm(excluded_tokens: &[String], duration: Duration) -> Result<Vec
     let aggregate = aggregate_description(&tap_uid)?;
     let mut aggregate_id = 0_u32;
     let status = unsafe {
-        AudioHardwareCreateAggregateDevice(aggregate.as_concrete_TypeRef().cast(), &mut aggregate_id)
+        AudioHardwareCreateAggregateDevice(
+            aggregate.as_concrete_TypeRef().cast(),
+            &mut aggregate_id,
+        )
     };
     if status != 0 {
         unsafe { AudioHardwareDestroyProcessTap(tap_id) };
-        return Err(format!("AudioHardwareCreateAggregateDevice failed ({status})"));
+        return Err(format!(
+            "AudioHardwareCreateAggregateDevice failed ({status})"
+        ));
     }
     let (pcm_tx, pcm_rx) = sync_channel::<Vec<f32>>(64);
     let context = Box::into_raw(Box::new(pcm_tx));
@@ -1022,26 +1050,62 @@ mod tests {
     fn discord_name_and_helper_bundles_all_match() {
         // Selected by display name.
         assert!(app_excluded_by_token("Discord", None, "Discord"));
-        assert!(app_excluded_by_token("Discord Helper (Renderer)", None, "Discord"));
+        assert!(app_excluded_by_token(
+            "Discord Helper (Renderer)",
+            None,
+            "Discord"
+        ));
         // Selected by bundle id.
-        assert!(app_excluded_by_token("Discord", Some("com.hnc.Discord"), "com.hnc.Discord"));
+        assert!(app_excluded_by_token(
+            "Discord",
+            Some("com.hnc.Discord"),
+            "com.hnc.Discord"
+        ));
         assert!(app_excluded_by_token(
             "Discord Helper",
             Some("com.hnc.Discord.helper"),
             "com.hnc.Discord"
         ));
         // Case-insensitive on both sides.
-        assert!(app_excluded_by_token("discord", Some("COM.HNC.DISCORD"), "Discord"));
-        assert!(app_excluded_by_token("Discord Helper", Some("com.hnc.Discord.helper"), "discord"));
+        assert!(app_excluded_by_token(
+            "discord",
+            Some("COM.HNC.DISCORD"),
+            "Discord"
+        ));
+        assert!(app_excluded_by_token(
+            "Discord Helper",
+            Some("com.hnc.Discord.helper"),
+            "discord"
+        ));
     }
 
     #[test]
     fn unrelated_apps_do_not_match() {
-        assert!(!app_excluded_by_token("Safari", Some("com.apple.Safari"), "Discord"));
-        assert!(!app_excluded_by_token("Google Chrome", Some("com.google.Chrome"), "discord"));
-        assert!(!app_excluded_by_token("Slack", Some("com.tinyspeck.slackmacgap"), "Discord"));
-        assert!(!app_excluded_by_token("Discord", Some("com.hnc.Discord"), ""));
-        assert!(!app_excluded_by_token("Discord", Some("com.hnc.Discord"), "   "));
+        assert!(!app_excluded_by_token(
+            "Safari",
+            Some("com.apple.Safari"),
+            "Discord"
+        ));
+        assert!(!app_excluded_by_token(
+            "Google Chrome",
+            Some("com.google.Chrome"),
+            "discord"
+        ));
+        assert!(!app_excluded_by_token(
+            "Slack",
+            Some("com.tinyspeck.slackmacgap"),
+            "Discord"
+        ));
+        assert!(!app_excluded_by_token(
+            "Discord",
+            Some("com.hnc.Discord"),
+            ""
+        ));
+        assert!(!app_excluded_by_token(
+            "Discord",
+            Some("com.hnc.Discord"),
+            "   "
+        ));
     }
 
     #[cfg(target_os = "macos")]

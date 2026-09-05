@@ -26,9 +26,11 @@ use std::ptr::null_mut;
 use std::sync::Arc;
 use std::time::Duration;
 use windows::core::{Interface, GUID};
-use windows::Win32::Media::MediaFoundation::*;
-use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::Foundation::VARIANT_BOOL;
+use windows::Win32::Media::MediaFoundation::*;
+use windows::Win32::System::Com::{
+    CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED,
+};
 use windows::Win32::System::Variant::{VARIANT, VARIANT_0_0, VT_BOOL, VT_UI4};
 
 // H.264 High profile for the output type; Baseline is the fallback when the
@@ -98,10 +100,7 @@ fn video_type(
         let media_type = MFCreateMediaType()?;
         media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         media_type.SetGUID(&MF_MT_SUBTYPE, subtype)?;
-        media_type.SetUINT64(
-            &MF_MT_FRAME_SIZE,
-            ((width as u64) << 32) | height as u64,
-        )?;
+        media_type.SetUINT64(&MF_MT_FRAME_SIZE, ((width as u64) << 32) | height as u64)?;
         media_type.SetUINT64(&MF_MT_FRAME_RATE, ((fps as u64) << 32) | 1)?;
         media_type.SetUINT32(&MF_MT_INTERLACE_MODE, 2)?;
         if let Some(bitrate) = bitrate {
@@ -118,7 +117,10 @@ fn set_codec_u32(api: &ICodecAPI, id: *const GUID, value: u32, what: &str) {
     let variant = variant_ui4(value);
     match unsafe { api.SetValue(id, &variant) } {
         Ok(()) => {}
-        Err(error) => eprintln!("[goDrinking] MF codec option {what} unavailable: {}", hr(error)),
+        Err(error) => eprintln!(
+            "[goDrinking] MF codec option {what} unavailable: {}",
+            hr(error)
+        ),
     }
 }
 
@@ -157,7 +159,9 @@ impl MfH264Encoder {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         }
         let _com = ComGuard(true);
-        unsafe { MFStartup(MF_VERSION, 0).map_err(hr)?; }
+        unsafe {
+            MFStartup(MF_VERSION, 0).map_err(hr)?;
+        }
         let (transform, friendly_name) = Self::open_hardware_encoder()
             .map_err(|error| format!("MF hardware MFT open failed: {error}"))?;
         eprintln!("[goDrinking] MF hardware encoder: {friendly_name}");
@@ -172,16 +176,16 @@ impl MfH264Encoder {
 
         // Prefer RGB32 input: our BGRA frames match its memory layout, so no
         // color conversion is needed. Fall back to NV12 with a CPU convert.
-        let input_rgb32 = video_type(&MFVideoFormat_RGB32, width, height, fps, None, None)
-            .map_err(hr)?;
+        let input_rgb32 =
+            video_type(&MFVideoFormat_RGB32, width, height, fps, None, None).map_err(hr)?;
         let mut use_nv12 = false;
         if let Err(error) = unsafe { transform.SetInputType(0, &input_rgb32, 0) } {
             // Mirrored to the log file: stderr is invisible in release/portable runs.
             let message = format!("MF RGB32 input rejected, trying NV12: {}", hr(error));
             eprintln!("[goDrinking] {message}");
             logger::log("WARN", "mf encoder", &message);
-            let input_nv12 = video_type(&MFVideoFormat_NV12, width, height, fps, None, None)
-                .map_err(hr)?;
+            let input_nv12 =
+                video_type(&MFVideoFormat_NV12, width, height, fps, None, None).map_err(hr)?;
             unsafe {
                 transform
                     .SetInputType(0, &input_nv12, 0)
@@ -201,9 +205,15 @@ impl MfH264Encoder {
         } else {
             (H264_BASELINE_PROFILE, H264_HIGH_PROFILE)
         };
-        let output_first =
-            video_type(&MFVideoFormat_H264, width, height, fps, Some(bitrate), Some(first))
-                .map_err(hr)?;
+        let output_first = video_type(
+            &MFVideoFormat_H264,
+            width,
+            height,
+            fps,
+            Some(bitrate),
+            Some(first),
+        )
+        .map_err(hr)?;
         let mut profile_high = first == H264_HIGH_PROFILE;
         if unsafe { transform.SetOutputType(0, &output_first, 0) }.is_err() {
             let message = format!(
@@ -213,30 +223,57 @@ impl MfH264Encoder {
             );
             eprintln!("[goDrinking] {message}");
             logger::log("WARN", "mf encoder", &message);
-            let output_second =
-                video_type(&MFVideoFormat_H264, width, height, fps, Some(bitrate), Some(second))
-                    .map_err(hr)?;
+            let output_second = video_type(
+                &MFVideoFormat_H264,
+                width,
+                height,
+                fps,
+                Some(bitrate),
+                Some(second),
+            )
+            .map_err(hr)?;
             unsafe {
-                transform.SetOutputType(0, &output_second, 0).map_err(|error| {
-                    format!("MF output type rejected (both profiles): {}", hr(error))
-                })?
+                transform
+                    .SetOutputType(0, &output_second, 0)
+                    .map_err(|error| {
+                        format!("MF output type rejected (both profiles): {}", hr(error))
+                    })?
             }
             profile_high = second == H264_HIGH_PROFILE;
         }
 
         let codec_api: Option<ICodecAPI> = transform.cast().ok();
         if let Some(api) = &codec_api {
-            set_codec_u32(api, &CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR.0 as u32, "rate control CBR");
-            set_codec_u32(api, &CODECAPI_AVEncCommonMeanBitRate, bitrate, "mean bitrate");
+            set_codec_u32(
+                api,
+                &CODECAPI_AVEncCommonRateControlMode,
+                eAVEncCommonRateControlMode_CBR.0 as u32,
+                "rate control CBR",
+            );
+            set_codec_u32(
+                api,
+                &CODECAPI_AVEncCommonMeanBitRate,
+                bitrate,
+                "mean bitrate",
+            );
             set_codec_u32(api, &CODECAPI_AVEncCommonMaxBitRate, bitrate, "max bitrate");
             set_codec_u32(api, &CODECAPI_AVEncMPVGOPSize, fps.max(1), "GOP size");
-            set_codec_u32(api, &CODECAPI_AVEncMPVDefaultBPictureCount, 0, "B-frames off");
+            set_codec_u32(
+                api,
+                &CODECAPI_AVEncMPVDefaultBPictureCount,
+                0,
+                "B-frames off",
+            );
             set_codec_u32(api, &CODECAPI_AVLowLatencyMode, 1, "low latency");
         }
 
         unsafe {
-            transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0).map_err(hr)?;
-            transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0).map_err(hr)?;
+            transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
+                .map_err(hr)?;
+            transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
+                .map_err(hr)?;
         }
 
         let mut encoder = Self {
@@ -265,7 +302,11 @@ impl MfH264Encoder {
         let units = encoder.encode_bytes(&test_pixels, 0)?;
         if units.is_empty() {
             let message = "MF encoder self-test produced no output".to_owned();
-            logger::log("WARN", "mf encoder", &format!("{message}; falling back to software"));
+            logger::log(
+                "WARN",
+                "mf encoder",
+                &format!("{message}; falling back to software"),
+            );
             return Err(message);
         }
         // Validate decodability, not just byte output: the transport drops
@@ -308,7 +349,11 @@ impl MfH264Encoder {
             let message = format!(
                 "MF encoder self-test failed decodability check (profile={profile:?} want_high={want_high}, keyframe={saw_keyframe})"
             );
-            logger::log("WARN", "mf encoder", &format!("{message}; falling back to software"));
+            logger::log(
+                "WARN",
+                "mf encoder",
+                &format!("{message}; falling back to software"),
+            );
             return Err(message);
         }
         Ok(encoder)
@@ -339,7 +384,8 @@ impl MfH264Encoder {
         if activates.is_null() || count == 0 {
             return Err("no hardware H.264 MFT found".into());
         }
-        let first: IMFActivate = unsafe { (*activates).clone() }.ok_or("empty hardware MFT entry")?;
+        let first: IMFActivate =
+            unsafe { (*activates).clone() }.ok_or("empty hardware MFT entry")?;
         unsafe {
             CoTaskMemFree(Some(activates as *const c_void));
         }
@@ -405,7 +451,11 @@ impl MfH264Encoder {
 
     // Feed one raw frame (RGB32 or NV12 bytes) and collect every output unit,
     // waiting briefly for the hardware when it lags behind the input.
-    fn encode_bytes(&mut self, bytes: &[u8], timestamp_micros: u64) -> Result<Vec<Vec<u8>>, String> {
+    fn encode_bytes(
+        &mut self,
+        bytes: &[u8],
+        timestamp_micros: u64,
+    ) -> Result<Vec<Vec<u8>>, String> {
         self.feed_sample(bytes, timestamp_micros)?;
         let mut units = Vec::new();
         for _ in 0..DRAIN_RETRIES {
@@ -431,7 +481,9 @@ impl MfH264Encoder {
             Err(error) if error.code() == MF_E_NOTACCEPTING => {
                 let _ = self.drain_available()?;
                 let retry = self.make_sample(bytes, timestamp_micros)?;
-                unsafe { self.transform.ProcessInput(0, &retry, 0).map_err(hr)?; }
+                unsafe {
+                    self.transform.ProcessInput(0, &retry, 0).map_err(hr)?;
+                }
                 Ok(())
             }
             Err(error) => Err(hr(error)),
@@ -446,7 +498,11 @@ impl MfH264Encoder {
                 let mut max_length: u32 = 0;
                 let mut current_length: u32 = 0;
                 buffer
-                    .Lock(&mut pointer, Some(&mut max_length), Some(&mut current_length))
+                    .Lock(
+                        &mut pointer,
+                        Some(&mut max_length),
+                        Some(&mut current_length),
+                    )
                     .map_err(hr)?;
                 if max_length < bytes.len() as u32 {
                     buffer.Unlock().map_err(hr)?;
@@ -458,8 +514,12 @@ impl MfH264Encoder {
             }
             let sample = MFCreateSample().map_err(hr)?;
             sample.AddBuffer(&buffer).map_err(hr)?;
-            sample.SetSampleTime(timestamp_micros as i64 * 10).map_err(hr)?;
-            sample.SetSampleDuration(10_000_000 / self.fps.max(1) as i64).map_err(hr)?;
+            sample
+                .SetSampleTime(timestamp_micros as i64 * 10)
+                .map_err(hr)?;
+            sample
+                .SetSampleDuration(10_000_000 / self.fps.max(1) as i64)
+                .map_err(hr)?;
             Ok(sample)
         }
     }
@@ -493,7 +553,8 @@ impl MfH264Encoder {
                         if self.output_buffer_size >= OUTPUT_BUFFER_MAX {
                             return Err("MF encoder output exceeds buffer cap".into());
                         }
-                        self.output_buffer_size = (self.output_buffer_size * 2).min(OUTPUT_BUFFER_MAX);
+                        self.output_buffer_size =
+                            (self.output_buffer_size * 2).min(OUTPUT_BUFFER_MAX);
                         continue;
                     }
                     Err(error) => {
@@ -510,7 +571,11 @@ impl MfH264Encoder {
                 let mut max_length: u32 = 0;
                 let mut current_length: u32 = 0;
                 contiguous
-                    .Lock(&mut pointer, Some(&mut max_length), Some(&mut current_length))
+                    .Lock(
+                        &mut pointer,
+                        Some(&mut max_length),
+                        Some(&mut current_length),
+                    )
                     .map_err(hr)?;
                 let data = std::slice::from_raw_parts(pointer, current_length as usize).to_vec();
                 contiguous.Unlock().map_err(hr)?;
@@ -527,7 +592,9 @@ impl MfH264Encoder {
             let variant = variant_bool(true);
             match unsafe { api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &variant) } {
                 Ok(()) => {}
-                Err(error) => eprintln!("[goDrinking] MF force keyframe unavailable: {}", hr(error)),
+                Err(error) => {
+                    eprintln!("[goDrinking] MF force keyframe unavailable: {}", hr(error))
+                }
             }
         }
     }
@@ -535,7 +602,12 @@ impl MfH264Encoder {
     pub(crate) fn set_bitrate(&mut self, bitrate: u32) -> Result<(), String> {
         self.bitrate = bitrate;
         if let Some(api) = &self.codec_api {
-            set_codec_u32(api, &CODECAPI_AVEncCommonMeanBitRate, bitrate, "mean bitrate");
+            set_codec_u32(
+                api,
+                &CODECAPI_AVEncCommonMeanBitRate,
+                bitrate,
+                "mean bitrate",
+            );
             set_codec_u32(api, &CODECAPI_AVEncCommonMaxBitRate, bitrate, "max bitrate");
         }
         Ok(())
@@ -545,8 +617,12 @@ impl MfH264Encoder {
 impl Drop for MfH264Encoder {
     fn drop(&mut self) {
         unsafe {
-            let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-            let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+            let _ = self
+                .transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+            let _ = self
+                .transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
         }
     }
 }

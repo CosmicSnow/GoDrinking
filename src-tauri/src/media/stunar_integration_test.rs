@@ -71,7 +71,14 @@ mod stunar_integration {
             eprintln!("SKIP: rendezvous not running on {base}");
             return;
         }
-        let host = StunarHost::start(base, "senha", "Ana", true, super::super::room_mode::SessionMode::Broadcast).expect("open");
+        let host = StunarHost::start(
+            base,
+            "senha",
+            "Ana",
+            true,
+            super::super::room_mode::SessionMode::Broadcast,
+        )
+        .expect("open");
         let code = host.code();
         assert_eq!(code.len(), 6);
         assert!(code.chars().all(|ch| ch.is_ascii_alphanumeric()));
@@ -101,7 +108,8 @@ mod stunar_integration {
         )
         .expect("send offer");
 
-        let (token, offer, viewer_ws) = viewer.join().expect("viewer thread").expect("viewer offer");
+        let (token, offer, viewer_ws) =
+            viewer.join().expect("viewer thread").expect("viewer offer");
         assert!(!token.is_empty());
         assert_eq!(offer.sdp, "v=0\r\n");
 
@@ -129,7 +137,9 @@ mod stunar_integration {
         let denied = runtime.block_on(async {
             let response = reqwest::Client::new()
                 .post(format!("{base}/v1/viewer/ask"))
-                .json(&serde_json::json!({ "code": code, "password": "senha", "nickname": "Outro" }))
+                .json(
+                    &serde_json::json!({ "code": code, "password": "senha", "nickname": "Outro" }),
+                )
                 .send()
                 .await
                 .unwrap();
@@ -145,7 +155,14 @@ mod stunar_integration {
             eprintln!("SKIP: rendezvous not running on {base}");
             return;
         }
-        let host = StunarHost::start(base, "senha", "Ana", false, super::super::room_mode::SessionMode::Broadcast).expect("open");
+        let host = StunarHost::start(
+            base,
+            "senha",
+            "Ana",
+            false,
+            super::super::room_mode::SessionMode::Broadcast,
+        )
+        .expect("open");
         let code = host.code();
 
         // Viewer asks; admission off => accepted immediately, no pending step.
@@ -171,7 +188,8 @@ mod stunar_integration {
         )
         .expect("send offer");
 
-        let (_token, offer, _viewer_ws) = viewer.join().expect("viewer thread").expect("viewer offer");
+        let (_token, offer, _viewer_ws) =
+            viewer.join().expect("viewer thread").expect("viewer offer");
         assert_eq!(offer.sdp, "v=0\r\n");
         host.close();
     }
@@ -183,7 +201,14 @@ mod stunar_integration {
             eprintln!("SKIP: rendezvous not running on {base}");
             return;
         }
-        let host = StunarHost::start(base, "senha", "Ana", false, super::super::room_mode::SessionMode::Broadcast).expect("open");
+        let host = StunarHost::start(
+            base,
+            "senha",
+            "Ana",
+            false,
+            super::super::room_mode::SessionMode::Broadcast,
+        )
+        .expect("open");
         let code = host.code();
         assert_eq!(code.len(), 6);
 

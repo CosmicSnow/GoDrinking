@@ -33,10 +33,8 @@ pub(crate) fn bgra_to_nv12(bgra: &[u8], width: u32, height: u32) -> Option<Vec<u
             let y_val = (16 + ((47 * r + 157 * g + 16 * b + 128) >> 8)).clamp(16, 235) as u8;
             nv12[y * w + x] = y_val;
             if x % 2 == 0 && y % 2 == 0 {
-                let u_val =
-                    (128 + ((-26 * r - 87 * g + 112 * b + 128) >> 8)).clamp(16, 240) as u8;
-                let v_val =
-                    (128 + ((112 * r - 102 * g - 10 * b + 128) >> 8)).clamp(16, 240) as u8;
+                let u_val = (128 + ((-26 * r - 87 * g + 112 * b + 128) >> 8)).clamp(16, 240) as u8;
+                let v_val = (128 + ((112 * r - 102 * g - 10 * b + 128) >> 8)).clamp(16, 240) as u8;
                 let uv = y_size + (y / 2) * w + x;
                 nv12[uv] = u_val;
                 nv12[uv + 1] = v_val;
@@ -406,7 +404,9 @@ impl AccessUnitReceiver {
 
 #[cfg(test)]
 mod tests {
-    use super::{AvccAnnexBConverter, AvccError, HevcAnnexBConverter, H264_PROFILE_LEVEL_ID, bgra_to_nv12};
+    use super::{
+        bgra_to_nv12, AvccAnnexBConverter, AvccError, HevcAnnexBConverter, H264_PROFILE_LEVEL_ID,
+    };
     use std::time::Duration;
 
     fn avcc(nals: &[&[u8]]) -> Vec<u8> {
@@ -511,7 +511,9 @@ mod tests {
         converter
             .convert(&avcc(&[&[0x67, 0x64, 0x00, 0x2a], &[0x68, 2]]), 0, false)
             .expect("parameter sets");
-        let unit = converter.convert(&avcc(&[&[0x65, 3]]), 3_000, true).expect("high IDR");
+        let unit = converter
+            .convert(&avcc(&[&[0x65, 3]]), 3_000, true)
+            .expect("high IDR");
         assert_eq!(unit.profile_level_id.as_deref(), Some("64002a"));
     }
 
@@ -533,7 +535,11 @@ mod tests {
         let red = vec![0_u8, 0, 255, 255].repeat(4);
         let nv12 = bgra_to_nv12(&red, 2, 2).expect("2x2 converts");
         assert_eq!(nv12.len(), 6);
-        assert!(nv12[0] >= 60 && nv12[0] <= 68, "red luma {} (want BT.709 ~63, not BT.601 ~81)", nv12[0]);
+        assert!(
+            nv12[0] >= 60 && nv12[0] <= 68,
+            "red luma {} (want BT.709 ~63, not BT.601 ~81)",
+            nv12[0]
+        );
         assert_eq!(&nv12[0..4], &[nv12[0]; 4]);
         assert!(nv12[5] > 220, "red Cr {}", nv12[5]);
         assert!(nv12[4] < 120, "red Cb {}", nv12[4]);
@@ -605,16 +611,16 @@ mod tests {
     #[test]
     fn hevc_injects_vps_sps_pps_before_irap() {
         let mut converter = HevcAnnexBConverter::default();
-        converter.convert(&avcc(&[VPS, SPS, PPS]), 0, false).expect("sets");
+        converter
+            .convert(&avcc(&[VPS, SPS, PPS]), 0, false)
+            .expect("sets");
         let unit = converter.convert(&avcc(&[IDR]), 3_000, true).expect("irap");
         assert!(unit.keyframe);
         assert_eq!(
             unit.data,
             vec![
-                0, 0, 0, 1, 0x40, 0x01, 0x0c,
-                0, 0, 0, 1, 0x42, 0x01, 0x0d,
-                0, 0, 0, 1, 0x44, 0x01, 0x0e,
-                0, 0, 0, 1, 0x26, 0x01, 0x11,
+                0, 0, 0, 1, 0x40, 0x01, 0x0c, 0, 0, 0, 1, 0x42, 0x01, 0x0d, 0, 0, 0, 1, 0x44, 0x01,
+                0x0e, 0, 0, 0, 1, 0x26, 0x01, 0x11,
             ]
         );
     }
@@ -631,7 +637,9 @@ mod tests {
     #[test]
     fn hevc_detects_cra_as_keyframe() {
         let mut converter = HevcAnnexBConverter::default();
-        converter.convert(&avcc(&[VPS, SPS, PPS]), 0, false).expect("sets");
+        converter
+            .convert(&avcc(&[VPS, SPS, PPS]), 0, false)
+            .expect("sets");
         let unit = converter.convert(&avcc(&[CRA]), 3_000, false).expect("cra");
         assert!(unit.keyframe);
     }

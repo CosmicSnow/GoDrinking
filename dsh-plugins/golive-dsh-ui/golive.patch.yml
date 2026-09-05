@@ -1,0 +1,4 @@
+# GoLive UI bundle layer: model seat with search, chat hard-delete, effort declare.
+- insert:
+    - id: golive-ui
+      name: '@golive/dsh-ui'

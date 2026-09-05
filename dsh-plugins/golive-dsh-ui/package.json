@@ -1,0 +1,30 @@
+{
+  "name": "@golive/dsh-ui",
+  "version": "1.0.0",
+  "description": "Seletor de modelo com busca + effort, lixeira de conversas e declarar efforts (GoLive)",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./lib/host.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "golive.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ],
+      "platform": "web"
+    }
+  },
+  "files": [
+    "lib/host.js",
+    "lib/client.js",
+    "golive.patch.yml"
+  ]
+}

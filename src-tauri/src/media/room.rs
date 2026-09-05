@@ -50,7 +50,10 @@ impl LanRoom {
         listener
             .set_nonblocking(true)
             .map_err(|error| error.to_string())?;
-        let port = listener.local_addr().map_err(|error| error.to_string())?.port();
+        let port = listener
+            .local_addr()
+            .map_err(|error| error.to_string())?
+            .port();
         let answers = Arc::new(Mutex::new(Vec::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let tcp_answers = Arc::clone(&answers);
@@ -134,7 +137,10 @@ impl DirectRoom {
         listener
             .set_nonblocking(true)
             .map_err(|error| error.to_string())?;
-        let port = listener.local_addr().map_err(|error| error.to_string())?.port();
+        let port = listener
+            .local_addr()
+            .map_err(|error| error.to_string())?
+            .port();
         let answers = Arc::new(Mutex::new(Vec::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let addresses = Arc::new(Mutex::new(Vec::new()));
@@ -210,7 +216,10 @@ fn bind_direct_listener() -> Result<(TcpListener, bool), String> {
         }
     }
     if let Ok(listener) = TcpListener::bind("[::]:0") {
-        let port = listener.local_addr().map_err(|error| error.to_string())?.port();
+        let port = listener
+            .local_addr()
+            .map_err(|error| error.to_string())?
+            .port();
         // Probe: can IPv4 reach this listener? On Windows `[::]` is v6-only
         // and the probe is refused immediately.
         let ipv4_reachable = TcpStream::connect_timeout(
@@ -237,7 +246,10 @@ fn bind_direct_listener() -> Result<(TcpListener, bool), String> {
     logger::log(
         "INFO",
         "direct listen",
-        &format!("ipv4-only {}", listener.local_addr().map_err(|e| e.to_string())?),
+        &format!(
+            "ipv4-only {}",
+            listener.local_addr().map_err(|e| e.to_string())?
+        ),
     );
     Ok((listener, false))
 }
@@ -245,18 +257,14 @@ fn bind_direct_listener() -> Result<(TcpListener, bool), String> {
 #[cfg(target_os = "windows")]
 fn bind_dual_stack() -> Result<TcpListener, String> {
     use socket2::{Domain, Protocol, Socket, Type};
-    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))
-        .map_err(|e| e.to_string())?;
-    socket
-        .set_only_v6(false)
-        .map_err(|e| e.to_string())?;
-    socket
-        .set_nonblocking(false)
-        .map_err(|e| e.to_string())?;
-    let addr: SocketAddr = "[::]:0".parse().map_err(|e: std::net::AddrParseError| e.to_string())?;
-    socket
-        .bind(&addr.into())
-        .map_err(|e| e.to_string())?;
+    let socket =
+        Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)).map_err(|e| e.to_string())?;
+    socket.set_only_v6(false).map_err(|e| e.to_string())?;
+    socket.set_nonblocking(false).map_err(|e| e.to_string())?;
+    let addr: SocketAddr = "[::]:0"
+        .parse()
+        .map_err(|e: std::net::AddrParseError| e.to_string())?;
+    socket.bind(&addr.into()).map_err(|e| e.to_string())?;
     socket.listen(128).map_err(|e| e.to_string())?;
     let std_listener: std::net::TcpListener = socket.into();
     std_listener
@@ -292,9 +300,7 @@ fn address_worker(port: u16, ipv6: bool, addresses: Arc<Mutex<Vec<DirectAddress>
             *guard = list;
         }
     }
-    eprintln!(
-        "[goDrinking] port mapping failed; Direct over the internet needs this port open"
-    );
+    eprintln!("[goDrinking] port mapping failed; Direct over the internet needs this port open");
 }
 
 fn direct_entry(ip: IpAddr, port: u16, kind: &str) -> DirectAddress {
@@ -320,7 +326,9 @@ fn ipv6_global() -> Option<IpAddr> {
     let ip = socket.local_addr().ok()?.ip();
     match ip {
         IpAddr::V4(v4) if v4.is_loopback() || v4.is_unspecified() => None,
-        IpAddr::V6(v6) if v6.is_loopback() || v6.is_unspecified() || v6.is_unicast_link_local() => None,
+        IpAddr::V6(v6) if v6.is_loopback() || v6.is_unspecified() || v6.is_unicast_link_local() => {
+            None
+        }
         _ => Some(ip),
     }
 }
@@ -345,9 +353,7 @@ fn stun_public_ipv4() -> Option<IpAddr> {
 /// Parses the XOR-MAPPED-ADDRESS attribute (0x0020) of a STUN binding
 /// success response (0x0101) whose transaction id matches.
 fn parse_xor_mapped(response: &[u8], txid: &[u8; 12]) -> Option<IpAddr> {
-    if response.len() < 20
-        || response[0..2] != 0x0101_u16.to_be_bytes()
-        || response[8..20] != *txid
+    if response.len() < 20 || response[0..2] != 0x0101_u16.to_be_bytes() || response[8..20] != *txid
     {
         return None;
     }
@@ -357,7 +363,8 @@ fn parse_xor_mapped(response: &[u8], txid: &[u8; 12]) -> Option<IpAddr> {
         let attr_len = u16::from_be_bytes([response[offset + 2], response[offset + 3]]) as usize;
         let value_start = offset + 4;
         let value_end = (value_start + attr_len).min(response.len());
-        if attr_type == 0x0020 && value_end >= value_start + 8 && response[value_start + 1] == 0x01 {
+        if attr_type == 0x0020 && value_end >= value_start + 8 && response[value_start + 1] == 0x01
+        {
             let ip = [
                 response[value_start + 4] ^ 0x21,
                 response[value_start + 5] ^ 0x12,
@@ -433,7 +440,8 @@ fn tcp_loop(
                 let _ = thread::Builder::new()
                     .name("godrinking-room-conn".into())
                     .spawn(move || {
-                        let _ = handle_tcp(stream, mint, gate, viewer_count, answers, &host_nickname);
+                        let _ =
+                            handle_tcp(stream, mint, gate, viewer_count, answers, &host_nickname);
                     });
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -469,18 +477,30 @@ fn handle_tcp(
     let mut reader = BufReader::new(stream.try_clone().map_err(|error| error.to_string())?);
 
     let mut first = String::new();
-    if reader.read_line(&mut first).map_err(|error| error.to_string())? == 0 {
+    if reader
+        .read_line(&mut first)
+        .map_err(|error| error.to_string())?
+        == 0
+    {
         return Err("connection closed before HELLO".into());
     }
     let first = first.trim_end();
     // Second-connection ANSWER (Fatia 1 flow): no HELLO/AUTH/NICK needed, the
     // offer id inside the JSON matches the Viewer.
     if let Some(json) = first.strip_prefix("ANSWER ") {
-        logger::log("INFO", "golive2 conn", &format!("ANSWER on second connection from {peer_ip:?}"));
+        logger::log(
+            "INFO",
+            "golive2 conn",
+            &format!("ANSWER on second connection from {peer_ip:?}"),
+        );
         return accept_answer(json, peer_ip, &answers);
     }
     if first != "HELLO GOLIVE2" {
-        logger::log("WARN", "golive2 conn", &format!("expected HELLO GOLIVE2, got {first:?}"));
+        logger::log(
+            "WARN",
+            "golive2 conn",
+            &format!("expected HELLO GOLIVE2, got {first:?}"),
+        );
         let _ = stream.write_all(b"ERR PROTO\n");
         return Err("expected HELLO GOLIVE2".into());
     }
@@ -488,14 +508,22 @@ fn handle_tcp(
     // Ignore list check before AUTH: a banned IP never gets to NICK.
     if let Some(ip) = peer_ip {
         if gate.is_ignored(ip) {
-            logger::log("WARN", "golive2 conn", &format!("peer {ip} is on the ignore list; refused"));
+            logger::log(
+                "WARN",
+                "golive2 conn",
+                &format!("peer {ip} is on the ignore list; refused"),
+            );
             let _ = stream.write_all(b"ERR BANNED\n");
             return Err("peer ip is on the ignore list".into());
         }
     }
 
     let mut auth_line = String::new();
-    if reader.read_line(&mut auth_line).map_err(|error| error.to_string())? == 0 {
+    if reader
+        .read_line(&mut auth_line)
+        .map_err(|error| error.to_string())?
+        == 0
+    {
         return Err("connection closed before AUTH".into());
     }
     let auth_line = auth_line.trim_end();
@@ -511,13 +539,21 @@ fn handle_tcp(
         if let Some(ip) = peer_ip {
             gate.note_auth_failure(ip);
         }
-        logger::log("WARN", "golive2 conn", &format!("AUTH failed (password mismatch) from {peer_ip:?}"));
+        logger::log(
+            "WARN",
+            "golive2 conn",
+            &format!("AUTH failed (password mismatch) from {peer_ip:?}"),
+        );
         let _ = stream.write_all(b"ERR AUTH\n");
         return Err("password mismatch".into());
     }
 
     let mut nick_line = String::new();
-    if reader.read_line(&mut nick_line).map_err(|error| error.to_string())? == 0 {
+    if reader
+        .read_line(&mut nick_line)
+        .map_err(|error| error.to_string())?
+        == 0
+    {
         return Err("connection closed before NICK".into());
     }
     let nick_line = nick_line.trim_end();
@@ -530,7 +566,11 @@ fn handle_tcp(
         }
     };
     if !valid_nickname(nickname) {
-        logger::log("WARN", "golive2 conn", &format!("invalid nickname {nickname:?}"));
+        logger::log(
+            "WARN",
+            "golive2 conn",
+            &format!("invalid nickname {nickname:?}"),
+        );
         let _ = stream.write_all(b"ERR NICK\n");
         return Err("invalid nickname".into());
     }
@@ -544,7 +584,11 @@ fn handle_tcp(
     let id = random_viewer_id();
     if gate.admission() {
         let rx = gate.register_pending(id.clone(), nickname.to_string());
-        logger::log("INFO", "golive2 conn", &format!("PENDING {id} (admission on)"));
+        logger::log(
+            "INFO",
+            "golive2 conn",
+            &format!("PENDING {id} (admission on)"),
+        );
         let _ = stream.write_all(format!("PENDING {id}\n").as_bytes());
         if !SessionGate::wait_pending(rx) {
             // Timeout (60s) or Host Reject: remove the slot and tell the
@@ -557,7 +601,11 @@ fn handle_tcp(
     }
 
     let payload = mint(&id, nickname).map_err(|error| {
-        logger::log("WARN", "golive2 conn", &format!("mint failed for {id}: {error}"));
+        logger::log(
+            "WARN",
+            "golive2 conn",
+            &format!("mint failed for {id}: {error}"),
+        );
         let _ = stream.write_all(b"ERR FULL\n");
         error
     })?;
@@ -581,7 +629,11 @@ fn handle_tcp(
     if reader.read_line(&mut answer_line).is_ok() {
         let answer_line = answer_line.trim_end();
         if let Some(json) = answer_line.strip_prefix("ANSWER ") {
-            logger::log("INFO", "golive2 conn", &format!("ANSWER on first connection from {peer_ip:?}"));
+            logger::log(
+                "INFO",
+                "golive2 conn",
+                &format!("ANSWER on first connection from {peer_ip:?}"),
+            );
             accept_answer(json, peer_ip, &answers)?;
         }
     }
@@ -593,8 +645,7 @@ fn accept_answer(
     peer_ip: Option<IpAddr>,
     answers: &Arc<Mutex<Vec<PeerSignal>>>,
 ) -> Result<(), String> {
-    let mut signal: PeerSignal =
-        serde_json::from_str(json).map_err(|error| error.to_string())?;
+    let mut signal: PeerSignal = serde_json::from_str(json).map_err(|error| error.to_string())?;
     signal.sdp = rewrite_mdns_candidate_addresses(&signal.sdp, &ice_ip_for_peer(peer_ip));
     if let Ok(mut answers) = answers.lock() {
         answers.push(signal);
@@ -651,7 +702,11 @@ pub fn discover_room(
     nickname: &str,
 ) -> Result<(SocketAddr, PeerSignal, String), String> {
     logger::begin_session("viewer", "lan");
-    logger::log("INFO", "lan find", &format!("code={code} nickname={nickname}"));
+    logger::log(
+        "INFO",
+        "lan find",
+        &format!("code={code} nickname={nickname}"),
+    );
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(|error| error.to_string())?;
     socket
         .set_broadcast(true)
@@ -668,7 +723,11 @@ pub fn discover_room(
         })?;
     let mut buffer = [0_u8; 256];
     let (size, from) = socket.recv_from(&mut buffer).map_err(|_| {
-        logger::log("ERROR", "lan find", "no host answered (room not found on this network)");
+        logger::log(
+            "ERROR",
+            "lan find",
+            "no host answered (room not found on this network)",
+        );
         "room was not found on this network".to_owned()
     })?;
     let reply = String::from_utf8_lossy(&buffer[..size]);
@@ -678,7 +737,11 @@ pub fn discover_room(
         return Err("invalid room discovery reply".into());
     }
     if parts.next() != Some(code) {
-        logger::log("ERROR", "lan find", &format!("code mismatch in reply: {reply}"));
+        logger::log(
+            "ERROR",
+            "lan find",
+            &format!("code mismatch in reply: {reply}"),
+        );
         return Err("room code mismatch".into());
     }
     let port = parts
@@ -713,7 +776,9 @@ pub(crate) fn fetch_offer(
         .write_all(b"HELLO GOLIVE2\n")
         .map_err(|error| error.to_string())?;
     if password.is_empty() {
-        stream.write_all(b"AUTH\n").map_err(|error| error.to_string())?;
+        stream
+            .write_all(b"AUTH\n")
+            .map_err(|error| error.to_string())?;
     } else {
         stream
             .write_all(format!("AUTH {password}\n").as_bytes())
@@ -727,7 +792,11 @@ pub(crate) fn fetch_offer(
     let mut host_nickname = String::new();
     loop {
         let mut line = String::new();
-        if reader.read_line(&mut line).map_err(|error| error.to_string())? == 0 {
+        if reader
+            .read_line(&mut line)
+            .map_err(|error| error.to_string())?
+            == 0
+        {
             logger::log("WARN", "golive2", "host closed the connection");
             return Err("host closed the connection".into());
         }
@@ -767,7 +836,11 @@ pub fn discover_direct(
     nickname: &str,
 ) -> Result<(PeerSignal, String), String> {
     logger::begin_session("viewer", "direct");
-    logger::log("INFO", "direct connect", &format!("host={host} nickname={nickname}"));
+    logger::log(
+        "INFO",
+        "direct connect",
+        &format!("host={host} nickname={nickname}"),
+    );
     fetch_offer(host, password, nickname).map_err(|error| {
         if error.starts_with("connect: ") {
             logger::log("ERROR", "direct connect", &error);
@@ -835,13 +908,19 @@ mod tests {
     #[test]
     fn udp_discovery_answers_only_the_current_code() {
         // Old code stops resolving after a rotate; the new one answers.
-        assert_eq!(udp_reply("GOLIVE1 FIND ABC123", "ABC123", 41234).as_deref(),
-            Some("GOLIVE1 HOST ABC123 41234"));
+        assert_eq!(
+            udp_reply("GOLIVE1 FIND ABC123", "ABC123", 41234).as_deref(),
+            Some("GOLIVE1 HOST ABC123 41234")
+        );
         assert_eq!(udp_reply("GOLIVE1 FIND ABC123", "XYZ789", 41234), None);
-        assert_eq!(udp_reply("GOLIVE1 FIND XYZ789", "XYZ789", 41234).as_deref(),
-            Some("GOLIVE1 HOST XYZ789 41234"));
-        assert_eq!(udp_reply("GOLIVE1 FIND ABC123", "ABC123", 41234).as_deref(),
-            Some("GOLIVE1 HOST ABC123 41234"));
+        assert_eq!(
+            udp_reply("GOLIVE1 FIND XYZ789", "XYZ789", 41234).as_deref(),
+            Some("GOLIVE1 HOST XYZ789 41234")
+        );
+        assert_eq!(
+            udp_reply("GOLIVE1 FIND ABC123", "ABC123", 41234).as_deref(),
+            Some("GOLIVE1 HOST ABC123 41234")
+        );
         // Garbage and wrong magic are ignored.
         assert_eq!(udp_reply("GOLIVE2 FIND ABC123", "ABC123", 41234), None);
         assert_eq!(udp_reply("GOLIVE1 LOOK ABC123", "ABC123", 41234), None);
@@ -856,9 +935,17 @@ mod tests {
         let server_answers = Arc::clone(&answers);
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept");
-            handle_tcp(stream, test_mint(), gate, test_count(), server_answers, "Host")
+            handle_tcp(
+                stream,
+                test_mint(),
+                gate,
+                test_count(),
+                server_answers,
+                "Host",
+            )
         });
-        let mut client = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+        let mut client =
+            TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
         client
             .write_all(b"HELLO GOLIVE2\nAUTH\nNICK Ana\n")
             .expect("write");
@@ -895,7 +982,8 @@ mod tests {
             let (stream, _) = listener.accept().expect("accept");
             handle_tcp(stream, test_mint(), gate, test_count(), answers, "Host")
         });
-        let mut client = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+        let mut client =
+            TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
         client
             .write_all(b"HELLO GOLIVE2\nAUTH wrong\nNICK Ana\n")
             .expect("write");
@@ -916,7 +1004,8 @@ mod tests {
             let (stream, _) = listener.accept().expect("accept");
             handle_tcp(stream, test_mint(), gate, test_count(), answers, "Host")
         });
-        let mut client = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+        let mut client =
+            TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
         client.write_all(b"GET_OFFER\n").expect("write");
         let mut body = String::new();
         use std::io::Read;
@@ -934,9 +1023,17 @@ mod tests {
         let server_gate = Arc::clone(&gate);
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept");
-            handle_tcp(stream, test_mint(), server_gate, test_count(), answers, "Host")
+            handle_tcp(
+                stream,
+                test_mint(),
+                server_gate,
+                test_count(),
+                answers,
+                "Host",
+            )
         });
-        let mut client = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+        let mut client =
+            TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
         client
             .write_all(b"HELLO GOLIVE2\nAUTH\nNICK Joao\n")
             .expect("write");
@@ -977,9 +1074,17 @@ mod tests {
         let server_gate = Arc::clone(&gate);
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept");
-            handle_tcp(stream, test_mint(), server_gate, test_count(), answers, "Host")
+            handle_tcp(
+                stream,
+                test_mint(),
+                server_gate,
+                test_count(),
+                answers,
+                "Host",
+            )
         });
-        let mut client = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+        let mut client =
+            TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
         client
             .write_all(b"HELLO GOLIVE2\nAUTH\nNICK Joao\n")
             .expect("write");

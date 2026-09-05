@@ -630,7 +630,7 @@ function App() {
     watchingRef.current = new Set(watchingRef.current).add(id);
     setWatching(new Set(watchingRef.current));
     try {
-      await invokeMedia("stunar_watch", { request: { to: id, start: true } });
+      await invokeMedia("stunar_watch", { to: id, start: true });
     } catch (error) {
       setNotice(diagnosticError(error, "Could not watch that person."));
     }
@@ -646,7 +646,7 @@ function App() {
     setRemoteIds([...remotesRef.current.keys()]);
     if (pinned === id) setPinned(null);
     try {
-      await invokeMedia("stunar_watch", { request: { to: id, start: false } });
+      await invokeMedia("stunar_watch", { to: id, start: false });
     } catch { /* already gone */ }
   };
   const startSharing = async () => {
@@ -1038,7 +1038,7 @@ function App() {
   };
   const admitViewer = async (id: string) => {
     try {
-      const next = await invokeMedia<Snapshot>("admit_media_viewer", { request: { id } });
+      const next = await invokeMedia<Snapshot>("admit_media_viewer", { id });
       setSession(next);
     } catch (error) {
       setNotice(diagnosticError(error, "Could not accept the viewer."));
@@ -1046,7 +1046,7 @@ function App() {
   };
   const rejectViewer = async (id: string) => {
     try {
-      const next = await invokeMedia<Snapshot>("reject_media_viewer", { request: { id } });
+      const next = await invokeMedia<Snapshot>("reject_media_viewer", { id });
       setSession(next);
     } catch (error) {
       setNotice(diagnosticError(error, "Could not decline the viewer."));
@@ -1054,7 +1054,7 @@ function App() {
   };
   const kickViewer = async (id: string) => {
     try {
-      const next = await invokeMedia<Snapshot>("kick_media_viewer", { request: { id } });
+      const next = await invokeMedia<Snapshot>("kick_media_viewer", { id });
       setSession(next);
     } catch (error) {
       setNotice(diagnosticError(error, "Could not disconnect the viewer."));

@@ -49,7 +49,13 @@ fn fit_baseline_size(width: u32, height: u32) -> (u32, u32) {
 // Nearest-neighbor BGRA downscale with fixed-point stepping: no division
 // in the hot loop. Mirrors the capture-side resampler: the per-pixel
 // division version cost tens of ms per frame and starved the encoder.
-fn downscale_bgra_frame(src: &[u8], src_width: u32, src_height: u32, dst_width: u32, dst_height: u32) -> Vec<u8> {
+fn downscale_bgra_frame(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+) -> Vec<u8> {
     let src_w = src_width as usize;
     let src_h = src_height as usize;
     let dst_w = dst_width as usize;
@@ -119,10 +125,20 @@ impl OpenH264Encoder {
                 .max_frame_rate(OpenH264FrameRate::from_hz(fps as f32))
                 .usage_type(UsageType::ScreenContentRealTime)
                 .rate_control_mode(RateControlMode::Bitrate)
-                .profile(if high { Profile::High } else { Profile::Baseline })
-                .level(if high { Level::Level_5_1 } else { Level::Level_4_2 })
+                .profile(if high {
+                    Profile::High
+                } else {
+                    Profile::Baseline
+                })
+                .level(if high {
+                    Level::Level_5_1
+                } else {
+                    Level::Level_4_2
+                })
                 .complexity(Complexity::Low)
-                .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(fps * 2))
+                .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(
+                    fps * 2,
+                ))
                 .vui(VuiConfig::bt709());
             Encoder::with_api_config(OpenH264API::from_source(), config)
         };
@@ -133,8 +149,9 @@ impl OpenH264Encoder {
                     "[goDrinking] OpenH264 High profile unavailable ({error}); falling back to Baseline"
                 );
                 (
-                    make(false)
-                        .map_err(|fallback| format!("OpenH264 initialization failed: {fallback}"))?,
+                    make(false).map_err(|fallback| {
+                        format!("OpenH264 initialization failed: {fallback}")
+                    })?,
                     false,
                 )
             }
@@ -239,9 +256,9 @@ impl OpenH264Encoder {
                 break;
             }
         }
-        let profile_ok = observed.as_deref().is_some_and(|id| {
-            is_baseline_profile(id) || (want_high && is_high_profile(id))
-        });
+        let profile_ok = observed
+            .as_deref()
+            .is_some_and(|id| is_baseline_profile(id) || (want_high && is_high_profile(id)));
         eprintln!(
             "[goDrinking] OpenH264 self-test ({}x{} {}fps, want_high={want_high}): profile={observed:?}",
             fit_width, fit_height, fps,
@@ -398,9 +415,10 @@ impl OpenH264Encoder {
 
     pub(crate) fn set_bitrate(&mut self, bitrate: u32) -> Result<(), String> {
         unsafe {
-            self.encoder
-                .raw_api()
-                .set_option(ENCODER_OPTION_BITRATE, (&bitrate as *const u32).cast_mut().cast());
+            self.encoder.raw_api().set_option(
+                ENCODER_OPTION_BITRATE,
+                (&bitrate as *const u32).cast_mut().cast(),
+            );
         }
         Ok(())
     }
@@ -441,9 +459,7 @@ impl AnnexBConverter {
                 _ => {}
             }
         }
-        let contains_idr = nals
-            .iter()
-            .any(|nal| !nal.is_empty() && nal[0] & 0x1f == 5);
+        let contains_idr = nals.iter().any(|nal| !nal.is_empty() && nal[0] & 0x1f == 5);
         let is_keyframe = keyframe || contains_idr;
         let profile_level_id = self.sps.as_deref().and_then(sps_profile_level_id);
         let mut out = Vec::with_capacity(data.len() + 64);
@@ -560,9 +576,7 @@ mod tests {
         assert!(unit.keyframe);
         assert_eq!(
             unit.data,
-            vec![
-                0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x2a, 1, 0, 0, 0, 1, 0x68, 2, 0, 0, 0, 1, 0x65, 3,
-            ]
+            vec![0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x2a, 1, 0, 0, 0, 1, 0x68, 2, 0, 0, 0, 1, 0x65, 3,]
         );
         assert_eq!(unit.profile_level_id.as_deref(), Some("42e02a"));
     }
@@ -571,7 +585,11 @@ mod tests {
     fn non_keyframes_do_not_repeat_parameter_sets() {
         let mut converter = AnnexBConverter::default();
         converter
-            .convert(&[0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x2a, 1, 0, 0, 0, 1, 0x68, 2], 0, false)
+            .convert(
+                &[0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x2a, 1, 0, 0, 0, 1, 0x68, 2],
+                0,
+                false,
+            )
             .expect("parameter sets");
         let unit = converter
             .convert(&[0, 0, 0, 1, 0x41, 9], 3_000, false)

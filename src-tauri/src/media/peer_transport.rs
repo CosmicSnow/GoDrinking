@@ -13,7 +13,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_AV1, MIME_TYPE_H264, MIME_TYPE_HEVC, MIME_TYPE_OPUS};
+use webrtc::api::media_engine::{
+    MediaEngine, MIME_TYPE_AV1, MIME_TYPE_H264, MIME_TYPE_HEVC, MIME_TYPE_OPUS,
+};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::ice::mdns::MulticastDnsMode;
@@ -31,8 +33,8 @@ use webrtc::rtcp::receiver_report::ReceiverReport;
 use webrtc::rtp_transceiver::rtp_codec::{
     RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
 };
-use webrtc::stats::StatsReportType;
 use webrtc::rtp_transceiver::RTCPFeedback;
+use webrtc::stats::StatsReportType;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 
@@ -242,7 +244,10 @@ impl PeerTransportClient {
         self.command_tx
             .try_send(PeerCommand::GetRtt(response_tx))
             .ok()?;
-        response_rx.recv_timeout(Duration::from_secs(2)).ok().flatten()
+        response_rx
+            .recv_timeout(Duration::from_secs(2))
+            .ok()
+            .flatten()
     }
 
     pub(crate) fn request_close(&self) -> Result<(), String> {
@@ -342,7 +347,10 @@ async fn run_peer(
         VideoCodec::Av1 => av1_codec(),
     };
     if let Err(error) = media_engine.register_codec(session_codec.clone(), RTPCodecType::Video) {
-        let message = format!("{} codec registration failed: {error}", video_codec.mime_type());
+        let message = format!(
+            "{} codec registration failed: {error}",
+            video_codec.mime_type()
+        );
         set_status(&status, PeerTransportState::Failed, message.clone());
         let _ = ready_tx.send(Err(message));
         return;
@@ -620,10 +628,8 @@ async fn run_peer(
                 awaiting_keyframe = false;
                 super::logger::log("INFO", "pump", "first keyframe seen, starting stream");
             }
-            let profile_ok = sample_profile_accepted(
-                unit.profile_level_id.as_deref(),
-                allow_high_profile,
-            );
+            let profile_ok =
+                sample_profile_accepted(unit.profile_level_id.as_deref(), allow_high_profile);
             if !profile_ok {
                 // Was a silent `eprintln!` (outside the session file): a
                 // profile mismatch black-screened viewers while the host log
@@ -746,9 +752,7 @@ async fn run_peer(
             if probe_shutdown.load(Ordering::Acquire) {
                 break;
             }
-            if let Some(bitrate) =
-                probe_control.probe_candidate(std::time::Instant::now())
-            {
+            if let Some(bitrate) = probe_control.probe_candidate(std::time::Instant::now()) {
                 probe_control.apply_probe(bitrate);
             }
         }
@@ -1044,7 +1048,9 @@ async fn set_answer(peer: &Arc<RTCPeerConnection>, answer: PeerSignal) -> Result
             "set-answer",
             &format!("viewer rejected the video stream ({rejected}) — browser likely lacks a decoder for the session codec"),
         );
-        return Err("viewer rejected the video stream: browser has no decoder for this codec".into());
+        return Err(
+            "viewer rejected the video stream: browser has no decoder for this codec".into(),
+        );
     }
     peer.set_remote_description(
         RTCSessionDescription::answer(sdp)
@@ -1124,10 +1130,7 @@ async fn wait_for_ice(mut gather: tokio::sync::mpsc::Receiver<()>) -> Result<(),
 /// Best-effort ICE wait: a slow/blocked STUN mirror must not fail the whole
 /// join when host candidates are already usable (same NAT, LAN, loopback).
 /// Only a candidate-less SDP still fails (via require_candidates).
-async fn gather_candidates_best_effort(
-    gather: tokio::sync::mpsc::Receiver<()>,
-    what: &str,
-) {
+async fn gather_candidates_best_effort(gather: tokio::sync::mpsc::Receiver<()>, what: &str) {
     if let Err(error) = wait_for_ice(gather).await {
         super::logger::log(
             "WARN",

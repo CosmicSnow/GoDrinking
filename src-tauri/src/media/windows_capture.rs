@@ -107,7 +107,11 @@ fn downscale_bgra(
     if src_stride < row_bytes {
         return None;
     }
-    if src.len() < src_stride.checked_mul(src_h.saturating_sub(1))?.checked_add(row_bytes)? {
+    if src.len()
+        < src_stride
+            .checked_mul(src_h.saturating_sub(1))?
+            .checked_add(row_bytes)?
+    {
         return None;
     }
     let mut dst = vec![0_u8; dst_w.checked_mul(dst_h)?.checked_mul(4)?];
@@ -150,7 +154,11 @@ fn thumbnail_rgb(
     if src_stride < row_bytes {
         return None;
     }
-    if src.len() < src_stride.checked_mul(src_h.saturating_sub(1))?.checked_add(row_bytes)? {
+    if src.len()
+        < src_stride
+            .checked_mul(src_h.saturating_sub(1))?
+            .checked_add(row_bytes)?
+    {
         return None;
     }
     let mut dst = vec![0_u8; dst_w * dst_h * 3];
@@ -261,7 +269,8 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         // whole app). The mapped source pixels are resampled in place into a
         // session-size BGRA frame plus a small RGB preview thumbnail, with
         // no full-frame copy (stride-aware, zero-copy even with padding).
-        let (enc_width, enc_height) = fit_within(width, height, self.target_width, self.target_height);
+        let (enc_width, enc_height) =
+            fit_within(width, height, self.target_width, self.target_height);
         let t_buf_start = Instant::now();
         let mut fb = match frame.buffer() {
             Ok(fb) => fb,
@@ -281,9 +290,8 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         let downsized = match (encoded, thumb) {
             (Some(encoded), Some(thumb)) => Some((encoded, thumb)),
             _ => {
-                self.diagnostics.record_error(
-                    "Windows capture downscale failed: undersized frame buffer.",
-                );
+                self.diagnostics
+                    .record_error("Windows capture downscale failed: undersized frame buffer.");
                 None
             }
         };
@@ -329,9 +337,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         });
         match result {
             Ok(()) => {
-                self.diagnostics
-                    .frame_count
-                    .fetch_add(1, Ordering::Relaxed);
+                self.diagnostics.frame_count.fetch_add(1, Ordering::Relaxed);
             }
             Err(TrySendError::Full(_)) => {
                 self.diagnostics
@@ -438,9 +444,7 @@ impl WindowsCaptureAdapter {
             min_frame_interval,
         };
         let control = match resolve_target(request)? {
-            CaptureTarget::Monitor(monitor) => {
-                start_free_threaded(monitor, flags, fps)?
-            }
+            CaptureTarget::Monitor(monitor) => start_free_threaded(monitor, flags, fps)?,
             CaptureTarget::Window(window) => start_free_threaded(window, flags, fps)?,
         };
         eprintln!(
@@ -467,10 +471,7 @@ impl WindowsCaptureAdapter {
         for (index, monitor) in monitors.iter().enumerate() {
             let width = monitor.width().ok().map(u64::from);
             let height = monitor.height().ok().map(u64::from);
-            let title = monitor
-                .name()
-                .ok()
-                .or_else(|| monitor.device_string().ok());
+            let title = monitor.name().ok().or_else(|| monitor.device_string().ok());
             sources.push(NativeCaptureSource {
                 id: (index + 1) as u64,
                 kind: NativeSourceKind::Display,
@@ -517,7 +518,11 @@ impl WindowsCaptureAdapter {
                 });
             }
         }
-        apps.sort_by(|left, right| left.name.to_ascii_lowercase().cmp(&right.name.to_ascii_lowercase()));
+        apps.sort_by(|left, right| {
+            left.name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase())
+        });
         apps.dedup_by(|left, right| left.pid == right.pid);
         Ok(apps)
     }
@@ -584,8 +589,7 @@ where
         GraphicsCaptureApi::is_minimum_update_interval_supported().unwrap_or(true);
     // The system draws a colored border around the captured item; users find
     // it ugly, so turn it off where the OS allows (same probe-and-fallback).
-    let borderless_supported =
-        GraphicsCaptureApi::is_border_settings_supported().unwrap_or(true);
+    let borderless_supported = GraphicsCaptureApi::is_border_settings_supported().unwrap_or(true);
     if !borderless_supported {
         logger::log(
             "WARN",
@@ -637,8 +641,7 @@ where
         Err(error) => {
             let message = error.to_string();
             let interval_fallback = custom_supported && is_min_interval_unsupported(&message);
-            let border_fallback =
-                borderless_supported && message.to_lowercase().contains("border");
+            let border_fallback = borderless_supported && message.to_lowercase().contains("border");
             if interval_fallback || border_fallback {
                 logger::log(
                     "WARN",

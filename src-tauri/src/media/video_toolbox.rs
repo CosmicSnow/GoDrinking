@@ -278,9 +278,9 @@ extern "C" fn encoded_callback(
     };
     let bytes = unsafe { std::slice::from_raw_parts(data, len) };
     let Ok(mut converter) = context.converter.lock() else {
-        context.state.report_error(VideoToolboxError(
-            "converter lock was poisoned".into(),
-        ));
+        context
+            .state
+            .report_error(VideoToolboxError("converter lock was poisoned".into()));
         return;
     };
     let unit = match converter.convert(bytes, timestamp_90khz, keyframe != 0) {
