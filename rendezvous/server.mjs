@@ -33,7 +33,11 @@ const MAX_ACCEPTED = 8;
 const MAX_PENDING = 8;
 // Overridable so the 5-minute expiry can be tested quickly.
 const HEARTBEAT_TTL_MS = Number(process.env.HEARTBEAT_TTL_MS || 5 * 60 * 1000);
-const GC_INTERVAL_MS = 15 * 1000;
+const GC_INTERVAL_MS = Number(process.env.GC_INTERVAL_MS || 15 * 1000);
+// How long a disconnected socket stays in the roster before the sweeper
+// drops it. Covers clean closes AND app kills (WS close fires either way);
+// a reconnect within the grace keeps the same viewer id.
+const GHOST_GRACE_MS = Number(process.env.GHOST_GRACE_MS || 20 * 1000);
 const BODY_LIMIT = 64 * 1024;
 const HEADER_TIMEOUT_MS = 5 * 1000;
 const REQUEST_TIMEOUT_MS = 15 * 1000;
@@ -89,7 +93,8 @@ const fakeTokens = new Map();
 
 // Room = { code, passwordHash, passwordSalt, admission, hostNickname,
 //          hostToken, heartbeatAt, hostWs, viewers: Map<id, Viewer> }
-// Viewer = { id, nickname, token, state: "pending"|"accepted", ws, inbox }
+// Viewer = { id, nickname, token, state: "pending"|"accepted", ws, inbox,
+//            heartbeatAt, wsClosedAt } — wsClosedAt is 0 while connected.
 
 // --- Helpers ---------------------------------------------------------------
 
@@ -313,11 +318,24 @@ function promoteMaster(room, newMasterId) {
   broadcastRoster(room);
 }
 
+/** Deletes a broadcast viewer and tells the host (roster shrinks). */
+function removeViewer(room, viewerId) {
+  const viewer = room.viewers.get(viewerId);
+  if (!viewer) return;
+  room.viewers.delete(viewerId);
+  tokens.delete(viewer.token);
+  send(viewer.ws, { t: "gone" });
+  if (viewer.ws) viewer.ws.close(4000, "gone");
+  log("info", "-", "drop-viewer", room.code, viewerId);
+  broadcastRoster(room);
+}
+
 function dropMember(room, memberId) {
   const member = room.members.get(memberId);
   if (!member) return;
   const leavingWasMaster = room.masterId === memberId;
   room.members.delete(memberId);
+  room.viewers.delete(memberId);
   tokens.delete(member.token);
   send(member.ws, { t: "gone" });
   if (member.ws) member.ws.close(4000, "gone");
@@ -475,7 +493,7 @@ async function handleAsk(ip, json, res) {
   const viewerId = randomViewerId();
   const viewerToken = randomToken();
   const state = room.admission ? "pending" : "accepted";
-  const viewer = { id: viewerId, nickname, token: viewerToken, state, ws: null, inbox: null };
+  const viewer = { id: viewerId, nickname, token: viewerToken, state, ws: null, inbox: null, heartbeatAt: Date.now(), wsClosedAt: 0 };
   room.viewers.set(viewerId, viewer);
   tokens.set(viewerToken, { role: "viewer", code, viewerId, memberId: viewerId });
 
@@ -486,6 +504,7 @@ async function handleAsk(ip, json, res) {
       token: viewerToken,
       joinedAt: Date.now(),
       heartbeatAt: Date.now(),
+      wsClosedAt: 0,
       ws: null,
       share: false,
       role: "member",
@@ -530,6 +549,13 @@ function handleMemberLeave(ip, json, res) {
       destroyRoom(room);
       return ok(res, { ok: true });
     }
+    // Broadcast viewers CAN leave explicitly now (used to be deny): drop
+    // the ghost immediately instead of lingering until the room dies.
+    if (entry.role === "viewer" && entry.viewerId) {
+      log("info", ip, "leave", room.code, entry.viewerId);
+      removeViewer(room, entry.viewerId);
+      return ok(res, { ok: true });
+    }
     return deny(res);
   }
   const memberId = entry.memberId || entry.viewerId || room.masterId;
@@ -549,6 +575,9 @@ function handleMemberHeartbeat(ip, json, res) {
     const memberId = entry.memberId || entry.viewerId || room.masterId;
     const member = room.members.get(memberId);
     if (member) member.heartbeatAt = now;
+  } else if (entry.role === "viewer" && entry.viewerId) {
+    const viewer = room.viewers.get(entry.viewerId);
+    if (viewer) viewer.heartbeatAt = now;
   }
   ok(res, { ok: true, master_id: room.masterId ?? null });
 }
@@ -753,7 +782,17 @@ wss.on("connection", (ws, req, meta) => {
       if (room.hostWs === ws) room.hostWs = null;
     } else {
       const viewer = room.viewers.get(meta.viewerId);
-      if (viewer && viewer.ws === ws) viewer.ws = null;
+      if (viewer && viewer.ws === ws) {
+        viewer.ws = null;
+        viewer.wsClosedAt = Date.now();
+      }
+      if (room.mode === "room") {
+        const member = room.members.get(meta.viewerId);
+        if (member && member.ws === ws) {
+          member.ws = null;
+          member.wsClosedAt = Date.now();
+        }
+      }
     }
   });
 });
@@ -904,19 +943,39 @@ setInterval(() => {
   }
 }, WS_PING_MS);
 
-// GC: rooms whose Host stopped heartbeating die after 5 minutes. Also prunes
-// the rate/ignore maps so a long-lived process stays bounded.
+// GC: rooms whose Host stopped heartbeating die after 5 minutes, and
+// disconnected viewers/members are swept (fast WS-close path + slow
+// heartbeat-TTL path) so the roster counts who is really there. Also
+// prunes the rate/ignore maps so a long-lived process stays bounded.
+function ghostDue(closedAt, heartbeatAt, now) {
+  if (closedAt && now - closedAt > GHOST_GRACE_MS) return true;
+  if (now - heartbeatAt > HEARTBEAT_TTL_MS) return true;
+  return false;
+}
 setInterval(() => {
   const now = Date.now();
   for (const [code, room] of rooms) {
     if (room.mode === "room") {
       for (const member of [...room.members.values()]) {
-        if (now - member.heartbeatAt > HEARTBEAT_TTL_MS) {
+        // Disconnected sockets go fast (grace); connected ones keep the
+        // original heartbeat-TTL rule.
+        const stale = now - member.heartbeatAt > HEARTBEAT_TTL_MS;
+        const ghostGone = member.ws == null && ghostDue(member.wsClosedAt || 0, member.heartbeatAt, now);
+        if (stale || ghostGone) {
           log("warn", "-", "gc-member", code, member.id);
           dropMember(room, member.id);
         }
       }
       continue;
+    }
+    for (const viewer of [...room.viewers.values()]) {
+      // Connected sockets stay, no matter what (reconnect replaces the
+      // socket within the grace, never the id).
+      if (viewer.ws != null) continue;
+      if (ghostDue(viewer.wsClosedAt || 0, viewer.heartbeatAt || 0, now)) {
+        log("warn", "-", "gc-viewer", code, viewer.id);
+        removeViewer(room, viewer.id);
+      }
     }
     if (now - room.heartbeatAt > HEARTBEAT_TTL_MS) {
       log("warn", "-", "gc", code);

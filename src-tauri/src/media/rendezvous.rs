@@ -604,6 +604,23 @@ async fn post_member_heartbeat(
     }
 }
 
+/// Best-effort explicit leave so the roster drops this viewer immediately
+/// instead of lingering as a ghost until the heartbeat TTL sweeps it.
+async fn post_member_leave(client: &reqwest::Client, base: &str, token: &str) -> Result<(), String> {
+    let base = normalize_base(base);
+    let response = client
+        .post(format!("{base}/v1/member/leave"))
+        .json(&json!({ "token": token }))
+        .send()
+        .await
+        .map_err(|_| "Stunar is unreachable.".to_owned())?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err("Stunar is unreachable.".into())
+    }
+}
+
 async fn post_decide(
     client: &reqwest::Client,
     base: &str,
@@ -891,6 +908,7 @@ pub(crate) struct StunarViewer {
     unwatch_from: Arc<Mutex<Vec<String>>>,
     master_id: Arc<Mutex<Option<String>>>,
     shutdown: Arc<AtomicBool>,
+    base: String,
     pub(crate) token: String,
     pub(crate) member_id: Option<String>,
     pub(crate) mode: String,
@@ -983,6 +1001,20 @@ impl StunarViewer {
             .lock()
             .map(|mut answers| std::mem::take(&mut *answers))
             .unwrap_or_default()
+    }
+
+    /// Explicit disconnect: tells the Rendezvous to drop this viewer from
+    /// the roster now (best-effort) and stops the worker. Without this the
+    /// entry lingers as a ghost and the host keeps minting dead offers.
+    pub(crate) fn leave(&self) {
+        logger::log("INFO", "stunar leave", "viewer leaving");
+        self.shutdown.store(true, Ordering::Release);
+        let _ = self.outgoing.send(Outgoing::Close);
+        if let Ok(runtime) = current_thread_runtime() {
+            if let Ok(client) = http_client() {
+                let _ = runtime.block_on(post_member_leave(&client, &self.base, &self.token));
+            }
+        }
     }
 }
 
@@ -1097,6 +1129,7 @@ pub(crate) fn discover_stunar_room(
             unwatch_from,
             master_id,
             shutdown,
+            base: base.clone(),
             token,
             member_id,
             mode,

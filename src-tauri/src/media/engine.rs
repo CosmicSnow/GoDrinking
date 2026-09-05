@@ -988,9 +988,12 @@ impl MediaEngine {
             .map_err(|_| MediaEngineError::QueueClosed)?
     }
 
-    /// Viewer-side Stunar: drops the stored WS (disconnect).
+    /// Viewer-side Stunar: explicit leave (roster drops now) + WS close.
     pub fn close_stunar_viewer(&self) {
         if let Ok(mut state) = self.state.lock() {
+            if let Some(viewer) = state.stunar_viewer.as_ref() {
+                viewer.leave();
+            }
             state.stunar_viewer = None;
         }
     }
