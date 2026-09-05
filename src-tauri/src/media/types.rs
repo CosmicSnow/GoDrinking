@@ -89,10 +89,24 @@ pub(crate) fn final_encode_size(
 ) -> (u32, u32) {
     const MAX_BASELINE_WIDTH: u32 = 1920;
     const MACROBLOCK: u32 = 16;
+    // Broadcast sizes pass through untouched: every MFT and decoder
+    // accepts them, and aligning 1080 down to 1072 would trade a proven
+    // size for a weirder one.
+    const STANDARD: [(u32, u32); 6] = [
+        (3840, 2160),
+        (2560, 1440),
+        (1920, 1080),
+        (1280, 720),
+        (854, 480),
+        (640, 360),
+    ];
     let (mut width, mut height) = fitted_even_size(src_width, src_height, max_width, max_height);
     if baseline && width > MAX_BASELINE_WIDTH {
         height = ((height as u64 * MAX_BASELINE_WIDTH as u64 / width as u64) as u32 & !1).max(2);
         width = MAX_BASELINE_WIDTH;
+    }
+    if STANDARD.contains(&(width, height)) {
+        return (width, height);
     }
     (
         (width & !(MACROBLOCK - 1)).max(MACROBLOCK),
@@ -658,12 +672,13 @@ mod tests {
         let (w, h) = final_encode_size(5120, 1440, 1920, 1080, false);
         assert!(w * h <= 1920 * 1080);
         assert_eq!((w % 16, h % 16), (0, 0));
-        // Tamanhos comuns passam quase intactos (so alinhamento).
+        // Tamanhos padrao passam intactos (nunca 1072 no lugar de 1080).
         assert_eq!(
             final_encode_size(1920, 1080, 1920, 1080, true),
-            (1920, 1072)
+            (1920, 1080)
         );
         assert_eq!(final_encode_size(1280, 720, 1920, 1080, true), (1280, 720));
+        assert_eq!(final_encode_size(640, 360, 1920, 1080, true), (640, 360));
         // Idempotente: reaplicar nao muda nada.
         let once = final_encode_size(5120, 1440, 1920, 1080, true);
         assert_eq!(final_encode_size(once.0, once.1, 1920, 1080, true), once);

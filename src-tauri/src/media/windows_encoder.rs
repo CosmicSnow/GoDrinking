@@ -536,10 +536,10 @@ mod tests {
         // black-screens Mac viewers; the Baseline cap lands on 1920x528.
         assert_eq!(fit_baseline_size(3620, 1018), (1920, 528));
         assert_eq!(fit_baseline_size(5120, 1440), (1920, 528));
-        // Normal sizes pass through (macroblock-aligned).
-        assert_eq!(fit_baseline_size(1920, 1080), (1920, 1072));
+        // Normal sizes pass through untouched.
+        assert_eq!(fit_baseline_size(1920, 1080), (1920, 1080));
         assert_eq!(fit_baseline_size(1280, 720), (1280, 720));
-        assert_eq!(fit_baseline_size(640, 360), (640, 352));
+        assert_eq!(fit_baseline_size(640, 360), (640, 360));
         // Second monitor sizes never trigger the cap.
         let (w, h) = fit_baseline_size(2714, 764);
         assert!(w <= 1920 && h % 2 == 0);
