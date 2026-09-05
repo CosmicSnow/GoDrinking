@@ -126,7 +126,7 @@ VIEWER ──────┘  (sem nuvem)</pre>
                 <li>Não é Go. O nome é uma piada que saiu do controle.</li>
                 <li>Não é app de bar nem tracker de drink.</li>
                 <li>Não há servidor vendo ou reencaminhando o vídeo.</li>
-                <li>Não é Open Source OSI. Uso comercial precisa de autorização.</li>
+                <li>Não é Open Source OSI. Usar no trabalho pode. Revender o código, não.</li>
               </ul>
             </div>
           </div>
@@ -280,7 +280,7 @@ VIEWER ──────┘  (sem nuvem)</pre>
             <details>
               <summary>Posso usar no trabalho?</summary>
               <div class="faq-answer">
-                PolyForm Noncommercial: pessoal, hobby, org sem fins lucrativos. Uso comercial precisa de autorização.
+                Pode. Reunião, suporte, o que for. O que não pode é pegar o código e revender (fork comercial, white-label, SaaS do mesmo app).
               </div>
             </details>
           </div>
