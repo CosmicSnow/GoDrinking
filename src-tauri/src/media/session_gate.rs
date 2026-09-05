@@ -70,7 +70,11 @@ impl SessionGate {
         };
         if let Some(until) = ignore.until.get(&ip).copied() {
             if Instant::now() < until {
-                logger::log("WARN", "ignore list", &format!("{ip} refused (on ignore list)"));
+                logger::log(
+                    "WARN",
+                    "ignore list",
+                    &format!("{ip} refused (on ignore list)"),
+                );
                 return true;
             }
             ignore.until.remove(&ip);
@@ -107,7 +111,18 @@ impl SessionGate {
     pub(crate) fn register_pending(&self, id: String, nickname: String) -> Receiver<bool> {
         let (tx, rx) = sync_channel(1);
         if let Ok(mut pending) = self.pending.lock() {
-            pending.insert(id, PendingSlot { nickname, decision: tx });
+            pending.insert(
+                id.clone(),
+                PendingSlot {
+                    nickname,
+                    decision: tx,
+                },
+            );
+            logger::log(
+                "INFO",
+                "admission pending",
+                &format!("viewer={id} queued decisions={}", pending.len()),
+            );
         }
         rx
     }
@@ -119,6 +134,9 @@ impl SessionGate {
         }
     }
 
+    /// Idempotent admission decision: the first call for `id` delivers the
+    /// verdict and prunes the slot (freeing Roster capacity); repeats find
+    /// no slot and return false without side effects.
     pub(crate) fn decide(&self, id: &str, accept: bool) -> bool {
         let tx = {
             let Ok(mut pending) = self.pending.lock() else {
@@ -126,7 +144,13 @@ impl SessionGate {
             };
             pending.remove(id).map(|slot| slot.decision)
         };
-        tx.and_then(|tx| tx.send(accept).ok()).is_some()
+        let delivered = tx.and_then(|tx| tx.send(accept).ok()).is_some();
+        logger::log(
+            "INFO",
+            "admission decide",
+            &format!("viewer={id} accept={accept} delivered={delivered}"),
+        );
+        delivered
     }
 
     pub(crate) fn pending_roster(&self) -> Vec<(String, String)> {
@@ -140,7 +164,6 @@ impl SessionGate {
             })
             .unwrap_or_default()
     }
-
 }
 
 pub(crate) fn passwords_match(expected: &str, got: &str) -> bool {
@@ -195,5 +218,32 @@ mod tests {
         }
         gate.note_auth_failure(ip);
         assert!(gate.is_ignored(ip));
+    }
+
+    #[test]
+    fn admission_decide_is_idempotent_and_prunes_the_slot() {
+        let gate = SessionGate::new(String::new(), true);
+        // Unknown ids decide nothing.
+        assert!(!gate.decide("ghostview", true));
+        let rx = gate.register_pending("view0001".into(), "Joao".into());
+        assert_eq!(gate.pending_roster().len(), 1);
+        assert!(gate.decide("view0001", true));
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("verdict"));
+        // The slot is pruned: capacity is freed and repeats have no effect.
+        assert!(gate.pending_roster().is_empty());
+        assert!(!gate.decide("view0001", true));
+    }
+
+    #[test]
+    fn admission_reject_prunes_without_admitting() {
+        let gate = SessionGate::new(String::new(), true);
+        let rx = gate.register_pending("view0002".into(), "Cyd".into());
+        assert!(gate.decide("view0002", false));
+        assert!(!rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("verdict"));
+        assert!(gate.pending_roster().is_empty());
     }
 }

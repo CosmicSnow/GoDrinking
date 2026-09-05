@@ -52,16 +52,11 @@ pub(crate) fn fitted_even_size(
     let max_height = max_height.max(2);
     // Contained sources stay native (no upscale, even dimensions).
     if source_width <= max_width && source_height <= max_height {
-        return (
-            (source_width & !1).max(2),
-            (source_height & !1).max(2),
-        );
+        return ((source_width & !1).max(2), (source_height & !1).max(2));
     }
     // Pixel-budget fit: use the area of the cap, not a 16:9 letterbox.
     // A 3440x1440 ultrawide at a 1080p cap stays ~21:9 and wider than 1920.
-    let cap_pixels = (max_width as u64)
-        .saturating_mul(max_height as u64)
-        .max(1);
+    let cap_pixels = (max_width as u64).saturating_mul(max_height as u64).max(1);
     let src_pixels = (source_width as u64)
         .saturating_mul(source_height as u64)
         .max(1);
@@ -147,6 +142,38 @@ pub enum TransmissionQuality {
     Low,
     Medium,
     High,
+}
+
+/// Tri-state source-ID intent for a live update.
+///
+/// This is intentionally not an `Option<u64>`: `Unchanged` means the update
+/// did not address the selected source, while `Clear` explicitly removes a
+/// previously selected source ID. The tagged representation is stable and
+/// unambiguous at Tauri/IPC boundaries.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", content = "id", rename_all = "snake_case")]
+pub enum SourceIdUpdate {
+    #[default]
+    Unchanged,
+    Set(u64),
+    Clear,
+}
+
+impl SourceIdUpdate {
+    pub fn is_unchanged(self) -> bool {
+        matches!(self, Self::Unchanged)
+    }
+
+    pub fn is_clear(self) -> bool {
+        matches!(self, Self::Clear)
+    }
+
+    pub fn value(self) -> Option<u64> {
+        match self {
+            Self::Set(id) => Some(id),
+            Self::Unchanged | Self::Clear => None,
+        }
+    }
 }
 
 impl Default for TransmissionQuality {
@@ -247,11 +274,40 @@ impl VideoCodec {
     /// SDP profile-level-id for the H.264 variants (None = not H.264).
     pub(crate) fn h264_profile_level_id(self) -> Option<&'static str> {
         match self {
-            Self::H264 => Some("42e02a"),
+            Self::H264 => Some(H264_BASELINE_PROFILE_LEVEL_ID),
             Self::H264High => Some("640033"),
             Self::Hevc | Self::Av1 => None,
         }
     }
+}
+
+/// Phase-2A media contract: exactly one H.264 payload type (PT102) with a
+/// single Constrained-Baseline fmtp line. Level 4.2 (`42e02a`) covers the
+/// full 1080p60 envelope; CBP L3.1 (`42e01f`) would cap 1080p at ~30fps, so
+/// the session pins 4.2 rather than negotiating a level per peer.
+pub(crate) const H264_BASELINE_PROFILE_LEVEL_ID: &str = "42e02a";
+pub(crate) const H264_PAYLOAD_TYPE: u8 = 102;
+pub(crate) const H264_BASELINE_FMTP: &str =
+    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e02a";
+
+/// Builds the single H.264 fmtp line for a session profile-level-id.
+pub(crate) fn h264_fmtp_line(profile_level_id: &str) -> String {
+    format!("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={profile_level_id}")
+}
+
+/// Packetization-mode=1 (non-interleaved) is mandatory: the sender emits
+/// STAP-A/FU-A only and the viewer must agree, otherwise it may offer
+/// mode 0 and then fail to depacketize.
+pub(crate) fn h264_fmtp_requires_packetization_mode_1(fmtp: &str) -> bool {
+    fmtp.split(';').any(|param| {
+        let mut parts = param.split('=');
+        matches!(
+            (parts.next(), parts.next()),
+            (Some(name), Some(value))
+                if name.trim().eq_ignore_ascii_case("packetization-mode")
+                    && value.trim() == "1"
+        )
+    })
 }
 
 /// Windows encoder backend. Auto tries the Media Foundation hardware
@@ -372,6 +428,12 @@ impl CreateMediaSessionRequest {
 /// recreate the encoder (brief freeze, no rejoin); None keeps the Start value.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct UpdateMediaSessionRequest {
+    /// Source changes restart only the local Share slot; the surrounding
+    /// Session and join service remain alive.
+    #[serde(default)]
+    pub source: Option<CaptureSource>,
+    #[serde(default)]
+    pub source_id: Option<u64>,
     pub quality: TransmissionQuality,
     /// Live encoder bitrate override in bps (None = follow the preset).
     #[serde(default)]
@@ -616,7 +678,9 @@ impl MediaSessionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::{
-        fitted_even_size, resolve_floor, MIN_BITRATE_BPS, TransmissionQuality, VideoCodec,
+        fitted_even_size, h264_fmtp_line, h264_fmtp_requires_packetization_mode_1, resolve_floor,
+        TransmissionQuality, VideoCodec, H264_BASELINE_FMTP, H264_BASELINE_PROFILE_LEVEL_ID,
+        H264_PAYLOAD_TYPE, MIN_BITRATE_BPS,
     };
 
     fn aspect(width: u32, height: u32) -> f64 {
@@ -642,8 +706,14 @@ mod tests {
         assert_eq!(width % 2, 0);
         assert_eq!(height % 2, 0);
         assert!(width * height <= 1920 * 1080);
-        assert!(width > 1920, "ultrawide may be wider than 1920, got {width}x{height}");
-        assert!(height > 804, "must beat the old letterbox height 804, got {height}");
+        assert!(
+            width > 1920,
+            "ultrawide may be wider than 1920, got {width}x{height}"
+        );
+        assert!(
+            height > 804,
+            "must beat the old letterbox height 804, got {height}"
+        );
         assert!((aspect(width, height) - aspect(3440, 1440)).abs() < 0.02);
 
         let (uwqhd_w, uwqhd_h) = fitted_even_size(5120, 1440, 1920, 1080);
@@ -700,5 +770,68 @@ mod tests {
         assert_eq!(TransmissionQuality::High.bitrate(), 8_000_000);
         assert_eq!(TransmissionQuality::High.max_dimensions(), (1920, 1080));
         assert_eq!(TransmissionQuality::Low.max_dimensions(), (1280, 720));
+    }
+
+    #[test]
+    fn h264_baseline_contract_is_a_single_pt102_fmtp_line() {
+        // Exact Phase-2A SDP string: ONE payload type, packetization-mode=1
+        // mandatory, Constrained Baseline 4.2 covering 1080p60.
+        assert_eq!(H264_BASELINE_PROFILE_LEVEL_ID, "42e02a");
+        assert_eq!(H264_PAYLOAD_TYPE, 102);
+        assert_eq!(
+            H264_BASELINE_FMTP,
+            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e02a"
+        );
+        assert_eq!(
+            h264_fmtp_line(H264_BASELINE_PROFILE_LEVEL_ID),
+            H264_BASELINE_FMTP
+        );
+        assert_eq!(
+            VideoCodec::H264.h264_profile_level_id(),
+            Some(H264_BASELINE_PROFILE_LEVEL_ID)
+        );
+        // Packetization-mode=1 is mandatory, not a default: mode 0 or a
+        // missing parameter must fail validation.
+        assert!(h264_fmtp_requires_packetization_mode_1(H264_BASELINE_FMTP));
+        assert!(!h264_fmtp_requires_packetization_mode_1(
+            "level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42e02a"
+        ));
+        assert!(!h264_fmtp_requires_packetization_mode_1(
+            "level-asymmetry-allowed=1;profile-level-id=42e02a"
+        ));
+        assert!(!h264_fmtp_requires_packetization_mode_1(""));
+    }
+
+    #[test]
+    fn source_id_update_has_explicit_tri_state_wire_contract() {
+        use super::SourceIdUpdate;
+        use serde_json::json;
+
+        let cases = [
+            (SourceIdUpdate::Unchanged, json!({"state": "unchanged"})),
+            (SourceIdUpdate::Set(42), json!({"state": "set", "id": 42})),
+            (SourceIdUpdate::Clear, json!({"state": "clear"})),
+        ];
+
+        for (intent, expected) in cases {
+            assert_eq!(serde_json::to_value(intent).expect("serialize"), expected);
+            assert_eq!(
+                serde_json::from_value::<SourceIdUpdate>(expected).expect("deserialize"),
+                intent
+            );
+        }
+    }
+
+    #[test]
+    fn source_id_update_helpers_do_not_conflate_clear_and_unchanged() {
+        use super::SourceIdUpdate;
+
+        assert!(SourceIdUpdate::Unchanged.is_unchanged());
+        assert!(!SourceIdUpdate::Unchanged.is_clear());
+        assert!(SourceIdUpdate::Clear.is_clear());
+        assert!(!SourceIdUpdate::Clear.is_unchanged());
+        assert_eq!(SourceIdUpdate::Set(7).value(), Some(7));
+        assert_eq!(SourceIdUpdate::Clear.value(), None);
+        assert_eq!(SourceIdUpdate::Unchanged.value(), None);
     }
 }

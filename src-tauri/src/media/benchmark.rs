@@ -54,7 +54,11 @@ pub fn recommend_preset(
                 RecommendedPreset::High,
                 format!(
                     "{} 1080p60 at {:.0} ms/frame. High.{}",
-                    if high.hardware { "Hardware" } else { "Software" },
+                    if high.hardware {
+                        "Hardware"
+                    } else {
+                        "Software"
+                    },
                     high.mean_encode_ms,
                     extra
                 ),
@@ -168,7 +172,12 @@ mod tests {
 
     #[test]
     fn fast_hardware_1080p60_recommends_high() {
-        let report = recommend_preset(&synthetic_samples_from_ms(6.0, 4.0, true), true, false, true);
+        let report = recommend_preset(
+            &synthetic_samples_from_ms(6.0, 4.0, true),
+            true,
+            false,
+            true,
+        );
         assert_eq!(report.recommended, RecommendedPreset::High);
         assert!(report.note.contains("High"));
         assert!(report.can_1440);
@@ -176,13 +185,23 @@ mod tests {
 
     #[test]
     fn slow_high_but_ok_medium_recommends_medium() {
-        let report = recommend_preset(&synthetic_samples_from_ms(40.0, 12.0, false), false, false, false);
+        let report = recommend_preset(
+            &synthetic_samples_from_ms(40.0, 12.0, false),
+            false,
+            false,
+            false,
+        );
         assert_eq!(report.recommended, RecommendedPreset::Medium);
     }
 
     #[test]
     fn everything_slow_recommends_low() {
-        let report = recommend_preset(&synthetic_samples_from_ms(50.0, 30.0, false), false, false, false);
+        let report = recommend_preset(
+            &synthetic_samples_from_ms(50.0, 30.0, false),
+            false,
+            false,
+            false,
+        );
         assert_eq!(report.recommended, RecommendedPreset::Low);
     }
 }

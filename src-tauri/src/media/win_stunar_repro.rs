@@ -84,9 +84,7 @@ mod win_stunar_repro {
     #[test]
     fn repro_viewer_answer_rejects_video_port_zero() {
         // Resposta real do viewer no incidente (porta 0 = sem decoder comum).
-        let answer = format!(
-            "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n{INCIDENT_REJECTED_M_LINE}\r\n"
-        );
+        let answer = format!("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n{INCIDENT_REJECTED_M_LINE}\r\n");
         let rejected = rejected_video_section(&answer);
         assert_eq!(rejected.as_deref(), Some(INCIDENT_REJECTED_M_LINE));
         eprintln!("[repro] REPLICADO: viewer rejeitou o video ({INCIDENT_REJECTED_M_LINE})");
@@ -99,9 +97,7 @@ mod win_stunar_repro {
         let offered = VideoCodec::H264.h264_profile_level_id().unwrap();
         assert_eq!(offered, "42e02a");
         assert!(!baseline_session_accepts(INCIDENT_ENCODER_PROFILE));
-        let answer = format!(
-            "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n{INCIDENT_REJECTED_M_LINE}\r\n"
-        );
+        let answer = format!("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n{INCIDENT_REJECTED_M_LINE}\r\n");
         assert!(rejected_video_section(&answer).is_some());
         // O viewer Mac nunca sai de `incoming offers=1`: oferta chega,
         // resposta rejeita, midia nunca flui — igual aos dois logs.
@@ -279,9 +275,7 @@ mod win_stunar_repro {
                     Arc::clone(&state),
                     Arc::clone(&control),
                 )
-                .unwrap_or_else(|e| {
-                    panic!("FIX QUEBROU: self-test falhou em {w}x{h}/{name}: {e}")
-                });
+                .unwrap_or_else(|e| panic!("FIX QUEBROU: self-test falhou em {w}x{h}/{name}: {e}"));
                 assert!(
                     !encoder.is_high_profile(),
                     "FIX QUEBROU: encoder High numa sessao H264 ({w}x{h}/{name})"

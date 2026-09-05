@@ -7,8 +7,8 @@ import "./App.css";
 import logo from "./assets/logo.png";
 import { APP_VERSION, detectLocale, dictionaries, type Copy, type Locale } from "./copy";
 import { RoomStage } from "./RoomStage";
-import { autoFloorMbps, BITRATE_MAX_MBPS, BITRATE_MIN_MBPS, FLOOR_MAX_MBPS, FLOOR_MIN_MBPS, collectViewerStats, qualityTargetMbps, type ViewerStats, type ViewerStatsPrev } from "./sessionStats";
-import { videoSectionRejected } from "./sdp";
+import { autoFloorMbps, BITRATE_MAX_MBPS, BITRATE_MIN_MBPS, FLOOR_MAX_MBPS, FLOOR_MIN_MBPS, admissionStateFor, buildMilestonePayload, classifyViewerPlayback, collectViewerStats, describeSourceSelectionIntent, joinFailureForStage, nextShareIntent, nextWatchIntent, qualityTargetMbps, shareIntentStatusText, shouldEmitMilestone, startVideoPlayback, viewerPlaybackStatusText, watchIntentStatusText, type JoinFailureKind, type ShareIntentState, type ViewerPlaybackFlags, type ViewerPlaybackMilestone, type ViewerPlaybackStage, type ViewerStats, type ViewerStatsPrev, type WatchIntentState } from "./sessionStats";
+import { answerWithAttempt, offerDedupeKey, releaseOfferKey, videoSectionRejected } from "./sdp";
 
 type IconName = "grid" | "monitor" | "window" | "game" | "settings" | "help" | "plus" | "copy" | "wifi" | "chevron" | "expand" | "minimize" | "volume" | "volume-off" | "terminal" | "activity" | "folder";
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
@@ -38,10 +38,11 @@ type Source = { id: number; kind: "display" | "window"; title?: string; applicat
 type RunningApp = { name: string; bundle_id?: string | null; pid: number; emitting_audio?: boolean };
 type Capabilities = { platform?: string; supported: boolean; native_capture_implemented: boolean; screen_capture_kit: boolean; source_enumeration_available: boolean; screen_recording_authorization: "granted" | "not_granted" | "unsupported"; app_audio_exclusion: "enhanced" | "best_effort" | "unsupported"; wasapi?: boolean; process_loopback?: boolean; av1_encode_supported?: boolean; detail: string };
 type RosterEntry = { id: string; nickname: string; state: string; master?: boolean; share?: boolean };
-type IncomingOffer = { from: string; sdp: string };
+type IncomingOffer = { from: string; sdp: string; offer_attempt: string };
 type DirectAddress = { ip: string; port: number; version: number; kind: string; copy: string };
 type Snapshot = { state: string; session_id: string | null; source_id: number | null; bitrate_bps: number | null; native_capture_active: boolean; preview_callback_count: number; preview_frame_count: number; preview_dropped_count: number; preview_error: string | null; detail: string; peer_state: string; peer_detail: string; session_code: string | null; lan_addresses: string[]; lan_port: number | null; roster?: RosterEntry[]; self_id?: string | null; session_mode?: "broadcast" | "room"; password_set?: boolean; admission?: boolean; join_mode?: string; direct_listen_port?: number | null; direct_addresses?: DirectAddress[]; direct_mapping?: boolean; stunar_state?: string | null; resolution?: string | null; frame_rate?: string | null };
-type Signal = { type: "offer" | "answer"; sdp: string; id?: string };
+type Signal = { type: "offer" | "answer"; sdp: string; id?: string; offer_attempt: string };
+type SourceIdUpdate = { state: "unchanged" } | { state: "set"; id: number } | { state: "clear" };
 type LogSession = { session: string; timestamp: string; lines: string[] };
 type ViewerLinkStats = { id: string; nickname: string; state: string; rtt_ms: number | null };
 type SessionLinkStats = { links: ViewerLinkStats[]; target_bps: number; congestion_bps: number | null; floor_bps: number };
@@ -210,6 +211,24 @@ function App() {
   const [watchIce, setWatchIce] = useState<"idle" | "connecting" | "connected" | "lost">("idle");
   const [watchCode, setWatchCode] = useState("");
   const [watchHostName, setWatchHostName] = useState("");
+  // Phase-2C Viewer playback: diagnosable stage + once-per-link milestones.
+  // Milestones carry session code / link id / join mode / counts only —
+  // never SDP, passwords, or tokens.
+  const [playbackStage, setPlaybackStage] = useState<ViewerPlaybackStage>("idle");
+  const [playbackMilestones, setPlaybackMilestones] = useState<ViewerPlaybackMilestone[]>([]);
+  // Phase-3B explicit intents. watchIntent is the Viewer join machine
+  // (idle/joining/waiting-approval/connecting/connected/failed-blocked);
+  // shareIntent is the Host capture-slot machine (idle/starting/sharing).
+  // watchBlockReason records the classifier bucket behind failed-blocked.
+  const [watchIntent, setWatchIntent] = useState<WatchIntentState>("idle");
+  const [watchBlockReason, setWatchBlockReason] = useState<JoinFailureKind | null>(null);
+  const [shareIntent, setShareIntent] = useState<ShareIntentState>("idle");
+  // Link/operation ids for the redacted diagnostics surface (Status popup).
+  // Attempt ids are opaque echoes — matched, never parsed.
+  const [watchAttempt, setWatchAttempt] = useState<string | null>(null);
+  const playbackFlagsRef = useRef<ViewerPlaybackFlags>({ decodedObserved: false, presentedObserved: false });
+  const emittedMilestonesRef = useRef<Set<string>>(new Set());
+  const playbackPollRef = useRef<number | null>(null);
   const [watchZoom, setWatchZoom] = useState(1);
   const [cinema, setCinema] = useState(false);
   const [windowFullscreen, setWindowFullscreen] = useState(false);
@@ -236,6 +255,7 @@ function App() {
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const remoteStreamRef = useRef<MediaStream | null>(null);
   const liveSettingsApplied = useRef(false);
+  const sourceIdUpdateRef = useRef<SourceIdUpdate>({ state: "unchanged" });
   const failedNoticeRef = useRef(false);
   const joinSeqRef = useRef(0);
   const active = session?.state === "running" || Boolean(session?.native_capture_active);
@@ -243,6 +263,20 @@ function App() {
   const watchConnected = watchIce === "connected";
   const watchStreamActive = watchConnected || watchIce === "connecting";
   const watchLabel = joinMode === "direct" ? (watchHostName || "via Direct") : watchCode;
+  // Diagnosable Watch status: the explicit Watch intent leads, and while
+  // connecting the playback-stage classifier says where the link is stuck
+  // (no-path vs packets-but-no-decode vs decoded-but-not-presented)
+  // instead of a silent black screen.
+  const watchStatusText = watchIntent === "failed-blocked"
+    ? watchIntentStatusText(watchIntent, playbackStage)
+    : watchIce === "connecting"
+      ? (playbackStage === "idle" ? notice : viewerPlaybackStatusText(playbackStage))
+      : (notice || (playbackStage !== "idle" && playbackStage !== "live" ? viewerPlaybackStatusText(playbackStage) : ""));
+  // Broadcast is the default Session for every join mode. Sala parity for
+  // LAN/Direct is deferred: LAN/Direct Sessions are Broadcast-only in this
+  // version, so the Room option only applies to Stunar.
+  const salaSupported = joinMode === "stunar";
+  const effectiveSessionMode = salaSupported ? sessionMode : "broadcast";
   const lanConnected = mode === "watch" ? watchConnected : connected;
   // Windows has no Screen Recording gate (authorization is "unsupported"):
   // capture readiness is native_capture_implemented there.
@@ -263,8 +297,12 @@ function App() {
   const inSala = salaAliveRef.current && (roomJoined || session?.session_mode === "room");
   const onStage = inSala && !roomDesk;
   const roster = session?.roster ?? [];
-  const pendingRoster = roster.filter((entry) => entry.state === "pending");
-  const connectedRoster = roster.filter((entry) => entry.state !== "pending" && entry.id !== session?.self_id);
+  const pendingRoster = roster.filter((entry) => admissionStateFor(entry.state) === "pending");
+  const connectedRoster = roster.filter((entry) => admissionStateFor(entry.state) === "admitted" && entry.id !== session?.self_id);
+  const removedRoster = roster.filter((entry) => {
+    const state = admissionStateFor(entry.state);
+    return state === "rejected" || state === "kicked";
+  });
   const [stickyPeople, setStickyPeople] = useState<RosterEntry[]>([]);
   const roomPeople = stickyPeople;
   const roomTiles = [
@@ -399,6 +437,48 @@ function App() {
     }, 2000);
     return () => window.clearInterval(timer);
   }, [watchConnected]);
+  // Viewer decode/presentation milestones for the Broadcast watch element.
+  // requestVideoFrameCallback fires per presented frame; the loadeddata and
+  // playing fallbacks cover packaged WebViews without rVFC.
+  useEffect(() => {
+    const el = remoteRef.current;
+    if (!el || (!watchConnected && watchIce !== "connecting")) return undefined;
+    let cancelled = false;
+    const markDecoded = () => {
+      if (cancelled || playbackFlagsRef.current.decodedObserved) return;
+      playbackFlagsRef.current = { ...playbackFlagsRef.current, decodedObserved: true };
+      emitViewerMilestone("first-decoded-frame", "host");
+      const pc = peerRef.current;
+      if (pc) {
+        void collectViewerStats(pc, remoteRef.current, null).then(({ stats }) => {
+          if (!cancelled) setPlaybackStage(classifyViewerPlayback(stats, playbackFlagsRef.current));
+        }).catch(() => undefined);
+      } else if (!cancelled) {
+        setPlaybackStage(classifyViewerPlayback(null, playbackFlagsRef.current));
+      }
+    };
+    const markPresented = () => {
+      if (cancelled || playbackFlagsRef.current.presentedObserved) return;
+      playbackFlagsRef.current = { decodedObserved: true, presentedObserved: true };
+      emitViewerMilestone("first-decoded-frame", "host");
+      emitViewerMilestone("first-presentation", "host");
+      if (!cancelled) setPlaybackStage("live");
+    };
+    const rvfc = (el as HTMLVideoElement & { requestVideoFrameCallback?: (cb: () => void) => number }).requestVideoFrameCallback;
+    if (typeof rvfc === "function") {
+      try {
+        rvfc.call(el, () => { markPresented(); });
+      } catch { /* fall back to events below */ }
+    }
+    el.addEventListener("loadeddata", markDecoded);
+    el.addEventListener("playing", markPresented);
+    return () => {
+      cancelled = true;
+      el.removeEventListener("loadeddata", markDecoded);
+      el.removeEventListener("playing", markPresented);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [watchConnected, watchIce]);
   useEffect(() => {
     if (mode !== "watch") setCinema(false);
   }, [mode]);
@@ -456,7 +536,17 @@ function App() {
   useEffect(() => {
     const el = remoteRef.current;
     const stream = remoteStreamRef.current;
-    if (el && stream && el.srcObject !== stream) el.srcObject = stream;
+    if (!el || !stream) return;
+    if (el.srcObject !== stream) el.srcObject = stream;
+    // Re-attached after a render/reconnect: play() may still reject
+    // (autoplay policy), which becomes a milestone, not a rejection.
+    void startVideoPlayback(el).then((outcome) => {
+      if (!outcome.ok) {
+        emitViewerMilestone("playback-blocked", "host");
+        setNotice("Video is ready but playback was blocked — interact with the page or press play.");
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, watchConnected]);
   useEffect(() => {
     if (!cinema) return undefined;
@@ -481,7 +571,15 @@ function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [cinema]);
   useEffect(() => {
-    setSourceId(sources.find((item) => item.kind === sourceKind)?.id ?? null);
+    // Source-selection intent: fires immediately (Session stays open).
+    const intent = describeSourceSelectionIntent(sourceKind, sourceId);
+    void intent;
+    const next = sources.find((item) => item.kind === sourceKind)?.id ?? null;
+    if (active && session?.session_id && next !== sourceId) {
+      sourceIdUpdateRef.current = next === null ? { state: "clear" } : { state: "set", id: next };
+      setShareIntent((current) => nextShareIntent(current, "select-source"));
+    }
+    setSourceId(next);
   }, [sourceKind, sources]);
   useEffect(() => {
     if (!active && !roomJoined) return undefined;
@@ -536,10 +634,11 @@ function App() {
     if (!active || !session?.session_id) { liveSettingsApplied.current = false; return; }
     if (sessionAction !== "idle") return;
     if (!liveSettingsApplied.current) { liveSettingsApplied.current = true; return; }
-    void invokeMedia<Snapshot | null>("update_media_session", { request: { quality, bitrate_bps: bitrateMbps !== null ? Math.round(bitrateMbps * 1_000_000) : null, min_bitrate_bps: minBitrateMbps !== null ? Math.round(minBitrateMbps * 1_000_000) : null, resolution: resolution === "auto" ? null : resolution, frame_rate: frameFps === "auto" ? null : frameFps, codec: videoCodec, encoder: videoEncoder, system_audio: systemAudio, excluded_apps: excludedApps } })
-      .then((next) => { if (next) setSession(next); })
+    const sourceIdUpdate = sourceIdUpdateRef.current;
+    void invokeMedia<Snapshot | null>("update_media_session", { request: { source: sourceKind === "display" ? "screen" : "window", quality, bitrate_bps: bitrateMbps !== null ? Math.round(bitrateMbps * 1_000_000) : null, min_bitrate_bps: minBitrateMbps !== null ? Math.round(minBitrateMbps * 1_000_000) : null, resolution: resolution === "auto" ? null : resolution, frame_rate: frameFps === "auto" ? null : frameFps, codec: videoCodec, encoder: videoEncoder, system_audio: systemAudio, excluded_apps: excludedApps, source_id_update: sourceIdUpdate } })
+      .then((next) => { if (sourceIdUpdateRef.current === sourceIdUpdate) sourceIdUpdateRef.current = { state: "unchanged" }; if (next) setSession(next); })
       .catch((error) => setNotice(`Could not apply the change: ${diagnosticError(error, "unknown error")}`));
-  }, [quality, bitrateMbps, minBitrateMbps, resolution, frameFps, systemAudio, excludedApps, active, sessionAction]);
+  }, [quality, bitrateMbps, minBitrateMbps, resolution, frameFps, systemAudio, excludedApps, sourceKind, sourceId, active, sessionAction]);
   useEffect(() => () => {
     peerRef.current?.close();
     void invokeMedia("close_media_peer_transport").catch(() => undefined).then(() => invokeMedia("stop_media_session").catch(() => undefined));
@@ -578,12 +677,15 @@ function App() {
       setNotice("Choose a display or window before sharing.");
       return;
     }
+    // Explicit start-share intent (Stunar Sala slot; Broadcast Sessions use Start).
+    setShareIntent((current) => nextShareIntent(current, "start"));
     setSessionAction("starting");
     setNotice(copy.startHint);
     try {
       if (session?.session_id) {
         const next = await invokeMedia<Snapshot>("start_media_share");
         setSession(next);
+        setShareIntent((current) => nextShareIntent(current, "started"));
         setNotice(next.detail || "Your screen is going out. They still don't go through the server.");
         return;
       }
@@ -612,23 +714,29 @@ function App() {
       });
       setSession(next);
       await invokeMedia("announce_media_share", { start: true }).catch(() => undefined);
+      setShareIntent((current) => nextShareIntent(current, "started"));
       setNotice(next.detail || "Your screen is going out. They still don't go through the server.");
     } catch (error) {
       const message = diagnosticError(error, "Could not share your screen.");
       setLastError(message);
       setNotice(message);
+      setShareIntent((current) => nextShareIntent(current, "failed"));
     } finally {
       setSessionAction("idle");
     }
   };
   const stopRoomShare = async () => {
+    // Explicit stop-share intent: the slot releases capture; the room stays.
+    setShareIntent((current) => nextShareIntent(current, "stop"));
     setSessionAction("stopping");
     try {
       const next = await invokeMedia<Snapshot>("stop_media_share");
       setSession(next);
+      setShareIntent("idle");
       setNotice("You stopped sharing. Still in the room.");
     } catch (error) {
       setNotice(diagnosticError(error, "Could not stop sharing."));
+      setShareIntent((current) => nextShareIntent(current, "failed"));
     } finally {
       setSessionAction("idle");
     }
@@ -658,12 +766,15 @@ function App() {
   };
   const startSharing = async () => {
     if (sessionAction !== "idle") return;
+    // Explicit start-share intent. Broadcast is the default Session for
+    // every join mode; Sala (room) applies to Stunar only in this version.
+    setShareIntent((current) => nextShareIntent(current, "start"));
     setSessionAction("starting");
     setNotice(copy.startHint);
     try {
       const current = await refreshCapabilities();
       const hostCaptureReady = current !== null && (current.platform === "windows" ? current.native_capture_implemented : current.screen_recording_authorization === "granted");
-      if (sessionMode !== "room") {
+      if (effectiveSessionMode !== "room") {
         if (!current?.supported || !hostCaptureReady) throw new Error(current?.platform === "windows" ? "Native capture is unavailable on this PC." : "Grant Screen Recording access first.");
         if (sourceId === null && filteredSources.length > 0) throw new Error("Choose a display or window before starting.");
       }
@@ -688,30 +799,33 @@ function App() {
           admission: hostAdmission,
           join_mode: joinMode,
           rendezvous_url: joinMode === "stunar" ? rendezvousUrl.trim() : null,
-          session_mode: sessionMode,
+          session_mode: effectiveSessionMode,
           attach_only: false,
-          share_on_start: sessionMode !== "room"
+          share_on_start: effectiveSessionMode !== "room"
         }
       });
       setSession(next);
-      if (sessionMode === "room") {
+      setShareIntent((current) => nextShareIntent(current, "started"));
+      if (effectiveSessionMode === "room") {
         salaAliveRef.current = true;
         setRoomJoined(true);
         setRoomDesk(false);
       }
-      setNotice(next.session_code ? (sessionMode === "room" ? `Room ${next.session_code} is open. Share if you want.` : `Session ${next.session_code} is live. Share that code.`) : next.detail);
+      setNotice(next.session_code ? (effectiveSessionMode === "room" ? `Room ${next.session_code} is open. Share if you want.` : `Session ${next.session_code} is live. Share that code.`) : next.detail);
     } catch (error) {
       const recovered = await invokeMedia<Snapshot>("get_media_session_state").catch(() => null);
       setSession(recovered && recovered.state !== "idle" ? recovered : null);
       const message = diagnosticError(error, "Native capture could not start.");
       setLastError(message);
       setNotice(message);
+      setShareIntent((current) => nextShareIntent(current, "failed"));
     } finally {
       setSessionAction("idle");
     }
   };
   const clearSalaUi = () => {
     salaAliveRef.current = false;
+    resetViewerPlayback();
     joinSeqRef.current += 1;
     peerRef.current?.close();
     peerRef.current = null;
@@ -729,6 +843,10 @@ function App() {
     setPinned(null);
     setSession(null);
     setWatchIce("idle");
+    setWatchIntent("idle");
+    setWatchBlockReason(null);
+    setWatchAttempt(null);
+    setShareIntent("idle");
     setWatchCode("");
     setWatchHostName("");
     setWatchZoom(1);
@@ -747,6 +865,7 @@ function App() {
     });
   };
   const stopSharing = async () => {
+    setShareIntent((current) => nextShareIntent(current, "stop"));
     clearSalaUi();
     setSessionAction("stopping");
     try {
@@ -790,15 +909,86 @@ function App() {
   const disconnectWatch = () => {
     leaveSala();
   };
+  // Emit a Viewer playback milestone once per link (keyed by link + kind).
+  // Payload is ids + counts only: session code, link id, join mode.
+  const emitViewerMilestone = (kind: ViewerPlaybackMilestone, linkId: string) => {
+    if (!shouldEmitMilestone(emittedMilestonesRef.current, linkId, kind)) return;
+    setPlaybackMilestones((current) => (current.includes(kind) ? current : [...current, kind]));
+    try {
+      // Redacted by construction: no SDP, passwords, or tokens cross here.
+      const payload = buildMilestonePayload(kind, watchCode || null, linkId, joinMode, playbackMilestones.length + 1);
+      console.info("[viewer-milestone]", payload);
+    } catch { /* logging must not break playback */ }
+  };
+  const resetViewerPlayback = () => {
+    playbackFlagsRef.current = { decodedObserved: false, presentedObserved: false };
+    emittedMilestonesRef.current.clear();
+    if (playbackPollRef.current !== null) {
+      window.clearInterval(playbackPollRef.current);
+      playbackPollRef.current = null;
+    }
+    setPlaybackMilestones([]);
+    setPlaybackStage("idle");
+    setWatchIntent("idle");
+    setWatchBlockReason(null);
+    setWatchAttempt(null);
+  };
+  // Attach a remote stream to a video element and start playback.
+  // play() rejections (autoplay policy, detached element) become a
+  // `playback-blocked` milestone + notice — never an unhandled rejection.
+  const bindViewerVideo = (el: HTMLVideoElement | null, stream: MediaStream, linkId: string) => {
+    if (!el) return;
+    if (el.srcObject !== stream) el.srcObject = stream;
+    void startVideoPlayback(el).then((outcome) => {
+      if (!outcome.ok) {
+        emitViewerMilestone("playback-blocked", linkId);
+        setNotice("Video is ready but playback was blocked — interact with the page or press play.");
+      }
+    });
+  };
+  // Poll getStats() briefly after ontrack so first-packets / first-decoded
+  // milestones correlate with the same bitrate path as the Status popup.
+  // The classifier also drives failed-blocked: a link that stays stuck in
+  // no-path / packets-no-decode / decoded-not-presented surfaces the
+  // bucket instead of hanging on "connecting".
+  const watchFirstMedia = (pc: RTCPeerConnection, linkId: string) => {
+    if (playbackPollRef.current !== null) {
+      window.clearInterval(playbackPollRef.current);
+      playbackPollRef.current = null;
+    }
+    let ticks = 0;
+    playbackPollRef.current = window.setInterval(() => {
+      ticks += 1;
+      void collectViewerStats(pc, remoteRef.current, null).then(({ stats }) => {
+        if ((stats.packetsReceived ?? 0) > 0) emitViewerMilestone("first-packets", linkId);
+        if ((stats.framesDecoded ?? 0) > 0 && !playbackFlagsRef.current.decodedObserved) {
+          playbackFlagsRef.current = { ...playbackFlagsRef.current, decodedObserved: true };
+          emitViewerMilestone("first-decoded-frame", linkId);
+        }
+        const stage = classifyViewerPlayback(stats, playbackFlagsRef.current);
+        setPlaybackStage(stage);
+        const failure = joinFailureForStage(stage);
+        if (failure && ticks >= 5) {
+          setWatchBlockReason(failure);
+          setWatchIntent((current) => nextWatchIntent(current, "blocked"));
+        }
+      }).catch(() => undefined);
+      if (ticks >= 20 && playbackPollRef.current !== null) {
+        window.clearInterval(playbackPollRef.current);
+        playbackPollRef.current = null;
+      }
+    }, 1000);
+  };
   const acceptIncomingOffer = async (incoming: IncomingOffer) => {
     if (inSala && !watchingRef.current.has(incoming.from)) return;
-    const offerKey = incoming.from + incoming.sdp.slice(0, 24);
+    // Stunar offer dedupe: keyed by from + opaque offer_attempt only.
+    const offerKey = offerDedupeKey(incoming.from, incoming.offer_attempt);
     if (seenOffers.current.has(offerKey)) return;
     seenOffers.current.add(offerKey);
     // A failed attempt must be retryable on the next poll: without this,
     // one throw leaves the viewer stuck on "incoming offers" forever with
     // no error anywhere (the Mac-viewer symptom of the Windows incident).
-    const allowRetry = () => { seenOffers.current.delete(offerKey); };
+    const allowRetry = () => { releaseOfferKey(seenOffers.current, incoming.from, incoming.offer_attempt); };
     const existing = remotesRef.current.get(incoming.from);
     try {
       existing?.pc.close();
@@ -810,8 +1000,9 @@ function App() {
         remotesRef.current.set(incoming.from, { pc, stream });
         setRemoteIds([...remotesRef.current.keys()].filter((id, index, all) => all.indexOf(id) === index));
         if (stageId === "host" && incoming.from !== "host") setStageId(incoming.from);
+        emitViewerMilestone("ontrack-fired", incoming.from);
         const el = document.querySelector<HTMLVideoElement>(`video[data-slot="${incoming.from}"]`);
-        if (el && el.srcObject !== stream) el.srcObject = stream;
+        bindViewerVideo(el, stream, incoming.from);
       };
       remotesRef.current.set(incoming.from, { pc, stream });
       await pc.setRemoteDescription({ type: "offer", sdp: incoming.sdp });
@@ -833,11 +1024,15 @@ function App() {
         const rejects = (rejectCountRef.current.get(offerKey) ?? 0) + 1;
         rejectCountRef.current.set(offerKey, rejects);
         if (rejects < 2) allowRetry();
+        emitViewerMilestone("answer-declined-video", incoming.from);
         setNotice("This browser could not use the session video (no common decoder).");
         return;
       }
       rejectCountRef.current.delete(offerKey);
-      await invokeMedia("send_stunar_room_answer", { request: { to: incoming.from, answer: { type: "answer", sdp: localSdp, id: incoming.from } } });
+      // Opaque echo: the answer round-trips offer_attempt verbatim so the
+      // Host matches the attempt without parsing SDP.
+      const answerEnvelope = answerWithAttempt({ type: "answer", sdp: localSdp, id: incoming.from }, incoming.offer_attempt);
+      await invokeMedia("send_stunar_room_answer", { request: { to: incoming.from, answer: answerEnvelope } });
     } catch (error) {
       allowRetry();
       setNotice(diagnosticError(error, "Could not answer the session."));
@@ -893,6 +1088,12 @@ function App() {
       }
     }
     const targetLabel = joinMode === "lan" ? joinCode.trim().toUpperCase() : joinMode === "direct" ? directHost.trim() : joinCode.trim().toUpperCase();
+    resetViewerPlayback();
+    // Explicit join intent: idle -> joining (-> waiting-approval for Stunar
+    // Admission, else connecting once the offer is ready).
+    setWatchIntent("joining");
+    if (joinMode === "stunar") setWatchIntent((current) => nextWatchIntent(current, "needs-approval"));
+    setWatchBlockReason(null);
     setSessionAction("joining");
     setNotice(joinMode === "lan" ? "Looking for the host on your network…" : joinMode === "direct" ? "Connecting to the host…" : "Waiting for approval…");
     const seq = ++joinSeqRef.current;
@@ -906,12 +1107,17 @@ function App() {
       if (joinSeqRef.current !== seq) return;
       const displayLabel = joinMode === "direct" ? (hostName.trim() || "via Direct") : targetLabel;
       if (!offer.sdp) {
+        // Sala lobby path: Stunar-only in this version. LAN/Direct Sessions
+        // are Broadcast and always carry an offer — an empty offer there is
+        // a backend error, not a room to enter.
+        if (joinMode !== "stunar") throw new Error("The host did not send video. Ask for a new code.");
         setWatchCode(targetLabel);
         setWatchHostName(hostName.trim() || "");
         salaAliveRef.current = true;
         setRoomJoined(true);
         setSessionMode("room");
         setWatchIce("connected");
+        setWatchIntent("connected");
         setRoomDesk(false);
         const snap = await invokeMedia<Snapshot>("get_media_session_state").catch(() => null);
         if (salaAliveRef.current && snap) setSession(snap);
@@ -922,6 +1128,9 @@ function App() {
       peerRef.current?.close();
       peerRef.current = pc;
       setWatchIce("connecting");
+      // Admission passed (or not required): the offer is ready to answer.
+      setWatchIntent((current) => nextWatchIntent(nextWatchIntent(current, "admitted"), "offer-ready"));
+      setWatchAttempt(offer.offer_attempt || null);
       setWatchCode(targetLabel);
       setWatchHostName(hostName.trim() || "");
       pc.ontrack = (event) => {
@@ -930,7 +1139,9 @@ function App() {
         remotesRef.current.set("host", { pc, stream });
         setRemoteIds(["host", ...[...remotesRef.current.keys()].filter((id) => id !== "host")]);
         setStageId("host");
-        if (remoteRef.current && remoteRef.current.srcObject !== stream) remoteRef.current.srcObject = stream;
+        emitViewerMilestone("ontrack-fired", "host");
+        bindViewerVideo(remoteRef.current, stream, "host");
+        watchFirstMedia(pc, "host");
       };
       await pc.setRemoteDescription({ type: "offer", sdp: offer.sdp });
       const answer = await pc.createAnswer();
@@ -939,6 +1150,9 @@ function App() {
       const local = pc.localDescription;
       if (!local?.sdp) throw new Error("The viewer could not create an answer.");
       if (videoSectionRejected(local.sdp)) {
+        emitViewerMilestone("answer-declined-video", "host");
+        setWatchBlockReason("declined");
+        setWatchIntent((current) => nextWatchIntent(current, "blocked"));
         throw new Error("This browser refused the session video (no common decoder — try another browser).");
       }
       const handleIce = () => {
@@ -946,9 +1160,13 @@ function App() {
         const state = pc.iceConnectionState;
         if (state === "connected" || state === "completed") {
           setWatchIce("connected");
+          setWatchIntent((current) => nextWatchIntent(current, "media-connected"));
+          setWatchBlockReason(null);
           setNotice(`Connected to ${displayLabel}.`);
         } else if (state === "failed" || state === "disconnected" || state === "closed") {
           setWatchIce("lost");
+          setWatchBlockReason("no-path");
+          setWatchIntent((current) => nextWatchIntent(current, "blocked"));
           setNotice("Connection lost.");
           setWatchZoom(1);
           leaveImmersive();
@@ -956,7 +1174,9 @@ function App() {
       };
       pc.oniceconnectionstatechange = handleIce;
       handleIce();
-      await invokeMedia("submit_media_room_answer", { request: { host, answer: { type: "answer", sdp: local.sdp, id: offer.id }, join_mode: joinMode } });
+      // Opaque echo: the answer round-trips offer_attempt verbatim.
+      const joinAnswer = answerWithAttempt({ type: "answer", sdp: local.sdp, id: offer.id }, offer.offer_attempt);
+      await invokeMedia("submit_media_room_answer", { request: { host, answer: joinAnswer, join_mode: joinMode } });
       if (joinSeqRef.current !== seq || peerRef.current !== pc) return;
       if (pc.iceConnectionState !== "connected" && pc.iceConnectionState !== "completed") setNotice(`Joined ${displayLabel}. Waiting for media…`);
     } catch (error) {
@@ -966,6 +1186,12 @@ function App() {
       setWatchIce("idle");
       const message = diagnosticError(error, "Could not join.");
       setLastError(message);
+      if (message.includes("declined") || message.includes("rejected")) {
+        setWatchBlockReason("declined");
+        setWatchIntent((current) => nextWatchIntent(current, "blocked"));
+      } else if (watchBlockReason === null) {
+        setWatchIntent("idle");
+      }
       setNotice(message.includes("full") ? "This session is full." : message.includes("declined") ? "The host declined." : message.includes("banned") ? "Could not join." : message);
     } finally {
       setSessionAction("idle");
@@ -1207,7 +1433,8 @@ function App() {
                 <input id="join-nickname" className="native-source" value={nickname} onChange={(event) => setNickname(event.target.value)} placeholder="Your name" maxLength={24}/>
                 <label className="native-select-label" htmlFor="join-password">Password {joinMode === "stunar" ? "(required)" : "(optional)"}</label>
                 <input id="join-password" className="native-source" type="password" value={joinPassword} onChange={(event) => setJoinPassword(event.target.value)} placeholder={joinMode === "stunar" ? "Required" : "Only if the host set one"} maxLength={64}/>
-                <p className="start-hint">{notice}</p>
+              <p className="start-hint">{notice}</p>
+              <p className="quality-hint">{shareIntentStatusText(shareIntent)}</p>
                 {inSala && roomDesk ? (
                   <>
                     <button className="primary-cta" onClick={() => setRoomDesk(false)}>{copy.backToRoom}</button>
@@ -1232,7 +1459,16 @@ function App() {
               <div className={`preview-screen ${watchConnected ? "watch-stage" : ""}`} style={watchConnected ? ({ "--watch-zoom": watchZoom } as CSSProperties) : undefined}>
                 <video ref={remoteRef} className="remote-preview visible" autoPlay playsInline data-slot="host" style={stageId !== "host" ? { opacity: 0, pointerEvents: "none" } : undefined} />
                 {[...remotesRef.current.entries()].filter(([id]) => id !== "host").map(([id, slot]) => (
-                  <video key={id} data-slot={id} className="remote-preview visible" autoPlay playsInline ref={(el) => { if (el && slot.stream && el.srcObject !== slot.stream) el.srcObject = slot.stream; }} style={stageId !== id ? { opacity: 0, pointerEvents: "none" } : undefined} />
+                  <video key={id} data-slot={id} className="remote-preview visible" autoPlay playsInline ref={(el) => {
+                    if (!el || !slot.stream || el.srcObject === slot.stream) return;
+                    el.srcObject = slot.stream;
+                    void startVideoPlayback(el).then((outcome) => {
+                      if (!outcome.ok) {
+                        emitViewerMilestone("playback-blocked", id);
+                        setNotice("Video is ready but playback was blocked — interact with the page or press play.");
+                      }
+                    });
+                  }} style={stageId !== id ? { opacity: 0, pointerEvents: "none" } : undefined} />
                 ))}
                 {watchConnected && !inSala && (
                   <>
@@ -1261,9 +1497,10 @@ function App() {
                   </>
                 )}
               </div>
-              {(watchConnected || watchIce === "connecting") && (
+              {(watchConnected || watchIce === "connecting" || watchIntent === "failed-blocked") && (
                 <div className="watch-status-row">
-                  {watchConnected && <p className="watch-status-line">{notice}</p>}
+                  {watchStatusText && <p className="watch-status-line">{watchStatusText}</p>}
+                  <p className="quality-hint">Join {watchIntent}{watchAttempt ? ` · attempt ${watchAttempt.slice(0, 8)}` : ""} · link host · {joinMode} · {watchCode || watchHostName || "no code yet"}</p>
                   <button className="watch-disconnect" onClick={disconnectWatch}>Disconnect</button>
                 </div>
               )}
@@ -1284,7 +1521,15 @@ function App() {
                 <button className={`source-card ${sourceKind === "window" ? "selected" : ""}`} onClick={() => setSourceKind("window")}><span className="source-icon"><Icon name="window" size={20}/></span><span className="source-copy"><strong>{copy.aWindow}</strong><small>{copy.aWindowHint}</small></span></button>
               </div>
               <label className="native-select-label" htmlFor="native-source">{copy.nativeSource}</label>
-              <select id="native-source" className="native-source" value={sourceId ?? ""} onChange={(event) => setSourceId(Number(event.target.value))} disabled={!filteredSources.length}>
+              <select id="native-source" className="native-source" value={sourceId ?? ""} onChange={(event) => {
+                const next = event.target.value === "" ? null : Number(event.target.value);
+                if (active && session?.session_id && next !== sourceId) {
+                  sourceIdUpdateRef.current = next === null ? { state: "clear" } : { state: "set", id: next };
+                  // Source-selection intent applies immediately; the Session stays open.
+                  setShareIntent((current) => nextShareIntent(current, "select-source"));
+                }
+                setSourceId(next);
+              }} disabled={!filteredSources.length}>
                 <option value="">{filteredSources.length ? copy.chooseSource : copy.noSources}</option>
                 {filteredSources.map((item) => <option key={item.id} value={item.id}>{item.title || item.application_name || `Source ${item.id}`}</option>)}
               </select>
@@ -1439,10 +1684,10 @@ function App() {
               <div className="join-mode-block">
                 <span>{copy.sessionMode}</span>
                 <div className="segmented">
-                  <button className={sessionMode === "broadcast" ? "selected" : ""} disabled={active} onClick={() => setSessionMode("broadcast")}>{copy.broadcast}</button>
-                  <button className={sessionMode === "room" ? "selected" : ""} disabled={active} onClick={() => setSessionMode("room")}>{copy.room}</button>
+                  <button className={effectiveSessionMode === "broadcast" ? "selected" : ""} disabled={active} onClick={() => setSessionMode("broadcast")}>{copy.broadcast}</button>
+                  <button className={effectiveSessionMode === "room" ? "selected" : ""} disabled={active || !salaSupported} title={salaSupported ? copy.roomHint : "Sala is Stunar-only in this version."} onClick={() => setSessionMode("room")}>{copy.room}</button>
                 </div>
-                <p className="quality-hint">{sessionMode === "room" ? copy.roomHint : copy.broadcastHint}</p>
+                <p className="quality-hint">{!salaSupported ? "Broadcast is the Session for LAN and Direct in this version." : effectiveSessionMode === "room" ? copy.roomHint : copy.broadcastHint}</p>
               </div>
               {joinMode === "stunar" && (
                 <>
@@ -1466,7 +1711,7 @@ function App() {
                   <button className="primary-cta" onClick={() => { if (inSala) leaveSala(); else void stopSharing(); }}>{sessionAction === "stopping" ? copy.stopping : inSala ? copy.closeRoom : copy.stop}</button>
                 </>
               ) : (
-                <button className="primary-cta" disabled={(sessionMode === "room" ? !canOpenRoom : (!canStart || !stunarHostPasswordValid)) || !nicknameValid || sessionAction !== "idle"} onClick={() => void startSharing()}>{sessionAction === "starting" ? copy.starting : sessionMode === "room" ? copy.openRoom : copy.start}</button>
+                <button className="primary-cta" disabled={(effectiveSessionMode === "room" ? !canOpenRoom : (!canStart || !stunarHostPasswordValid)) || !nicknameValid || sessionAction !== "idle"} onClick={() => void startSharing()}>{sessionAction === "starting" ? copy.starting : effectiveSessionMode === "room" ? copy.openRoom : copy.start}</button>
               )}
             </section>
             <div className="right-column">
@@ -1557,7 +1802,16 @@ function App() {
                           ))}
                         </div>
                       )}
-                      {pendingRoster.length === 0 && connectedRoster.length === 0 && (
+                      {removedRoster.length > 0 && (
+                        <div className="roster-group">
+                          {removedRoster.map((entry) => (
+                            <div className="roster-row" key={`removed-${entry.id}`}>
+                              <span className="roster-name">{entry.nickname}<small>{admissionStateFor(entry.state) === "rejected" ? "Declined" : "Disconnected by Host"}</small></span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {pendingRoster.length === 0 && connectedRoster.length === 0 && removedRoster.length === 0 && (
                         <p className="roster-empty">{joinMode === "direct" ? "No one here yet. Share the address." : "No one here yet. Share the code."}</p>
                       )}
                     </div>
@@ -1585,8 +1839,9 @@ function App() {
                   <div><span>Encoder target</span><code>{session?.bitrate_bps ? `${Math.round(session.bitrate_bps / 1e5) / 10} Mbps applied` : `${qualityTargetMbps[quality]} Mbps (preset)`} · {(session?.resolution ?? resolvedResolution)} · {(session?.frame_rate ?? resolvedFrameRate).replace("_fps", "fps")}{bitrateMbps !== null ? " · custom" : ""}</code></div>
                   <div><span>Session / peer</span><code>{session?.state ?? "idle"} / {session?.peer_state ?? "—"}</code></div>
                   {session?.detail ? <div><span>Session detail</span><code className={session?.state === "failed" ? "is-error" : ""} title={session.detail}>{session.detail}</code></div> : null}
-                  <div><span>Viewers connected</span><code>{connectedRoster.length}{pendingRoster.length > 0 ? " (+" + pendingRoster.length + " waiting)" : ""}</code></div>
+                  <div><span>Viewers connected</span><code>{connectedRoster.length}{pendingRoster.length > 0 ? " (+" + pendingRoster.length + " waiting)" : ""}{removedRoster.length > 0 ? " (+" + removedRoster.length + " declined/disconnected)" : ""}</code></div>
                   <div><span>Join mode</span><code>{joinMode}{session?.session_code ? " · " + session.session_code : ""}</code></div>
+                  <div><span>Link / operation</span><code>session {session?.session_code ?? "—"} · join {joinMode} · links {hostLinks?.length ?? connectedRoster.length} · share {shareIntent}</code></div>
                   <div><span>Capture active</span><code>{session?.native_capture_active ? "yes" : active ? "starting…" : "no"}</code></div>
                   <div><span>Capture preview</span><code>{hostPreviewFps !== null ? hostPreviewFps + " fps" : "—"}{session ? " · " + session.preview_frame_count + " frames" : ""}{session && session.preview_dropped_count > 0 ? " · " + session.preview_dropped_count + " dropped" : ""}</code></div>
                   <div><span>Peer detail</span><code title={session?.peer_detail ?? ""}>{session?.peer_detail || "—"}</code></div>
@@ -1619,6 +1874,11 @@ function App() {
                   <div><span>Frames (drop)</span><code>{viewerStats?.framesDecoded !== null && viewerStats?.framesDecoded !== undefined ? viewerStats.framesDecoded + " dec." + (viewerStats.dropPercent !== null && viewerStats.dropPercent !== undefined ? " · " + viewerStats.dropPercent + "% drop" : "") : "—"}</code></div>
                   <div><span>Player delay</span><code>{viewerStats?.liveDelaySec !== null && viewerStats?.liveDelaySec !== undefined ? viewerStats.liveDelaySec + " s" : "—"}</code></div>
                   <div><span>Connection / ICE</span><code>{viewerStats?.connectionState ?? watchIce}{viewerStats?.iceState ? " / " + viewerStats.iceState : ""}</code></div>
+                  <div><span>Join intent</span><code>{watchIntent}{watchBlockReason ? " · " + watchBlockReason : ""}</code></div>
+                  <div><span>Link / operation</span><code>link host{watchAttempt ? " · attempt " + watchAttempt.slice(0, 8) : ""} · join {joinMode} · session {watchCode || "—"}</code></div>
+                  <div><span>Playback</span><code>{viewerPlaybackStatusText(playbackStage)}</code></div>
+                  <div><span>Milestones</span><code title={playbackMilestones.join(", ")}>{playbackMilestones.length > 0 ? playbackMilestones.join(" · ") : "—"}</code></div>
+                  <div><span>Redaction</span><code>ids + counts only · no Passwords/Tokens/SDP</code></div>
                 </div>
                 {!watchConnected && <p className="stats-hint">No media yet. Numbers show up after you connect.</p>}
                 {watchConnected && (viewerStats?.bitrateMbps === null || viewerStats?.bitrateMbps === undefined) && <p className="stats-hint">Sampling… give it a second or two.</p>}

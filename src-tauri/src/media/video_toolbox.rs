@@ -62,6 +62,21 @@ impl std::fmt::Display for VideoToolboxError {
 
 impl std::error::Error for VideoToolboxError {}
 
+/// Phase-2B product codec gate: goDrinking emits H.264 Constrained Baseline
+/// only (SDP 42e02a). The engine validates this before acquisition; this
+/// second gate keeps the VideoToolbox seam honest if that validation is
+/// ever bypassed. There are no High/HEVC/AV1 emission paths.
+pub(crate) fn validate_baseline_codec(codec: VideoCodec) -> Result<(), VideoToolboxError> {
+    if codec == VideoCodec::H264 {
+        Ok(())
+    } else {
+        Err(VideoToolboxError(
+            "goDrinking requires H.264 Constrained Baseline; High/HEVC/AV1 have no encoder path"
+                .into(),
+        ))
+    }
+}
+
 #[cfg(target_os = "macos")]
 impl PipelineState {
     fn report_error(&self, error: VideoToolboxError) {
@@ -82,6 +97,9 @@ enum Converter {
 
 #[cfg(target_os = "macos")]
 impl Converter {
+    /// Only the H264 arm is reachable: `new` rejects every other codec via
+    /// `validate_baseline_codec`. The remaining arms exist so the match stays
+    /// exhaustive if the product codec ever changes.
     fn for_codec(codec: VideoCodec) -> Self {
         match codec {
             VideoCodec::H264 => Self::H264(AvccAnnexBConverter::default()),
@@ -140,6 +158,10 @@ impl VideoToolboxEncoder {
         state: Arc<PipelineState>,
         control: Arc<EncoderControl>,
     ) -> Result<Self, VideoToolboxError> {
+        // Fail fast on non-Baseline sessions: the Swift shim rejects them
+        // too, and silently emitting the wrong profile black-screens viewers
+        // while the host preview looks fine.
+        validate_baseline_codec(codec)?;
         let callback_context = Box::into_raw(Box::new(CallbackContext {
             output,
             converter: Mutex::new(Converter::for_codec(codec)),
@@ -278,9 +300,9 @@ extern "C" fn encoded_callback(
     };
     let bytes = unsafe { std::slice::from_raw_parts(data, len) };
     let Ok(mut converter) = context.converter.lock() else {
-        context.state.report_error(VideoToolboxError(
-            "converter lock was poisoned".into(),
-        ));
+        context
+            .state
+            .report_error(VideoToolboxError("converter lock was poisoned".into()));
         return;
     };
     let unit = match converter.convert(bytes, timestamp_90khz, keyframe != 0) {
@@ -314,3 +336,17 @@ extern "C" fn encoder_error_callback(context: *mut c_void, status: i32) {
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) struct VideoToolboxEncoder;
+
+#[cfg(test)]
+mod tests {
+    use super::validate_baseline_codec;
+    use crate::media::types::VideoCodec;
+
+    #[test]
+    fn only_constrained_baseline_reaches_videotoolbox() {
+        assert!(validate_baseline_codec(VideoCodec::H264).is_ok());
+        assert!(validate_baseline_codec(VideoCodec::H264High).is_err());
+        assert!(validate_baseline_codec(VideoCodec::Hevc).is_err());
+        assert!(validate_baseline_codec(VideoCodec::Av1).is_err());
+    }
+}

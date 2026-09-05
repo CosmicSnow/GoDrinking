@@ -13,7 +13,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_AV1, MIME_TYPE_H264, MIME_TYPE_HEVC, MIME_TYPE_OPUS};
+use webrtc::api::media_engine::{
+    MediaEngine, MIME_TYPE_AV1, MIME_TYPE_H264, MIME_TYPE_HEVC, MIME_TYPE_OPUS,
+};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::ice::mdns::MulticastDnsMode;
@@ -31,8 +33,8 @@ use webrtc::rtcp::receiver_report::ReceiverReport;
 use webrtc::rtp_transceiver::rtp_codec::{
     RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
 };
-use webrtc::stats::StatsReportType;
 use webrtc::rtp_transceiver::RTCPFeedback;
+use webrtc::stats::StatsReportType;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 
@@ -63,6 +65,75 @@ pub enum PeerSignalKind {
 pub(crate) struct PeerTransportStatus {
     pub(crate) state: PeerTransportState,
     pub(crate) detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShutdownStatus {
+    pub(crate) quiesced: bool,
+    pub(crate) pending: Vec<&'static str>,
+    pub(crate) errors: Vec<String>,
+}
+
+pub(crate) enum PeerTransportInitError {
+    Failed(String),
+    Pending(PendingPeerTransport),
+}
+
+pub(crate) struct PendingPeerTransport {
+    command_tx: SyncSender<PeerCommand>,
+    shutdown: Arc<AtomicBool>,
+    completion: Arc<WorkerCompletion>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl PendingPeerTransport {
+    pub(crate) fn shutdown_and_join(&mut self, timeout: Duration) -> ShutdownStatus {
+        self.shutdown.store(true, Ordering::Release);
+        let _ = self.command_tx.try_send(PeerCommand::Close);
+        let mut status = ShutdownStatus {
+            quiesced: true,
+            pending: Vec::new(),
+            errors: Vec::new(),
+        };
+        let Some(worker) = self.worker.as_ref() else {
+            return status;
+        };
+        let deadline = std::time::Instant::now() + timeout;
+        let Ok(mut done) = self.completion.done.lock() else {
+            status.quiesced = false;
+            status
+                .errors
+                .push("peer completion state is poisoned".into());
+            return status;
+        };
+        if !*done {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                status.quiesced = false;
+                status.pending.push("peer initialization worker");
+                return status;
+            }
+            let Ok((next, _)) = self.completion.wake.wait_timeout(done, remaining) else {
+                status.quiesced = false;
+                status.errors.push("peer completion wait failed".into());
+                return status;
+            };
+            done = next;
+        }
+        if !*done || !worker.is_finished() {
+            status.quiesced = false;
+            status.pending.push("peer initialization worker");
+            return status;
+        }
+        let worker = self.worker.take().expect("pending peer worker handle");
+        if worker.join().is_err() {
+            status.quiesced = false;
+            status
+                .errors
+                .push("peer initialization worker panicked".into());
+        }
+        status
+    }
 }
 
 struct SharedStatus {
@@ -106,6 +177,31 @@ impl PeerTransport {
         join_mode: JoinMode,
         video_codec: VideoCodec,
     ) -> Result<Self, String> {
+        match Self::new_with_initialization(
+            access_units,
+            audio_packets,
+            encoder_control,
+            frame_duration,
+            join_mode,
+            video_codec,
+        ) {
+            Ok(peer) => Ok(peer),
+            Err(PeerTransportInitError::Failed(error)) => Err(error),
+            Err(PeerTransportInitError::Pending(mut pending)) => {
+                let status = pending.shutdown_and_join(WORKER_COMPLETION_TIMEOUT);
+                Err(format!("peer initialization cleanup pending: {status:?}"))
+            }
+        }
+    }
+
+    pub(crate) fn new_with_initialization(
+        access_units: AccessUnitReceiver,
+        audio_packets: Option<Receiver<EncodedAudioPacket>>,
+        encoder_control: Arc<EncoderControl>,
+        frame_duration: Duration,
+        join_mode: JoinMode,
+        video_codec: VideoCodec,
+    ) -> Result<Self, PeerTransportInitError> {
         let (command_tx, command_rx) = sync_channel(TRANSPORT_COMMAND_CAPACITY);
         let (ready_tx, ready_rx) = sync_channel(1);
         let status = Arc::new(Mutex::new(SharedStatus {
@@ -154,15 +250,21 @@ impl PeerTransport {
                 ));
                 mark_worker_complete(&worker_completion);
             })
-            .map_err(|error| format!("failed to start WebRTC worker: {error}"))?;
+            .map_err(|error| {
+                PeerTransportInitError::Failed(format!("failed to start WebRTC worker: {error}"))
+            })?;
 
         let ready = match ready_rx.recv_timeout(Duration::from_secs(10)) {
             Ok(ready) => ready,
             Err(_) => {
                 shutdown.store(true, Ordering::Release);
                 let _ = command_tx.try_send(PeerCommand::Close);
-                finish_worker(worker, &completion);
-                return Err("WebRTC worker failed during initialization".to_owned());
+                return Err(PeerTransportInitError::Pending(PendingPeerTransport {
+                    command_tx,
+                    shutdown,
+                    completion,
+                    worker: Some(worker),
+                }));
             }
         };
         match ready {
@@ -176,7 +278,7 @@ impl PeerTransport {
             Err(error) => {
                 shutdown.store(true, Ordering::Release);
                 finish_worker(worker, &completion);
-                Err(error)
+                Err(PeerTransportInitError::Failed(error))
             }
         }
     }
@@ -202,11 +304,68 @@ impl PeerTransport {
     }
 
     pub(crate) fn close(&mut self) {
+        let status = self.shutdown_and_join(PEER_CLOSE_TIMEOUT + WORKER_COMPLETION_TIMEOUT);
+        if !status.quiesced {
+            eprintln!("[goDrinking] peer cleanup incomplete: {status:?}");
+        }
+    }
+
+    /// Requests peer shutdown and joins the native WebRTC worker. If the
+    /// deadline expires, the worker handle remains owned here for a later
+    /// retry and the pending component is returned to the caller.
+    pub(crate) fn shutdown_and_join(&mut self, timeout: Duration) -> ShutdownStatus {
         self.shutdown.store(true, Ordering::Release);
         let _ = self.command_tx.try_send(PeerCommand::Close);
-        if let Some(worker) = self.worker.take() {
-            finish_worker(worker, &self.completion);
+        let mut status = ShutdownStatus {
+            quiesced: true,
+            pending: Vec::new(),
+            errors: Vec::new(),
+        };
+        let Some(worker) = self.worker.as_ref() else {
+            return status;
+        };
+        let deadline = std::time::Instant::now() + timeout;
+        let Ok(mut done) = self.completion.done.lock() else {
+            status.quiesced = false;
+            status
+                .errors
+                .push("peer completion state is poisoned".into());
+            return status;
+        };
+        if !*done {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                status.quiesced = false;
+                status.pending.push("peer worker");
+                return status;
+            }
+            let Ok((next, _)) = self.completion.wake.wait_timeout(done, remaining) else {
+                status.quiesced = false;
+                status.errors.push("peer completion wait failed".into());
+                return status;
+            };
+            done = next;
         }
+        if !*done {
+            status.quiesced = false;
+            status.pending.push("peer worker");
+            return status;
+        }
+        drop(done);
+        if !worker.is_finished() {
+            status.quiesced = false;
+            status.pending.push("peer worker");
+            return status;
+        }
+        let worker = self
+            .worker
+            .take()
+            .expect("peer worker handle still present");
+        if worker.join().is_err() {
+            status.quiesced = false;
+            status.errors.push("peer worker panicked".into());
+        }
+        status
     }
 }
 
@@ -242,7 +401,10 @@ impl PeerTransportClient {
         self.command_tx
             .try_send(PeerCommand::GetRtt(response_tx))
             .ok()?;
-        response_rx.recv_timeout(Duration::from_secs(2)).ok().flatten()
+        response_rx
+            .recv_timeout(Duration::from_secs(2))
+            .ok()
+            .flatten()
     }
 
     pub(crate) fn request_close(&self) -> Result<(), String> {
@@ -281,34 +443,35 @@ fn mark_worker_complete(completion: &WorkerCompletion) {
 }
 
 fn finish_worker(worker: JoinHandle<()>, completion: &Arc<WorkerCompletion>) {
-    finish_worker_with_timeout(worker, completion, WORKER_COMPLETION_TIMEOUT);
+    let _ = finish_worker_with_timeout(worker, completion, WORKER_COMPLETION_TIMEOUT);
 }
 
 fn finish_worker_with_timeout(
     worker: JoinHandle<()>,
     completion: &Arc<WorkerCompletion>,
     timeout: Duration,
-) {
+) -> Result<(), String> {
     let Ok(mut done) = completion.done.lock() else {
         drop(worker);
-        return;
+        return Err("peer completion state is poisoned".into());
     };
     if !*done {
         let Ok((next, _)) = completion.wake.wait_timeout(done, timeout) else {
             drop(worker);
-            return;
+            return Err("peer completion wait failed".into());
         };
         done = next;
     }
     let completed = *done;
     drop(done);
     if completed {
-        let _ = worker.join();
+        worker.join().map_err(|_| "peer worker panicked".to_owned())
     } else {
-        // The worker owns all native peer resources and has its own shutdown
-        // deadline. Dropping the JoinHandle detaches it without blocking the
-        // caller or invalidating its captured Arcs.
+        // Initialization has no PeerTransport owner to retain this handle;
+        // make the cleanup-pending result visible to the caller instead of
+        // treating a detached worker as quiescent.
         drop(worker);
+        Err("peer worker cleanup pending after deadline".into())
     }
 }
 
@@ -335,14 +498,19 @@ async fn run_peer(
     // host is not sending.
     let mut media_engine = MediaEngine::default();
     let session_codec = match video_codec {
-        VideoCodec::H264 | VideoCodec::H264High => {
-            h264_codec(video_codec.h264_profile_level_id().unwrap_or("42e02a"))
-        }
+        VideoCodec::H264 | VideoCodec::H264High => h264_codec(
+            video_codec
+                .h264_profile_level_id()
+                .unwrap_or(super::types::H264_BASELINE_PROFILE_LEVEL_ID),
+        ),
         VideoCodec::Hevc => hevc_codec(),
         VideoCodec::Av1 => av1_codec(),
     };
     if let Err(error) = media_engine.register_codec(session_codec.clone(), RTPCodecType::Video) {
-        let message = format!("{} codec registration failed: {error}", video_codec.mime_type());
+        let message = format!(
+            "{} codec registration failed: {error}",
+            video_codec.mime_type()
+        );
         set_status(&status, PeerTransportState::Failed, message.clone());
         let _ = ready_tx.send(Err(message));
         return;
@@ -620,10 +788,8 @@ async fn run_peer(
                 awaiting_keyframe = false;
                 super::logger::log("INFO", "pump", "first keyframe seen, starting stream");
             }
-            let profile_ok = sample_profile_accepted(
-                unit.profile_level_id.as_deref(),
-                allow_high_profile,
-            );
+            let profile_ok =
+                sample_profile_accepted(unit.profile_level_id.as_deref(), allow_high_profile);
             if !profile_ok {
                 // Was a silent `eprintln!` (outside the session file): a
                 // profile mismatch black-screened viewers while the host log
@@ -746,9 +912,7 @@ async fn run_peer(
             if probe_shutdown.load(Ordering::Acquire) {
                 break;
             }
-            if let Some(bitrate) =
-                probe_control.probe_candidate(std::time::Instant::now())
-            {
+            if let Some(bitrate) = probe_control.probe_candidate(std::time::Instant::now()) {
                 probe_control.apply_probe(bitrate);
             }
         }
@@ -950,9 +1114,7 @@ fn h264_codec(profile_level_id: &str) -> RTCRtpCodecParameters {
             mime_type: MIME_TYPE_H264.into(),
             clock_rate: 90_000,
             channels: 0,
-            sdp_fmtp_line: format!(
-                "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={profile_level_id}"
-            ),
+            sdp_fmtp_line: super::types::h264_fmtp_line(profile_level_id),
             rtcp_feedback: vec![
                 RTCPFeedback {
                     typ: "goog-remb".into(),
@@ -968,9 +1130,91 @@ fn h264_codec(profile_level_id: &str) -> RTCRtpCodecParameters {
                 },
             ],
         },
-        payload_type: 102,
+        payload_type: super::types::H264_PAYLOAD_TYPE,
         ..Default::default()
     }
+}
+
+/// RFC 6184 FU-A fragmentation for one H.264 NAL unit (pure, tested here so
+/// the sender packetization round-trips without a live peer). Small NALs
+/// pass through as a single RTP payload; larger ones split into
+/// indicator/header/chunk packets with S/E bits set on the ends.
+pub(crate) fn fragment_h264_fu_a(nal: &[u8], max_fragment_payload: usize) -> Vec<Vec<u8>> {
+    if nal.is_empty() || max_fragment_payload == 0 {
+        return Vec::new();
+    }
+    if nal.len() <= max_fragment_payload + 1 {
+        return vec![nal.to_vec()];
+    }
+    let header = nal[0];
+    let forbidden = header & 0x80;
+    let nri = header & 0x60;
+    let nal_type = header & 0x1f;
+    let indicator = forbidden | nri | 28;
+    let body = &nal[1..];
+    let mut packets = Vec::new();
+    let mut offset = 0;
+    while offset < body.len() {
+        let end = (offset + max_fragment_payload).min(body.len());
+        let start = u8::from(offset == 0) << 7;
+        let finish = u8::from(end == body.len()) << 6;
+        let fu_header = start | finish | nal_type;
+        let mut packet = Vec::with_capacity(2 + (end - offset));
+        packet.push(indicator);
+        packet.push(fu_header);
+        packet.extend_from_slice(&body[offset..end]);
+        packets.push(packet);
+        offset = end;
+    }
+    packets
+}
+
+/// Inverse of [`fragment_h264_fu_a`]: reassembles FU-A fragments (or a
+/// single NAL payload) back into the original NAL unit. Returns None on
+/// truncated headers, mixed types, or missing S/E markers.
+pub(crate) fn reassemble_h264_fu_a(packets: &[Vec<u8>]) -> Option<Vec<u8>> {
+    if packets.is_empty() {
+        return None;
+    }
+    if packets.len() == 1 && packets[0].first().is_some_and(|b| b & 0x1f != 28) {
+        return Some(packets[0].clone());
+    }
+    let mut nal_type = None;
+    let mut nri = 0;
+    let mut forbidden = 0;
+    let mut body = Vec::new();
+    for (index, packet) in packets.iter().enumerate() {
+        if packet.len() < 3 {
+            return None;
+        }
+        let indicator = packet[0];
+        let fu_header = packet[1];
+        if indicator & 0x1f != 28 {
+            return None;
+        }
+        let start = fu_header & 0x80 != 0;
+        let end = fu_header & 0x40 != 0;
+        if (index == 0) != start || (index + 1 == packets.len()) != end {
+            return None;
+        }
+        let current_type = fu_header & 0x1f;
+        if nal_type
+            .replace(current_type)
+            .is_some_and(|first| first != current_type)
+        {
+            return None;
+        }
+        forbidden = forbidden | (indicator & 0x80);
+        nri = nri | (indicator & 0x60);
+        body.extend_from_slice(&packet[2..]);
+    }
+    let Some(nal_type) = nal_type else {
+        return None;
+    };
+    let mut nal = Vec::with_capacity(body.len() + 1);
+    nal.push(forbidden | nri | nal_type);
+    nal.extend_from_slice(&body);
+    Some(nal)
 }
 
 async fn create_offer(peer: &Arc<RTCPeerConnection>) -> Result<PeerSignal, String> {
@@ -1044,7 +1288,9 @@ async fn set_answer(peer: &Arc<RTCPeerConnection>, answer: PeerSignal) -> Result
             "set-answer",
             &format!("viewer rejected the video stream ({rejected}) — browser likely lacks a decoder for the session codec"),
         );
-        return Err("viewer rejected the video stream: browser has no decoder for this codec".into());
+        return Err(
+            "viewer rejected the video stream: browser has no decoder for this codec".into(),
+        );
     }
     peer.set_remote_description(
         RTCSessionDescription::answer(sdp)
@@ -1124,10 +1370,7 @@ async fn wait_for_ice(mut gather: tokio::sync::mpsc::Receiver<()>) -> Result<(),
 /// Best-effort ICE wait: a slow/blocked STUN mirror must not fail the whole
 /// join when host candidates are already usable (same NAT, LAN, loopback).
 /// Only a candidate-less SDP still fails (via require_candidates).
-async fn gather_candidates_best_effort(
-    gather: tokio::sync::mpsc::Receiver<()>,
-    what: &str,
-) {
+async fn gather_candidates_best_effort(gather: tokio::sync::mpsc::Receiver<()>, what: &str) {
     if let Err(error) = wait_for_ice(gather).await {
         super::logger::log(
             "WARN",
@@ -1235,9 +1478,9 @@ fn map_peer_state(state: RTCPeerConnectionState) -> PeerTransportState {
 #[cfg(test)]
 mod tests {
     use super::{
-        close_async_operation_with_deadline, finish_worker_with_timeout, h264_codec,
-        map_peer_state, rewrite_mdns_candidate_addresses, run_signaling_operation_with_timeout,
-        PeerSignal, PeerSignalKind, WorkerCompletion,
+        close_async_operation_with_deadline, finish_worker_with_timeout, fragment_h264_fu_a,
+        h264_codec, map_peer_state, reassemble_h264_fu_a, rewrite_mdns_candidate_addresses,
+        run_signaling_operation_with_timeout, PeerSignal, PeerSignalKind, WorkerCompletion,
     };
     use crate::media::types::PeerTransportState;
     use std::time::Duration;
@@ -1329,6 +1572,27 @@ mod tests {
     }
 
     #[test]
+    fn h264_sdp_is_the_single_baseline_contract() {
+        use crate::media::types::{
+            h264_fmtp_requires_packetization_mode_1, H264_BASELINE_FMTP,
+            H264_BASELINE_PROFILE_LEVEL_ID, H264_PAYLOAD_TYPE,
+        };
+        // ONE payload type for every H.264 session; the fmtp line is the
+        // centralized baseline constant (4.2 covers 1080p60; 3.1 would not).
+        let codec = h264_codec(H264_BASELINE_PROFILE_LEVEL_ID);
+        assert_eq!(codec.payload_type, H264_PAYLOAD_TYPE);
+        assert_eq!(codec.payload_type, 102);
+        assert_eq!(codec.capability.sdp_fmtp_line, H264_BASELINE_FMTP);
+        assert_eq!(
+            codec.capability.sdp_fmtp_line,
+            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e02a"
+        );
+        assert!(h264_fmtp_requires_packetization_mode_1(
+            &codec.capability.sdp_fmtp_line
+        ));
+    }
+
+    #[test]
     fn peer_states_map_to_serializable_media_states() {
         assert_eq!(
             map_peer_state(RTCPeerConnectionState::Connecting),
@@ -1360,6 +1624,71 @@ mod tests {
             Duration::from_nanos(1501 * 1_000_000_000 / 90_000)
         );
         assert_eq!(super::duration_from_90khz(None, 90_000, fallback), fallback);
+    }
+
+    #[test]
+    fn frame_durations_follow_the_60fps_tick_grid_and_wrap() {
+        // 1/60s == 1500 ticks @90kHz; three monotonic frames stay on the grid.
+        let frame = Duration::from_nanos(1_500 * 1_000_000_000 / 90_000);
+        let fallback = Duration::from_millis(33);
+        let t0 = 1_000_000u64;
+        assert_eq!(
+            super::duration_from_90khz(Some(t0), t0 + 1_500, fallback),
+            frame
+        );
+        assert_eq!(
+            super::duration_from_90khz(Some(t0 + 1_500), t0 + 3_000, fallback),
+            frame
+        );
+        // Sequence/timestamp stay monotonic across the u32 wrap.
+        assert_eq!(
+            super::duration_from_90khz(Some(u32::MAX as u64 - 750), 750, fallback),
+            Duration::from_nanos(1_501 * 1_000_000_000 / 90_000)
+        );
+        // Zero deltas and gaps over 10s (>900_000 ticks) fall back to the
+        // configured frame duration instead of emitting 0 / huge samples.
+        assert_eq!(super::duration_from_90khz(Some(t0), t0, fallback), fallback);
+        assert_eq!(
+            super::duration_from_90khz(Some(t0), t0 + 900_001, fallback),
+            fallback
+        );
+        // Sender timestamps are overflow-checked and monotonic in 90kHz.
+        let a = super::timestamp_from_90khz(t0).expect("a converts");
+        let b = super::timestamp_from_90khz(t0 + 1_500).expect("b converts");
+        assert!(b > a);
+        assert_eq!(b.duration_since(a).expect("monotonic"), frame);
+        assert_eq!(super::timestamp_from_90khz(u64::MAX), None);
+    }
+
+    #[test]
+    fn fu_a_fragmentation_round_trips_the_original_nal() {
+        // A realistic IDR NAL fragments and reassembles byte-identical, so a
+        // viewer behind a small MTU decodes the same access unit the
+        // encoder emitted.
+        let mut nal = vec![0x65u8];
+        nal.extend((0..5_000u32).map(|value| (value % 251) as u8));
+        let fragments = fragment_h264_fu_a(&nal, 1_200);
+        assert!(fragments.len() > 1);
+        assert!(fragments.iter().all(|packet| packet.len() <= 1_202));
+        // S set only on the first fragment, E only on the last.
+        assert_eq!(fragments[0][1] & 0x80, 0x80);
+        assert_eq!(fragments[0][1] & 0x40, 0x00);
+        let last = fragments.len() - 1;
+        assert_eq!(fragments[last][1] & 0x80, 0x00);
+        assert_eq!(fragments[last][1] & 0x40, 0x40);
+        assert_eq!(reassemble_h264_fu_a(&fragments), Some(nal));
+        // Small NALs pass through unfragmented and still round-trip.
+        let small = vec![0x41, 0x9a, 0x22, 0x11];
+        let single = fragment_h264_fu_a(&small, 1_200);
+        assert_eq!(single, vec![small.clone()]);
+        assert_eq!(reassemble_h264_fu_a(&single), Some(small));
+        // Corrupt framing (missing E marker) is rejected, not half-decoded.
+        let mut truncated = fragments.clone();
+        truncated.pop();
+        assert_ne!(
+            reassemble_h264_fu_a(&truncated),
+            reassemble_h264_fu_a(&fragments)
+        );
     }
 
     #[test]
@@ -1444,7 +1773,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_completion_can_detach_after_a_deadline() {
+    fn worker_completion_reports_pending_after_a_deadline() {
         let completion = std::sync::Arc::new(WorkerCompletion {
             done: std::sync::Mutex::new(false),
             wake: std::sync::Condvar::new(),
@@ -1457,7 +1786,11 @@ mod tests {
             }
         });
         let started = std::time::Instant::now();
-        finish_worker_with_timeout(worker, &completion, Duration::from_millis(1));
+        let result = finish_worker_with_timeout(worker, &completion, Duration::from_millis(1));
+        assert_eq!(
+            result,
+            Err("peer worker cleanup pending after deadline".into())
+        );
         stop.store(true, std::sync::atomic::Ordering::Release);
         assert!(started.elapsed() < Duration::from_secs(1));
     }

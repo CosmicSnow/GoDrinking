@@ -7,14 +7,73 @@
 #[cfg(target_os = "macos")]
 use super::pipeline::NativeEncoderFrame;
 use super::pipeline::{EncoderCommand, NativeFrame, PreviewDiagnostics};
-use super::types::{
-    CaptureSource, CreateMediaSessionRequest, FrameRate, NativeCaptureSource,
-};
+use super::types::{CaptureSource, CreateMediaSessionRequest, FrameRate, NativeCaptureSource};
 use serde::Serialize;
 use std::fmt::{Display, Formatter};
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
+use std::time::Duration;
+/// Cancellation shared by a native Start operation and its eventual Stop.
+///
+/// This is deliberately small and platform-neutral so the resource-ledger
+/// lane can inject the same kind of token without owning native handles.
+#[derive(Clone, Debug, Default)]
+pub struct CaptureCancellationToken(Arc<AtomicBool>);
+
+impl CaptureCancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_atomic(flag: Arc<AtomicBool>) -> Self {
+        Self(flag)
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+impl From<Arc<AtomicBool>> for CaptureCancellationToken {
+    fn from(flag: Arc<AtomicBool>) -> Self {
+        Self::from_atomic(flag)
+    }
+}
+
+/// Compatibility name for callers which model cancellation as part of Start.
+pub type StartCancellationToken = CaptureCancellationToken;
+
+pub(crate) type CaptureShutdownStatus = super::process_tap::ShutdownStatus;
+
+fn shutdown_quiescent() -> CaptureShutdownStatus {
+    CaptureShutdownStatus {
+        quiesced: true,
+        pending: Vec::new(),
+        errors: Vec::new(),
+    }
+}
+
+fn shutdown_pending(component: &'static str) -> CaptureShutdownStatus {
+    CaptureShutdownStatus {
+        quiesced: false,
+        pending: vec![component],
+        errors: Vec::new(),
+    }
+}
+
+fn shutdown_error(error: impl Into<String>) -> CaptureShutdownStatus {
+    CaptureShutdownStatus {
+        quiesced: false,
+        pending: Vec::new(),
+        errors: vec![error.into()],
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PendingNativeOperation {
@@ -200,6 +259,19 @@ impl NativeTransitionReducer {
         self.shutdown_requested = true;
     }
 
+    fn shutdown_status(&self) -> CaptureShutdownStatus {
+        match self.lifecycle {
+            CaptureLifecycle::Idle => shutdown_quiescent(),
+            CaptureLifecycle::Failed => {
+                shutdown_error("ScreenCaptureKit capture is failed and still owns native state")
+            }
+            CaptureLifecycle::Starting
+            | CaptureLifecycle::Running
+            | CaptureLifecycle::Stopping
+            | CaptureLifecycle::CleanupPending => shutdown_pending("screen capture"),
+        }
+    }
+
     #[cfg(test)]
     fn lifecycle(&self) -> CaptureLifecycle {
         self.lifecycle
@@ -219,8 +291,8 @@ mod native {
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
     use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass};
-    use objc2_core_media::{CMSampleBuffer, CMTime};
     use objc2_core_graphics::kCGColorSpaceITUR_709;
+    use objc2_core_media::{CMSampleBuffer, CMTime};
     use objc2_core_video::{
         kCVPixelFormatType_32BGRA, kCVReturnSuccess, CVPixelBuffer, CVPixelBufferGetBaseAddress,
         CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType,
@@ -229,15 +301,15 @@ mod native {
     };
     use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
     use objc2_screen_capture_kit::{
-        SCContentFilter, SCContentSharingPicker, SCContentSharingPickerObserver, SCShareableContent,
-        SCShareableContentStyle, SCStream, SCStreamConfiguration, SCStreamDelegate, SCStreamOutput,
-        SCStreamOutputType, SCWindow,
+        SCContentFilter, SCContentSharingPicker, SCContentSharingPickerObserver,
+        SCShareableContent, SCShareableContentStyle, SCStream, SCStreamConfiguration,
+        SCStreamDelegate, SCStreamOutput, SCStreamOutputType, SCWindow,
     };
     use std::slice;
     use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
     use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
     use std::sync::{Arc, Mutex};
-    use std::thread;
+    use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
     const PREVIEW_WIDTH: u32 = 160;
@@ -262,6 +334,7 @@ mod native {
             diagnostics: Arc<PreviewDiagnostics>,
             generation: u64,
             operation_id: u64,
+            cancellation: CaptureCancellationToken,
             response: SyncSender<Result<(), ScreenCaptureKitError>>,
         },
         StartCompleted {
@@ -358,6 +431,22 @@ mod native {
                 _ => super::CaptureLifecycle::Idle,
             }
         }
+
+        fn shutdown_status(&self) -> super::CaptureShutdownStatus {
+            match self.get() {
+                super::CaptureLifecycle::Idle => super::shutdown_quiescent(),
+                super::CaptureLifecycle::Failed => super::shutdown_error(
+                    self.failure_detail()
+                        .unwrap_or_else(|| "ScreenCaptureKit actor is failed".into()),
+                ),
+                super::CaptureLifecycle::Starting
+                | super::CaptureLifecycle::Running
+                | super::CaptureLifecycle::Stopping
+                | super::CaptureLifecycle::CleanupPending => {
+                    super::shutdown_pending("screen capture")
+                }
+            }
+        }
     }
 
     #[derive(Debug)]
@@ -427,6 +516,9 @@ mod native {
                     return;
                 }
 
+                // Color-contract validation per callback: the encoder seam
+                // only accepts the 32BGRA/709 capture contract. Anything else
+                // is recorded (first error wins) rather than forwarded.
                 if CVPixelBufferGetPixelFormatType(pixel_buffer) != kCVPixelFormatType_32BGRA {
                     self.ivars().diagnostics.record_error(
                         "ScreenCaptureKit callback returned a non-BGRA pixel buffer.",
@@ -573,21 +665,22 @@ mod native {
                     Retained::retain(filter as *const SCContentFilter as *mut SCContentFilter)
                 };
                 if let Some(filter) = retained {
-                    let _ = self.ivars().tx.send(PickerEvent::Selected(SendFilter(filter)));
-                } else {
                     let _ = self
                         .ivars()
                         .tx
-                        .send(PickerEvent::Failed("picker returned an empty filter".into()));
+                        .send(PickerEvent::Selected(SendFilter(filter)));
+                } else {
+                    let _ = self.ivars().tx.send(PickerEvent::Failed(
+                        "picker returned an empty filter".into(),
+                    ));
                 }
             }
 
             #[unsafe(method(contentSharingPickerStartDidFailWithError:))]
             unsafe fn content_sharing_picker_start_did_fail_with_error(&self, error: &NSError) {
-                let _ = self
-                    .ivars()
-                    .tx
-                    .send(PickerEvent::Failed(error.localizedDescription().to_string()));
+                let _ = self.ivars().tx.send(PickerEvent::Failed(
+                    error.localizedDescription().to_string(),
+                ));
             }
         }
     );
@@ -613,6 +706,9 @@ mod native {
         command_tx: SyncSender<ActorCommand>,
         status: Arc<ActorStatus>,
         next_operation: AtomicU64,
+        start_cancellation: Arc<Mutex<Option<CaptureCancellationToken>>>,
+        thread: Option<JoinHandle<()>>,
+        shutdown_sent: bool,
     }
 
     impl NativeCaptureActor {
@@ -621,14 +717,19 @@ mod native {
             let status = Arc::new(ActorStatus::new());
             let actor_status = Arc::clone(&status);
             let actor_tx = command_tx.clone();
-            thread::Builder::new()
+            let start_cancellation = Arc::new(Mutex::new(None));
+            let actor_cancellation = Arc::clone(&start_cancellation);
+            let thread = thread::Builder::new()
                 .name("godrinking-screencapturekit-actor".into())
-                .spawn(move || actor_loop(command_rx, actor_tx, actor_status))
+                .spawn(move || actor_loop(command_rx, actor_tx, actor_status, actor_cancellation))
                 .expect("failed to start ScreenCaptureKit actor");
             Self {
                 command_tx,
                 status,
                 next_operation: AtomicU64::new(1),
+                start_cancellation,
+                thread: Some(thread),
+                shutdown_sent: false,
             }
         }
 
@@ -657,8 +758,30 @@ mod native {
             diagnostics: Arc<PreviewDiagnostics>,
             generation: u64,
         ) -> Result<(), ScreenCaptureKitError> {
+            self.start_with_cancellation(
+                request,
+                capture_tx,
+                encoder_tx,
+                diagnostics,
+                generation,
+                CaptureCancellationToken::new(),
+            )
+        }
+
+        pub(crate) fn start_with_cancellation(
+            &self,
+            request: &CreateMediaSessionRequest,
+            capture_tx: SyncSender<NativeFrame>,
+            encoder_tx: SyncSender<EncoderCommand>,
+            diagnostics: Arc<PreviewDiagnostics>,
+            generation: u64,
+            cancellation: CaptureCancellationToken,
+        ) -> Result<(), ScreenCaptureKitError> {
             let operation_id = self.next_operation.fetch_add(1, Ordering::Relaxed);
             let (response_tx, response_rx) = sync_channel(1);
+            if let Ok(mut active) = self.start_cancellation.lock() {
+                *active = Some(cancellation.clone());
+            }
             self.command_tx
                 .send(ActorCommand::Start {
                     request: request.clone(),
@@ -667,15 +790,22 @@ mod native {
                     diagnostics,
                     generation,
                     operation_id,
+                    cancellation,
                     response: response_tx,
                 })
-                .map_err(|_| ScreenCaptureKitError::ActorUnavailable)?;
+                .map_err(|_| {
+                    if let Ok(mut active) = self.start_cancellation.lock() {
+                        *active = None;
+                    }
+                    ScreenCaptureKitError::ActorUnavailable
+                })?;
             response_rx
                 .recv()
                 .map_err(|_| ScreenCaptureKitError::ActorUnavailable)?
         }
 
         pub(crate) fn stop(&self, generation: u64) -> Result<(), ScreenCaptureKitError> {
+            self.cancel_start();
             let operation_id = self.next_operation.fetch_add(1, Ordering::Relaxed);
             let (response_tx, response_rx) = sync_channel(1);
             self.command_tx
@@ -690,8 +820,68 @@ mod native {
                 .map_err(|_| ScreenCaptureKitError::ActorUnavailable)?
         }
 
-        pub(crate) fn shutdown(&mut self) {
-            let _ = self.command_tx.try_send(ActorCommand::Shutdown);
+        fn cancel_start(&self) {
+            if let Ok(guard) = self.start_cancellation.lock() {
+                if let Some(token) = guard.as_ref() {
+                    token.cancel();
+                }
+            }
+        }
+
+        pub(crate) fn shutdown(&mut self) -> CaptureShutdownStatus {
+            self.shutdown_with_timeout(CALLBACK_TIMEOUT)
+        }
+
+        pub(crate) fn shutdown_with_timeout(&mut self, timeout: Duration) -> CaptureShutdownStatus {
+            self.cancel_start();
+            if !self.shutdown_sent {
+                match self.command_tx.try_send(ActorCommand::Shutdown) {
+                    Ok(()) => {}
+                    Err(std::sync::mpsc::TrySendError::Full(command)) => {
+                        if self.command_tx.send(command).is_err() {
+                            return shutdown_error("ScreenCaptureKit actor is unavailable");
+                        }
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                        return shutdown_error("ScreenCaptureKit actor is unavailable");
+                    }
+                }
+                self.shutdown_sent = true;
+            }
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                let Some(thread) = self.thread.as_ref() else {
+                    return self.status.shutdown_status();
+                };
+                if thread.is_finished() {
+                    let thread = self
+                        .thread
+                        .take()
+                        .expect("actor thread handle was retained");
+                    return match thread.join() {
+                        Ok(()) => self.status.shutdown_status(),
+                        Err(_) => shutdown_error("ScreenCaptureKit actor panicked"),
+                    };
+                }
+                if std::time::Instant::now() >= deadline {
+                    return shutdown_pending("screen capture actor");
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    impl Drop for NativeCaptureActor {
+        fn drop(&mut self) {
+            if self.thread.is_some() {
+                let _ = self.shutdown();
+                if let Some(thread) = self.thread.take() {
+                    // Drop must not detach a native actor. The cancellation
+                    // token makes the normal picker wait interruptible before
+                    // this final join.
+                    let _ = thread.join();
+                }
+            }
         }
     }
 
@@ -699,6 +889,7 @@ mod native {
         receiver: Receiver<ActorCommand>,
         actor_tx: SyncSender<ActorCommand>,
         status: Arc<ActorStatus>,
+        start_cancellation: Arc<Mutex<Option<CaptureCancellationToken>>>,
     ) {
         let mut capture: Option<NativeCapture> = None;
         let mut pending_start: Option<(NativeCapture, u64, u64)> = None;
@@ -715,6 +906,7 @@ mod native {
                     diagnostics,
                     generation,
                     operation_id,
+                    cancellation,
                     response,
                 } => {
                     if capture.is_some()
@@ -729,6 +921,9 @@ mod native {
                     }
                     status.clear_failure();
                     status.set(ACTOR_STARTING);
+                    if let Ok(mut active) = start_cancellation.lock() {
+                        *active = Some(cancellation.clone());
+                    }
                     match start_capture(
                         &request,
                         capture_tx,
@@ -737,6 +932,7 @@ mod native {
                         diagnostics,
                         generation,
                         operation_id,
+                        cancellation,
                     ) {
                         Ok(StartAttempt::Complete(new_capture)) => {
                             capture = Some(new_capture);
@@ -778,6 +974,9 @@ mod native {
                             status.set(ACTOR_IDLE);
                             let _ = response.send(Err(error));
                         }
+                    }
+                    if let Ok(mut active) = start_cancellation.lock() {
+                        *active = None;
                     }
                 }
                 ActorCommand::StartCompleted {
@@ -1084,7 +1283,8 @@ mod native {
         Ok(Vec::new())
     }
 
-    pub(crate) fn enumerate_running_apps() -> Result<Vec<crate::media::types::NativeRunningApp>, ScreenCaptureKitError> {
+    pub(crate) fn enumerate_running_apps(
+    ) -> Result<Vec<crate::media::types::NativeRunningApp>, ScreenCaptureKitError> {
         // NSWorkspace runningApplications carries name, pid, and bundle id so
         // audio exclusion can match helper processes (e.g. Discord). The
         // window list remains a fallback for names/pids. Neither path calls
@@ -1107,7 +1307,11 @@ mod native {
 
     fn pick_filter_with_system_picker(
         request: &CreateMediaSessionRequest,
+        cancellation: &CaptureCancellationToken,
     ) -> Result<(Retained<SCContentFilter>, (u32, u32)), ScreenCaptureKitError> {
+        if cancellation.is_cancelled() {
+            return Err(ScreenCaptureKitError::StartCancelled);
+        }
         let (tx, rx) = sync_channel(1);
         let observer = PickerObserver::new(tx);
         let style = match request.source {
@@ -1127,18 +1331,42 @@ mod native {
                 }
             }
         });
-        let event = rx
-            .recv_timeout(PICKER_TIMEOUT)
-            .map_err(|_| ScreenCaptureKitError::StreamStartTimedOut)?;
+        let deadline = Instant::now() + PICKER_TIMEOUT;
+        let event = loop {
+            if cancellation.is_cancelled() {
+                break Err(ScreenCaptureKitError::StartCancelled);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break Err(ScreenCaptureKitError::StreamStartTimedOut);
+            }
+            match rx.recv_timeout(remaining.min(Duration::from_millis(50))) {
+                Ok(event) => break Ok(event),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    break Err(ScreenCaptureKitError::ActorUnavailable)
+                }
+            }
+        };
+        let (cleanup_tx, cleanup_rx) = sync_channel(1);
         DispatchQueue::main().exec_async({
             let observer = observer.clone();
             move || {
                 let picker = unsafe { SCContentSharingPicker::sharedPicker() };
                 unsafe {
                     picker.removeObserver(ProtocolObject::from_ref(&*observer));
+                    picker.setActive(false);
                 }
+                let _ = cleanup_tx.send(());
             }
         });
+        if cleanup_rx.recv_timeout(CALLBACK_TIMEOUT).is_err() {
+            return Err(ScreenCaptureKitError::PickerCleanupFailed);
+        }
+        if cancellation.is_cancelled() {
+            return Err(ScreenCaptureKitError::StartCancelled);
+        }
+        let event = event?;
         match event {
             PickerEvent::Selected(SendFilter(filter)) => {
                 let (requested_width, requested_height) = request.capture_cap();
@@ -1162,8 +1390,12 @@ mod native {
         diagnostics: Arc<PreviewDiagnostics>,
         generation: u64,
         operation_id: u64,
+        cancellation: CaptureCancellationToken,
     ) -> Result<StartAttempt, ScreenCaptureKitError> {
-        let (filter, source_dimensions) = pick_filter_with_system_picker(request)?;
+        let (filter, source_dimensions) = pick_filter_with_system_picker(request, &cancellation)?;
+        if cancellation.is_cancelled() {
+            return Err(ScreenCaptureKitError::StartCancelled);
+        }
         let configuration = stream_configuration(request, source_dimensions);
         eprintln!(
             "[goDrinking] starting ScreenCaptureKit source={:?} source_id={:?} dimensions={}x{}",
@@ -1213,6 +1445,9 @@ mod native {
                 result: result.clone(),
             });
         });
+        if cancellation.is_cancelled() {
+            return Err(ScreenCaptureKitError::StartCancelled);
+        }
         unsafe { stream.startCaptureWithCompletionHandler(Some(&completion)) };
         let capture = NativeCapture {
             generation,
@@ -1417,11 +1652,20 @@ mod native {
     ) -> Retained<SCStreamConfiguration> {
         let configuration = unsafe { SCStreamConfiguration::new() };
         let (requested_width, requested_height) = request.capture_cap();
-        let (width, height) = super::super::types::fitted_even_size(
+        // Final encode size, not capture-only sizing: Baseline sessions are
+        // additionally capped to 1920 wide (wider Baseline black-screens some
+        // decoders) and non-standard sizes are macroblock-aligned down, with
+        // aspect preserved and never forced to 16:9. Same contract the
+        // Windows capture path and both encoder safety nets apply, so the
+        // pipeline re-fit below is idempotent in steady state.
+        // A 5120x1440 source at a 1080p cap captures as 1920x528 Baseline.
+        let baseline = matches!(request.codec, super::super::types::VideoCodec::H264);
+        let (width, height) = super::super::types::final_encode_size(
             source_dimensions.0,
             source_dimensions.1,
             requested_width,
             requested_height,
+            baseline,
         );
         let interval = match request.effective_frame_rate() {
             FrameRate::Fps120 => unsafe { CMTime::new(1, 120) },
@@ -1431,6 +1675,12 @@ mod native {
         unsafe {
             configuration.setWidth(width as usize);
             configuration.setHeight(height as usize);
+            // Color contract: the capture pixel format stays 32BGRA with the
+            // ITU-R 709 color space; the encoder seam (VideoToolbox, governed
+            // by its 709 primaries/transfer/matrix properties) owns the
+            // canonical NV12 BT.709 limited-range output. The derived RGB
+            // preview thumbnail below is a host convenience: it is never
+            // proof of viewer color correctness.
             configuration.setPixelFormat(kCVPixelFormatType_32BGRA);
             configuration.setColorSpaceName(kCGColorSpaceITUR_709);
             configuration.setMinimumFrameInterval(interval);
@@ -1539,6 +1789,12 @@ pub enum ScreenCaptureKitError {
     },
     StreamStartTimedOut,
     StreamStopTimedOut,
+    StartCancelled,
+    PickerCleanupFailed,
+    /// Frame rates above the 60 fps product envelope. Rejected before any
+    /// native acquisition (the engine validates first; this is the
+    /// defense-in-depth gate at the capture seam).
+    UnsupportedFrameRate(u32),
     #[cfg(not(target_os = "macos"))]
     NoActiveCapture,
     OperationPending,
@@ -1570,6 +1826,14 @@ impl Display for ScreenCaptureKitError {
             }
             Self::StreamStartTimedOut => "ScreenCaptureKit stream start timed out",
             Self::StreamStopTimedOut => "ScreenCaptureKit stream stop timed out",
+            Self::StartCancelled => "ScreenCaptureKit start was cancelled",
+            Self::UnsupportedFrameRate(fps) => {
+                return write!(
+                    formatter,
+                    "frame rate {fps} fps exceeds the 60 fps product envelope"
+                )
+            }
+            Self::PickerCleanupFailed => "ScreenCaptureKit picker observer cleanup timed out",
             #[cfg(not(target_os = "macos"))]
             Self::NoActiveCapture => "ScreenCaptureKit has no active capture",
             Self::OperationPending => "ScreenCaptureKit has an operation or cleanup pending",
@@ -1587,7 +1851,7 @@ impl ScreenCaptureKitError {
             Self::NativeFailure {
                 operation: "removeStreamOutput",
                 ..
-            }
+            } | Self::PickerCleanupFailed
         )
     }
 }
@@ -1714,11 +1978,36 @@ impl ScreenCaptureKitAdapter {
         diagnostics: Arc<PreviewDiagnostics>,
         generation: u64,
     ) -> Result<(), ScreenCaptureKitError> {
+        self.start_capture_with_cancellation(
+            request,
+            capture_tx,
+            encoder_tx,
+            diagnostics,
+            generation,
+            CaptureCancellationToken::new(),
+        )
+    }
+
+    pub(crate) fn start_capture_with_cancellation(
+        &mut self,
+        request: &CreateMediaSessionRequest,
+        capture_tx: SyncSender<NativeFrame>,
+        encoder_tx: SyncSender<EncoderCommand>,
+        diagnostics: Arc<PreviewDiagnostics>,
+        generation: u64,
+        cancellation: CaptureCancellationToken,
+    ) -> Result<(), ScreenCaptureKitError> {
         if !self.availability.framework_available {
             return Err(ScreenCaptureKitError::UnsupportedPlatform);
         }
         if !self.availability.source_enumeration_available {
             return Err(ScreenCaptureKitError::ScreenRecordingNotGranted);
+        }
+        // 60 fps envelope, rejected before acquisition (the Share slot never
+        // starts, so no restart semantics are involved).
+        let fps = request.effective_frame_rate().hertz();
+        if !super::pipeline::fps_within_envelope(fps) {
+            return Err(ScreenCaptureKitError::UnsupportedFrameRate(fps));
         }
         if self.lifecycle() != CaptureLifecycle::Idle
             && self.lifecycle() != CaptureLifecycle::Failed
@@ -1728,10 +2017,14 @@ impl ScreenCaptureKitAdapter {
         self.lifecycle = CaptureLifecycle::Starting;
         #[cfg(target_os = "macos")]
         {
-            match self
-                .actor
-                .start(request, capture_tx, encoder_tx, diagnostics, generation)
-            {
+            match self.actor.start_with_cancellation(
+                request,
+                capture_tx,
+                encoder_tx,
+                diagnostics,
+                generation,
+                cancellation,
+            ) {
                 Ok(()) => {
                     self.lifecycle = CaptureLifecycle::Running;
                     Ok(())
@@ -1770,12 +2063,30 @@ impl ScreenCaptureKitAdapter {
             }
         }
     }
+
+    /// Requests native shutdown and reports whether the actor is actually
+    /// quiescent. `Pending` is intentionally not treated as success.
+    pub(crate) fn shutdown(&mut self) -> CaptureShutdownStatus {
+        self.shutdown_with_timeout(Duration::from_secs(10))
+    }
+
+    pub(crate) fn shutdown_with_timeout(&mut self, timeout: Duration) -> CaptureShutdownStatus {
+        #[cfg(target_os = "macos")]
+        {
+            return self.actor.shutdown_with_timeout(timeout);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = timeout;
+            shutdown_quiescent()
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
 impl Drop for ScreenCaptureKitAdapter {
     fn drop(&mut self) {
-        self.actor.shutdown();
+        let _ = self.shutdown();
     }
 }
 
@@ -2066,7 +2377,11 @@ fn dedupe_apps_by_pid(
         }
     }
     let mut result: Vec<_> = by_pid.into_values().collect();
-    result.sort_by(|left, right| left.name.to_ascii_lowercase().cmp(&right.name.to_ascii_lowercase()));
+    result.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+    });
     result
 }
 
@@ -2102,7 +2417,58 @@ fn detect_availability() -> ScreenCaptureKitAvailability {
 
 #[cfg(test)]
 mod tests {
-    use super::{CaptureLifecycle, NativeTransitionReducer, ScreenCaptureKitAdapter};
+    use super::{
+        CaptureCancellationToken, CaptureLifecycle, NativeTransitionReducer,
+        ScreenCaptureKitAdapter,
+    };
+
+    #[test]
+    fn macos_capture_uses_final_encode_size_with_baseline_cap() {
+        // Locks the Phase-2B capture contract without native handles: the
+        // size `stream_configuration` programs into SCStream must equal
+        // `final_encode_size` (Baseline cap + mod16 align, aspect preserved).
+        use super::super::types::final_encode_size;
+        // 5120x1440 at a 1080p cap captures as 1920x528 Baseline.
+        assert_eq!(final_encode_size(5120, 1440, 1920, 1080, true), (1920, 528));
+        // 3440x1440 (21:9) stays 21:9 and macroblock-aligned.
+        let (w, h) = final_encode_size(3440, 1440, 1920, 1080, true);
+        assert_eq!(w, 1920);
+        assert_eq!((w % 16, h % 16), (0, 0));
+        assert!(((w as f64) / (h as f64) - 3440.0 / 1440.0).abs() < 0.03);
+        // Standard broadcast sizes pass through untouched.
+        assert_eq!(
+            final_encode_size(1920, 1080, 1920, 1080, true),
+            (1920, 1080)
+        );
+        assert_eq!(final_encode_size(1280, 720, 1920, 1080, true), (1280, 720));
+    }
+
+    #[test]
+    fn sixty_fps_envelope_rejects_high_frame_rates() {
+        use super::super::pipeline::fps_within_envelope;
+        assert!(fps_within_envelope(30));
+        assert!(fps_within_envelope(60));
+        assert!(!fps_within_envelope(0));
+        assert!(!fps_within_envelope(61));
+        assert!(!fps_within_envelope(120));
+        let error = super::ScreenCaptureKitError::UnsupportedFrameRate(120).to_string();
+        assert!(error.contains("120"), "error should name the rate: {error}");
+        assert!(
+            error.contains("60"),
+            "error should name the envelope: {error}"
+        );
+    }
+
+    #[test]
+    fn start_cancellation_token_is_shared_and_idempotent() {
+        let token = CaptureCancellationToken::new();
+        let copy = token.clone();
+        assert!(!token.is_cancelled());
+        copy.cancel();
+        assert!(token.is_cancelled());
+        token.cancel();
+        assert!(copy.is_cancelled());
+    }
 
     #[test]
     fn adapter_does_not_claim_a_running_stream_without_successful_start() {
@@ -2129,10 +2495,12 @@ mod tests {
         assert!(reducer.begin_stop(1, 2));
         reducer.stop_timed_out();
         assert_eq!(reducer.lifecycle(), CaptureLifecycle::Stopping);
+        assert!(!reducer.shutdown_status().quiesced);
         assert!(!reducer.begin_stop(1, 3));
         assert!(reducer.complete_stop(1, 2, true, true));
         assert_eq!(reducer.lifecycle(), CaptureLifecycle::Idle);
         assert!(reducer.active_generation().is_none());
+        assert!(reducer.shutdown_status().quiesced);
     }
 
     #[test]
@@ -2180,6 +2548,20 @@ mod tests {
         assert_eq!(reducer.lifecycle(), CaptureLifecycle::Idle);
     }
 
+    #[test]
+    fn real_reducer_exposes_pending_and_error_shutdown_states() {
+        let mut reducer = NativeTransitionReducer::new();
+        assert!(reducer.shutdown_status().quiesced);
+        reducer.begin_start(1, 1);
+        reducer.start_timed_out();
+        let status = reducer.shutdown_status();
+        assert!(!status.quiesced);
+        assert!(status.pending.is_empty());
+        assert_eq!(status.errors.len(), 1);
+        assert!(reducer.terminate(1));
+        assert!(!reducer.shutdown_status().quiesced);
+    }
+
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn unsupported_start_failure_is_retryable() {
@@ -2216,7 +2598,13 @@ mod tests {
         let (encoder_tx, _encoder_rx) = sync_channel::<EncoderCommand>(1);
         let diagnostics = super::super::pipeline::PreviewDiagnostics::new();
         assert!(adapter
-            .start_capture(&request, capture_tx.clone(), encoder_tx.clone(), Arc::clone(&diagnostics), 1)
+            .start_capture(
+                &request,
+                capture_tx.clone(),
+                encoder_tx.clone(),
+                Arc::clone(&diagnostics),
+                1
+            )
             .is_err());
         assert_eq!(adapter.lifecycle(), CaptureLifecycle::Idle);
         assert!(adapter

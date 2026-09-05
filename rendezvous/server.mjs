@@ -33,6 +33,9 @@ const MAX_ACCEPTED = 8;
 const MAX_PENDING = 8;
 // Overridable so the 5-minute expiry can be tested quickly.
 const HEARTBEAT_TTL_MS = Number(process.env.HEARTBEAT_TTL_MS || 5 * 60 * 1000);
+// Prepared Hosts are deliberately not rooms yet. They get a short lease so
+// an abandoned Start cannot consume a Room code or server memory forever.
+const PREPARED_TTL_MS = Number(process.env.PREPARED_TTL_MS || 60 * 1000);
 const GC_INTERVAL_MS = Number(process.env.GC_INTERVAL_MS || 15 * 1000);
 // How long a disconnected socket stays in the roster before the sweeper
 // drops it. Covers clean closes AND app kills (WS close fires either way);
@@ -50,6 +53,10 @@ const SALT_LEN = 16;
 const RATE_WINDOW_MS = 60 * 1000;
 const RATE_LIMITS = {
   "host/open": 5,
+  "host/prepare": 5,
+  "host/commit": 10,
+  "host/activate": 10,
+  "host/abort": 10,
   "host/heartbeat": 6,
   "viewer/ask": 10,
   "member/leave": 10,
@@ -68,6 +75,10 @@ const TARPIT_SOCKET_MS = 60 * 1000;
 const NICK_RE = /^[A-Za-z0-9 _\-.]+$/;
 const ROUTES = new Set([
   "/v1/host/open",
+  "/v1/host/prepare",
+  "/v1/host/commit",
+  "/v1/host/activate",
+  "/v1/host/abort",
   "/v1/host/heartbeat",
   "/v1/host/rotate",
   "/v1/host/close",
@@ -82,6 +93,8 @@ const ROUTES = new Set([
 
 /** @type {Map<string, object>} code -> Room */
 const rooms = new Map();
+/** @type {Map<string, object>} prepare token -> unadvertised Host bundle */
+const prepared = new Map();
 /** @type {Map<string, {role: "host"|"viewer", code: string, viewerId?: string}>} */
 const tokens = new Map();
 /** @type {Map<string, Map<string, number[]>>} ip -> route -> hit timestamps */
@@ -361,13 +374,13 @@ async function handleOpen(ip, json, res) {
   if (!validNickname(json.nickname)) return invalid(res);
   const password = typeof json.password === "string" ? json.password : "";
   if (!validPassword(password)) return invalid(res);
-  if (rooms.size >= MAX_ROOMS) return busy(res);
+  if (rooms.size + prepared.size >= MAX_ROOMS) return busy(res);
 
   // The server picks the code; a client-supplied one is ignored (compat).
   let code = null;
   for (let attempt = 0; attempt < 10; attempt += 1) {
     const candidate = randomCode();
-    if (!rooms.has(candidate)) {
+    if (!rooms.has(candidate) && ![...prepared.values()].some((item) => item.code === candidate)) {
       code = candidate;
       break;
     }
@@ -410,6 +423,133 @@ async function handleOpen(ip, json, res) {
   tokens.set(hostToken, { role: "host", code, memberId: masterId });
   log("info", ip, "open", code, "-", mode);
   ok(res, { ok: true, host_token: hostToken, code, mode, member_id: masterId });
+}
+
+/**
+ * Reserve a complete Host bundle without publishing a Room. The returned
+ * code is only useful to the Host until commit; viewer/ask intentionally
+ * consults `rooms`, never this map.
+ */
+async function handlePrepare(ip, json, res) {
+  if (!validNickname(json.nickname)) return invalid(res);
+  const password = typeof json.password === "string" ? json.password : "";
+  if (!validPassword(password)) return invalid(res);
+  if (rooms.size + prepared.size >= MAX_ROOMS) return busy(res);
+
+  let code = null;
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const candidate = randomCode();
+    if (!rooms.has(candidate) && ![...prepared.values()].some((item) => item.code === candidate)) {
+      code = candidate;
+      break;
+    }
+  }
+  if (!code) return busy(res);
+
+  const hostToken = randomToken();
+  const passwordSalt = randomBytes(SALT_LEN);
+  const passwordHash = await scryptAsync(password, passwordSalt);
+  const mode = json.mode === "room" ? "room" : "broadcast";
+  const masterId = randomViewerId();
+  const now = Date.now();
+  prepared.set(hostToken, {
+    code,
+    mode,
+    passwordHash,
+    passwordSalt,
+    admission: json.admission === true,
+    hostNickname: json.nickname,
+    hostToken,
+    preparedAt: now,
+    masterId,
+  });
+  log("info", ip, "prepare", code, "-", mode);
+  ok(res, {
+    ok: true,
+    status: "prepared",
+    host_token: hostToken,
+    prepare_token: hostToken,
+    code,
+    mode,
+    member_id: mode === "room" ? masterId : null,
+  });
+}
+
+function hostTokenFrom(json) {
+  return typeof json.host_token === "string"
+    ? json.host_token
+    : typeof json.prepare_token === "string"
+      ? json.prepare_token
+      : "";
+}
+
+function activeRoomForHostToken(token) {
+  const entry = tokens.get(token);
+  if (!entry || entry.role !== "host") return null;
+  const room = rooms.get(entry.code);
+  return room && room.hostToken === token ? room : null;
+}
+
+function commitResponse(room) {
+  return {
+    ok: true,
+    status: "active",
+    code: room.code,
+    mode: room.mode,
+    member_id: room.mode === "room" ? room.masterId : null,
+  };
+}
+
+/** Publishes one prepared bundle atomically as a normal Room. */
+function handleCommit(ip, json, res) {
+  const token = hostTokenFrom(json);
+  const bundle = prepared.get(token);
+  if (!bundle) {
+    // A lost response can leave the client unsure whether the synchronous
+    // commit completed. The already-issued Host token is sufficient proof;
+    // only the current Host token for a live Room gets the idempotent result.
+    const room = activeRoomForHostToken(token);
+    if (room) return ok(res, commitResponse(room));
+    return deny(res);
+  }
+  const now = Date.now();
+  if (now - bundle.preparedAt > PREPARED_TTL_MS) {
+    prepared.delete(token);
+    return deny(res);
+  }
+  const room = {
+    ...bundle,
+    heartbeatAt: now,
+    hostWs: null,
+    viewers: new Map(),
+    members: new Map(),
+  };
+  if (room.mode === "room") {
+    room.members.set(room.masterId, {
+      id: room.masterId,
+      nickname: room.hostNickname,
+      token,
+      joinedAt: now,
+      heartbeatAt: now,
+      ws: null,
+      share: false,
+      role: "host",
+    });
+  }
+  prepared.delete(token);
+  rooms.set(room.code, room);
+  tokens.set(token, { role: "host", code: room.code, memberId: room.masterId });
+  log("info", ip, "commit", room.code, "-", room.mode);
+  ok(res, commitResponse(room));
+}
+
+function handleAbort(ip, json, res) {
+  const token = hostTokenFrom(json);
+  const bundle = prepared.get(token);
+  if (!bundle) return deny(res);
+  prepared.delete(token);
+  log("info", ip, "abort", bundle.code);
+  ok(res, { ok: true, status: "aborted" });
 }
 
 function handleHeartbeat(ip, json, res) {
@@ -862,6 +1002,14 @@ const server = http.createServer(async (req, res) => {
     switch (path) {
       case "/v1/host/open":
         return await handleOpen(ip, json, res);
+      case "/v1/host/prepare":
+        return await handlePrepare(ip, json, res);
+      case "/v1/host/commit":
+        return handleCommit(ip, json, res);
+      case "/v1/host/activate":
+        return handleCommit(ip, json, res);
+      case "/v1/host/abort":
+        return handleAbort(ip, json, res);
       case "/v1/host/heartbeat":
         return handleHeartbeat(ip, json, res);
       case "/v1/host/rotate":
@@ -954,6 +1102,12 @@ function ghostDue(closedAt, heartbeatAt, now) {
 }
 setInterval(() => {
   const now = Date.now();
+  for (const [token, bundle] of prepared) {
+    if (now - bundle.preparedAt > PREPARED_TTL_MS) {
+      prepared.delete(token);
+      log("info", "-", "gc-prepared", bundle.code);
+    }
+  }
   for (const [code, room] of rooms) {
     if (room.mode === "room") {
       for (const member of [...room.members.values()]) {

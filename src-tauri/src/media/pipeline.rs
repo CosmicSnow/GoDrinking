@@ -38,10 +38,26 @@ const ENCODER_QUEUE_CAPACITY: usize = 8;
 const ACCESS_UNIT_QUEUE_CAPACITY: usize = 16;
 const WORKER_COMPLETION_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Product envelope: the initial supported envelope ends at 60 fps.
+/// Higher rates are rejected before acquisition (capture adapters enforce
+/// this; the engine validates first). Zero is never a valid rate.
+pub(crate) const MAX_SUPPORTED_FPS: u32 = 60;
+
+pub(crate) fn fps_within_envelope(fps: u32) -> bool {
+    (1..=MAX_SUPPORTED_FPS).contains(&fps)
+}
+
 pub(crate) struct PipelineState {
     pub(crate) failed: AtomicBool,
     pub(crate) failure: Mutex<Option<String>>,
     pub(crate) accepting_callbacks: AtomicBool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShutdownStatus {
+    pub(crate) quiesced: bool,
+    pub(crate) pending: Vec<&'static str>,
+    pub(crate) errors: Vec<String>,
 }
 
 struct WorkerCompletion {
@@ -245,11 +261,7 @@ impl EncoderControl {
     /// Live floor update: re-asserts the encoder at the raised floor so a
     /// previously collapsed stream recovers without waiting for REMB.
     pub(crate) fn set_floor(&self, floor: u32) {
-        let (floor, target, current) = (
-            floor,
-            self.target(),
-            self.congestion_bitrate(),
-        );
+        let (floor, target, current) = (floor, self.target(), self.congestion_bitrate());
         let floor = floor.min(target);
         if let Ok(mut slot) = self.floor.lock() {
             *slot = floor;
@@ -317,11 +329,19 @@ impl EncoderControl {
     }
 
     pub(crate) fn floor(&self) -> u32 {
-        self.floor.lock().ok().map(|floor| *floor).unwrap_or(250_000)
+        self.floor
+            .lock()
+            .ok()
+            .map(|floor| *floor)
+            .unwrap_or(250_000)
     }
 
     pub(crate) fn applied(&self) -> u32 {
-        self.applied.lock().ok().map(|applied| *applied).unwrap_or(0)
+        self.applied
+            .lock()
+            .ok()
+            .map(|applied| *applied)
+            .unwrap_or(0)
     }
 
     /// Records the rate actually programmed into a fresh encoder (e.g. the
@@ -390,7 +410,10 @@ impl EncoderControl {
     }
 
     pub(crate) fn congestion_bitrate(&self) -> Option<u32> {
-        self.congestion.lock().ok().and_then(|congestion| *congestion)
+        self.congestion
+            .lock()
+            .ok()
+            .and_then(|congestion| *congestion)
     }
 
     pub(crate) fn request_stop(&self) {
@@ -399,6 +422,12 @@ impl EncoderControl {
 
     fn take_keyframe(&self) -> bool {
         self.keyframe_requested.swap(false, Ordering::AcqRel)
+    }
+
+    /// Test-only read of the coalesced flag (join / PLI-FIR / overflow IDR).
+    #[cfg(test)]
+    pub(crate) fn take_keyframe_for_test(&self) -> bool {
+        self.take_keyframe()
     }
 
     fn take_bitrate(&self) -> Option<u32> {
@@ -580,6 +609,34 @@ impl NativePipeline {
     pub(crate) fn preview_diagnostics(&self) -> Arc<PreviewDiagnostics> {
         Arc::clone(&self.preview_diagnostics)
     }
+
+    /// Stops both pipeline workers and joins them before reporting quiescence.
+    /// A timed-out worker remains owned by the pipeline for a later retry.
+    pub(crate) fn shutdown_and_join(&mut self, timeout: Duration) -> ShutdownStatus {
+        self.shutdown.store(true, Ordering::Release);
+        self.encoder_control.request_stop();
+        let deadline = Instant::now() + timeout;
+        let mut status = ShutdownStatus {
+            quiesced: true,
+            pending: Vec::new(),
+            errors: Vec::new(),
+        };
+        join_pipeline_worker(
+            &mut self.encoder_worker,
+            &self.encoder_completion,
+            deadline,
+            "encoder worker",
+            &mut status,
+        );
+        join_pipeline_worker(
+            &mut self.preview_worker,
+            &self.preview_completion,
+            deadline,
+            "preview worker",
+            &mut status,
+        );
+        status
+    }
 }
 
 fn mark_worker_complete(completion: &WorkerCompletion) {
@@ -589,39 +646,57 @@ fn mark_worker_complete(completion: &WorkerCompletion) {
     }
 }
 
-fn finish_worker(worker: JoinHandle<()>, completion: &Arc<WorkerCompletion>) {
+fn join_pipeline_worker(
+    worker: &mut Option<JoinHandle<()>>,
+    completion: &Arc<WorkerCompletion>,
+    deadline: Instant,
+    component: &'static str,
+    status: &mut ShutdownStatus,
+) {
+    if worker.is_none() {
+        return;
+    }
     let Ok(mut done) = completion.done.lock() else {
-        drop(worker);
+        status.quiesced = false;
+        status
+            .errors
+            .push(format!("{component} completion state is poisoned"));
         return;
     };
     if !*done {
-        let Ok((next, _)) = completion
-            .wake
-            .wait_timeout(done, WORKER_COMPLETION_TIMEOUT)
-        else {
-            drop(worker);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            status.quiesced = false;
+            status.pending.push(component);
+            return;
+        }
+        let Ok((next, _)) = completion.wake.wait_timeout(done, remaining) else {
+            status.quiesced = false;
+            status
+                .errors
+                .push(format!("{component} completion wait failed"));
             return;
         };
         done = next;
     }
-    let completed = *done;
+    if !*done {
+        status.quiesced = false;
+        status.pending.push(component);
+        return;
+    }
     drop(done);
-    if completed {
-        let _ = worker.join();
-    } else {
-        drop(worker);
+    let handle = worker.take().expect("pipeline worker handle still present");
+    if handle.join().is_err() {
+        status.quiesced = false;
+        status.errors.push(format!("{component} panicked"));
     }
 }
 
 impl Drop for NativePipeline {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Release);
-        self.encoder_control.request_stop();
-        if let Some(worker) = self.encoder_worker.take() {
-            finish_worker(worker, &self.encoder_completion);
-        }
-        if let Some(worker) = self.preview_worker.take() {
-            finish_worker(worker, &self.preview_completion);
+        let status = self.shutdown_and_join(WORKER_COMPLETION_TIMEOUT);
+        if !status.quiesced {
+            eprintln!("[goDrinking] pipeline cleanup incomplete: {status:?}");
         }
     }
 }
@@ -649,11 +724,21 @@ fn encoder_bitrate(
     scaled.clamp(preset / 4, preset)
 }
 
+/// macOS encoder input size: the capture stream is already programmed to
+/// the final encode size, but VideoToolbox must never receive an uncapped
+/// frame if capture ever hands one over. Re-applies `final_encode_size`
+/// (1920 Baseline cap + mod16-down align, aspect preserved, never forced to
+/// 16:9) exactly like the Windows encoder-construction safety net, so the
+/// macOS path cannot emit the 2714x764-class frames that black-screen
+/// viewers. Idempotent in steady state. Dimensions stay even (`(w+1)&!1`
+/// floor at minimum).
 #[cfg(target_os = "macos")]
-fn pixel_buffer_size(buffer: &CVPixelBuffer) -> (u32, u32) {
+fn pixel_buffer_size(buffer: &CVPixelBuffer, cap: (u32, u32), baseline: bool) -> (u32, u32) {
     use objc2_core_video::{CVPixelBufferGetHeight, CVPixelBufferGetWidth};
-    let width = (CVPixelBufferGetWidth(buffer) as u32).max(2) & !1;
-    let height = (CVPixelBufferGetHeight(buffer) as u32).max(2) & !1;
+    let raw_width = (CVPixelBufferGetWidth(buffer) as u32).max(2);
+    let raw_height = (CVPixelBufferGetHeight(buffer) as u32).max(2);
+    let (width, height) =
+        super::types::final_encode_size(raw_width, raw_height, cap.0, cap.1, baseline);
     (width.max(2), height.max(2))
 }
 
@@ -661,8 +746,8 @@ fn pixel_buffer_size(buffer: &CVPixelBuffer) -> (u32, u32) {
 fn encoder_worker_loop(
     receiver: Receiver<EncoderCommand>,
     output: AccessUnitQueue,
-    _width: u32,
-    _height: u32,
+    width: u32,
+    height: u32,
     fps: u32,
     quality: TransmissionQuality,
     bitrate_bps: Option<u32>,
@@ -718,7 +803,14 @@ fn encoder_worker_loop(
                     let Some(output) = pending_output.take() else {
                         continue;
                     };
-                    let size = pixel_buffer_size(&frame.pixel_buffer);
+                    // Safety net: capture already programs the final encode
+                    // size into SCStream; re-fit so encoder construction
+                    // always matches the Baseline contract (capped, mod16).
+                    let size = pixel_buffer_size(
+                        &frame.pixel_buffer,
+                        (width, height),
+                        matches!(video_codec, VideoCodec::H264),
+                    );
                     let initial = encoder_bitrate(size.0, size.1, quality, bitrate_bps);
                     control.set_target(initial);
                     control.note_applied(initial);
@@ -864,7 +956,11 @@ fn encoder_worker_loop(
         };
         let software_or_fail = |error: String| {
             if backend == VideoEncoder::Hardware {
-                logger::log("ERROR", "encoder", &format!("explicit Hardware failed: {error}"));
+                logger::log(
+                    "ERROR",
+                    "encoder",
+                    &format!("explicit Hardware failed: {error}"),
+                );
                 state.fail(error);
                 None
             } else {
@@ -930,7 +1026,11 @@ fn encoder_worker_loop(
                         if encoder.is_high_profile() != want_high {
                             let message = format!(
                                 "hardware encoder negotiated {} profile for a {} session",
-                                if encoder.is_high_profile() { "High" } else { "Baseline" },
+                                if encoder.is_high_profile() {
+                                    "High"
+                                } else {
+                                    "Baseline"
+                                },
                                 if want_high { "H.264 High" } else { "H.264" },
                             );
                             eprintln!(
@@ -955,7 +1055,11 @@ fn encoder_worker_loop(
                             );
                             return match software() {
                                 Ok(encoder) => {
-                                    logger::log("INFO", "encoder", "engaged OpenH264 software encoder");
+                                    logger::log(
+                                        "INFO",
+                                        "encoder",
+                                        "engaged OpenH264 software encoder",
+                                    );
                                     Some(WindowsVideoEncoder::Software(encoder))
                                 }
                                 Err(error) => {
@@ -974,7 +1078,11 @@ fn encoder_worker_loop(
                             "encoder",
                             &format!(
                                 "engaged MF hardware encoder ({} profile)",
-                                if encoder.is_high_profile() { "High" } else { "Baseline" }
+                                if encoder.is_high_profile() {
+                                    "High"
+                                } else {
+                                    "Baseline"
+                                }
                             ),
                         );
                         Some(encoder)
@@ -1094,10 +1202,7 @@ fn encoder_worker_loop(
                             logger::log(
                                 "INFO",
                                 "encoder",
-                                &format!(
-                                    "first frame accepted ({}x{})",
-                                    frame.width, frame.height
-                                ),
+                                &format!("first frame accepted ({}x{})", frame.width, frame.height),
                             );
                         }
                     }
@@ -1148,10 +1253,55 @@ fn encoder_worker_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::{FrameRate, TransmissionQuality, VideoCodec, VideoEncoder, VideoResolution};
+    use super::super::types::{
+        FrameRate, TransmissionQuality, VideoCodec, VideoEncoder, VideoResolution,
+    };
     use super::{EncoderCommand, EncoderControl, NativeFrame, NativePipeline, PreviewState};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn sixty_fps_envelope_rejects_high_frame_rates() {
+        use super::{fps_within_envelope, MAX_SUPPORTED_FPS};
+        assert_eq!(MAX_SUPPORTED_FPS, 60);
+        // Supported envelope: 720p30 / 1080p30 / 1080p60 session rates.
+        assert!(fps_within_envelope(30));
+        assert!(fps_within_envelope(60));
+        assert!(!fps_within_envelope(0));
+        assert!(!fps_within_envelope(61));
+        assert!(!fps_within_envelope(120));
+    }
+
+    #[test]
+    fn queue_caps_stay_bounded_for_backpressure() {
+        // Capture 3 / encoder 8 / access-unit 16: overflow drops and forces
+        // a new keyframe instead of growing memory or stalling the session.
+        assert_eq!(super::CAPTURE_QUEUE_CAPACITY, 3);
+        assert_eq!(super::ENCODER_QUEUE_CAPACITY, 8);
+        assert_eq!(super::ACCESS_UNIT_QUEUE_CAPACITY, 16);
+        assert_eq!(super::super::fanout::VIDEO_QUEUE_CAPACITY, 16);
+    }
+
+    #[test]
+    fn macos_encoder_path_applies_baseline_refit() {
+        // Same `final_encode_size` contract the macOS worker applies to every
+        // CVPixelBuffer before VideoToolbox construction: 5120x1440 becomes
+        // 1920x528 Baseline, 3440x1440 keeps 21:9 mod16-aligned, broadcast
+        // sizes pass through, arbitrary aspects are preserved.
+        use super::super::types::final_encode_size;
+        assert_eq!(final_encode_size(5120, 1440, 1920, 1080, true), (1920, 528));
+        let (w, h) = final_encode_size(3440, 1440, 1920, 1080, true);
+        assert_eq!(w, 1920);
+        assert_eq!((w % 16, h % 16), (0, 0));
+        assert!(((w as f64) / (h as f64) - 3440.0 / 1440.0).abs() < 0.03);
+        assert_eq!(
+            final_encode_size(1920, 1080, 1920, 1080, true),
+            (1920, 1080)
+        );
+        assert_eq!(final_encode_size(1280, 720, 1920, 1080, true), (1280, 720));
+        let once = final_encode_size(5120, 1440, 1920, 1080, true);
+        assert_eq!(final_encode_size(once.0, once.1, 1920, 1080, true), once);
+    }
 
     #[test]
     fn probing_climbs_toward_target_when_path_is_clean() {
@@ -1327,7 +1477,7 @@ mod tests {
     fn pipeline_drop_quiesces_workers() {
         let preview = std::sync::Arc::new(PreviewState::new());
         preview.begin_session();
-        let pipeline = NativePipeline::new(
+        let mut pipeline = NativePipeline::new(
             preview,
             VideoResolution::P720,
             FrameRate::Fps30,
@@ -1337,7 +1487,10 @@ mod tests {
             VideoCodec::H264,
             VideoEncoder::Auto,
         );
-        drop(pipeline);
+        let status = pipeline.shutdown_and_join(Duration::from_secs(1));
+        assert!(status.quiesced, "pipeline shutdown status: {status:?}");
+        assert!(status.pending.is_empty());
+        assert!(status.errors.is_empty());
     }
 
     #[test]
