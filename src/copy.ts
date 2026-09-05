@@ -1,6 +1,10 @@
 /** UI copy. English and Brazilian Portuguese. Short, in place. */
 
-export const APP_VERSION = "0.5.0";
+import pkg from "../package.json";
+
+// Single source of truth for the displayed version: package.json.
+// Zero future manual bumps — the vite build inlines the JSON at bundle time.
+export const APP_VERSION: string = pkg.version;
 
 export type Locale = "en" | "pt-BR";
 

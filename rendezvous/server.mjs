@@ -714,7 +714,24 @@ function handleMemberHeartbeat(ip, json, res) {
   if (room.mode === "room") {
     const memberId = entry.memberId || entry.viewerId || room.masterId;
     const member = room.members.get(memberId);
-    if (member) member.heartbeatAt = now;
+    if (member) {
+      member.heartbeatAt = now;
+      // Synchronous share publish: a Start/StopShare heartbeat carries the
+      // member's new share flag so the next roster broadcast echoes it
+      // verbatim (share, state, master per member). Applied immediately with
+      // no debounce that could hide a fresh share:true.
+      const share =
+        typeof json.share === "boolean"
+          ? json.share
+          : typeof json.sharing === "boolean"
+            ? json.sharing
+            : null;
+      if (share !== null && member.share !== share) {
+        member.share = share;
+        log("info", ip, "share", room.code, memberId, share ? "start" : "stop");
+        broadcastRoster(room);
+      }
+    }
   } else if (entry.role === "viewer" && entry.viewerId) {
     const viewer = room.viewers.get(entry.viewerId);
     if (viewer) viewer.heartbeatAt = now;

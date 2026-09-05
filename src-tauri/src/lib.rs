@@ -359,6 +359,56 @@ fn poll_stunar_offers(engine: State<'_, MediaEngine>) -> Vec<PublicIncomingOffer
         .collect()
 }
 
+#[derive(serde::Deserialize, Default)]
+struct RequeueOfferPayload {
+    #[serde(default)]
+    from: String,
+    #[serde(default)]
+    sdp: String,
+    #[serde(default)]
+    offer_attempt: String,
+}
+
+/// Tolerant shape for the Viewer lane: either `{ offer: { from, sdp,
+/// offer_attempt } }` or the same fields flattened. Unknown shapes are
+/// rejected without touching engine state.
+#[derive(serde::Deserialize)]
+struct RequeueOfferRequest {
+    #[serde(default)]
+    offer: Option<RequeueOfferPayload>,
+    #[serde(default)]
+    from: String,
+    #[serde(default)]
+    sdp: String,
+    #[serde(default)]
+    offer_attempt: String,
+}
+
+/// Puts a drained Stunar offer back at the front of the incoming-offers
+/// queue so the next `poll_stunar_offers` yields the same offer again.
+#[tauri::command]
+fn requeue_stunar_offer(
+    engine: State<'_, MediaEngine>,
+    request: RequeueOfferRequest,
+) -> Result<(), String> {
+    let (from, sdp, offer_attempt) = match request.offer {
+        Some(offer)
+            if !offer.from.is_empty()
+                || !offer.sdp.is_empty()
+                || !offer.offer_attempt.is_empty() =>
+        {
+            (offer.from, offer.sdp, offer.offer_attempt)
+        }
+        _ => (request.from, request.sdp, request.offer_attempt),
+    };
+    if from.is_empty() || sdp.is_empty() {
+        return Err("offer is missing sender or SDP".into());
+    }
+    engine
+        .requeue_incoming_offer(from, sdp, &offer_attempt)
+        .map_err(|error| error.to_string())
+}
+
 #[derive(serde::Deserialize)]
 struct RoomSignalRequest {
     to: String,
@@ -569,6 +619,7 @@ pub fn run() {
             get_firewall_status,
             run_media_benchmark,
             poll_stunar_offers,
+            requeue_stunar_offer,
             send_stunar_room_answer,
             send_stunar_room_offer,
             create_member_offer,
