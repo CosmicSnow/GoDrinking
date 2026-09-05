@@ -35,3 +35,7 @@ jobs:
         with:
           workspaces: src-tauri -> target
       - run: cargo test --manifest-path src-tauri/Cargo.toml
+        env:
+          # Same as release.yml: Opus's bundled CMakeLists still declares
+          # cmake_minimum_required < 3.5, which stock CMake now rejects.
+          CMAKE_POLICY_VERSION_MINIMUM: 3.5
