@@ -1047,8 +1047,16 @@ fn encoder_worker_loop(
                     let Some(output) = pending_output.take() else {
                         continue;
                     };
-                    let width = frame.width.max(2) & !1;
-                    let height = frame.height.max(2) & !1;
+                    // Safety net: capture already fits frames to the final
+                    // encode size; re-fit so encoder construction always
+                    // matches what encode() produces (capped, mod16).
+                    let (width, height) = super::types::final_encode_size(
+                        frame.width,
+                        frame.height,
+                        frame.width,
+                        frame.height,
+                        matches!(video_codec, VideoCodec::H264),
+                    );
                     let initial = encoder_bitrate(width, height, quality, bitrate_bps);
                     control.set_target(initial);
                     control.note_applied(initial);

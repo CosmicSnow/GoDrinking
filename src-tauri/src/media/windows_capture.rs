@@ -13,7 +13,7 @@ use super::logger;
 use super::pipeline::{EncoderCommand, NativeFrame, PreviewDiagnostics};
 use super::types::{
     CaptureSource, CreateMediaSessionRequest, FrameRate, NativeCaptureSource, NativeRunningApp,
-    NativeSourceKind, VideoResolution,
+    NativeSourceKind, VideoCodec, VideoResolution,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -45,6 +45,7 @@ struct CaptureFlags {
     generation: u64,
     target_width: u32,
     target_height: u32,
+    baseline_cap: bool,
     min_frame_interval: Duration,
 }
 
@@ -68,8 +69,9 @@ const PREVIEW_WIDTH: u32 = 160;
 const PREVIEW_HEIGHT: u32 = 90;
 
 // Session encode ceiling per axis, from the request resolution. Source
-// frames are fit inside preserving aspect ratio (a 5120x1440 ultrawide
-// becomes 1920x540 at High), always even for the encoder.
+// frames are fit to the final encode size (Baseline additionally capped
+// to 1920 wide, everything macroblock-aligned), so the encoder queue
+// never re-scales: a 5120x1440 ultrawide arrives as 1920x528 Baseline.
 fn encode_ceiling(resolution: VideoResolution) -> (u32, u32) {
     match resolution {
         VideoResolution::P2160 => (3840, 2160),
@@ -80,8 +82,14 @@ fn encode_ceiling(resolution: VideoResolution) -> (u32, u32) {
     }
 }
 
-fn fit_within(src_width: u32, src_height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
-    crate::media::types::fitted_even_size(src_width, src_height, max_width, max_height)
+fn fit_within(
+    src_width: u32,
+    src_height: u32,
+    max_width: u32,
+    max_height: u32,
+    baseline: bool,
+) -> (u32, u32) {
+    crate::media::types::final_encode_size(src_width, src_height, max_width, max_height, baseline)
 }
 
 // Nearest-neighbor BGRA downscale over a possibly-padded source (row
@@ -186,6 +194,7 @@ struct CaptureHandler {
     generation: u64,
     target_width: u32,
     target_height: u32,
+    baseline_cap: bool,
     min_frame_interval: Duration,
     last_processed: Option<Instant>,
     sequence: AtomicU64,
@@ -209,6 +218,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             generation: context.flags.generation,
             target_width: context.flags.target_width,
             target_height: context.flags.target_height,
+            baseline_cap: context.flags.baseline_cap,
             min_frame_interval: context.flags.min_frame_interval,
             last_processed: None,
             sequence: AtomicU64::new(0),
@@ -261,7 +271,13 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         // whole app). The mapped source pixels are resampled in place into a
         // session-size BGRA frame plus a small RGB preview thumbnail, with
         // no full-frame copy (stride-aware, zero-copy even with padding).
-        let (enc_width, enc_height) = fit_within(width, height, self.target_width, self.target_height);
+        let (enc_width, enc_height) = fit_within(
+            width,
+            height,
+            self.target_width,
+            self.target_height,
+            self.baseline_cap,
+        );
         let t_buf_start = Instant::now();
         let mut fb = match frame.buffer() {
             Ok(fb) => fb,
@@ -419,6 +435,10 @@ impl WindowsCaptureAdapter {
         }
         let fps = request.effective_frame_rate().hertz();
         let (target_width, target_height) = encode_ceiling(request.resolution);
+        // Baseline sessions encode at most 1920 wide: fit straight to the
+        // final size here so the encoder never re-scales (and the MFT gets
+        // macroblock-aligned input it accepts).
+        let baseline_cap = matches!(request.codec, VideoCodec::H264);
         let min_frame_interval = Duration::from_micros(1_000_000 / fps as u64);
         logger::log(
             "INFO",
@@ -435,6 +455,7 @@ impl WindowsCaptureAdapter {
             generation,
             target_width,
             target_height,
+            baseline_cap,
             min_frame_interval,
         };
         let control = match resolve_target(request)? {

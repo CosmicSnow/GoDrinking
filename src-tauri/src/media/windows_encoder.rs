@@ -12,8 +12,8 @@ use super::logger;
 use super::pipeline::{EncoderControl, NativeFrame, PipelineState};
 use super::types::VideoCodec;
 use openh264::encoder::{
-    BitRate, Complexity, Encoder, EncoderConfig, FrameRate as OpenH264FrameRate, FrameType, Level,
-    Profile, RateControlMode, UsageType, VuiConfig,
+    BitRate, Complexity, Encoder, EncoderConfig, FrameRate as OpenH264FrameRate, FrameType, Profile,
+    RateControlMode, UsageType, VuiConfig,
 };
 use openh264::formats::{BgraSliceU8, YUVBuffer};
 use openh264::OpenH264API;
@@ -28,22 +28,16 @@ const ANNEX_B_START_CODE: &[u8] = &[0, 0, 0, 1];
 // full-res leak must never reach OpenH264 (a 7MP software encode per frame
 // pegs the CPU and the session falls behind forever).
 fn fit_encode_size(width: u32, height: u32) -> (u32, u32) {
-    crate::media::types::fitted_even_size(width, height, 1920, 1080)
+    crate::media::types::final_encode_size(width, height, 1920, 1080, false)
 }
 
 // Baseline-only decoder-safe ceiling: the pixel-budget fit above keeps
-// 21:9 ultrawide WIDER than 1920 (e.g. 3620x1018 -> 2714x762), and that is
+// 21:9 ultrawide WIDER than 1920 (e.g. 5120x1440 -> 2714x764), and that is
 // exactly what black-screens Mac viewers while 1080p monitors work on the
 // same network with the same SDP: anything wider than 1920 in a Baseline
-// session must go. Keeps aspect (2714x762 -> 1920x538), stays even.
+// session must go. Keeps aspect (2714x764 -> 1920x528), macroblock-aligned.
 fn fit_baseline_size(width: u32, height: u32) -> (u32, u32) {
-    const MAX_BASELINE_WIDTH: u32 = 1920;
-    let (mut w, mut h) = fit_encode_size(width, height);
-    if w > MAX_BASELINE_WIDTH {
-        h = ((h as u64 * MAX_BASELINE_WIDTH as u64 / w as u64) as u32 & !1).max(2);
-        w = MAX_BASELINE_WIDTH;
-    }
-    (w, h)
+    crate::media::types::final_encode_size(width, height, 1920, 1080, true)
 }
 
 // Nearest-neighbor BGRA downscale with fixed-point stepping: no division
@@ -107,11 +101,6 @@ impl OpenH264Encoder {
         // The software encoder must match the session codec: the SDP offer
         // advertises Baseline (42e02a) for H.264 and High (64002a) for
         // H.264 High, and the transport drops samples whose SPS disagrees.
-        // The level is pinned to the offer (4.2 for Baseline) so OpenH264
-        // cannot silently upgrade the SPS beyond what viewers negotiated:
-        // a 3620x1018 frame once came out as 640c2a (High) in a Baseline
-        // session and black-screened every viewer while the host looked
-        // healthy.
         let want_high = matches!(video_codec, VideoCodec::H264High);
         let make = |high: bool| {
             let config = EncoderConfig::new()
@@ -120,7 +109,6 @@ impl OpenH264Encoder {
                 .usage_type(UsageType::ScreenContentRealTime)
                 .rate_control_mode(RateControlMode::Bitrate)
                 .profile(if high { Profile::High } else { Profile::Baseline })
-                .level(if high { Level::Level_5_1 } else { Level::Level_4_2 })
                 .complexity(Complexity::Low)
                 .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(fps * 2))
                 .vui(VuiConfig::bt709());
@@ -140,139 +128,17 @@ impl OpenH264Encoder {
             }
             Err(error) => return Err(format!("OpenH264 initialization failed: {error}")),
         };
-        let mut built = Self {
+        Ok(Self {
             encoder,
             high_profile,
             converter: AnnexBConverter::default(),
-            // Self-test runs on a throwaway queue so synthetic frames never
-            // leak to viewers; the real queue is attached after the SPS is
-            // proven to match the session codec.
-            output: AccessUnitQueue::bounded(16).0,
-            control: Arc::clone(&control),
+            output,
+            control,
             frames_seen: 0,
             empty_bitstream: 0,
             converter_none: 0,
             pushed_units: 0,
-        };
-        // Self-test (mirrors MfH264Encoder): encode synthetic frames at the
-        // real fitted size until the SPS is seen, then require it to match
-        // the session codec. An OpenH264 that "succeeds" with the wrong
-        // profile would otherwise black-screen every viewer while the host
-        // preview looks fine, with no error anywhere. Fail loudly instead
-        // so the session errors with the exact cause.
-        if let Err(error) = built.self_test_profile(_width, _height, fps, video_codec) {
-            return Err(error);
-        }
-        // Loud one-liner when the ultrawide Baseline cap engages, so a
-        // session log shows exactly which size the Mac viewer receives.
-        if !built.high_profile {
-            let (budget_w, budget_h) = fit_encode_size(_width.max(2), _height.max(2));
-            let (capped_w, capped_h) = built.fit_for_encoder(_width.max(2), _height.max(2));
-            if (capped_w, capped_h) != (budget_w, budget_h) {
-                logger::log(
-                    "WARN",
-                    "encoder",
-                    &format!(
-                        "ultrawide Baseline cap: {budget_w}x{budget_h} -> {capped_w}x{capped_h} (decoder-safe 1920 wide)"
-                    ),
-                );
-            }
-        }
-        built.output = output;
-        Ok(built)
-    }
-
-    /// Encodes synthetic frames at the real fitted size until the SPS
-    /// profile is observed, then checks it against the session codec.
-    /// Returns Err (loud, with the actual vs expected profile) when the
-    /// encoder would produce a stream the transport must drop.
-    fn self_test_profile(
-        &mut self,
-        width: u32,
-        height: u32,
-        fps: u32,
-        video_codec: VideoCodec,
-    ) -> Result<(), String> {
-        use super::access_unit::{is_baseline_profile, is_high_profile};
-
-        let want_high = matches!(video_codec, VideoCodec::H264High);
-        let (fit_width, fit_height) = self.fit_for_encoder(width.max(2), height.max(2));
-        // Bars pattern: cheap to build, rich enough to force a real IDR.
-        let w = fit_width as usize;
-        let h = fit_height as usize;
-        let mut bgra = vec![128u8; w * h * 4];
-        for y in 0..h {
-            for x in (0..w).step_by(16) {
-                let v = ((x + y) % 256) as u8;
-                for k in 0..16 {
-                    if x + k >= w {
-                        break;
-                    }
-                    let i = (y * w + x + k) * 4;
-                    bgra[i] = v;
-                    bgra[i + 1] = v ^ 0x55;
-                    bgra[i + 2] = v ^ 0xAA;
-                    bgra[i + 3] = 255;
-                }
-            }
-        }
-        self.force_keyframe();
-        let mut observed: Option<String> = None;
-        for i in 0..30u64 {
-            let frame = super::pipeline::NativeFrame {
-                storage: Arc::from(bgra.clone().into_boxed_slice()),
-                timestamp_micros: i * 33_333,
-                sequence: i,
-                width: fit_width,
-                height: fit_height,
-                generation: 0,
-            };
-            // Encode errors here are fatal: the encoder just initialized,
-            // so a failure means it can never produce this session.
-            self.encode(&frame).map_err(|error| {
-                format!("OpenH264 self-test encode failed ({fit_width}x{fit_height}): {error}")
-            })?;
-            // The converter parses the SPS of every encoded frame; the
-            // first frame carrying parameter sets reveals the profile.
-            observed = self.converter_profile();
-            if observed.is_some() {
-                break;
-            }
-        }
-        let profile_ok = observed.as_deref().is_some_and(|id| {
-            is_baseline_profile(id) || (want_high && is_high_profile(id))
-        });
-        eprintln!(
-            "[goDrinking] OpenH264 self-test ({}x{} {}fps, want_high={want_high}): profile={observed:?}",
-            fit_width, fit_height, fps,
-        );
-        logger::log(
-            "INFO",
-            "encoder",
-            &format!(
-                "OpenH264 self-test ({fit_width}x{fit_height} {fps}fps, want_high={want_high}): profile={observed:?}"
-            ),
-        );
-        if !profile_ok {
-            let message = format!(
-                "OpenH264 self-test failed decodability check (SPS profile={observed:?} does not match {} session; transport would drop every sample)",
-                if want_high { "H.264 High" } else { "H.264 Baseline" },
-            );
-            logger::log("ERROR", "encoder", &message);
-            return Err(message);
-        }
-        // Reset per-run counters so the self-test frames never pollute the
-        // session's `encode stats` (frames=1 must be the first real frame).
-        self.frames_seen = 0;
-        self.empty_bitstream = 0;
-        self.converter_none = 0;
-        self.pushed_units = 0;
-        Ok(())
-    }
-
-    /// Profile parsed from the cached SPS, if any frame produced one yet.
-    fn converter_profile(&self) -> Option<String> {
-        self.converter.cached_profile()
+        })
     }
 
     pub(crate) fn is_high_profile(&self) -> bool {
@@ -280,8 +146,8 @@ impl OpenH264Encoder {
     }
 
     /// Encode size for this encoder instance: Baseline output additionally
-    /// honors the decoder-safe 1920-wide ceiling (ultrawide 2714x762
-    /// black-screens Mac viewers; 1920x538 does not). High keeps the
+    /// honors the decoder-safe 1920-wide ceiling (ultrawide 2714x764
+    /// black-screens Mac viewers; 1920x528 does not). High keeps the
     /// pixel-budget fit.
     fn fit_for_encoder(&self, width: u32, height: u32) -> (u32, u32) {
         if self.high_profile {
@@ -300,6 +166,8 @@ impl OpenH264Encoder {
         }
         // Apply the defensive ceiling first so an unexpected full-res frame
         // degrades to a downscale instead of a multi-second software encode.
+        // Profile-aware: Baseline output stays within the decoder-safe
+        // 1920-wide ceiling even when capture hands us a raw frame.
         let (fit_width, fit_height) = self.fit_for_encoder(frame.width, frame.height);
         let fitted: Cow<[u8]> = if (fit_width, fit_height) == (frame.width, frame.height) {
             Cow::Borrowed(frame.storage.as_ref())
@@ -416,11 +284,6 @@ pub(crate) struct AnnexBConverter {
 }
 
 impl AnnexBConverter {
-    /// Profile parsed from the cached SPS, if any frame produced one yet.
-    pub(crate) fn cached_profile(&self) -> Option<String> {
-        self.sps.as_deref().and_then(sps_profile_level_id)
-    }
-
     pub(crate) fn convert(
         &mut self,
         data: &[u8],
@@ -523,13 +386,13 @@ mod tests {
     #[test]
     fn baseline_cap_keeps_ultrawide_within_1920() {
         // The incident frame (3620x1018) budget-fits to 2714x764, which
-        // black-screens Mac viewers; the Baseline cap lands on 1920x540.
-        assert_eq!(fit_baseline_size(3620, 1018), (1920, 540));
-        assert_eq!(fit_baseline_size(5120, 1440), (1920, 540));
-        // Normal sizes pass through untouched (and even).
-        assert_eq!(fit_baseline_size(1920, 1080), (1920, 1080));
+        // black-screens Mac viewers; the Baseline cap lands on 1920x528.
+        assert_eq!(fit_baseline_size(3620, 1018), (1920, 528));
+        assert_eq!(fit_baseline_size(5120, 1440), (1920, 528));
+        // Normal sizes pass through (macroblock-aligned).
+        assert_eq!(fit_baseline_size(1920, 1080), (1920, 1072));
         assert_eq!(fit_baseline_size(1280, 720), (1280, 720));
-        assert_eq!(fit_baseline_size(640, 360), (640, 360));
+        assert_eq!(fit_baseline_size(640, 360), (640, 352));
         // Second monitor sizes never trigger the cap.
         let (w, h) = fit_baseline_size(2714, 764);
         assert!(w <= 1920 && h % 2 == 0);

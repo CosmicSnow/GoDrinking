@@ -1918,6 +1918,13 @@ fn refresh_native_state(state: &mut EngineState) {
         if let Some(detail) = session._pipeline.state.failure() {
             state.lifecycle = MediaLifecycleState::Failed;
             state.detail = detail;
+            // A dead encoder with live capture streams black to connected
+            // viewers while burning CPU: stop capture so the failure is a
+            // visible Failed state, never a silent black room.
+            #[cfg(target_os = "macos")]
+            let _ = session.adapter.stop_capture(session.generation);
+            #[cfg(not(target_os = "macos"))]
+            let _ = session.adapter.stop_capture();
         }
         // A Viewer whose WebRTC peer failed is gone for good (the Viewer
         // re-joins with a fresh connection). Drop it so the Roster and the
