@@ -139,7 +139,7 @@ describe("APP_VERSION (single source of truth)", () => {
     expect(APP_VERSION).toBe(pkg.version);
   });
 
-  it("displays 0.6.0", () => {
-    expect(APP_VERSION).toBe("0.6.0");
+  it("is a plain version string (never hardcoded per release)", () => {
+    expect(APP_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
   });
 });
