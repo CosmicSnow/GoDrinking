@@ -236,6 +236,7 @@ function App() {
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const remoteStreamRef = useRef<MediaStream | null>(null);
   const liveSettingsApplied = useRef(false);
+  const failedNoticeRef = useRef(false);
   const joinSeqRef = useRef(0);
   const active = session?.state === "running" || Boolean(session?.native_capture_active);
   const connected = session?.peer_state === "connected";
@@ -491,6 +492,12 @@ function App() {
         if (!salaAliveRef.current) return;
         setSession(next);
         if (next.preview_error) setNotice(`Native preview: ${next.preview_error}`);
+        if (next.state === "failed" && !failedNoticeRef.current) {
+          failedNoticeRef.current = true;
+          setNotice(next.detail || "Screen sharing failed.");
+        } else if (next.state !== "failed" && failedNoticeRef.current) {
+          failedNoticeRef.current = false;
+        }
         const frame = await invokeMedia<{ width: number; height: number; encoding: string; payload: number[] } | null>("get_media_preview");
         if (frame && frame.encoding === "rgb8_thumbnail" && canvasRef.current) {
           const rgba = rgbToRgba(frame.payload, frame.width, frame.height);

@@ -75,6 +75,31 @@ pub(crate) fn fitted_even_size(
     (width.max(2), height.max(2))
 }
 
+/// Single home for capture and encoder sizing: pixel-budget fit inside the
+/// session ceiling, Baseline sessions additionally capped to 1920 wide
+/// (wider Baseline black-screens some decoders), then macroblock-aligned
+/// down (Media Foundation MFTs reject non-mod16 input such as 2714x764).
+/// Idempotent: feeding an already-final size back returns it unchanged.
+pub(crate) fn final_encode_size(
+    src_width: u32,
+    src_height: u32,
+    max_width: u32,
+    max_height: u32,
+    baseline: bool,
+) -> (u32, u32) {
+    const MAX_BASELINE_WIDTH: u32 = 1920;
+    const MACROBLOCK: u32 = 16;
+    let (mut width, mut height) = fitted_even_size(src_width, src_height, max_width, max_height);
+    if baseline && width > MAX_BASELINE_WIDTH {
+        height = ((height as u64 * MAX_BASELINE_WIDTH as u64 / width as u64) as u32 & !1).max(2);
+        width = MAX_BASELINE_WIDTH;
+    }
+    (
+        (width & !(MACROBLOCK - 1)).max(MACROBLOCK),
+        (height & !(MACROBLOCK - 1)).max(MACROBLOCK),
+    )
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum FrameRate {
     #[serde(rename = "120_fps")]
@@ -620,6 +645,28 @@ mod tests {
     #[test]
     fn fitted_size_never_upscales() {
         assert_eq!(fitted_even_size(800, 600, 1920, 1080), (800, 600));
+    }
+
+    #[test]
+    fn final_size_caps_baseline_and_aligns_macroblock() {
+        use super::final_encode_size;
+        // O caso do incidente: ultrawide Baseline vira 1920 de largura e
+        // altura multipla de 16 (MFTs rejeitam 2714x764).
+        assert_eq!(final_encode_size(5120, 1440, 1920, 1080, true), (1920, 528));
+        assert_eq!(final_encode_size(3620, 1018, 1920, 1080, true), (1920, 528));
+        // High mantem o budget fit, so alinhado.
+        let (w, h) = final_encode_size(5120, 1440, 1920, 1080, false);
+        assert!(w * h <= 1920 * 1080);
+        assert_eq!((w % 16, h % 16), (0, 0));
+        // Tamanhos comuns passam quase intactos (so alinhamento).
+        assert_eq!(
+            final_encode_size(1920, 1080, 1920, 1080, true),
+            (1920, 1072)
+        );
+        assert_eq!(final_encode_size(1280, 720, 1920, 1080, true), (1280, 720));
+        // Idempotente: reaplicar nao muda nada.
+        let once = final_encode_size(5120, 1440, 1920, 1080, true);
+        assert_eq!(final_encode_size(once.0, once.1, 1920, 1080, true), once);
         assert_eq!(fitted_even_size(854, 480, 1280, 720), (854, 480));
     }
 
