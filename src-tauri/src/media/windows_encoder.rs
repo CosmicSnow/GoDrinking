@@ -31,6 +31,21 @@ fn fit_encode_size(width: u32, height: u32) -> (u32, u32) {
     crate::media::types::fitted_even_size(width, height, 1920, 1080)
 }
 
+// Baseline-only decoder-safe ceiling: the pixel-budget fit above keeps
+// 21:9 ultrawide WIDER than 1920 (e.g. 3620x1018 -> 2714x762), and that is
+// exactly what black-screens Mac viewers while 1080p monitors work on the
+// same network with the same SDP: anything wider than 1920 in a Baseline
+// session must go. Keeps aspect (2714x762 -> 1920x538), stays even.
+fn fit_baseline_size(width: u32, height: u32) -> (u32, u32) {
+    const MAX_BASELINE_WIDTH: u32 = 1920;
+    let (mut w, mut h) = fit_encode_size(width, height);
+    if w > MAX_BASELINE_WIDTH {
+        h = ((h as u64 * MAX_BASELINE_WIDTH as u64 / w as u64) as u32 & !1).max(2);
+        w = MAX_BASELINE_WIDTH;
+    }
+    (w, h)
+}
+
 // Nearest-neighbor BGRA downscale with fixed-point stepping: no division
 // in the hot loop. Mirrors the capture-side resampler: the per-pixel
 // division version cost tens of ms per frame and starved the encoder.
@@ -148,6 +163,21 @@ impl OpenH264Encoder {
         if let Err(error) = built.self_test_profile(_width, _height, fps, video_codec) {
             return Err(error);
         }
+        // Loud one-liner when the ultrawide Baseline cap engages, so a
+        // session log shows exactly which size the Mac viewer receives.
+        if !built.high_profile {
+            let (budget_w, budget_h) = fit_encode_size(_width.max(2), _height.max(2));
+            let (capped_w, capped_h) = built.fit_for_encoder(_width.max(2), _height.max(2));
+            if (capped_w, capped_h) != (budget_w, budget_h) {
+                logger::log(
+                    "WARN",
+                    "encoder",
+                    &format!(
+                        "ultrawide Baseline cap: {budget_w}x{budget_h} -> {capped_w}x{capped_h} (decoder-safe 1920 wide)"
+                    ),
+                );
+            }
+        }
         built.output = output;
         Ok(built)
     }
@@ -166,7 +196,7 @@ impl OpenH264Encoder {
         use super::access_unit::{is_baseline_profile, is_high_profile};
 
         let want_high = matches!(video_codec, VideoCodec::H264High);
-        let (fit_width, fit_height) = fit_encode_size(width.max(2), height.max(2));
+        let (fit_width, fit_height) = self.fit_for_encoder(width.max(2), height.max(2));
         // Bars pattern: cheap to build, rich enough to force a real IDR.
         let w = fit_width as usize;
         let h = fit_height as usize;
@@ -249,6 +279,18 @@ impl OpenH264Encoder {
         self.high_profile
     }
 
+    /// Encode size for this encoder instance: Baseline output additionally
+    /// honors the decoder-safe 1920-wide ceiling (ultrawide 2714x762
+    /// black-screens Mac viewers; 1920x538 does not). High keeps the
+    /// pixel-budget fit.
+    fn fit_for_encoder(&self, width: u32, height: u32) -> (u32, u32) {
+        if self.high_profile {
+            fit_encode_size(width, height)
+        } else {
+            fit_baseline_size(width, height)
+        }
+    }
+
     pub(crate) fn encode(&mut self, frame: &NativeFrame) -> Result<(), String> {
         if frame.width < 2 || frame.height < 2 {
             return Ok(());
@@ -258,7 +300,7 @@ impl OpenH264Encoder {
         }
         // Apply the defensive ceiling first so an unexpected full-res frame
         // degrades to a downscale instead of a multi-second software encode.
-        let (fit_width, fit_height) = fit_encode_size(frame.width, frame.height);
+        let (fit_width, fit_height) = self.fit_for_encoder(frame.width, frame.height);
         let fitted: Cow<[u8]> = if (fit_width, fit_height) == (frame.width, frame.height) {
             Cow::Borrowed(frame.storage.as_ref())
         } else {
@@ -476,7 +518,22 @@ fn next_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{annex_b_nals, AnnexBConverter};
+    use super::{annex_b_nals, fit_baseline_size, AnnexBConverter};
+
+    #[test]
+    fn baseline_cap_keeps_ultrawide_within_1920() {
+        // The incident frame (3620x1018) budget-fits to 2714x764, which
+        // black-screens Mac viewers; the Baseline cap lands on 1920x540.
+        assert_eq!(fit_baseline_size(3620, 1018), (1920, 540));
+        assert_eq!(fit_baseline_size(5120, 1440), (1920, 540));
+        // Normal sizes pass through untouched (and even).
+        assert_eq!(fit_baseline_size(1920, 1080), (1920, 1080));
+        assert_eq!(fit_baseline_size(1280, 720), (1280, 720));
+        assert_eq!(fit_baseline_size(640, 360), (640, 360));
+        // Second monitor sizes never trigger the cap.
+        let (w, h) = fit_baseline_size(2714, 764);
+        assert!(w <= 1920 && h % 2 == 0);
+    }
 
     #[test]
     fn splits_annex_b_with_three_and_four_byte_start_codes() {
