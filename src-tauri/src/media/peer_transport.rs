@@ -1656,7 +1656,14 @@ mod tests {
         let a = super::timestamp_from_90khz(t0).expect("a converts");
         let b = super::timestamp_from_90khz(t0 + 1_500).expect("b converts");
         assert!(b > a);
-        assert_eq!(b.duration_since(a).expect("monotonic"), frame);
+        // SystemTime precision is platform-dependent (100ns FILETIME ticks
+        // on Windows), so compare the round-trip numerically within 1µs
+        // instead of exact Duration equality.
+        let round_trip = b.duration_since(a).expect("monotonic");
+        assert!(
+            round_trip.as_nanos().abs_diff(frame.as_nanos()) <= 1_000,
+            "60fps tick-grid round-trip out of tolerance: got {round_trip:?}, want {frame:?}"
+        );
         assert_eq!(super::timestamp_from_90khz(u64::MAX), None);
     }
 
