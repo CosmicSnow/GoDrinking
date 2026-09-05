@@ -800,9 +800,25 @@ impl StunarHost {
         if !self.ingress.is_active() {
             return Err("Stunar Session is prepared but not committed.".to_owned());
         }
-        self.outgoing
-            .send(Outgoing::Share { start })
-            .map_err(|_| "Stunar is unreachable.".to_owned())
+        // Optimistic local flip so room_roster() reflects the new share
+        // within one heartbeat even before the server roster echo arrives.
+        // The server broadcast remains authoritative and overwrites this.
+        mark_local_share(&self.roster, self.self_id.as_deref(), start);
+        let queued = self.outgoing.send(Outgoing::Share { start });
+        // Synchronous share publish: the heartbeat carries sharing=true/false
+        // now instead of waiting for the next periodic tick, so a Sala
+        // roster (and the Watch button) flips on Start/StopShare.
+        if let (Ok(runtime), Ok(client)) = (current_thread_runtime(), http_client()) {
+            let _ = runtime.block_on(post_heartbeat(
+                &client,
+                &self.base,
+                &self.host_token,
+                Some(start),
+            ));
+        }
+        // Redacted by construction: sharing flag only, never tokens or SDP.
+        logger::log("INFO", "stunar share", &format!("sharing={start}"));
+        queued.map_err(|_| "Stunar is unreachable.".to_owned())
     }
 
     pub(crate) fn send_watch(&self, to: &str, start: bool) -> Result<(), String> {
@@ -883,6 +899,20 @@ impl StunarHost {
     /// Closes the room on the Rendezvous and stops the worker.
     pub(crate) fn close(&self) {
         logger::log("INFO", "stunar close", "room closed");
+        // Publish share:false synchronously so a sharing member's roster
+        // flag never lingers true after the Session ends. Best-effort and
+        // outside all locks, like the close itself.
+        mark_local_share(&self.roster, self.self_id.as_deref(), false);
+        if self.committed.load(Ordering::Acquire) {
+            if let (Ok(runtime), Ok(client)) = (current_thread_runtime(), http_client()) {
+                let _ = runtime.block_on(post_heartbeat(
+                    &client,
+                    &self.base,
+                    &self.host_token,
+                    Some(false),
+                ));
+            }
+        }
         self.ingress.deactivate();
         self.shutdown.store(true, Ordering::Release);
         let _ = self.outgoing.send(Outgoing::Close);
@@ -1134,11 +1164,19 @@ async fn post_heartbeat(
     client: &reqwest::Client,
     base: &str,
     host_token: &str,
+    sharing: Option<bool>,
 ) -> Result<(), String> {
     let base = normalize_base(base);
+    // The share flag rides the heartbeat so a Sala roster flips
+    // share:true/false synchronously on Start/StopShare instead of waiting
+    // for the next periodic heartbeat. `None` leaves the stored flag alone.
+    let mut body = json!({ "host_token": host_token });
+    if let Some(sharing) = sharing {
+        body["share"] = json!(sharing);
+    }
     let response = client
         .post(format!("{base}/v1/host/heartbeat"))
-        .json(&json!({ "host_token": host_token }))
+        .json(&body)
         .send()
         .await
         .map_err(|_| "Stunar is unreachable.".to_owned())?;
@@ -1158,11 +1196,19 @@ async fn post_member_heartbeat(
     client: &reqwest::Client,
     base: &str,
     token: &str,
+    sharing: Option<bool>,
 ) -> Result<(), String> {
     let base = normalize_base(base);
+    // Same synchronous share publish as the host heartbeat: `Some`
+    // flips the member's roster share flag now, `None` only refreshes
+    // presence for the periodic tick.
+    let mut body = json!({ "token": token });
+    if let Some(sharing) = sharing {
+        body["share"] = json!(sharing);
+    }
     let response = client
         .post(format!("{base}/v1/member/heartbeat"))
-        .json(&json!({ "token": token }))
+        .json(&body)
         .send()
         .await
         .map_err(|_| "Stunar is unreachable.".to_owned())?;
@@ -1254,6 +1300,28 @@ async fn post_close(client: &reqwest::Client, base: &str, host_token: &str) -> R
     }
 }
 
+/// Optimistic local share flip for the caller's own roster entry. The
+/// server roster broadcast stays authoritative; this only makes
+/// room_roster() reflect Start/StopShare within one heartbeat instead of
+/// waiting for the echo round-trip.
+fn mark_local_share(
+    roster: &Arc<Mutex<HashMap<String, RosterViewer>>>,
+    self_id: Option<&str>,
+    sharing: bool,
+) {
+    let Some(self_id) = self_id else { return };
+    if let Ok(mut roster) = roster.lock() {
+        if let Some(entry) = roster.get_mut(self_id) {
+            entry.share = sharing;
+            if sharing {
+                entry.state = "sharing".into();
+            } else if entry.state == "sharing" {
+                entry.state = "accepted".into();
+            }
+        }
+    }
+}
+
 async fn host_worker(
     base: String,
     host_token: String,
@@ -1291,7 +1359,9 @@ async fn host_worker(
                 continue;
             }
             let ok = match &client {
-                Some(client) => post_heartbeat(client, &hb_base, &hb_token).await.is_ok(),
+                Some(client) => post_heartbeat(client, &hb_base, &hb_token, None)
+                    .await
+                    .is_ok(),
                 None => false,
             };
             if !ok {
@@ -1726,9 +1796,23 @@ impl StunarViewer {
     }
 
     pub(crate) fn send_share(&self, start: bool) -> Result<(), String> {
-        self.outgoing
-            .send(Outgoing::Share { start })
-            .map_err(|_| "Stunar is unreachable.".to_owned())
+        // Optimistic local flip so room_roster() reflects the new share
+        // within one heartbeat even before the server roster echo arrives.
+        mark_local_share(&self.roster, self.member_id.as_deref(), start);
+        let queued = self.outgoing.send(Outgoing::Share { start });
+        // Synchronous share publish on the member heartbeat: the roster
+        // flips share:true/false now, not on the next periodic tick.
+        if let (Ok(runtime), Ok(client)) = (current_thread_runtime(), http_client()) {
+            let _ = runtime.block_on(post_member_heartbeat(
+                &client,
+                &self.base,
+                &self.token,
+                Some(start),
+            ));
+        }
+        // Redacted by construction: sharing flag only, never tokens or SDP.
+        logger::log("INFO", "stunar share", &format!("sharing={start}"));
+        queued.map_err(|_| "Stunar is unreachable.".to_owned())
     }
 
     pub(crate) fn send_watch(&self, to: &str, start: bool) -> Result<(), String> {
@@ -2277,7 +2361,7 @@ async fn viewer_worker(
             if hb_shutdown.load(Ordering::Acquire) {
                 break;
             }
-            let _ = post_member_heartbeat(&client, &hb_base, &hb_token).await;
+            let _ = post_member_heartbeat(&client, &hb_base, &hb_token, None).await;
         }
     });
     while !shutdown.load(Ordering::Acquire) {
@@ -2471,6 +2555,144 @@ mod tests {
         assert_eq!(inbox.watch_from, vec!["bob".to_string()]);
         apply_ws_message(r#"{"t":"unwatch","from":"bob","to":"ada"}"#, &mut inbox);
         assert_eq!(inbox.unwatch_from, vec!["bob".to_string()]);
+    }
+
+    fn share_host_fixture(
+        self_id: &str,
+    ) -> (
+        StunarHost,
+        tokio::sync::mpsc::UnboundedReceiver<super::Outgoing>,
+    ) {
+        let (outgoing_tx, outgoing_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut roster_map = std::collections::HashMap::new();
+        roster_map.insert(
+            self_id.to_owned(),
+            super::RosterViewer {
+                nickname: "Ada".into(),
+                state: "accepted".into(),
+                master: true,
+                share: false,
+            },
+        );
+        let host = StunarHost {
+            base: "http://127.0.0.1:9".into(),
+            code: Mutex::new("ABC123".into()),
+            host_token: "host-token".into(),
+            state: Arc::new(Mutex::new(crate::media::types::StunarState::Live)),
+            roster: Arc::new(Mutex::new(roster_map)),
+            answers: Arc::new(Mutex::new(Vec::new())),
+            exact_answers: Arc::new(Mutex::new(Vec::new())),
+            offer_fences: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            exact_offer_fences: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            incoming_offers: Arc::new(Mutex::new(Vec::new())),
+            watch_from: Arc::new(Mutex::new(Vec::new())),
+            unwatch_from: Arc::new(Mutex::new(Vec::new())),
+            master_id: Arc::new(Mutex::new(Some(self_id.to_owned()))),
+            self_id: Some(self_id.to_owned()),
+            outgoing: outgoing_tx,
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ingress: IngressGate::active(),
+            committed: std::sync::atomic::AtomicBool::new(true),
+            completion: Arc::new(WorkerCompletion {
+                done: Mutex::new(false),
+                wake: std::sync::Condvar::new(),
+            }),
+            worker: None,
+        };
+        (host, outgoing_rx)
+    }
+
+    fn own_share(host: &StunarHost, id: &str) -> bool {
+        host.room_roster()
+            .into_iter()
+            .find(|(entry_id, _, _, _)| entry_id == id)
+            .map(|(_, _, _, share)| share)
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn start_share_heartbeat_flips_roster_share_true_within_one_heartbeat() {
+        // The heartbeat base is unreachable on purpose: the synchronous
+        // share publish is best-effort, while the local roster flip and the
+        // queued WS share-start must still happen.
+        let (host, mut outgoing) = share_host_fixture("ada");
+        assert!(host.send_share(true).is_ok());
+        assert!(
+            own_share(&host, "ada"),
+            "StartShare heartbeat must flip room_roster().share true within 1 heartbeat"
+        );
+        assert!(
+            outgoing.try_recv().is_ok(),
+            "the WS share-start must still be queued for the live path"
+        );
+    }
+
+    #[test]
+    fn stop_share_heartbeat_flips_roster_share_false() {
+        let (host, _outgoing) = share_host_fixture("ada");
+        assert!(host.send_share(true).is_ok());
+        assert!(own_share(&host, "ada"));
+        assert!(host.send_share(false).is_ok());
+        assert!(
+            !own_share(&host, "ada"),
+            "StopShare must flip room_roster().share back to false"
+        );
+    }
+
+    #[test]
+    fn viewer_start_then_stop_share_flips_roster_share() {
+        let (outgoing_tx, _outgoing_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut roster_map = std::collections::HashMap::new();
+        roster_map.insert(
+            "bob".to_owned(),
+            super::RosterViewer {
+                nickname: "Bob".into(),
+                state: "accepted".into(),
+                master: false,
+                share: false,
+            },
+        );
+        let viewer = super::StunarViewer {
+            outgoing: outgoing_tx,
+            incoming_offers: Arc::new(Mutex::new(Vec::new())),
+            answers: Arc::new(Mutex::new(Vec::new())),
+            offer_fences: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            roster: Arc::new(Mutex::new(roster_map)),
+            watch_from: Arc::new(Mutex::new(Vec::new())),
+            unwatch_from: Arc::new(Mutex::new(Vec::new())),
+            master_id: Arc::new(Mutex::new(None)),
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            completion: Arc::new(WorkerCompletion {
+                done: Mutex::new(false),
+                wake: std::sync::Condvar::new(),
+            }),
+            base: "http://127.0.0.1:9".into(),
+            token: "member-token".into(),
+            member_id: Some("bob".into()),
+            mode: "room".into(),
+            initial_offer_fence: None,
+            worker: None,
+        };
+        assert!(viewer.send_share(true).is_ok());
+        assert!(
+            viewer
+                .room_roster()
+                .into_iter()
+                .find(|(id, _, _, _)| id == "bob")
+                .map(|(_, _, _, share)| share)
+                .unwrap_or(false),
+            "viewer StartShare heartbeat must flip room_roster().share true within 1 heartbeat"
+        );
+        assert!(viewer.send_share(false).is_ok());
+        assert!(
+            !viewer
+                .room_roster()
+                .into_iter()
+                .find(|(id, _, _, _)| id == "bob")
+                .map(|(_, _, _, share)| share)
+                .unwrap_or(true),
+            "viewer StopShare must flip room_roster().share back to false"
+        );
     }
 
     #[test]

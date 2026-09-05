@@ -9,6 +9,7 @@ import { APP_VERSION, detectLocale, dictionaries, type Copy, type Locale } from 
 import { RoomStage } from "./RoomStage";
 import { autoFloorMbps, BITRATE_MAX_MBPS, BITRATE_MIN_MBPS, FLOOR_MAX_MBPS, FLOOR_MIN_MBPS, admissionStateFor, buildMilestonePayload, classifyViewerPlayback, collectViewerStats, describeSourceSelectionIntent, joinFailureForStage, nextShareIntent, nextWatchIntent, qualityTargetMbps, shareIntentStatusText, shouldEmitMilestone, startVideoPlayback, viewerPlaybackStatusText, watchIntentStatusText, type JoinFailureKind, type ShareIntentState, type ViewerPlaybackFlags, type ViewerPlaybackMilestone, type ViewerPlaybackStage, type ViewerStats, type ViewerStatsPrev, type WatchIntentState } from "./sessionStats";
 import { answerWithAttempt, offerDedupeKey, releaseOfferKey, videoSectionRejected } from "./sdp";
+import { decideSalaOfferGate, nextSalaOfferBatch, shouldAutoUnwatch } from "./salaOffers";
 
 type IconName = "grid" | "monitor" | "window" | "game" | "settings" | "help" | "plus" | "copy" | "wifi" | "chevron" | "expand" | "minimize" | "volume" | "volume-off" | "terminal" | "activity" | "folder";
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
@@ -194,6 +195,12 @@ function App() {
   const [roomDesk, setRoomDesk] = useState(false);
   const salaAliveRef = useRef(false);
   const seenOffers = useRef<Set<string>>(new Set());
+  // Peek-don't-drop fallback: offers held locally when the engine has no
+  // requeue lane yet, retried on the next poll — never silently dropped.
+  const pendingOffersRef = useRef<Map<string, IncomingOffer>>(new Map());
+  // Fresh-roster mirror for the offer gate: the poll effect closure would
+  // otherwise decide auto-watch vs requeue on a stale roster tick.
+  const rosterRef = useRef<RosterEntry[]>([]);
   const rejectCountRef = useRef<Map<string, number>>(new Map());
   const [joinMode, setJoinMode] = useState<"lan" | "direct" | "stunar">(() => {
     const saved = localStorage.getItem("godrinking.join_mode");
@@ -297,6 +304,7 @@ function App() {
   const inSala = salaAliveRef.current && (roomJoined || session?.session_mode === "room");
   const onStage = inSala && !roomDesk;
   const roster = session?.roster ?? [];
+  rosterRef.current = roster;
   const pendingRoster = roster.filter((entry) => admissionStateFor(entry.state) === "pending");
   const connectedRoster = roster.filter((entry) => admissionStateFor(entry.state) === "admitted" && entry.id !== session?.self_id);
   const removedRoster = roster.filter((entry) => {
@@ -834,6 +842,7 @@ function App() {
     remotesRef.current.forEach((slot) => slot.pc.close());
     remotesRef.current.clear();
     seenOffers.current.clear();
+    pendingOffersRef.current.clear();
     setRemoteIds([]);
     setStageId("host");
     setRoomJoined(false);
@@ -980,7 +989,29 @@ function App() {
     }, 1000);
   };
   const acceptIncomingOffer = async (incoming: IncomingOffer) => {
-    if (inSala && !watchingRef.current.has(incoming.from)) return;
+    // Peek-don't-drop Sala gate (Failure A): the engine poll DRAINs the
+    // queue, so returning here without requeueing would destroy the offer
+    // with no answer. A live sharer we are not watching yet is auto-watched
+    // and answered below; anything else goes back to the Rust queue — or, if
+    // the engine has no requeue lane yet, into a local pending buffer retried
+    // on the next poll. Never silently drop. Dedupe stays below the gate so
+    // a requeued/buffered offer is not consumed as seen.
+    const gate = decideSalaOfferGate({
+      inSala,
+      watching: watchingRef.current,
+      roster: rosterRef.current,
+      from: incoming.from,
+    });
+    if (gate === "auto-watch") {
+      void watchMember(incoming.from);
+    } else if (gate === "requeue") {
+      try {
+        await invokeMedia("requeue_stunar_offer", { offer: incoming });
+      } catch {
+        pendingOffersRef.current.set(offerDedupeKey(incoming.from, incoming.offer_attempt), incoming);
+      }
+      return;
+    }
     // Stunar offer dedupe: keyed by from + opaque offer_attempt only.
     const offerKey = offerDedupeKey(incoming.from, incoming.offer_attempt);
     if (seenOffers.current.has(offerKey)) return;
@@ -1038,21 +1069,37 @@ function App() {
       setNotice(diagnosticError(error, "Could not answer the session."));
     }
   };
+  // Offer poll runs whenever the Stunar WS can exist (Sala alive), decoupled
+  // from watchConnected/active/roomJoined: those describe media/session
+  // state, not the signaling socket. Playback polling (watchFirstMedia) stays
+  // a separate interval. Pending offers held locally (no engine requeue lane)
+  // ride along ahead of the fresh poll; a failed poll restores them so
+  // nothing is lost.
   useEffect(() => {
-    if (!watchConnected && !active && !roomJoined) return;
+    if (joinMode !== "stunar") return undefined;
     const timer = window.setInterval(() => {
+      if (!salaAliveRef.current) return;
+      const pending = [...pendingOffersRef.current.values()];
+      pendingOffersRef.current.clear();
       void invokeMedia<IncomingOffer[]>("poll_stunar_offers").then((offers) => {
-        for (const offer of offers) void acceptIncomingOffer(offer);
-      }).catch(() => undefined);
+        for (const offer of nextSalaOfferBatch(pending, offers)) void acceptIncomingOffer(offer);
+      }).catch(() => {
+        for (const offer of pending) pendingOffersRef.current.set(offerDedupeKey(offer.from, offer.offer_attempt), offer);
+      });
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [watchConnected, active, roomJoined, joinMode, stageId, inSala]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [joinMode]);
+  // Watching-intent retention (Failure B companion): a transient share:false
+  // flap must never delete intent — the backend owns the roster share flag.
+  // Only an explicit Unwatch click (unwatchMember) or a member gone from a
+  // KNOWN roster removes watching.
   useEffect(() => {
     if (!inSala) return;
     for (const id of [...watching]) {
-      const person = roster.find((entry) => entry.id === id);
-      if (!person || !person.share) void unwatchMember(id);
+      if (shouldAutoUnwatch({ inSala, roster, selfId: session?.self_id ?? null, id })) void unwatchMember(id);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inSala, roster, watching]);
   const joinRoom = async () => {
     if (sessionAction !== "idle") return;

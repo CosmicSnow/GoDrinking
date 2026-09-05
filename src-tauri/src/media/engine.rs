@@ -10,7 +10,7 @@ use super::peer_transport::{
 };
 use super::pipeline::{NativePipeline, PreviewState};
 use super::process_tap::{EncodedAudioPacket, ProcessTap};
-use super::rendezvous::{StunarHost, StunarViewer};
+use super::rendezvous::{StunarHost, StunarIncomingOffer, StunarViewer};
 use super::room::{DirectRoom, ExactOffer, ExactOfferMint, LanRoom, ViewerCount};
 #[cfg(target_os = "macos")]
 use super::screen_capture_kit::CaptureCancellationToken;
@@ -285,6 +285,9 @@ struct EngineState {
     preview: Arc<PreviewState>,
     // Viewer-side Stunar WS, kept alive between ask and answer.
     stunar_viewer: Option<StunarViewer>,
+    // Offers drained by the Viewer lane but not yet consumed. Requeued offers
+    // are served before the Rendezvous queues by poll_incoming_offers.
+    requeued_offers: Vec<StunarIncomingOffer>,
     // Ingress back into the serialized actor. Tests use the direct fallback
     // because they invoke the state reducer without starting a worker.
     control_tx: Option<SyncSender<MediaCommand>>,
@@ -420,6 +423,7 @@ impl MediaEngine {
             next_session_id: 1,
             preview: Arc::new(PreviewState::new()),
             stunar_viewer: None,
+            requeued_offers: Vec::new(),
             control_tx: None,
             pending_start: None,
             pending_share: None,
@@ -633,9 +637,46 @@ impl MediaEngine {
     }
 
     /// Sala: mint an offer only when a member asked to watch our share.
+    ///
+    /// Runs on every command-pump tail. Queued watches are retained upstream
+    /// while capture is down (`take_watch_requests(false)` drains nothing);
+    /// the StartShare commit flushes explicitly (see flush_stunar_watches) so
+    /// a watch that arrived while the Share slot was closed is minted without
+    /// waiting for the next command.
     fn apply_stunar_watches(&self) {
-        let (to_mint, dropped, stunar_host, send_via_viewer, origin) = {
-            let mut guard = match self.state.lock() {
+        Self::drain_stunar_watches(&self.state);
+    }
+
+    /// Explicit StartShare-commit flush. Called after the committed session
+    /// carries `native_capture_active=true`, so retained watches drain here
+    /// instead of waiting for the next command-pump tail.
+    fn flush_stunar_watches(&self) {
+        logger::log(
+            "INFO",
+            "watch flush",
+            "flushing queued watches after Share start",
+        );
+        Self::drain_stunar_watches(&self.state);
+    }
+
+    /// Actor-owned Sala watch drain shared by the command-pump tail and the
+    /// explicit StartShare-commit flush. All mint/retire stays on these two
+    /// paths; snapshots never advance signaling or lifecycle work.
+    ///
+    /// Redacted milestones only: Session/Share/Link/attempt IDs, never
+    /// Passwords, Tokens, or SDP.
+    fn drain_stunar_watches(state: &Arc<Mutex<EngineState>>) {
+        let (
+            to_mint,
+            dropped,
+            stunar_host,
+            send_via_viewer,
+            origin,
+            watch_received,
+            unwatch_received,
+            capturing,
+        ) = {
+            let mut guard = match state.lock() {
                 Ok(guard) => guard,
                 Err(_) => return,
             };
@@ -674,6 +715,8 @@ impl MediaEngine {
                 watch.extend(w);
                 unwatch.extend(u);
             }
+            let watch_received = watch.len();
+            let unwatch_received = unwatch.len();
             let Some(session) = guard.session.as_mut() else {
                 return;
             };
@@ -694,14 +737,9 @@ impl MediaEngine {
                 }
             }
             let mut to_mint = Vec::new();
-            if capturing {
-                for id in watch {
-                    if self_id.as_deref() == Some(id.as_str()) {
-                        continue;
-                    }
-                    if session.viewers.contains_key(&id) {
-                        continue;
-                    }
+            if capturing && !watch.is_empty() {
+                let linked: HashSet<String> = session.viewers.keys().cloned().collect();
+                for id in Self::select_watch_mints(&linked, self_id.as_deref(), watch, capturing) {
                     let nickname = session
                         .stunar
                         .as_ref()
@@ -716,27 +754,132 @@ impl MediaEngine {
             for link_id in retired {
                 guard.actor.retire_link(link_id);
             }
-            (to_mint, dropped, stunar_host, send_via_viewer, origin)
+            (
+                to_mint,
+                dropped,
+                stunar_host,
+                send_via_viewer,
+                origin,
+                watch_received,
+                unwatch_received,
+                capturing,
+            )
         };
+        if watch_received > 0 || unwatch_received > 0 {
+            logger::log(
+            "INFO",
+            "watch-received",
+            &format!(
+                "session={} share={} watching={watch_received} unwatching={unwatch_received} capturing={capturing}",
+                origin.session.0, origin.share.0,
+            ),
+        );
+        }
+        if !capturing && unwatch_received > 0 {
+            // Drained watch requests are empty by construction while capture is
+            // down (`take_watch_requests(false)` retains them upstream), so
+            // unwatch traffic is the observable proof the watch channel is live
+            // and any inbound watches stay queued until the Share slot opens.
+            logger::log(
+                "INFO",
+                "watch-queued",
+                &format!(
+                    "session={} share={} retained_until_capture=true",
+                    origin.session.0, origin.share.0,
+                ),
+            );
+        }
         drop(dropped);
         for (id, nickname) in to_mint {
-            let Ok(minted) = mint_viewer_offer_fenced(&self.state, &id, &nickname, Some(origin))
-            else {
-                continue;
+            logger::log(
+                "INFO",
+                "mint-attempt",
+                &format!(
+                    "viewer={id} session={} share={}",
+                    origin.session.0, origin.share.0,
+                ),
+            );
+            let minted = match mint_viewer_offer_fenced(state, &id, &nickname, Some(origin)) {
+                Ok(minted) => minted,
+                Err(error) => {
+                    logger::log(
+                        "WARN",
+                        "mint-attempt",
+                        &format!("viewer={id} failed: {error}"),
+                    );
+                    continue;
+                }
             };
+            let attempt = minted.fence;
             if let Some(host) = stunar_host.as_ref() {
-                host.remember_exact_offer_fence(&id, minted.fence);
-                let _ = host.send_signal_with_offer_fence(&id, &minted.signal, minted.fence);
+                host.remember_exact_offer_fence(&id, attempt);
+                match host.send_signal_with_offer_fence(&id, &minted.signal, attempt) {
+                    Ok(()) => logger::log(
+                        "INFO",
+                        "offer-sent",
+                        &format!(
+                            "viewer={id} session={} share={} attempt={:?}",
+                            origin.session.0, origin.share.0, attempt.attempt,
+                        ),
+                    ),
+                    Err(error) => logger::log(
+                        "WARN",
+                        "offer-sent",
+                        &format!("viewer={id} failed: {error}"),
+                    ),
+                }
             } else if send_via_viewer {
-                if let Ok(state) = self.state.lock() {
-                    if let Some(viewer) = state.stunar_viewer.as_ref() {
-                        viewer.remember_offer_fence(&id, minted.fence.epoch);
-                        let _ =
-                            viewer.send_signal_with_offer_fence(&id, &minted.signal, minted.fence);
+                if let Ok(guard) = state.lock() {
+                    if let Some(viewer) = guard.stunar_viewer.as_ref() {
+                        viewer.remember_offer_fence(&id, attempt.epoch);
+                        match viewer.send_signal_with_offer_fence(&id, &minted.signal, attempt) {
+                            Ok(()) => logger::log(
+                                "INFO",
+                                "offer-sent",
+                                &format!(
+                                    "viewer={id} session={} share={} attempt={:?}",
+                                    origin.session.0, origin.share.0, attempt.attempt,
+                                ),
+                            ),
+                            Err(error) => logger::log(
+                                "WARN",
+                                "offer-sent",
+                                &format!("viewer={id} failed: {error}"),
+                            ),
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// Pure Sala watch selection: which drained watchers still need an offer.
+    /// Not capturing → no mints (watches stay retained upstream via
+    /// `take_watch_requests(false)`). Self and already-linked watchers are
+    /// skipped so a StartShare flush never mints twice for one member.
+    fn select_watch_mints(
+        linked: &HashSet<String>,
+        self_id: Option<&str>,
+        watch: Vec<String>,
+        capturing: bool,
+    ) -> Vec<String> {
+        if !capturing {
+            return Vec::new();
+        }
+        let mut selected = Vec::new();
+        for id in watch {
+            if self_id == Some(id.as_str()) {
+                continue;
+            }
+            if linked.contains(&id) {
+                continue;
+            }
+            if selected.iter().any(|selected| selected == &id) {
+                continue;
+            }
+            selected.push(id);
+        }
+        selected
     }
 
     fn apply_room_answer(&self) {
@@ -798,8 +941,11 @@ impl MediaEngine {
                 Some((client, control)) => {
                     logger::log(
                         "INFO",
-                        "room answer",
-                        &format!("applied answer id={answer_id}"),
+                        "answer-applied",
+                        &format!(
+                            "viewer={answer_id} session={} share={} attempt={:?}",
+                            fence.epoch.session.0, fence.epoch.share.0, fence.attempt,
+                        ),
                     );
                     let _ = client.set_answer(signal);
                     // Fresh IDR as the peer connects: the pump starts streaming
@@ -1418,11 +1564,14 @@ impl MediaEngine {
             .map_err(MediaEngineError::NativePeer)
     }
 
-    pub fn poll_incoming_offers(&self) -> Vec<super::rendezvous::StunarIncomingOffer> {
-        let Ok(state) = self.state.lock() else {
+    pub fn poll_incoming_offers(&self) -> Vec<StunarIncomingOffer> {
+        let Ok(mut state) = self.state.lock() else {
             return Vec::new();
         };
-        let mut offers = Vec::new();
+        // Requeued offers go back to the front: they are served before the
+        // Rendezvous queues so a lane that could not consume an offer sees
+        // the same offer again on its next poll.
+        let mut offers = std::mem::take(&mut state.requeued_offers);
         if let Some(host) = state
             .session
             .as_ref()
@@ -1434,6 +1583,37 @@ impl MediaEngine {
             offers.extend(viewer.take_incoming_offers());
         }
         offers
+    }
+
+    /// Puts a drained offer back at the front of the incoming-offers queue
+    /// (the Viewer lane could not consume it yet). Observational only: no
+    /// actor, epoch, or lifecycle state is touched.
+    pub fn requeue_incoming_offer(
+        &self,
+        from: String,
+        sdp: String,
+        offer_attempt: &str,
+    ) -> Result<(), MediaEngineError> {
+        let fence = if offer_attempt.trim().is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_str(offer_attempt)
+                    .map_err(|_| MediaEngineError::NativePeer("invalid offer attempt".into()))?,
+            )
+        };
+        let Ok(mut state) = self.state.lock() else {
+            return Err(MediaEngineError::StatePoisoned);
+        };
+        logger::log(
+            "INFO",
+            "offer-requeue",
+            &format!("from={from} attempt={fence:?}"),
+        );
+        state
+            .requeued_offers
+            .insert(0, StunarIncomingOffer { from, sdp, fence });
+        Ok(())
     }
 
     pub fn send_stunar_signal(&self, to: &str, signal: PeerSignal) -> Result<(), MediaEngineError> {
@@ -1555,9 +1735,14 @@ impl MediaEngine {
                 response: response_tx,
             })
             .map_err(|_| MediaEngineError::QueueClosed)?;
-        response_rx
+        let snapshot = response_rx
             .recv()
-            .map_err(|_| MediaEngineError::QueueClosed)?
+            .map_err(|_| MediaEngineError::QueueClosed)??;
+        // The commit already flushed retained watches; this second pass
+        // covers watches that raced the commit without waiting for the next
+        // command-pump tail.
+        self.flush_stunar_watches();
+        Ok(snapshot)
     }
 
     pub fn stop_share(&self) -> Result<MediaSessionSnapshot, MediaEngineError> {
@@ -2693,6 +2878,18 @@ fn accept_transaction_completion(
                 }
             }
             drop(session);
+            if reply.is_ok() {
+                // StartShare commit is published with `native_capture_active`
+                // already set by the Share bundle: flush watches retained
+                // while the Share slot was closed so they mint here instead
+                // of waiting for the next command-pump tail.
+                logger::log(
+                    "INFO",
+                    "watch flush",
+                    "flushing queued watches after Share start",
+                );
+                MediaEngine::drain_stunar_watches(state);
+            }
             let _ = response.send(reply);
             if !stop_waiters.is_empty() {
                 if let Some(snapshot) = state.lock().ok().map(|guard| snapshot_from_state(&guard)) {
@@ -4429,6 +4626,7 @@ fn start_share_in_state(
         }
         restore_session(state, session)?;
         announce_viewer_share(state, true);
+        MediaEngine::drain_stunar_watches(state);
         let guard = state.lock().map_err(|_| MediaEngineError::StatePoisoned)?;
         return Ok(snapshot_from_state(&guard));
     }
@@ -4513,6 +4711,10 @@ fn start_share_in_state(
     }
     restore_session(state, session)?;
     announce_viewer_share(state, true);
+    // Same explicit flush as the production StartShare commit: the restored
+    // session already carries `native_capture_active`, so watches retained
+    // while the Share slot was closed drain here.
+    MediaEngine::drain_stunar_watches(state);
     let guard = state.lock().map_err(|_| MediaEngineError::StatePoisoned)?;
     Ok(snapshot_from_state(&guard))
 }
@@ -4673,8 +4875,11 @@ fn stop_in_state(
     Ok(snapshot_from_state(&state))
 }
 
-fn merge_viewer_roster(roster: &mut Vec<RosterEntry>, viewer: &super::rendezvous::StunarViewer) {
-    for (id, nickname, master, share) in viewer.room_roster() {
+/// Room roster is authoritative over synthetic snapshot entries: when the
+/// Rendezvous knows a member, its share flag wins — a roster-known sharing
+/// member is never left at the synthetic `share:false` default.
+fn overlay_roster_share(roster: &mut Vec<RosterEntry>, entries: Vec<(String, String, bool, bool)>) {
+    for (id, nickname, master, share) in entries {
         if let Some(entry) = roster.iter_mut().find(|entry| entry.id == id) {
             entry.master = master;
             entry.share = share;
@@ -4692,6 +4897,10 @@ fn merge_viewer_roster(roster: &mut Vec<RosterEntry>, viewer: &super::rendezvous
             });
         }
     }
+}
+
+fn merge_viewer_roster(roster: &mut Vec<RosterEntry>, viewer: &super::rendezvous::StunarViewer) {
+    overlay_roster_share(roster, viewer.room_roster());
 }
 
 fn snapshot_from_state(state: &EngineState) -> MediaSessionSnapshot {
@@ -4750,12 +4959,35 @@ fn snapshot_from_state(state: &EngineState) -> MediaSessionSnapshot {
         .values()
         .map(|viewer| {
             let status = viewer.peer.status();
+            // The room roster (below) is authoritative: seed the share flag
+            // from what the Rendezvous knows so a roster-known sharing
+            // member never renders with the synthetic `share:false` default.
+            let (master, share) = session
+                .stunar
+                .as_ref()
+                .and_then(|stunar| {
+                    stunar
+                        .room_roster()
+                        .into_iter()
+                        .find(|(id, _, _, _)| *id == viewer.id)
+                        .map(|(_, _, master, share)| (master, share))
+                })
+                .or_else(|| {
+                    state.stunar_viewer.as_ref().and_then(|viewer_side| {
+                        viewer_side
+                            .room_roster()
+                            .into_iter()
+                            .find(|(id, _, _, _)| *id == viewer.id)
+                            .map(|(_, _, master, share)| (master, share))
+                    })
+                })
+                .unwrap_or((false, false));
             RosterEntry {
                 id: viewer.id.clone(),
                 nickname: viewer.nickname.clone(),
                 state: status.state,
-                master: false,
-                share: false,
+                master,
+                share,
             }
         })
         .collect();
@@ -4781,24 +5013,9 @@ fn snapshot_from_state(state: &EngineState) -> MediaSessionSnapshot {
                 share: false,
             });
         }
-        for (id, nickname, master, share) in stunar.room_roster() {
-            if let Some(entry) = roster.iter_mut().find(|entry| entry.id == id) {
-                entry.master = master;
-                entry.share = share;
-            } else {
-                roster.push(RosterEntry {
-                    id,
-                    nickname,
-                    state: if share {
-                        PeerTransportState::Connected
-                    } else {
-                        PeerTransportState::New
-                    },
-                    master,
-                    share,
-                });
-            }
-        }
+        // Authoritative overlay: roster-known share flags win over every
+        // synthetic entry above (links, gate-pending, stunar-pending).
+        overlay_roster_share(&mut roster, stunar.room_roster());
     }
     if let Some(viewer) = state.stunar_viewer.as_ref() {
         merge_viewer_roster(&mut roster, viewer);
@@ -5223,6 +5440,7 @@ mod tests {
             detail: "idle".into(),
             preview: Arc::new(PreviewState::new()),
             stunar_viewer: None,
+            requeued_offers: Vec::new(),
             control_tx: None,
             pending_start: None,
             pending_share: None,
@@ -5818,6 +6036,163 @@ mod tests {
             link: Some(link)
         }));
         assert_eq!(guard.actor.discarded_events(), discarded);
+    }
+
+    #[test]
+    fn sala_watch_selection_retains_without_capture_and_mints_once_with_capture() {
+        use std::collections::HashSet;
+        // Queue watch with capturing=false → retained upstream, never minted.
+        assert!(super::MediaEngine::select_watch_mints(
+            &HashSet::new(),
+            None,
+            vec!["bob".to_owned()],
+            false,
+        )
+        .is_empty());
+        // Capturing=true → a new watcher is selected exactly once per flush.
+        assert_eq!(
+            super::MediaEngine::select_watch_mints(
+                &HashSet::new(),
+                None,
+                vec!["bob".to_owned(), "bob".to_owned()],
+                true,
+            ),
+            vec!["bob".to_owned()],
+        );
+        // Already-linked watchers and self never mint again.
+        let linked: HashSet<String> = ["bob".to_owned()].into_iter().collect();
+        assert!(super::MediaEngine::select_watch_mints(
+            &linked,
+            None,
+            vec!["bob".to_owned()],
+            true,
+        )
+        .is_empty());
+        assert!(super::MediaEngine::select_watch_mints(
+            &HashSet::new(),
+            Some("ada"),
+            vec!["ada".to_owned()],
+            true,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn sala_roster_overlay_is_authoritative_over_synthetic_share_flags() {
+        use super::super::types::{PeerTransportState, RosterEntry};
+        // Synthetic snapshot entries default to share:false ...
+        let mut roster = vec![
+            RosterEntry {
+                id: "bob".into(),
+                nickname: "Bob".into(),
+                state: PeerTransportState::New,
+                master: false,
+                share: false,
+            },
+            RosterEntry {
+                id: "pending".into(),
+                nickname: "Pending".into(),
+                state: PeerTransportState::Pending,
+                master: false,
+                share: false,
+            },
+        ];
+        // ... but a roster-known sharing member wins over the default.
+        super::overlay_roster_share(&mut roster, vec![("bob".into(), "Bob".into(), false, true)]);
+        assert!(
+            roster
+                .iter()
+                .find(|entry| entry.id == "bob")
+                .expect("bob")
+                .share
+        );
+        assert!(
+            !roster
+                .iter()
+                .find(|entry| entry.id == "pending")
+                .expect("pending")
+                .share
+        );
+        // Unknown members are appended with their roster flags ...
+        super::overlay_roster_share(&mut roster, vec![("ada".into(), "Ada".into(), true, true)]);
+        let ada = roster.iter().find(|entry| entry.id == "ada").expect("ada");
+        assert!(ada.share && ada.master);
+        // ... and StopShare (share:false) clears them again.
+        super::overlay_roster_share(
+            &mut roster,
+            vec![
+                ("bob".into(), "Bob".into(), false, false),
+                ("ada".into(), "Ada".into(), true, false),
+            ],
+        );
+        assert!(
+            !roster
+                .iter()
+                .find(|entry| entry.id == "bob")
+                .expect("bob")
+                .share
+        );
+        assert!(
+            !roster
+                .iter()
+                .find(|entry| entry.id == "ada")
+                .expect("ada")
+                .share
+        );
+    }
+
+    #[test]
+    fn requeued_offer_returns_to_poll_front() {
+        use super::super::control_plane::OfferEpochFence;
+        let engine = worker_engine(None, None);
+        // Drain-then-requeue: the poll is empty, requeue restores the offer.
+        assert!(engine.poll_incoming_offers().is_empty());
+        engine
+            .requeue_incoming_offer("bob".into(), "v=0".into(), "")
+            .expect("requeue");
+        let offers = engine.poll_incoming_offers();
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].from, "bob");
+        assert_eq!(offers[0].sdp, "v=0");
+        assert!(offers[0].fence.is_none());
+        // Consumed: the next poll is empty again.
+        assert!(engine.poll_incoming_offers().is_empty());
+        // Front order: the last requeued offer is served first.
+        engine
+            .requeue_incoming_offer("a".into(), "v=a".into(), "")
+            .expect("requeue a");
+        engine
+            .requeue_incoming_offer("b".into(), "v=b".into(), "")
+            .expect("requeue b");
+        let offers = engine.poll_incoming_offers();
+        assert_eq!(offers.len(), 2);
+        assert_eq!(offers[0].from, "b");
+        assert_eq!(offers[1].from, "a");
+        // The exact offer fence round-trips through the tolerant string form.
+        let mut req = request();
+        req.share_on_start = false;
+        engine.create_session(req).expect("session");
+        let minted = engine
+            .offer_for_member("viewer-1", "Viewer")
+            .expect("offer");
+        engine
+            .requeue_incoming_offer("viewer-1".into(), "v=0".into(), &minted.offer_attempt)
+            .expect("requeue with attempt");
+        let offers = engine.poll_incoming_offers();
+        assert_eq!(offers.len(), 1);
+        let expected: OfferEpochFence =
+            serde_json::from_str(&minted.offer_attempt).expect("attempt parses");
+        assert_eq!(offers[0].fence, Some(expected));
+        assert!(engine
+            .requeue_incoming_offer("x".into(), "v=x".into(), "{bad")
+            .is_err());
+        // The explicit flush is observational with no watches queued.
+        engine.flush_stunar_watches();
+        assert!(engine
+            .snapshot()
+            .roster
+            .iter()
+            .any(|entry| entry.id == "viewer-1"));
     }
 }
 
