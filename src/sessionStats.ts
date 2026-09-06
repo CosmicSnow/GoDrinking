@@ -228,6 +228,25 @@ export function viewerPlaybackStatusText(stage: ViewerPlaybackStage): string {
 }
 
 /**
+ * Sala per-link ICE status line. Returns text for terminal ICE states so a
+ * dead Sala link is never a silent black tile; null while the link is still
+ * progressing (connecting/checking/new/connected/completed). Redacted by
+ * construction: member id + ICE state only, never SDP.
+ */
+export function salaIceStatusText(linkId: string, iceState: string): string | null {
+  switch (iceState) {
+    case "failed":
+      return `Connection to ${linkId} failed — no network path (ICE failed). Waiting for a new offer…`;
+    case "disconnected":
+      return `Connection to ${linkId} was lost (ICE disconnected). Waiting for a new offer…`;
+    case "closed":
+      return `Connection to ${linkId} closed (ICE closed). Waiting for a new offer…`;
+    default:
+      return null;
+  }
+}
+
+/**
  * Once-per-link milestone dedupe (keyed by link + kind). Returns true when
  * the milestone should be emitted; records it in `seen` so repeats and
  * re-renders stay silent. Pure for tests; App.tsx owns the actual logging.
