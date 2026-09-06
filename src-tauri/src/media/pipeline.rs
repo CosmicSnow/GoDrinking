@@ -1430,16 +1430,21 @@ mod tests {
             })
             .expect("capture queue should accept the preview");
 
-        for _ in 0..100 {
+        // Loaded runners can starve the preview worker past a fixed
+        // budget: poll with a generous deadline instead of 100 x 1ms.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
             if let Some(event) = preview.latest.lock().expect("preview state").clone() {
                 assert_eq!(event.sequence, 4);
                 assert_eq!(event.encoding, "rgb8_thumbnail");
                 assert_eq!(event.payload, vec![9, 8, 7]);
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            if std::time::Instant::now() > deadline {
+                panic!("preview worker did not publish the frame");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        panic!("preview worker did not publish the frame");
     }
 
     #[test]
