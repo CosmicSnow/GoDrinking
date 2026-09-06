@@ -194,6 +194,84 @@ struct WsInbox {
     kicked: bool,
 }
 
+/// Parses one authoritative Sala roster (WS broadcast or heartbeat echo)
+/// into the local snapshot map. `share` wins verbatim; a `sharing` state
+/// without the flag still counts as sharing so a partial entry can never
+/// hide a live sharer from a joiner.
+fn parse_roster_entries(entries: &serde_json::Value) -> HashMap<String, RosterViewer> {
+    let mut next = HashMap::new();
+    if let Some(entries) = entries.as_array() {
+        for entry in entries {
+            if let (Some(id), Some(nickname)) = (entry["id"].as_str(), entry["nickname"].as_str()) {
+                let state = entry["state"].as_str().unwrap_or("accepted");
+                next.insert(
+                    id.to_owned(),
+                    RosterViewer {
+                        nickname: nickname.to_owned(),
+                        state: state.to_owned(),
+                        master: entry["master"].as_bool().unwrap_or(false),
+                        share: entry["share"].as_bool().unwrap_or(false) || state == "sharing",
+                    },
+                );
+            }
+        }
+    }
+    next
+}
+
+/// Authoritative roster echo carried by every Sala heartbeat response. A
+/// member that missed a WS roster broadcast still converges on the
+/// sharer's share:true via its own heartbeat echo.
+#[derive(Debug, Default)]
+struct HeartbeatEcho {
+    master_id: Option<String>,
+    roster: Option<HashMap<String, RosterViewer>>,
+}
+
+fn parse_heartbeat_echo(body: &serde_json::Value) -> HeartbeatEcho {
+    if body["ok"] != true {
+        return HeartbeatEcho::default();
+    }
+    HeartbeatEcho {
+        master_id: body["master_id"].as_str().map(str::to_owned),
+        // Broadcast heartbeats carry no entries (and neither does an older
+        // server): absent entries mean "presence only", never a roster wipe.
+        roster: body
+            .get("entries")
+            .map(|entries| parse_roster_entries(entries)),
+    }
+}
+
+/// Applies a heartbeat echo to the local roster snapshot. The echo is
+/// authoritative like a WS roster broadcast; only share-flag transitions
+/// are logged, redacted by construction (member id + flag only).
+fn apply_heartbeat_echo(
+    roster: &Arc<Mutex<HashMap<String, RosterViewer>>>,
+    master_id: &Arc<Mutex<Option<String>>>,
+    echo: HeartbeatEcho,
+) {
+    if let Some(next) = echo.roster {
+        if let Ok(mut roster) = roster.lock() {
+            for (id, entry) in &next {
+                let before = roster.get(id).map(|known| known.share).unwrap_or(false);
+                if entry.share != before {
+                    logger::log(
+                        "INFO",
+                        "stunar heartbeat echo",
+                        &format!("member={id} sharing={}", entry.share),
+                    );
+                }
+            }
+            *roster = next;
+        }
+    }
+    if let Some(id) = echo.master_id {
+        if let Ok(mut slot) = master_id.lock() {
+            *slot = Some(id);
+        }
+    }
+}
+
 fn apply_ws_message(text: &str, inbox: &mut WsInbox) {
     let Ok(msg) = serde_json::from_str::<serde_json::Value>(text) else {
         return;
@@ -220,28 +298,8 @@ fn apply_ws_message(text: &str, inbox: &mut WsInbox) {
             }
         }
         "roster" => {
-            let mut next = HashMap::new();
-            if let Some(entries) = msg["entries"].as_array() {
-                for entry in entries {
-                    if let (Some(id), Some(nickname)) =
-                        (entry["id"].as_str(), entry["nickname"].as_str())
-                    {
-                        let state = entry["state"].as_str().unwrap_or("accepted");
-                        next.insert(
-                            id.to_owned(),
-                            RosterViewer {
-                                nickname: nickname.to_owned(),
-                                state: state.to_owned(),
-                                master: entry["master"].as_bool().unwrap_or(false),
-                                share: entry["share"].as_bool().unwrap_or(false)
-                                    || state == "sharing",
-                            },
-                        );
-                    }
-                }
-            }
+            inbox.roster = Some(parse_roster_entries(&msg["entries"]));
             inbox.master_id = msg["master_id"].as_str().map(str::to_owned);
-            inbox.roster = Some(next);
         }
         "signal" => {
             let payload = &msg["payload"];
@@ -807,14 +865,18 @@ impl StunarHost {
         let queued = self.outgoing.send(Outgoing::Share { start });
         // Synchronous share publish: the heartbeat carries sharing=true/false
         // now instead of waiting for the next periodic tick, so a Sala
-        // roster (and the Watch button) flips on Start/StopShare.
+        // roster (and the Watch button) flips on Start/StopShare. The echo
+        // is authoritative: applying it confirms the flip even if the WS
+        // roster broadcast was missed.
         if let (Ok(runtime), Ok(client)) = (current_thread_runtime(), http_client()) {
-            let _ = runtime.block_on(post_heartbeat(
+            if let Ok(echo) = runtime.block_on(post_heartbeat(
                 &client,
                 &self.base,
                 &self.host_token,
                 Some(start),
-            ));
+            )) {
+                apply_heartbeat_echo(&self.roster, &self.master_id, echo);
+            }
         }
         // Redacted by construction: sharing flag only, never tokens or SDP.
         logger::log("INFO", "stunar share", &format!("sharing={start}"));
@@ -946,16 +1008,26 @@ impl StunarHost {
                     status.quiesced = false;
                     status.pending.push("Stunar close request");
                 } else {
+                    // The timeout future must be built INSIDE the runtime
+                    // context: `tokio::time::timeout` needs the timer handle
+                    // at construction, and there is none on a plain thread
+                    // (stop runs off-runtime via spawn_blocking).
                     let close_result = if self.committed.load(Ordering::Acquire) {
-                        runtime.block_on(tokio::time::timeout(
-                            remaining,
-                            post_close(&client, &self.base, &self.host_token),
-                        ))
+                        runtime.block_on(async {
+                            tokio::time::timeout(
+                                remaining,
+                                post_close(&client, &self.base, &self.host_token),
+                            )
+                            .await
+                        })
                     } else {
-                        runtime.block_on(tokio::time::timeout(
-                            remaining,
-                            post_abort(&client, &self.base, &self.host_token),
-                        ))
+                        runtime.block_on(async {
+                            tokio::time::timeout(
+                                remaining,
+                                post_abort(&client, &self.base, &self.host_token),
+                            )
+                            .await
+                        })
                     };
                     match close_result {
                         Ok(Ok(())) => {}
@@ -1165,11 +1237,12 @@ async fn post_heartbeat(
     base: &str,
     host_token: &str,
     sharing: Option<bool>,
-) -> Result<(), String> {
+) -> Result<HeartbeatEcho, String> {
     let base = normalize_base(base);
     // The share flag rides the heartbeat so a Sala roster flips
     // share:true/false synchronously on Start/StopShare instead of waiting
     // for the next periodic heartbeat. `None` leaves the stored flag alone.
+    // The response echo carries the authoritative roster back verbatim.
     let mut body = json!({ "host_token": host_token });
     if let Some(sharing) = sharing {
         body["share"] = json!(sharing);
@@ -1180,14 +1253,15 @@ async fn post_heartbeat(
         .send()
         .await
         .map_err(|_| "Stunar is unreachable.".to_owned())?;
-    if response.status().is_success() {
-        Ok(())
+    let status = response.status();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|_| "Stunar is unreachable.".to_owned())?;
+    if status.is_success() {
+        Ok(parse_heartbeat_echo(&body))
     } else {
-        logger::log(
-            "WARN",
-            "stunar heartbeat",
-            &format!("status={}", response.status()),
-        );
+        logger::log("WARN", "stunar heartbeat", &format!("status={status}"));
         Err("Stunar is unreachable.".into())
     }
 }
@@ -1197,11 +1271,12 @@ async fn post_member_heartbeat(
     base: &str,
     token: &str,
     sharing: Option<bool>,
-) -> Result<(), String> {
+) -> Result<HeartbeatEcho, String> {
     let base = normalize_base(base);
     // Same synchronous share publish as the host heartbeat: `Some`
     // flips the member's roster share flag now, `None` only refreshes
-    // presence for the periodic tick.
+    // presence for the periodic tick. The response echo carries the
+    // authoritative roster back verbatim.
     let mut body = json!({ "token": token });
     if let Some(sharing) = sharing {
         body["share"] = json!(sharing);
@@ -1212,8 +1287,13 @@ async fn post_member_heartbeat(
         .send()
         .await
         .map_err(|_| "Stunar is unreachable.".to_owned())?;
-    if response.status().is_success() {
-        Ok(())
+    let status = response.status();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|_| "Stunar is unreachable.".to_owned())?;
+    if status.is_success() {
+        Ok(parse_heartbeat_echo(&body))
     } else {
         Err("Stunar is unreachable.".into())
     }
@@ -1347,6 +1427,8 @@ async fn host_worker(
     let hb_state = Arc::clone(&state);
     let hb_shutdown = Arc::clone(&shutdown);
     let hb_ingress = ingress.clone();
+    let hb_roster = Arc::clone(&roster);
+    let hb_master = Arc::clone(&master_id);
     let heartbeat = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
         ticker.tick().await; // skip the immediate first tick
@@ -1358,10 +1440,16 @@ async fn host_worker(
             if !hb_ingress.is_active() {
                 continue;
             }
+            // The periodic echo heals missed WS roster broadcasts: a joiner
+            // converges on share:true/false here at the latest.
             let ok = match &client {
-                Some(client) => post_heartbeat(client, &hb_base, &hb_token, None)
-                    .await
-                    .is_ok(),
+                Some(client) => match post_heartbeat(client, &hb_base, &hb_token, None).await {
+                    Ok(echo) => {
+                        apply_heartbeat_echo(&hb_roster, &hb_master, echo);
+                        true
+                    }
+                    Err(_) => false,
+                },
                 None => false,
             };
             if !ok {
@@ -1801,14 +1889,18 @@ impl StunarViewer {
         mark_local_share(&self.roster, self.member_id.as_deref(), start);
         let queued = self.outgoing.send(Outgoing::Share { start });
         // Synchronous share publish on the member heartbeat: the roster
-        // flips share:true/false now, not on the next periodic tick.
+        // flips share:true/false now, not on the next periodic tick. The
+        // echo is authoritative: applying it confirms the flip even if the
+        // WS roster broadcast was missed.
         if let (Ok(runtime), Ok(client)) = (current_thread_runtime(), http_client()) {
-            let _ = runtime.block_on(post_member_heartbeat(
+            if let Ok(echo) = runtime.block_on(post_member_heartbeat(
                 &client,
                 &self.base,
                 &self.token,
                 Some(start),
-            ));
+            )) {
+                apply_heartbeat_echo(&self.roster, &self.master_id, echo);
+            }
         }
         // Redacted by construction: sharing flag only, never tokens or SDP.
         logger::log("INFO", "stunar share", &format!("sharing={start}"));
@@ -1933,10 +2025,15 @@ impl StunarViewer {
                     status.quiesced = false;
                     status.pending.push("Stunar member leave request");
                 } else {
-                    match runtime.block_on(tokio::time::timeout(
-                        remaining,
-                        post_member_leave(&client, &self.base, &self.token),
-                    )) {
+                    // Same off-runtime rule as the host twin: build the timeout
+                    // future inside the runtime context.
+                    match runtime.block_on(async {
+                        tokio::time::timeout(
+                            remaining,
+                            post_member_leave(&client, &self.base, &self.token),
+                        )
+                        .await
+                    }) {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => status.errors.push(error),
                         Err(_) => {
@@ -2350,6 +2447,8 @@ async fn viewer_worker(
     hb_token: String,
 ) {
     let hb_shutdown = Arc::clone(&shutdown);
+    let hb_roster = Arc::clone(&roster);
+    let hb_master = Arc::clone(&master_id);
     let heartbeat = tokio::spawn(async move {
         let Ok(client) = http_client() else {
             return;
@@ -2361,7 +2460,11 @@ async fn viewer_worker(
             if hb_shutdown.load(Ordering::Acquire) {
                 break;
             }
-            let _ = post_member_heartbeat(&client, &hb_base, &hb_token, None).await;
+            // The periodic echo heals missed WS roster broadcasts: a joiner
+            // converges on share:true/false here at the latest.
+            if let Ok(echo) = post_member_heartbeat(&client, &hb_base, &hb_token, None).await {
+                apply_heartbeat_echo(&hb_roster, &hb_master, echo);
+            }
         }
     });
     while !shutdown.load(Ordering::Acquire) {
@@ -2549,6 +2652,74 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_echo_carries_share_state_master_verbatim() {
+        let body = serde_json::json!({
+            "ok": true,
+            "master_id": "ada",
+            "entries": [
+                {"id": "ada", "nickname": "Ada", "state": "sharing", "master": true, "share": true},
+                {"id": "bob", "nickname": "Bob", "state": "accepted", "master": false, "share": false},
+            ],
+        });
+        let echo = super::parse_heartbeat_echo(&body);
+        assert_eq!(echo.master_id.as_deref(), Some("ada"));
+        let roster = echo.roster.expect("echo roster");
+        assert!(roster["ada"].share && roster["ada"].master);
+        assert_eq!(roster["ada"].state, "sharing");
+        assert!(!roster["bob"].share && !roster["bob"].master);
+        assert_eq!(roster["bob"].state, "accepted");
+    }
+
+    #[test]
+    fn viewer_applies_share_true_from_heartbeat_echo() {
+        // A joiner that missed every WS roster broadcast still converges on
+        // share:true via its own heartbeat echo.
+        let roster = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let master_id = Arc::new(Mutex::new(None));
+        let body = serde_json::json!({
+            "ok": true,
+            "master_id": "ada",
+            "entries": [
+                {"id": "ada", "nickname": "Ada", "state": "sharing", "master": true, "share": true},
+                {"id": "bob", "nickname": "Bob", "state": "accepted", "master": false, "share": false},
+            ],
+        });
+        let echo = super::parse_heartbeat_echo(&body);
+        super::apply_heartbeat_echo(&roster, &master_id, echo);
+        let roster = roster.lock().expect("roster");
+        assert!(
+            roster["ada"].share,
+            "viewer-side roster must apply share:true from heartbeat echo"
+        );
+        assert_eq!(roster["ada"].state, "sharing");
+        assert!(roster["ada"].master);
+        assert!(!roster["bob"].share);
+        assert_eq!(master_id.lock().expect("master").as_deref(), Some("ada"));
+    }
+
+    #[test]
+    fn heartbeat_echo_without_entries_leaves_roster_alone() {
+        // Broadcast heartbeats (and older servers) carry presence only:
+        // absent entries must never wipe the local roster.
+        let mut initial = std::collections::HashMap::new();
+        initial.insert(
+            "ada".to_owned(),
+            super::RosterViewer {
+                nickname: "Ada".into(),
+                state: "sharing".into(),
+                master: true,
+                share: true,
+            },
+        );
+        let roster = Arc::new(Mutex::new(initial));
+        let master_id = Arc::new(Mutex::new(Some("ada".to_owned())));
+        let echo = super::parse_heartbeat_echo(&serde_json::json!({"ok": true}));
+        assert!(echo.roster.is_none());
+        super::apply_heartbeat_echo(&roster, &master_id, echo);
+        assert!(roster.lock().expect("roster")["ada"].share);
+    }
+
+    #[test]
     fn watch_request_carries_the_asker() {
         let mut inbox = WsInbox::default();
         apply_ws_message(r#"{"t":"watch","from":"bob","to":"ada"}"#, &mut inbox);
@@ -2559,6 +2730,16 @@ mod tests {
 
     fn share_host_fixture(
         self_id: &str,
+    ) -> (
+        StunarHost,
+        tokio::sync::mpsc::UnboundedReceiver<super::Outgoing>,
+    ) {
+        share_host_fixture_with_base(self_id, "http://127.0.0.1:9")
+    }
+
+    fn share_host_fixture_with_base(
+        self_id: &str,
+        base: &str,
     ) -> (
         StunarHost,
         tokio::sync::mpsc::UnboundedReceiver<super::Outgoing>,
@@ -2575,7 +2756,7 @@ mod tests {
             },
         );
         let host = StunarHost {
-            base: "http://127.0.0.1:9".into(),
+            base: base.into(),
             code: Mutex::new("ABC123".into()),
             host_token: "host-token".into(),
             state: Arc::new(Mutex::new(crate::media::types::StunarState::Live)),
@@ -2608,6 +2789,158 @@ mod tests {
             .find(|(entry_id, _, _, _)| entry_id == id)
             .map(|(_, _, _, share)| share)
             .unwrap_or(false)
+    }
+
+    fn share_viewer_fixture(member_id: &str, base: &str) -> super::StunarViewer {
+        let (outgoing_tx, _outgoing_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut roster_map = std::collections::HashMap::new();
+        roster_map.insert(
+            member_id.to_owned(),
+            super::RosterViewer {
+                nickname: "Bob".into(),
+                state: "accepted".into(),
+                master: false,
+                share: false,
+            },
+        );
+        super::StunarViewer {
+            outgoing: outgoing_tx,
+            incoming_offers: Arc::new(Mutex::new(Vec::new())),
+            answers: Arc::new(Mutex::new(Vec::new())),
+            offer_fences: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            roster: Arc::new(Mutex::new(roster_map)),
+            watch_from: Arc::new(Mutex::new(Vec::new())),
+            unwatch_from: Arc::new(Mutex::new(Vec::new())),
+            master_id: Arc::new(Mutex::new(None)),
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            completion: Arc::new(WorkerCompletion {
+                done: Mutex::new(false),
+                wake: std::sync::Condvar::new(),
+            }),
+            base: base.into(),
+            token: "member-token".into(),
+            member_id: Some(member_id.into()),
+            mode: "room".into(),
+            initial_offer_fence: None,
+            worker: None,
+        }
+    }
+
+    /// Loopback HTTP stub for the stop path: accepts one POST, asserts the
+    /// expected Rendezvous route was hit, and answers 200. Returns the base
+    /// URL plus the server thread (joined by the caller).
+    fn loopback_stop_server(expected_path: &'static str) -> (String, thread::JoinHandle<()>) {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback bind");
+        let port = listener.local_addr().expect("loopback addr").port();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("loopback accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("loopback read timeout");
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 1024];
+            let header_end = loop {
+                let n = stream.read(&mut buf).expect("loopback read");
+                assert!(n > 0, "loopback connection closed before headers");
+                raw.extend_from_slice(&buf[..n]);
+                assert!(raw.len() < 64 * 1024, "loopback request too large");
+                let text = String::from_utf8_lossy(&raw);
+                if let Some(pos) = text.find("\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&raw[..header_end]).into_owned();
+            assert!(
+                head.starts_with(&format!("POST {expected_path} ")),
+                "stop must hit {expected_path}, got {}",
+                head.lines().next().unwrap_or(""),
+            );
+            let content_length = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    (name.trim().eq_ignore_ascii_case("content-length"))
+                        .then(|| value.trim().parse::<usize>().unwrap_or(0))
+                })
+                .unwrap_or(0);
+            while raw.len() < header_end + content_length {
+                let n = stream.read(&mut buf).expect("loopback read body");
+                assert!(n > 0, "loopback connection closed before body");
+                raw.extend_from_slice(&buf[..n]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\nConnection: close\r\n\r\n{\"ok\": true}",
+                )
+                .expect("loopback write");
+        });
+        (format!("http://127.0.0.1:{port}"), handle)
+    }
+
+    /// `shutdown_and_join` runs off-runtime in production (spawn_blocking, no
+    /// tokio context). Building `tokio::time::timeout` outside a runtime
+    /// panics deterministically; these tests pin the stop path on a plain
+    /// thread and assert a checked status comes back instead of a panic.
+    #[test]
+    fn shutdown_and_join_close_completes_off_runtime_without_panic() {
+        let (base, server) = loopback_stop_server("/v1/host/close");
+        let (mut host, _outgoing) = share_host_fixture_with_base("ada", &base);
+        let joined = thread::spawn(move || host.shutdown_and_join(Duration::from_secs(5))).join();
+        let status = joined.expect("shutdown_and_join must not panic off-runtime");
+        assert!(
+            status.errors.is_empty(),
+            "close errors: {:?}",
+            status.errors
+        );
+        assert!(
+            status.pending.is_empty(),
+            "close pending: {:?}",
+            status.pending
+        );
+        assert!(status.quiesced, "close must quiesce, got {status:?}");
+        server.join().expect("loopback server");
+    }
+
+    #[test]
+    fn shutdown_and_join_abort_path_off_runtime_without_panic() {
+        let (base, server) = loopback_stop_server("/v1/host/abort");
+        let (mut host, _outgoing) = share_host_fixture_with_base("ada", &base);
+        host.committed.store(false, Ordering::Release);
+        let joined = thread::spawn(move || host.shutdown_and_join(Duration::from_secs(5))).join();
+        let status = joined.expect("abort-path shutdown_and_join must not panic off-runtime");
+        assert!(
+            status.errors.is_empty(),
+            "abort errors: {:?}",
+            status.errors
+        );
+        assert!(status.quiesced, "abort must quiesce, got {status:?}");
+        server.join().expect("loopback server");
+    }
+
+    #[test]
+    fn shutdown_and_join_close_unreachable_reports_error_without_panic() {
+        let (mut host, _outgoing) = share_host_fixture("ada");
+        let joined = thread::spawn(move || host.shutdown_and_join(Duration::from_secs(5))).join();
+        let status = joined.expect("unreachable shutdown_and_join must not panic off-runtime");
+        assert_eq!(status.errors, vec!["Stunar is unreachable.".to_owned()]);
+        assert!(
+            status.quiesced,
+            "worker-less stop stays quiesced, got {status:?}"
+        );
+    }
+
+    #[test]
+    fn viewer_shutdown_and_join_off_runtime_without_panic() {
+        let mut viewer = share_viewer_fixture("bob", "http://127.0.0.1:9");
+        let joined = thread::spawn(move || viewer.shutdown_and_join(Duration::from_secs(5))).join();
+        let status = joined.expect("viewer shutdown_and_join must not panic off-runtime");
+        assert_eq!(status.errors, vec!["Stunar is unreachable.".to_owned()]);
+        assert!(
+            status.quiesced,
+            "worker-less viewer stop stays quiesced, got {status:?}"
+        );
     }
 
     #[test]

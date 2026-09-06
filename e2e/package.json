@@ -1,0 +1,16 @@
+{
+  "name": "godrinking-visual-e2e",
+  "private": true,
+  "version": "0.1.0",
+  "description": "LOCAL-ONLY visual E2E for goDrinking Sala (two packaged instances). Never runs in CI.",
+  "type": "module",
+  "scripts": {
+    "test": "node run.mjs"
+  },
+  "devDependencies": {
+    "@wdio/cli": "^9",
+    "@wdio/local-runner": "^9",
+    "@wdio/mocha-framework": "^9",
+    "@wdio/spec-reporter": "^9"
+  }
+}

@@ -6,7 +6,7 @@ import "./index.css";
 import "./App.css";
 import logo from "./assets/logo.png";
 import { APP_VERSION, detectLocale, dictionaries, type Copy, type Locale } from "./copy";
-import { RoomStage } from "./RoomStage";
+import { nextStickyPeople, RoomStage, salaRailDiagnostics } from "./RoomStage";
 import { autoFloorMbps, BITRATE_MAX_MBPS, BITRATE_MIN_MBPS, FLOOR_MAX_MBPS, FLOOR_MIN_MBPS, admissionStateFor, buildMilestonePayload, classifyViewerPlayback, collectViewerStats, describeSourceSelectionIntent, joinFailureForStage, nextShareIntent, nextWatchIntent, qualityTargetMbps, shareIntentStatusText, shouldEmitMilestone, startVideoPlayback, viewerPlaybackStatusText, watchIntentStatusText, type JoinFailureKind, type ShareIntentState, type ViewerPlaybackFlags, type ViewerPlaybackMilestone, type ViewerPlaybackStage, type ViewerStats, type ViewerStatsPrev, type WatchIntentState } from "./sessionStats";
 import { answerWithAttempt, offerDedupeKey, releaseOfferKey, videoSectionRejected } from "./sdp";
 import { decideSalaOfferGate, nextSalaOfferBatch, shouldAutoUnwatch } from "./salaOffers";
@@ -312,7 +312,21 @@ function App() {
     return state === "rejected" || state === "kicked";
   });
   const [stickyPeople, setStickyPeople] = useState<RosterEntry[]>([]);
+  // Ticks without a roster before retained people are dropped, so a dead
+  // share:false can't pin Watch disabled forever.
+  const stickyStaleRef = useRef(0);
   const roomPeople = stickyPeople;
+  // Empty-rail diagnostics (joiner Watch affordance): self-aliasing vs
+  // empty-roster must be distinguishable at a glance.
+  const salaDiagnostics = onStage
+    ? salaRailDiagnostics({
+        selfId: session?.self_id ?? null,
+        rosterLength: roster.length,
+        salaAlive: salaAliveRef.current,
+        roomJoined,
+        sessionMode: session?.session_mode ?? null,
+      })
+    : null;
   const roomTiles = [
     ...(session?.native_capture_active ? [{ id: "local", nickname: nickname.trim() || "You", stream: null as MediaStream | null, local: true }] : []),
     ...remoteIds.filter((id) => id !== "local" && id !== session?.self_id && watching.has(id)).map((id) => {
@@ -621,23 +635,24 @@ function App() {
   }, [active, roomJoined]);
   useEffect(() => {
     if (!inSala) {
+      stickyStaleRef.current = 0;
       setStickyPeople([]);
       return;
     }
+    // Viewer side (stunar_viewer owns the engine state: no local session) is
+    // `session_id == null`. There the roster is authoritative — never inject
+    // self as master:true; the master flag comes from the roster only.
+    const viewerSide = session?.session_id == null;
     const incoming = (session?.roster ?? []).filter((entry) => entry.state !== "pending");
+    const self = !viewerSide && session?.self_id
+      ? { id: session.self_id, nickname: nickname.trim() || "You", share: Boolean(session.native_capture_active) }
+      : null;
     setStickyPeople((prev) => {
-      if (incoming.length === 0) {
-        if (prev.length > 0) return prev;
-        if (session?.self_id) return [{ id: session.self_id, nickname: nickname.trim() || "You", state: "new", master: true, share: Boolean(session.native_capture_active) }];
-        return prev;
-      }
-      const byId = new Map(incoming.map((entry) => [entry.id, entry]));
-      if (session?.self_id && !byId.has(session.self_id)) {
-        byId.set(session.self_id, { id: session.self_id, nickname: nickname.trim() || "You", state: "new", master: true, share: Boolean(session.native_capture_active) });
-      }
-      return [...byId.values()];
+      const next = nextStickyPeople({ prev, incoming, self, staleTicks: stickyStaleRef.current });
+      stickyStaleRef.current = next.staleTicks;
+      return next.people;
     });
-  }, [inSala, session?.roster, session?.self_id, session?.native_capture_active, nickname]);
+  }, [inSala, session?.roster, session?.self_id, session?.session_id, session?.native_capture_active, nickname]);
   useEffect(() => {
     if (!active || !session?.session_id) { liveSettingsApplied.current = false; return; }
     if (sessionAction !== "idle") return;
@@ -1439,6 +1454,7 @@ function App() {
             onLeave={leaveSala}
             localCanvas={canvasRef}
             copy={copy}
+            diagnostics={salaDiagnostics}
           />
         )}
         {(watchStreamActive || mode === "watch") && !onStage ? (

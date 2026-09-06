@@ -37,6 +37,8 @@ type Props = {
   onLeave: () => void;
   localCanvas?: RefObject<HTMLCanvasElement | null>;
   copy: Copy;
+  /** Joiner diagnostics line for the empty rail (self-aliasing vs empty-roster). */
+  diagnostics?: string | null;
 };
 
 export function roomGridShape(count: number): { cols: number; rows: number } {
@@ -55,6 +57,94 @@ export function liveRoomTiles(tiles: RoomTile[], watching: Set<string>): RoomTil
     if (!watching.has(tile.id)) return false;
     return Boolean(tile.stream && tile.stream.getVideoTracks().some((track) => track.readyState !== "ended"));
   });
+}
+
+// --- Sala rail: Watch affordance + joiner diagnostics (pure, tested) --------
+
+/** Watch-button state for one roster person. Mirrors the rail row exactly. */
+export function watchButtonState(
+  person: Pick<RoomPerson, "id" | "share">,
+  watching: ReadonlySet<string>,
+): { watching: boolean; disabled: boolean } {
+  const on = watching.has(person.id);
+  return { watching: on, disabled: !person.share && !on };
+}
+
+/**
+ * Empty-rail diagnostics line: self_id, roster size, and Sala liveness, so a
+ * joiner can tell self-aliasing apart from an empty roster. Technical by
+ * design (ids/flags, never translated).
+ */
+export function salaRailDiagnostics(opts: {
+  selfId?: string | null;
+  rosterLength: number;
+  salaAlive: boolean;
+  roomJoined: boolean;
+  sessionMode?: string | null;
+}): string {
+  return `self ${opts.selfId ?? "—"} · roster ${opts.rosterLength} · sala ${opts.salaAlive ? "alive" : "down"} · ${opts.roomJoined ? "joined" : "not-joined"} · ${opts.sessionMode ?? "—"}`;
+}
+
+export type StickyPerson = {
+  id: string;
+  nickname: string;
+  state?: string;
+  master?: boolean;
+  share?: boolean;
+};
+
+/** Ticks without a roster before retained people are dropped. */
+export const STICKY_STALE_TICKS = 10;
+
+/**
+ * Sticky roster reducer with capped staleness. A non-empty roster replaces
+ * the list (self is added as master only when `self` is provided — on the
+ * stunar_viewer side self is null, so the master flag comes from the roster
+ * only). An empty roster retains the previous list for STICKY_STALE_TICKS
+ * ticks, then drops stale remotes (a host-side self entry survives; a dead
+ * share:false must not pin Watch disabled forever).
+ */
+export function nextStickyPeople<T extends StickyPerson>(opts: {
+  prev: readonly T[];
+  incoming: readonly T[];
+  self: { id: string; nickname: string; share: boolean } | null;
+  staleTicks: number;
+}): { people: T[]; staleTicks: number } {
+  if (opts.incoming.length > 0) {
+    const byId = new Map<string, T>(opts.incoming.map((entry) => [entry.id, entry]));
+    if (opts.self && !byId.has(opts.self.id)) {
+      byId.set(opts.self.id, {
+        id: opts.self.id,
+        nickname: opts.self.nickname,
+        state: "new",
+        master: true,
+        share: opts.self.share,
+      } as T);
+    }
+    return { people: [...byId.values()], staleTicks: 0 };
+  }
+  const staleRemotes = opts.prev.filter((entry) => entry.id !== opts.self?.id);
+  if (staleRemotes.length === 0) {
+    if (!opts.self) return { people: [], staleTicks: 0 };
+    const kept = opts.prev.find((entry) => entry.id === opts.self?.id);
+    if (kept) return { people: opts.prev as T[], staleTicks: 0 };
+    return {
+      people: [{
+        id: opts.self.id,
+        nickname: opts.self.nickname,
+        state: "new",
+        master: true,
+        share: opts.self.share,
+      } as T],
+      staleTicks: 0,
+    };
+  }
+  if (opts.staleTicks < STICKY_STALE_TICKS) {
+    return { people: opts.prev as T[], staleTicks: opts.staleTicks + 1 };
+  }
+  if (!opts.self) return { people: [], staleTicks: 0 };
+  const kept = opts.prev.filter((entry) => entry.id === opts.self?.id);
+  return { people: kept, staleTicks: 0 };
 }
 
 type TileCtl = { zoom: number; panX: number; panY: number; volume: number; muted: boolean };
@@ -204,6 +294,7 @@ export function RoomStage({
   onLeave,
   localCanvas,
   copy,
+  diagnostics,
 }: Props) {
   const visible = liveRoomTiles(tiles, watching);
   const [ctl, setCtl] = useState<Record<string, TileCtl>>({});
@@ -361,22 +452,25 @@ export function RoomStage({
             </div>
           )}
           {others.length === 0 && <p className="roster-empty">{copy.onlyYou}</p>}
+          {others.length === 0 && diagnostics ? (
+            <p className="room-diagnostics" title="Sala diagnostics">{diagnostics}</p>
+          ) : null}
           {others.map((person) => {
-            const on = watching.has(person.id);
+            const button = watchButtonState(person, watching);
             return (
               <div className="room-person" key={person.id}>
                 <span>
                   {person.master ? <span className="roster-crown" title="Master">♛</span> : null}
                   {person.nickname}
-                  <small>{person.share ? (on ? copy.liveWatching : copy.sharing) : copy.inRoom}</small>
+                  <small>{person.share ? (button.watching ? copy.liveWatching : copy.sharing) : copy.inRoom}</small>
                 </span>
                 <button
                   type="button"
-                  className={on ? "room-watch is-on" : "room-watch"}
-                  disabled={!person.share && !on}
-                  onClick={() => (on ? onUnwatch(person.id) : onWatch(person.id))}
+                  className={button.watching ? "room-watch is-on" : "room-watch"}
+                  disabled={button.disabled}
+                  onClick={() => (button.watching ? onUnwatch(person.id) : onWatch(person.id))}
                 >
-                  {on ? copy.unwatchPerson : copy.watchPerson}
+                  {button.watching ? copy.unwatchPerson : copy.watchPerson}
                 </button>
               </div>
             );

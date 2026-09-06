@@ -1,7 +1,7 @@
 {
   "name": "godrinking",
   "private": true,
-  "version": "0.6.1",
+  "version": "0.6.2",
   "license": "PolyForm-Noncommercial-1.0.0",
   "type": "module",
   "scripts": {
@@ -25,6 +25,7 @@
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
+    "happy-dom": "20.12.0",
     "typescript": "~5.8.3",
     "vite": "^7.0.4",
     "vitest": "^5.0.0"
