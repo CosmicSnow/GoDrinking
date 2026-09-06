@@ -8,7 +8,7 @@ use super::logger;
 use super::peer_transport::{
     PeerSignal, PeerTransport, PeerTransportClient, PeerTransportInitError, PendingPeerTransport,
 };
-use super::pipeline::{NativePipeline, PreviewState};
+use super::pipeline::{EncoderControl, NativePipeline, PreviewState};
 use super::process_tap::{EncodedAudioPacket, ProcessTap};
 use super::rendezvous::{StunarHost, StunarIncomingOffer, StunarViewer};
 use super::room::{DirectRoom, ExactOffer, ExactOfferMint, LanRoom, ViewerCount};
@@ -942,42 +942,40 @@ impl MediaEngine {
         );
         for (signal, fence) in answers {
             let answer_id = signal.id.clone().unwrap_or_default();
-            let pending = self.state.lock().ok().and_then(|state| {
-                if !state.actor.accepts_offer(fence) {
-                    return None;
-                }
-                let session = state.session.as_ref()?;
-                let id = signal.id.as_deref()?;
-                let viewer = session.viewers.get(id)?;
-                if viewer.offer_fence != fence {
-                    return None;
-                }
-                Some((
-                    viewer.peer.client(),
-                    Arc::clone(&session._pipeline.encoder_control),
-                ))
-            });
-            match pending {
-                Some((client, control)) => {
+            let candidates = count_sdp_candidates(&signal.sdp);
+            let fence_log = answer_fence_summary(fence);
+            match resolve_answer(&self.state, &signal, fence) {
+                AnswerVerdict::Apply(pending) => {
                     logger::log(
                         "INFO",
                         "answer-applied",
                         &format!(
-                            "viewer={answer_id} session={} share={} attempt={:?}",
-                            fence.epoch.session.0, fence.epoch.share.0, fence.attempt,
+                            "viewer={} id={} id_match={} {fence_log} candidates={candidates}",
+                            short_id(&pending.id),
+                            short_id(&answer_id),
+                            pending.id_matched,
                         ),
                     );
-                    let _ = client.set_answer(signal);
-                    // Fresh IDR as the peer connects: the pump starts streaming
-                    // on the first keyframe, so this bounds viewer join latency
-                    // to one encode interval even on static screens.
-                    control.request_keyframe();
+                    apply_accepted_answer(pending, signal);
                 }
-                None => {
+                AnswerVerdict::StaleEpoch => {
                     logger::log(
                         "WARN",
-                        "room answer",
-                        &format!("dropped answer id={answer_id} (no matching viewer)"),
+                        "dropped answer",
+                        &format!(
+                            "id={} {fence_log} candidates={candidates} (stale epoch)",
+                            short_id(&answer_id),
+                        ),
+                    );
+                }
+                AnswerVerdict::NoMatch => {
+                    logger::log(
+                        "WARN",
+                        "dropped answer",
+                        &format!(
+                            "id={} {fence_log} candidates={candidates} (no fence-exact link)",
+                            short_id(&answer_id),
+                        ),
                     );
                 }
             }
@@ -1399,49 +1397,62 @@ impl MediaEngine {
     ) -> Result<(), MediaEngineError> {
         let offer_fence: OfferEpochFence = serde_json::from_str(&offer_attempt)
             .map_err(|_| MediaEngineError::NativePeer("invalid offer attempt".into()))?;
-        let id = answer
-            .id
-            .as_deref()
-            .ok_or_else(|| MediaEngineError::NativePeer("answer is missing viewer id".into()))?
-            .to_owned();
-        let stale = {
+        // Preserve the legacy envelope errors before fence-first matching.
+        {
             let state = self
                 .state
                 .lock()
                 .map_err(|_| MediaEngineError::StatePoisoned)?;
-            let session = state
-                .session
-                .as_ref()
-                .ok_or(MediaEngineError::NoActiveSession)?;
-            let viewer = session
-                .viewers
-                .get(&id)
-                .ok_or_else(|| MediaEngineError::NativePeer("unknown viewer".into()))?;
-            viewer.offer_fence != offer_fence || !state.actor.accepts_offer(offer_fence)
-        };
-        if stale {
-            logger::log(
-                "WARN",
-                "answer",
-                &format!("discarded stale viewer answer viewer={id}"),
-            );
-            return Err(MediaEngineError::NativePeer("stale viewer answer".into()));
+            if state.session.is_none() {
+                return Err(MediaEngineError::NoActiveSession);
+            }
         }
-        let client = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| MediaEngineError::StatePoisoned)?;
-            state
-                .session
-                .as_ref()
-                .and_then(|session| session.viewers.get(&id))
-                .map(|viewer| viewer.peer.client())
-                .ok_or_else(|| MediaEngineError::NativePeer("unknown viewer".into()))?
-        };
-        client
-            .set_answer(answer)
-            .map_err(MediaEngineError::NativePeer)
+        // `signal.id` is auxiliary here too (fence-first): logged, never a
+        // veto, so a missing id no longer fails the envelope on its own.
+        let answer_id = answer.id.clone().unwrap_or_default();
+        let candidates = count_sdp_candidates(&answer.sdp);
+        let fence_log = answer_fence_summary(offer_fence);
+        match resolve_answer(&self.state, &answer, offer_fence) {
+            AnswerVerdict::Apply(pending) => {
+                logger::log(
+                    "INFO",
+                    "answer-applied",
+                    &format!(
+                        "viewer={} id={} id_match={} {fence_log} candidates={candidates}",
+                        short_id(&pending.id),
+                        short_id(&answer_id),
+                        pending.id_matched,
+                    ),
+                );
+                pending
+                    .client
+                    .set_answer(answer)
+                    .map_err(MediaEngineError::NativePeer)?;
+                Ok(())
+            }
+            AnswerVerdict::StaleEpoch => {
+                logger::log(
+                    "WARN",
+                    "dropped answer",
+                    &format!(
+                        "id={} {fence_log} candidates={candidates} (stale epoch)",
+                        short_id(&answer_id),
+                    ),
+                );
+                Err(MediaEngineError::NativePeer("stale viewer answer".into()))
+            }
+            AnswerVerdict::NoMatch => {
+                logger::log(
+                    "WARN",
+                    "dropped answer",
+                    &format!(
+                        "id={} {fence_log} candidates={candidates} (no fence-exact link)",
+                        short_id(&answer_id),
+                    ),
+                );
+                Err(MediaEngineError::NativePeer("unknown viewer".into()))
+            }
+        }
     }
 
     pub fn close_peer_transport(&self) -> Result<(), MediaEngineError> {
@@ -1658,6 +1669,11 @@ impl MediaEngine {
         Err(MediaEngineError::NativePeer("no stunar session".into()))
     }
 
+    /// Viewer answers (and host offers) travel back over Stunar. Route BY
+    /// `to`, consistent with the watch routing: a viewer-roster hit leaves
+    /// on the viewer socket, otherwise the host socket — so an answer from
+    /// a dual-role engine still reaches the SHARER. Channel pushes only;
+    /// no lock-held network beyond the mailbox send.
     pub fn send_stunar_signal_with_attempt(
         &self,
         to: &str,
@@ -1666,25 +1682,61 @@ impl MediaEngine {
     ) -> Result<(), MediaEngineError> {
         let fence: OfferEpochFence = serde_json::from_str(&offer_attempt)
             .map_err(|_| MediaEngineError::NativePeer("invalid offer attempt".into()))?;
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| MediaEngineError::StatePoisoned)?;
-        if let Some(host) = state
-            .session
-            .as_ref()
-            .and_then(|session| session.stunar.as_ref())
-        {
-            return host
-                .send_signal_with_offer_fence(to, &signal, fence)
-                .map_err(MediaEngineError::NativePeer);
+        let candidates = count_sdp_candidates(&signal.sdp);
+        let (route, result) = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| MediaEngineError::StatePoisoned)?;
+            let viewer_roster: Vec<(String, String, bool, bool)> = state
+                .stunar_viewer
+                .as_ref()
+                .map(|viewer| viewer.room_roster())
+                .unwrap_or_default();
+            let route = resolve_watch_route(
+                &viewer_roster,
+                state
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.stunar.as_ref())
+                    .is_some(),
+                state.stunar_viewer.is_some(),
+                to,
+            );
+            let result = match route {
+                WatchRoute::Viewer => state
+                    .stunar_viewer
+                    .as_ref()
+                    .map(|viewer| viewer.send_signal_with_offer_fence(to, &signal, fence))
+                    .unwrap_or(Err("no stunar session".into())),
+                WatchRoute::Host => state
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.stunar.as_ref())
+                    .map(|host| host.send_signal_with_offer_fence(to, &signal, fence))
+                    .unwrap_or(Err("no stunar session".into())),
+                WatchRoute::None => Err("no stunar session".into()),
+            };
+            (route, result)
+        };
+        match &result {
+            Ok(()) => logger::log(
+                "INFO",
+                "signal-sent",
+                &format!(
+                    "via={} to={} {} candidates={candidates}",
+                    route.as_str(),
+                    short_id(to),
+                    answer_fence_summary(fence),
+                ),
+            ),
+            Err(error) => logger::log(
+                "WARN",
+                "signal-sent",
+                &format!("via={} to={} failed: {error}", route.as_str(), short_id(to)),
+            ),
         }
-        if let Some(viewer) = state.stunar_viewer.as_ref() {
-            return viewer
-                .send_signal_with_offer_fence(to, &signal, fence)
-                .map_err(MediaEngineError::NativePeer);
-        }
-        Err(MediaEngineError::NativePeer("no stunar session".into()))
+        result.map_err(MediaEngineError::NativePeer)
     }
 
     pub fn offer_for_member(
@@ -4994,6 +5046,106 @@ fn resolve_watch_route(
     WatchRoute::None
 }
 
+/// How many ICE candidates an SDP carries. Cheap O(n) line scan; the SDP
+/// payload itself is never logged.
+fn count_sdp_candidates(sdp: &str) -> usize {
+    sdp.lines()
+        .filter(|line| line.trim_start().starts_with("a=candidate:"))
+        .count()
+}
+
+/// Truncate untrusted ids for log lines.
+fn short_id(id: &str) -> &str {
+    const MAX_ID_LOG_LEN: usize = 64;
+    match id.char_indices().nth(MAX_ID_LOG_LEN) {
+        Some((index, _)) => &id[..index],
+        None => id,
+    }
+}
+
+fn answer_fence_summary(fence: OfferEpochFence) -> String {
+    format!(
+        "session={} share={} attempt={:?}",
+        fence.epoch.session.0, fence.epoch.share.0, fence.attempt,
+    )
+}
+
+/// A resolved answer: which link to apply to, and whether the sender's id
+/// agreed with it (auxiliary only — never a veto).
+struct PendingAnswerApply {
+    id: String,
+    id_matched: bool,
+    client: PeerTransportClient,
+    control: Arc<EncoderControl>,
+}
+
+enum AnswerVerdict {
+    Apply(PendingAnswerApply),
+    StaleEpoch,
+    NoMatch,
+}
+
+/// Fence-first answer target: the opaque offer attempt uniquely identifies
+/// the minted link, so `signal.id` (sharer id in the old frontend envelope,
+/// watcher id in the new one) is auxiliary — accepted on match, never a
+/// veto on a fence-exact hit.
+fn match_answer_target(
+    viewers: &HashMap<String, ViewerLink>,
+    fence: OfferEpochFence,
+    answer_id: Option<&str>,
+) -> Option<(String, bool)> {
+    viewers.iter().find_map(|(id, viewer)| {
+        if viewer.offer_fence == fence {
+            Some((id.clone(), answer_id == Some(id.as_str())))
+        } else {
+            None
+        }
+    })
+}
+
+/// Resolve one answer to a verdict under a single lock: epoch validation
+/// FIRST via the unchanged `accepts` predicate, then the fence-exact link.
+/// Attempt liveness is proven by the live link holding that exact fence.
+/// Stale/wrong-fence answers resolve to a drop verdict exactly as before.
+fn resolve_answer(
+    state: &Arc<Mutex<EngineState>>,
+    signal: &PeerSignal,
+    fence: OfferEpochFence,
+) -> AnswerVerdict {
+    let Ok(guard) = state.lock() else {
+        return AnswerVerdict::StaleEpoch;
+    };
+    if !guard.actor.accepts(fence.epoch) {
+        return AnswerVerdict::StaleEpoch;
+    }
+    let Some(session) = guard.session.as_ref() else {
+        return AnswerVerdict::NoMatch;
+    };
+    let Some((id, id_matched)) = match_answer_target(&session.viewers, fence, signal.id.as_deref())
+    else {
+        return AnswerVerdict::NoMatch;
+    };
+    let Some(viewer) = session.viewers.get(&id) else {
+        return AnswerVerdict::NoMatch;
+    };
+    AnswerVerdict::Apply(PendingAnswerApply {
+        id,
+        id_matched,
+        client: viewer.peer.client(),
+        control: Arc::clone(&session._pipeline.encoder_control),
+    })
+}
+
+/// Applies an accepted answer and requests the join IDR. Split out so the
+/// fence-exact/wrong-id regression path is unit-testable without network.
+fn apply_accepted_answer(pending: PendingAnswerApply, signal: PeerSignal) {
+    let _ = pending.client.set_answer(signal);
+    // Fresh IDR as the peer connects: the pump starts streaming on the
+    // first keyframe, so this bounds viewer join latency to one encode
+    // interval even on static screens.
+    pending.control.request_keyframe();
+}
+
 /// Room roster is authoritative over synthetic snapshot entries: when the
 /// Rendezvous knows a member, its share flag wins — a roster-known sharing
 /// member is never left at the synthetic `share:false` default.
@@ -6239,6 +6391,143 @@ mod tests {
             resolve_watch_route(&[], false, false, "ada"),
             WatchRoute::None
         );
+    }
+
+    #[test]
+    fn fence_first_answer_applies_with_wrong_id_and_requests_keyframe() {
+        use super::super::control_plane::{
+            EpochFence, OfferAttemptId, OfferEpochFence, SessionEpoch, ShareEpoch,
+        };
+        use super::{apply_accepted_answer, resolve_answer, AnswerVerdict};
+        let engine = worker_engine(None, None);
+        let mut req = request();
+        req.share_on_start = false;
+        engine.create_session(req).expect("session");
+        let minted = engine
+            .offer_for_member("watcher-1", "Watcher")
+            .expect("offer");
+        let fence: OfferEpochFence =
+            serde_json::from_str(&minted.offer_attempt).expect("fence parses");
+        // Drain the mint-time keyframe request so the take below proves the
+        // apply path requested its own join IDR.
+        let drained = engine
+            .state
+            .lock()
+            .expect("state")
+            .session
+            .as_ref()
+            .expect("session")
+            ._pipeline
+            .encoder_control
+            .take_keyframe_for_test();
+        assert!(drained, "mint must request the first keyframe");
+        let answer_sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\na=candidate:1 1 udp 1 127.0.0.1 9 typ host\r\na=candidate:2 1 udp 1 127.0.0.1 10 typ host\r\n";
+        // REGRESSION (universal Stunar black): OLD envelope carries the
+        // SHARER id while links are keyed by WATCHER id. Fence-exact must
+        // still apply + request the join keyframe.
+        let wrong_id = PeerSignal {
+            kind: PeerSignalKind::Answer,
+            sdp: answer_sdp.into(),
+            id: Some("sharer-id".into()),
+        };
+        let AnswerVerdict::Apply(pending) = resolve_answer(&engine.state, &wrong_id, fence) else {
+            panic!("fence-exact answer with wrong id must apply");
+        };
+        assert_eq!(pending.id, "watcher-1");
+        assert!(!pending.id_matched);
+        apply_accepted_answer(pending, wrong_id);
+        let keyframed = engine
+            .state
+            .lock()
+            .expect("state")
+            .session
+            .as_ref()
+            .expect("session")
+            ._pipeline
+            .encoder_control
+            .take_keyframe_for_test();
+        assert!(keyframed, "an applied answer must request a join keyframe");
+        // Correct id still applies, now with id_matched set.
+        let right_id = PeerSignal {
+            kind: PeerSignalKind::Answer,
+            sdp: "v=0\r\n".into(),
+            id: Some("watcher-1".into()),
+        };
+        let AnswerVerdict::Apply(pending) = resolve_answer(&engine.state, &right_id, fence) else {
+            panic!("correct-id answer must apply");
+        };
+        assert!(pending.id_matched);
+        // Unknown attempt on a live epoch: dropped (no fence-exact link),
+        // link untouched.
+        let epoch = engine.state.lock().expect("state").actor.fence(None);
+        let foreign: OfferAttemptId =
+            serde_json::from_value(serde_json::json!(u64::MAX - 7)).expect("attempt parses");
+        let unknown = OfferEpochFence {
+            epoch,
+            attempt: foreign,
+        };
+        assert!(
+            matches!(
+                resolve_answer(&engine.state, &right_id, unknown),
+                AnswerVerdict::NoMatch
+            ),
+            "unknown fence must drop"
+        );
+        // Stale epoch: dropped even with the live attempt.
+        let stale = OfferEpochFence {
+            epoch: EpochFence {
+                session: SessionEpoch(u64::MAX - 3),
+                share: ShareEpoch(u64::MAX - 3),
+                link: None,
+            },
+            attempt: fence.attempt,
+        };
+        assert!(
+            matches!(
+                resolve_answer(&engine.state, &right_id, stale),
+                AnswerVerdict::StaleEpoch
+            ),
+            "stale epoch must drop"
+        );
+        // Submit path maps verdicts to the legacy error strings: wrong-id +
+        // exact fence reaches the peer (fails only on the fake SDP, proving
+        // the lookup passed instead of "unknown viewer").
+        let probe = PeerSignal {
+            kind: PeerSignalKind::Answer,
+            sdp: answer_sdp.into(),
+            id: Some("sharer-id".into()),
+        };
+        let err = engine
+            .set_peer_answer(probe, minted.offer_attempt.clone())
+            .expect_err("fake SDP must fail at the peer");
+        assert!(
+            err.to_string().contains("remote answer"),
+            "wrong-id lookup must pass through to the peer, got: {err}"
+        );
+        assert_eq!(
+            engine.set_peer_answer(
+                right_id,
+                serde_json::to_string(&unknown).expect("fence serializes")
+            ),
+            Err(MediaEngineError::NativePeer("unknown viewer".into()))
+        );
+        assert_eq!(
+            engine.set_peer_answer(
+                PeerSignal {
+                    kind: PeerSignalKind::Answer,
+                    sdp: String::new(),
+                    id: Some("watcher-1".into()),
+                },
+                serde_json::to_string(&stale).expect("fence serializes")
+            ),
+            Err(MediaEngineError::NativePeer("stale viewer answer".into()))
+        );
+        // The link survived all of the above.
+        assert!(engine
+            .snapshot()
+            .roster
+            .iter()
+            .any(|entry| entry.id == "watcher-1"));
     }
 
     #[test]

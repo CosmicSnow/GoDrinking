@@ -7,8 +7,8 @@ import "./App.css";
 import logo from "./assets/logo.png";
 import { APP_VERSION, detectLocale, dictionaries, type Copy, type Locale } from "./copy";
 import { nextStickyPeople, RoomStage, salaRailDiagnostics } from "./RoomStage";
-import { autoFloorMbps, BITRATE_MAX_MBPS, BITRATE_MIN_MBPS, FLOOR_MAX_MBPS, FLOOR_MIN_MBPS, admissionStateFor, buildMilestonePayload, classifyViewerPlayback, collectViewerStats, describeSourceSelectionIntent, joinFailureForStage, nextShareIntent, nextWatchIntent, qualityTargetMbps, shareIntentStatusText, shouldEmitMilestone, startVideoPlayback, viewerPlaybackStatusText, watchIntentStatusText, type JoinFailureKind, type ShareIntentState, type ViewerPlaybackFlags, type ViewerPlaybackMilestone, type ViewerPlaybackStage, type ViewerStats, type ViewerStatsPrev, type WatchIntentState } from "./sessionStats";
-import { answerWithAttempt, offerDedupeKey, releaseOfferKey, videoSectionRejected } from "./sdp";
+import { autoFloorMbps, BITRATE_MAX_MBPS, BITRATE_MIN_MBPS, FLOOR_MAX_MBPS, FLOOR_MIN_MBPS, admissionStateFor, buildMilestonePayload, classifyViewerPlayback, collectViewerStats, describeSourceSelectionIntent, joinFailureForStage, nextShareIntent, nextWatchIntent, qualityTargetMbps, salaIceStatusText, shareIntentStatusText, shouldEmitMilestone, startVideoPlayback, viewerPlaybackStatusText, watchIntentStatusText, type JoinFailureKind, type ShareIntentState, type ViewerPlaybackFlags, type ViewerPlaybackMilestone, type ViewerPlaybackStage, type ViewerStats, type ViewerStatsPrev, type WatchIntentState } from "./sessionStats";
+import { AnswerGenerationGuard, buildBroadcastAnswerEnvelope, buildSalaAnswerEnvelope, offerDedupeKey, releaseOfferKey, resolveAnswerIdentity, videoSectionRejected } from "./sdp";
 import { decideSalaOfferGate, nextSalaOfferBatch, shouldAutoUnwatch } from "./salaOffers";
 
 type IconName = "grid" | "monitor" | "window" | "game" | "settings" | "help" | "plus" | "copy" | "wifi" | "chevron" | "expand" | "minimize" | "volume" | "volume-off" | "terminal" | "activity" | "folder";
@@ -41,7 +41,7 @@ type Capabilities = { platform?: string; supported: boolean; native_capture_impl
 type RosterEntry = { id: string; nickname: string; state: string; master?: boolean; share?: boolean };
 type IncomingOffer = { from: string; sdp: string; offer_attempt: string };
 type DirectAddress = { ip: string; port: number; version: number; kind: string; copy: string };
-type Snapshot = { state: string; session_id: string | null; source_id: number | null; bitrate_bps: number | null; native_capture_active: boolean; preview_callback_count: number; preview_frame_count: number; preview_dropped_count: number; preview_error: string | null; detail: string; peer_state: string; peer_detail: string; session_code: string | null; lan_addresses: string[]; lan_port: number | null; roster?: RosterEntry[]; self_id?: string | null; session_mode?: "broadcast" | "room"; password_set?: boolean; admission?: boolean; join_mode?: string; direct_listen_port?: number | null; direct_addresses?: DirectAddress[]; direct_mapping?: boolean; stunar_state?: string | null; resolution?: string | null; frame_rate?: string | null };
+type Snapshot = { state: string; session_id: string | null; source_id: number | null; bitrate_bps: number | null; native_capture_active: boolean; preview_callback_count: number; preview_frame_count: number; preview_dropped_count: number; preview_error: string | null; detail: string; peer_state: string; peer_detail: string; session_code: string | null; lan_addresses: string[]; lan_port: number | null; roster?: RosterEntry[]; self_id?: string | null; viewer_member_id?: string | null; session_mode?: "broadcast" | "room"; password_set?: boolean; admission?: boolean; join_mode?: string; direct_listen_port?: number | null; direct_addresses?: DirectAddress[]; direct_mapping?: boolean; stunar_state?: string | null; resolution?: string | null; frame_rate?: string | null };
 type Signal = { type: "offer" | "answer"; sdp: string; id?: string; offer_attempt: string };
 type SourceIdUpdate = { state: "unchanged" } | { state: "set"; id: number } | { state: "clear" };
 type LogSession = { session: string; timestamp: string; lines: string[] };
@@ -195,12 +195,22 @@ function App() {
   const [roomDesk, setRoomDesk] = useState(false);
   const salaAliveRef = useRef(false);
   const seenOffers = useRef<Set<string>>(new Set());
+  // Per-member answer serialization: concurrent poll redeliveries/re-mints
+  // for the same `from` must never close (or overwrite the store of) a
+  // newer PC. Stale invocations clean up only their own PC and return.
+  const salaAnswerGuardRef = useRef(new AnswerGenerationGuard());
   // Peek-don't-drop fallback: offers held locally when the engine has no
   // requeue lane yet, retried on the next poll — never silently dropped.
   const pendingOffersRef = useRef<Map<string, IncomingOffer>>(new Map());
   // Fresh-roster mirror for the offer gate: the poll effect closure would
   // otherwise decide auto-watch vs requeue on a stale roster tick.
   const rosterRef = useRef<RosterEntry[]>([]);
+  // Watcher-identity mirror for the answer path: the decoupled poll effect
+  // holds the first acceptIncomingOffer closure, so reading `session`
+  // directly there would pin a stale (null) snapshot forever. The ref stays
+  // fresh every render; resolveAnswerIdentity prefers viewer_member_id
+  // (dual-role) and falls back to self_id (viewer branch).
+  const watcherIdRef = useRef<string | null>(null);
   const rejectCountRef = useRef<Map<string, number>>(new Map());
   const [joinMode, setJoinMode] = useState<"lan" | "direct" | "stunar">(() => {
     const saved = localStorage.getItem("godrinking.join_mode");
@@ -305,6 +315,7 @@ function App() {
   const onStage = inSala && !roomDesk;
   const roster = session?.roster ?? [];
   rosterRef.current = roster;
+  watcherIdRef.current = resolveAnswerIdentity(session);
   const pendingRoster = roster.filter((entry) => admissionStateFor(entry.state) === "pending");
   const connectedRoster = roster.filter((entry) => admissionStateFor(entry.state) === "admitted" && entry.id !== session?.self_id);
   const removedRoster = roster.filter((entry) => {
@@ -778,6 +789,9 @@ function App() {
     next.delete(id);
     watchingRef.current = next;
     setWatching(next);
+    // Explicit Unwatch supersedes any in-flight answer for this member so a
+    // late redelivery can never close a future PC.
+    salaAnswerGuardRef.current.invalidate(id);
     const slot = remotesRef.current.get(id);
     slot?.pc.close();
     remotesRef.current.delete(id);
@@ -858,6 +872,7 @@ function App() {
     remotesRef.current.clear();
     seenOffers.current.clear();
     pendingOffersRef.current.clear();
+    salaAnswerGuardRef.current.reset();
     setRemoteIds([]);
     setStageId("host");
     setRoomJoined(false);
@@ -1028,21 +1043,50 @@ function App() {
       return;
     }
     // Stunar offer dedupe: keyed by from + opaque offer_attempt only.
+    // Answer identity: `id` is ALWAYS our own watcher-side member id (the
+    // ask/join handshake stores it engine-side as stunar_viewer.member_id;
+    // the snapshot exposes it as viewer_member_id / self_id). Sending the
+    // sharer's id (`incoming.from`) here makes the host drop the answer
+    // with "no matching viewer" — a silent black tile. When our id is not
+    // known yet, hold the offer in the pending buffer (peek-don't-drop) so
+    // the next poll retries with identity instead of mislabeling it.
+    const watcherId = watcherIdRef.current;
+    if (!watcherId) {
+      pendingOffersRef.current.set(offerDedupeKey(incoming.from, incoming.offer_attempt), incoming);
+      return;
+    }
     const offerKey = offerDedupeKey(incoming.from, incoming.offer_attempt);
     if (seenOffers.current.has(offerKey)) return;
     seenOffers.current.add(offerKey);
+    // Serialize per-`from` answers: a redelivered older attempt that is
+    // still in flight must never close the PC a newer attempt stored.
+    const { isCurrent } = salaAnswerGuardRef.current.begin(incoming.from);
+    const abortStale = (pc: RTCPeerConnection) => {
+      pc.close();
+    };
     // A failed attempt must be retryable on the next poll: without this,
     // one throw leaves the viewer stuck on "incoming offers" forever with
     // no error anywhere (the Mac-viewer symptom of the Windows incident).
     const allowRetry = () => { releaseOfferKey(seenOffers.current, incoming.from, incoming.offer_attempt); };
     const existing = remotesRef.current.get(incoming.from);
     try {
-      existing?.pc.close();
+      // Close only the exact superseded instance: a newer invocation may
+      // already have replaced it (begin() runs synchronously, so no newer
+      // generation can exist yet — this documents the invariant).
+      if (existing && isCurrent()) existing.pc.close();
       const pc = new RTCPeerConnection({ iceServers: iceServersFor(joinMode) });
+      // Sala ICE parity with Broadcast: terminal ICE states surface in the
+      // status line (never a silent black tile); the first-media poll
+      // drives per-link milestones after the answer is sent.
+      pc.oniceconnectionstatechange = () => {
+        const text = salaIceStatusText(incoming.from, pc.iceConnectionState);
+        if (text) setNotice(text);
+      };
       const stream = new MediaStream();
       pc.ontrack = (event) => {
         event.streams[0]?.getTracks().forEach((track) => stream.addTrack(track));
         if (!event.streams[0] && event.track) stream.addTrack(event.track);
+        if (!isCurrent()) return;
         remotesRef.current.set(incoming.from, { pc, stream });
         setRemoteIds([...remotesRef.current.keys()].filter((id, index, all) => all.indexOf(id) === index));
         if (stageId === "host" && incoming.from !== "host") setStageId(incoming.from);
@@ -1052,21 +1096,27 @@ function App() {
       };
       remotesRef.current.set(incoming.from, { pc, stream });
       await pc.setRemoteDescription({ type: "offer", sdp: incoming.sdp });
+      if (!isCurrent()) { abortStale(pc); return; }
       const answer = await pc.createAnswer();
+      if (!isCurrent()) { abortStale(pc); return; }
       await pc.setLocalDescription(answer);
+      if (!isCurrent()) { abortStale(pc); return; }
       await waitIce(pc);
+      if (!isCurrent()) { abortStale(pc); return; }
       const localSdp = pc.localDescription?.sdp;
       if (!localSdp) {
         pc.close();
-        allowRetry();
+        if (isCurrent()) allowRetry();
         return;
       }
       // Never ship a dead answer: a browser with no decoder for the session
       // codec answers m=video 0, which only fails loudly on the host while
       // this viewer stays silent. Surface it here and retry (bounded: the
       // poll dedups after two consecutive rejections of the same offer).
+      // A superseded invocation just cleans up: the newer attempt owns the key.
       if (videoSectionRejected(localSdp)) {
         pc.close();
+        if (!isCurrent()) return;
         const rejects = (rejectCountRef.current.get(offerKey) ?? 0) + 1;
         rejectCountRef.current.set(offerKey, rejects);
         if (rejects < 2) allowRetry();
@@ -1076,11 +1126,17 @@ function App() {
       }
       rejectCountRef.current.delete(offerKey);
       // Opaque echo: the answer round-trips offer_attempt verbatim so the
-      // Host matches the attempt without parsing SDP.
-      const answerEnvelope = answerWithAttempt({ type: "answer", sdp: localSdp, id: incoming.from }, incoming.offer_attempt);
+      // Host matches the attempt without parsing SDP. `id` is our own
+      // watcher member id; `to` routes to the sharer. Never the reverse.
+      if (!isCurrent()) { abortStale(pc); return; }
+      const answerEnvelope = buildSalaAnswerEnvelope(watcherId, localSdp, incoming.offer_attempt);
       await invokeMedia("send_stunar_room_answer", { request: { to: incoming.from, answer: answerEnvelope } });
+      if (!isCurrent()) return;
+      watchFirstMedia(pc, incoming.from);
     } catch (error) {
-      allowRetry();
+      // A superseded invocation must not resurrect its key: the newer
+      // attempt owns retries from here.
+      if (isCurrent()) allowRetry();
       setNotice(diagnosticError(error, "Could not answer the session."));
     }
   };
@@ -1116,6 +1172,26 @@ function App() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inSala, roster, watching]);
+  // Sala tile rebind: ontrack may fire before the tile video element exists
+  // (or React remounts it on pin/spotlight changes), so every tile mount
+  // re-attaches the stored remotesRef stream — never rely solely on the
+  // ontrack-time querySelector. Filter mirrors the tile list: only watched
+  // non-self remotes are bound; the Broadcast host element is owned by its
+  // own re-attach effect below.
+  useEffect(() => {
+    if (!inSala) return;
+    const selfId = watcherIdRef.current;
+    for (const id of remoteIds) {
+      if (id === "host" || id === "local") continue;
+      if (selfId != null && id === selfId) continue;
+      if (!watching.has(id)) continue;
+      const slot = remotesRef.current.get(id);
+      if (!slot?.stream) continue;
+      const el = document.querySelector<HTMLVideoElement>(`video[data-slot="${id}"]`);
+      if (el) bindViewerVideo(el, slot.stream, id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inSala, remoteIds, watching, pinned]);
   const joinRoom = async () => {
     if (sessionAction !== "idle") return;
     if (!nicknameValid) {
@@ -1237,7 +1313,20 @@ function App() {
       pc.oniceconnectionstatechange = handleIce;
       handleIce();
       // Opaque echo: the answer round-trips offer_attempt verbatim.
-      const joinAnswer = answerWithAttempt({ type: "answer", sdp: local.sdp, id: offer.id }, offer.offer_attempt);
+      // Answer identity audit: for LAN/Direct `offer.id` IS us — the host
+      // minted that viewer id at discover (OK + OFFER) and matches the
+      // answer by it, so echoing it back is correct. For Stunar Broadcast
+      // `offer.id` names the sharer side (the `from` field), so the answer
+      // must instead carry our own member id from the ask handshake
+      // (stunar_viewer.member_id, exposed as self_id/viewer_member_id).
+      // Unknown → fall back to the echo (the Rendezvous stamps the
+      // authenticated sender on the wire, so the fallback stays compatible).
+      let broadcastViewerId: string | null = null;
+      if (joinMode === "stunar") {
+        const snap = await invokeMedia<Snapshot>("get_media_session_state").catch(() => null);
+        broadcastViewerId = resolveAnswerIdentity(snap);
+      }
+      const joinAnswer = buildBroadcastAnswerEnvelope(broadcastViewerId ?? offer.id ?? "", local.sdp, offer.offer_attempt);
       await invokeMedia("submit_media_room_answer", { request: { host, answer: joinAnswer, join_mode: joinMode } });
       if (joinSeqRef.current !== seq || peerRef.current !== pc) return;
       if (pc.iceConnectionState !== "connected" && pc.iceConnectionState !== "completed") setNotice(`Joined ${displayLabel}. Waiting for media…`);

@@ -722,9 +722,17 @@ fn watch_offer_answer_media(
         .unwrap_or_else(|| panic!("loopback E2E milestone missing: {what} fenced offer"));
     let fence_json = serde_json::to_string(fence).expect("loopback E2E: fence must serialize");
     // Answer with the raw webrtc viewer (the browser lane, in-process).
+    // OLD frontend envelope on purpose: the answer carries the SHARER id,
+    // not the watcher id. Fence-first matching applies it anyway, so
+    // decode_ok below proves either-layer sufficiency (the frontend may
+    // send either shape and the host still connects).
     let (rtp_tx, mut rtp_rx) = tokio::sync::mpsc::unbounded_channel();
     let (viewer, answer_sdp) = LoopbackViewer::answer(&incoming.sdp, rtp_tx);
     assert_has_candidates(&answer_sdp, &format!("{what} viewer answer"));
+    assert_eq!(
+        incoming.from, host_id,
+        "loopback E2E: {what} answer must target the sharing host"
+    );
     joiner
         .submit_stunar_answer(
             PeerSignal {

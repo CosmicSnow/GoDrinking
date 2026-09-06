@@ -18,6 +18,7 @@ import {
   MILESTONE_ORDER,
   nextShareIntent,
   nextWatchIntent,
+  salaIceStatusText,
   shareIntentStatusText,
   shouldEmitMilestone,
   startVideoPlayback,
@@ -432,5 +433,23 @@ describe("admission + redaction", () => {
     expect(containsSensitiveField("password=hunter2")).toBe(true);
     expect(containsSensitiveField("token abc123")).toBe(true);
     expect(containsSensitiveField("link host · join lan · session ABC123")).toBe(false);
+  });
+});
+
+describe("salaIceStatusText (Sala ICE parity: never silent black)", () => {
+  it("surfaces terminal ICE states with the link id", () => {
+    for (const state of ["failed", "disconnected", "closed"]) {
+      const text = salaIceStatusText("sharer-1", state);
+      expect(text).not.toBeNull();
+      expect(text).toContain("sharer-1");
+      expect(text).toMatch(/ICE/);
+      expect(containsSensitiveField(text as string)).toBe(false);
+    }
+  });
+
+  it("stays silent while the link is still progressing", () => {
+    for (const state of ["new", "checking", "connected", "completed", "connecting"]) {
+      expect(salaIceStatusText("sharer-1", state)).toBeNull();
+    }
   });
 });
