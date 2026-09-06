@@ -68,11 +68,37 @@ const NO_LINK_WAIT: Duration = Duration::from_secs(3);
 struct TestServer {
     child: Child,
     base: String,
+    stderr_path: std::path::PathBuf,
+}
+
+fn stderr_tail(path: &std::path::Path, max_bytes: u64) -> String {
+    let text = std::fs::read(path).unwrap_or_default();
+    let tail = if text.len() as u64 > max_bytes {
+        &text[text.len() - max_bytes as usize..]
+    } else {
+        &text[..]
+    };
+    String::from_utf8_lossy(tail).into_owned()
 }
 
 impl TestServer {
     fn spawn(port: u16) -> Self {
         let rendezvous_dir = format!("{}/../rendezvous", env!("CARGO_MANIFEST_DIR"));
+        // Child stderr goes to a temp file (never null): when the server
+        // dies early — e.g. `import ws` failing because `npm ci` never ran
+        // — the failure below quotes the real cause instead of a bare port
+        // timeout.
+        let stderr_path = std::env::temp_dir().join(format!(
+            "godrinking-rendezvous-{port}-p{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        let stderr_file = std::fs::File::create(&stderr_path).unwrap_or_else(|error| {
+            panic!("loopback E2E: cannot create server stderr file: {error}")
+        });
         let mut child = Command::new("node")
             .arg("server.mjs")
             .env("PORT", port.to_string())
@@ -80,10 +106,13 @@ impl TestServer {
             .current_dir(&rendezvous_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr_file))
             .spawn()
             .unwrap_or_else(|error| {
-                panic!("loopback E2E needs node server.mjs: spawn failed: {error}")
+                panic!(
+                    "loopback E2E needs node server.mjs: spawn failed: {error} \
+                     (is node on PATH?)"
+                )
             });
         let base = format!("http://127.0.0.1:{port}");
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -91,13 +120,37 @@ impl TestServer {
             if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
                 break;
             }
+            // Fail fast when the server process is already gone: the port
+            // will never open, so quote stderr immediately instead of
+            // burning the whole deadline on a misleading timeout.
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let _ = child.wait();
+                    panic!(
+                        "loopback E2E: rendezvous on {base} exited early ({status}) — server stderr tail:\n{} \
+                         (did rendezvous `npm ci` run? is node on PATH?)",
+                        stderr_tail(&stderr_path, 2048),
+                    );
+                }
+                Ok(None) => {}
+                Err(_) => {}
+            }
             if Instant::now() > deadline {
                 let _ = child.kill();
-                panic!("loopback E2E: rendezvous on {base} never opened its port");
+                let _ = child.wait();
+                panic!(
+                    "loopback E2E: rendezvous on {base} never opened its port — server stderr tail:\n{} \
+                     (did rendezvous `npm ci` run? is node on PATH?)",
+                    stderr_tail(&stderr_path, 2048),
+                );
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        Self { child, base }
+        Self {
+            child,
+            base,
+            stderr_path,
+        }
     }
 }
 
@@ -105,6 +158,7 @@ impl Drop for TestServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.stderr_path);
     }
 }
 

@@ -34,6 +34,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # The Sala loopback E2E tests spawn a real `node rendezvous/server.mjs`,
+      # which needs its `ws` dependency installed. Without this, the spawn
+      # dies on import and the tests time out waiting for the port.
+      - run: npm ci --prefix rendezvous
       - run: cargo test --manifest-path src-tauri/Cargo.toml
         env:
           # Same as release.yml: Opus's bundled CMakeLists still declares
