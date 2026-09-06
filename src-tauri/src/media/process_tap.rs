@@ -1187,14 +1187,46 @@ mod tests {
         ));
         assert_eq!(status.pending, vec!["audio encoder"]);
         std::thread::sleep(Duration::from_millis(30));
+        // Loaded runners can starve the spawned worker past any fixed
+        // budget: poll with a generous deadline instead of a single join.
+        // Pending-then-retry-success stays a valid outcome (no fake pass:
+        // errors must stay empty, and the handle must be consumed).
+        let retry_deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut retry = super::ShutdownStatus::complete();
-        assert!(super::join_worker_until(
-            &mut worker,
-            std::time::Instant::now() + Duration::from_secs(1),
-            "audio encoder",
-            &mut retry
-        ));
+        let mut joined = false;
+        while !joined && std::time::Instant::now() < retry_deadline {
+            let mut attempt = super::ShutdownStatus::complete();
+            joined = super::join_worker_until(
+                &mut worker,
+                std::time::Instant::now() + Duration::from_millis(100),
+                "audio encoder",
+                &mut attempt,
+            );
+            assert!(
+                attempt.errors.is_empty(),
+                "audio worker must never report errors while retrying"
+            );
+            if !joined {
+                assert_eq!(
+                    attempt.pending,
+                    vec!["audio encoder"],
+                    "an unjoined worker must keep reporting pending"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            } else {
+                retry = attempt;
+            }
+        }
+        assert!(
+            joined,
+            "audio worker did not finish within the retry deadline"
+        );
         assert!(retry.quiesced);
+        assert!(retry.errors.is_empty());
+        assert!(
+            worker.is_none(),
+            "a joined worker handle must be consumed on success"
+        );
     }
 
     #[cfg(target_os = "macos")]
