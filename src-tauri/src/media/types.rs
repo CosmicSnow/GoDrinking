@@ -618,6 +618,11 @@ pub struct MediaSessionSnapshot {
     /// This member's id on the Rendezvous (Sala) or None for Broadcast Host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_id: Option<String>,
+    /// Dual-role processes (host + joiner in one engine) expose the
+    /// viewer-side member id here alongside `self_id`, so the UI never
+    /// conflates the host tile with self. None when no viewer is attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewer_member_id: Option<String>,
     /// True when the Session has a Password. The Password itself never leaves
     /// the native side.
     pub password_set: bool,
@@ -663,6 +668,7 @@ impl MediaSessionSnapshot {
             lan_port: None,
             roster: Vec::new(),
             self_id: None,
+            viewer_member_id: None,
             password_set: false,
             admission: false,
             join_mode: JoinMode::Lan,

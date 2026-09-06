@@ -736,7 +736,16 @@ function handleMemberHeartbeat(ip, json, res) {
     const viewer = room.viewers.get(entry.viewerId);
     if (viewer) viewer.heartbeatAt = now;
   }
-  ok(res, { ok: true, master_id: room.masterId ?? null });
+  // Heartbeat echo: the Sala roster rides the heartbeat response verbatim
+  // (share/state/master per member) so a member that missed a WS roster
+  // broadcast still converges on share:true/false via its own heartbeat.
+  // Broadcast rooms carry no share flags, so their echo keeps the
+  // historical shape.
+  if (room.mode === "room") {
+    ok(res, { ok: true, master_id: room.masterId ?? null, entries: rosterEntries(room) });
+  } else {
+    ok(res, { ok: true, master_id: room.masterId ?? null });
+  }
 }
 
 function handleMasterKick(ip, json, res) {

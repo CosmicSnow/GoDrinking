@@ -720,11 +720,10 @@ impl MediaEngine {
             let Some(session) = guard.session.as_mut() else {
                 return;
             };
-            let self_id = session
+            let self_host = session
                 .stunar
                 .as_ref()
-                .and_then(|host| host.self_id.clone())
-                .or(viewer_member_id);
+                .and_then(|host| host.self_id.clone());
             let mut dropped = Vec::new();
             let mut retired = Vec::new();
             for id in unwatch {
@@ -739,7 +738,26 @@ impl MediaEngine {
             let mut to_mint = Vec::new();
             if capturing && !watch.is_empty() {
                 let linked: HashSet<String> = session.viewers.keys().cloned().collect();
-                for id in Self::select_watch_mints(&linked, self_id.as_deref(), watch, capturing) {
+                for id in watch.iter().filter(|id| {
+                    Some(id.as_str()) == self_host.as_deref()
+                        || Some(id.as_str()) == viewer_member_id.as_deref()
+                }) {
+                    logger::log(
+                        "INFO",
+                        "mint-skip-self",
+                        &format!(
+                            "to={id} session={} share={}",
+                            origin.session.0, origin.share.0,
+                        ),
+                    );
+                }
+                for id in Self::select_watch_mints(
+                    &linked,
+                    self_host.as_deref(),
+                    viewer_member_id.as_deref(),
+                    watch,
+                    capturing,
+                ) {
                     let nickname = session
                         .stunar
                         .as_ref()
@@ -855,11 +873,13 @@ impl MediaEngine {
 
     /// Pure Sala watch selection: which drained watchers still need an offer.
     /// Not capturing → no mints (watches stay retained upstream via
-    /// `take_watch_requests(false)`). Self and already-linked watchers are
-    /// skipped so a StartShare flush never mints twice for one member.
+    /// `take_watch_requests(false)`). Self in EITHER role (host id or own
+    /// viewer member id) and already-linked watchers are skipped so a
+    /// StartShare flush never mints twice — or to self — for one member.
     fn select_watch_mints(
         linked: &HashSet<String>,
-        self_id: Option<&str>,
+        self_host: Option<&str>,
+        self_viewer: Option<&str>,
         watch: Vec<String>,
         capturing: bool,
     ) -> Vec<String> {
@@ -868,7 +888,7 @@ impl MediaEngine {
         }
         let mut selected = Vec::new();
         for id in watch {
-            if self_id == Some(id.as_str()) {
+            if self_host == Some(id.as_str()) || self_viewer == Some(id.as_str()) {
                 continue;
             }
             if linked.contains(&id) {
@@ -1706,26 +1726,85 @@ impl MediaEngine {
         Ok(())
     }
 
+    /// Sala watch routing: route BY `to`. When `to` is in the viewer-side
+    /// roster the watch leaves on the viewer socket, otherwise on the host
+    /// socket — never "host wins". Redacted milestones only (ids and flags,
+    /// never Passwords, Tokens, or SDP).
     pub fn request_watch(&self, to: &str, start: bool) -> Result<(), MediaEngineError> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| MediaEngineError::StatePoisoned)?;
-        if let Some(host) = state
-            .session
-            .as_ref()
-            .and_then(|session| session.stunar.as_ref())
-        {
-            return host
-                .send_watch(to, start)
-                .map_err(MediaEngineError::NativePeer);
+        let (route, result, fence) = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| MediaEngineError::StatePoisoned)?;
+            let viewer_roster: Vec<(String, String, bool, bool)> = state
+                .stunar_viewer
+                .as_ref()
+                .map(|viewer| viewer.room_roster())
+                .unwrap_or_default();
+            let fence = state.actor.fence(None);
+            // Route BY `to`: viewer-side roster wins, else host socket.
+            let route = resolve_watch_route(
+                &viewer_roster,
+                state
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.stunar.as_ref())
+                    .is_some(),
+                state.stunar_viewer.is_some(),
+                to,
+            );
+            // `send_watch` only pushes to a bounded channel; the milestones
+            // below stay redacted (ids and flags only).
+            if !viewer_roster.is_empty() {
+                let applied: Vec<String> = viewer_roster
+                    .iter()
+                    .map(|(id, _, _, share)| format!("{id}={}", u8::from(*share)))
+                    .collect();
+                logger::log(
+                    "INFO",
+                    "roster-applied",
+                    &format!(
+                        "session={} share={} viewer_roster=[{}]",
+                        fence.session.0,
+                        fence.share.0,
+                        applied.join(","),
+                    ),
+                );
+            }
+            let result = match route {
+                WatchRoute::Viewer => state
+                    .stunar_viewer
+                    .as_ref()
+                    .map(|viewer| viewer.send_watch(to, start))
+                    .unwrap_or(Err("no stunar session".into())),
+                WatchRoute::Host => state
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.stunar.as_ref())
+                    .map(|host| host.send_watch(to, start))
+                    .unwrap_or(Err("no stunar session".into())),
+                WatchRoute::None => Err("no stunar session".into()),
+            };
+            (route, result, fence)
+        };
+        match &result {
+            Ok(()) => logger::log(
+                "INFO",
+                "watch-sent",
+                &format!(
+                    "via={} to={to} start={start} session={} share={}",
+                    route.as_str(),
+                    fence.session.0,
+                    fence.share.0,
+                ),
+            ),
+            Err(error) => logger::log(
+                "WARN",
+                "watch-sent",
+                &format!("via={} to={to} failed: {error}", route.as_str()),
+            ),
         }
-        if let Some(viewer) = state.stunar_viewer.as_ref() {
-            return viewer
-                .send_watch(to, start)
-                .map_err(MediaEngineError::NativePeer);
-        }
-        Err(MediaEngineError::NativePeer("no stunar session".into()))
+        result.map_err(MediaEngineError::NativePeer)
     }
 
     pub fn start_share(&self) -> Result<MediaSessionSnapshot, MediaEngineError> {
@@ -4875,6 +4954,46 @@ fn stop_in_state(
     Ok(snapshot_from_state(&state))
 }
 
+/// Socket a Sala watch leaves on. Pure so the routing table is
+/// unit-tested directly; `request_watch` implements it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WatchRoute {
+    Viewer,
+    Host,
+    None,
+}
+
+impl WatchRoute {
+    fn as_str(self) -> &'static str {
+        match self {
+            WatchRoute::Viewer => "viewer",
+            WatchRoute::Host => "host",
+            WatchRoute::None => "none",
+        }
+    }
+}
+
+/// Route BY `to`: a viewer-roster hit leaves on the viewer socket,
+/// otherwise the host socket. Never "host wins".
+fn resolve_watch_route(
+    viewer_roster: &[(String, String, bool, bool)],
+    has_host: bool,
+    has_viewer: bool,
+    to: &str,
+) -> WatchRoute {
+    let viewer_knows_to = viewer_roster.iter().any(|(id, _, _, _)| id == to);
+    if viewer_knows_to && has_viewer {
+        return WatchRoute::Viewer;
+    }
+    if has_host {
+        return WatchRoute::Host;
+    }
+    if has_viewer {
+        return WatchRoute::Viewer;
+    }
+    WatchRoute::None
+}
+
 /// Room roster is authoritative over synthetic snapshot entries: when the
 /// Rendezvous knows a member, its share flag wins — a roster-known sharing
 /// member is never left at the synthetic `share:false` default.
@@ -4915,7 +5034,9 @@ fn snapshot_from_state(state: &EngineState) -> MediaSessionSnapshot {
             snap.state = MediaLifecycleState::Running;
             snap.detail = state.detail.clone();
             snap.roster = roster;
+            // Viewer branch: self is EXCLUSIVELY the viewer member id.
             snap.self_id = viewer.member_id.clone();
+            snap.viewer_member_id = viewer.member_id.clone();
             snap.session_mode = if viewer.mode == "room" {
                 super::room_mode::SessionMode::Room
             } else {
@@ -5082,16 +5203,17 @@ fn snapshot_from_state(state: &EngineState) -> MediaSessionSnapshot {
             .unwrap_or_default(),
         lan_port: session.room.as_ref().map(|room| room.port),
         roster,
+        // Session branch: self is EXCLUSIVELY the host member id. A
+        // dual-role process (host + joiner in one engine) exposes the
+        // viewer-side id separately as `viewer_member_id`.
         self_id: session
             .stunar
             .as_ref()
-            .and_then(|host| host.self_id.clone())
-            .or_else(|| {
-                state
-                    .stunar_viewer
-                    .as_ref()
-                    .and_then(|viewer| viewer.member_id.clone())
-            }),
+            .and_then(|host| host.self_id.clone()),
+        viewer_member_id: state
+            .stunar_viewer
+            .as_ref()
+            .and_then(|viewer| viewer.member_id.clone()),
         password_set: session.gate.password_set(),
         admission: session.gate.admission(),
         join_mode: session.request.join_mode,
@@ -6045,6 +6167,7 @@ mod tests {
         assert!(super::MediaEngine::select_watch_mints(
             &HashSet::new(),
             None,
+            None,
             vec!["bob".to_owned()],
             false,
         )
@@ -6054,15 +6177,17 @@ mod tests {
             super::MediaEngine::select_watch_mints(
                 &HashSet::new(),
                 None,
+                None,
                 vec!["bob".to_owned(), "bob".to_owned()],
                 true,
             ),
             vec!["bob".to_owned()],
         );
-        // Already-linked watchers and self never mint again.
+        // Already-linked watchers and self in EITHER role never mint again.
         let linked: HashSet<String> = ["bob".to_owned()].into_iter().collect();
         assert!(super::MediaEngine::select_watch_mints(
             &linked,
+            None,
             None,
             vec!["bob".to_owned()],
             true,
@@ -6071,10 +6196,49 @@ mod tests {
         assert!(super::MediaEngine::select_watch_mints(
             &HashSet::new(),
             Some("ada"),
+            None,
             vec!["ada".to_owned()],
             true,
         )
         .is_empty());
+        assert!(super::MediaEngine::select_watch_mints(
+            &HashSet::new(),
+            Some("host-ada"),
+            Some("ada"),
+            vec!["ada".to_owned()],
+            true,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn sala_watch_routes_by_target_never_host_wins() {
+        use super::{resolve_watch_route, WatchRoute};
+        let roster = vec![("ada".to_owned(), "Ada".to_owned(), true, true)];
+        // Viewer-roster hit → viewer socket even with a host session present.
+        assert_eq!(
+            resolve_watch_route(&roster, true, true, "ada"),
+            WatchRoute::Viewer
+        );
+        // Unknown target → host socket when a host session exists.
+        assert_eq!(
+            resolve_watch_route(&roster, true, true, "mallory"),
+            WatchRoute::Host
+        );
+        // Viewer-only engine still sends (fallback), host-only too.
+        assert_eq!(
+            resolve_watch_route(&roster, false, true, "mallory"),
+            WatchRoute::Viewer
+        );
+        assert_eq!(
+            resolve_watch_route(&[], true, false, "ada"),
+            WatchRoute::Host
+        );
+        // Nothing attached → explicit None (fails loudly upstream).
+        assert_eq!(
+            resolve_watch_route(&[], false, false, "ada"),
+            WatchRoute::None
+        );
     }
 
     #[test]
@@ -6199,3 +6363,7 @@ mod tests {
 #[cfg(test)]
 #[path = "media_engine_integration_test.rs"]
 mod media_engine_integration_test;
+
+#[cfg(test)]
+#[path = "sala_loopback_test.rs"]
+mod sala_loopback_test;
