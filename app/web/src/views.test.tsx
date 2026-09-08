@@ -217,6 +217,36 @@ describe("RoomScreen (snapshot → markup, sem inferência)", () => {
     expect(html.match(/Assistir/g)?.length).toBe(1);
   });
 
+  it("topbar tem Copiar ao lado da pill; stage-head tem Atualizar, sem room-code-bar", () => {
+    const html = renderToStaticMarkup(createElement(RoomScreen, roomProps({ roster: members })));
+    expect(html).toContain("Copiar");
+    expect(html).toContain("Atualizar");
+    expect(html).toContain("Ignorar Áudio de Apps");
+    expect(html).not.toContain("room-code-bar");
+    expect(html).not.toContain("Copiar código");
+  });
+
+  it("palco mostra só quem compartilha; sidebar lista todo mundo", () => {
+    const html = renderToStaticMarkup(createElement(RoomScreen, roomProps({ roster: members })));
+    // Ana (sem share) não tem tile; Bia (com share) tem.
+    expect(html).not.toContain("tile-view-m-1");
+    expect(html).toContain("tile-view-m-2");
+    // Sidebar continua com todo mundo.
+    expect(html).toContain("(você)");
+  });
+
+  it("ninguém compartilhando: palco vazio honesto, sidebar intacta", () => {
+    const idle = renderToStaticMarkup(
+      createElement(
+        RoomScreen,
+        roomProps({ roster: [{ id: "m-9", nickname: "Zé", master: false, share: false }] }),
+      ),
+    );
+    expect(idle).toContain("Sem transmissões");
+    expect(idle).not.toContain("tile-view-m-9");
+    expect(idle).toContain("Zé");
+  });
+
   it("membro assistido mostra Parar de ver", () => {
     const html = renderToStaticMarkup(
       createElement(RoomScreen, roomProps({ roster: members, watching: ["m-2"] })),
@@ -246,16 +276,19 @@ describe("RoomScreen (snapshot → markup, sem inferência)", () => {
     );
     expect(withLinks).toContain("Bia");
     expect(withLinks).toContain("Negociando");
-    expect(withLinks).toContain("No ar");
+    // Share no ar: o botão de controle reflete o estado (selo removido).
+    expect(withLinks).toContain("Parar de compartilhar");
 
     const empty = renderToStaticMarkup(createElement(RoomScreen, roomProps()));
     expect(empty).toContain("Nenhum link ativo no snapshot");
   });
 
-  it("estado de vídeo real: sem link conectado vs janela nativa + apresentados", () => {
+  it("placeholder de vídeo removido: stage sem selo de share nem contadores", () => {
     const withoutLink = renderToStaticMarkup(createElement(RoomScreen, roomProps()));
-    expect(withoutLink).toContain("Sem vídeo: nenhum link conectado");
-    expect(withoutLink).toContain("ainda sem amostra do evento de mídia");
+    expect(withoutLink).not.toContain("video-placeholder");
+    expect(withoutLink).not.toContain("Sem vídeo: nenhum link conectado");
+    expect(withoutLink).not.toContain("share-state");
+    expect(withoutLink).toContain("Sem transmissões");
 
     const connected = renderToStaticMarkup(
       createElement(
@@ -268,9 +301,9 @@ describe("RoomScreen (snapshot → markup, sem inferência)", () => {
         }),
       ),
     );
-    expect(connected).toContain("Vídeo na janela nativa");
-    expect(connected).toContain("Frames recebidos: 120");
-    expect(connected).toContain("apresentados: 118");
+    expect(connected).not.toContain("video-placeholder");
+    expect(connected).not.toContain("Vídeo na janela nativa");
+    expect(connected).not.toContain("Frames recebidos");
   });
 
   it("sem snapshot, diagnóstico pede Atualizar (nunca estado inventado)", () => {
@@ -544,9 +577,11 @@ describe("QualityPanel (integrado na sala)", () => {
         }),
       ),
     );
-    // Botão existe mas desabilitado (fieldset + botão desabilitados).
+    // Botão desabilitado com motivo; fieldset segue editável para corrigir.
     expect(html).toContain("Aplicar qualidade");
     expect(html).toContain("disabled");
+    expect(html).toContain("Corrija os erros do perfil custom.");
+    expect(html).not.toContain("<fieldset disabled");
   });
 
   it("custom mostra os campos editáveis", () => {
@@ -570,7 +605,7 @@ describe("QualityPanel (integrado na sala)", () => {
     expect(html).toContain("Desejado: 640×360 @ 1000 kbps · 24 fps");
   });
 
-  it("custom inválido lista erros em vez de perfil", () => {
+  it("custom inválido esconde o perfil sem lista de erros (só o Aplicar gata)", () => {
     const html = renderToStaticMarkup(
       createElement(
         RoomScreen,
@@ -581,6 +616,7 @@ describe("QualityPanel (integrado na sala)", () => {
     );
     expect(html).toContain("par");
     expect(html).not.toContain("Desejado:");
+    expect(html).not.toContain('class="errors"');
   });
 });
 

@@ -288,13 +288,16 @@ export function QualityPanel(props: QualityPanelProps) {
     resolution, customW, customH, quality, customBitrate, customFps, srcDims,
   });
   const valid = "profile" in resolved;
-  const disabled = !shareLive || busy || applying || !valid;
+  // Fieldset libera digitação sempre que há share (sem `!valid`: com CUSTOM
+  // vazio o usuário precisa digitar para corrigir). Só o Aplicar gata em `valid`.
+  const fieldDisabled = !shareLive || busy || applying;
+  const disabled = fieldDisabled || !valid;
   return (
     <div className="quality">
       {!shareLive ? (
         <p className="empty" role="status">{QUALITY_DISABLED_REASON}</p>
       ) : null}
-      <fieldset disabled={disabled} aria-label="Perfil de qualidade">
+      <fieldset disabled={fieldDisabled} aria-label="Perfil de qualidade">
         <div className="row">
           <div className="field">
             <label htmlFor="resolution">Resolução</label>
@@ -330,7 +333,7 @@ export function QualityPanel(props: QualityPanelProps) {
               <input
                 id="custom-w"
                 value={customW}
-                onChange={(event) => onCustomW(event.target.value)}
+                onChange={(event) => onCustomW(event.target.value.replace(/\D/g, ""))}
                 placeholder="1280"
                 inputMode="numeric"
                 autoComplete="off"
@@ -341,7 +344,7 @@ export function QualityPanel(props: QualityPanelProps) {
               <input
                 id="custom-h"
                 value={customH}
-                onChange={(event) => onCustomH(event.target.value)}
+                onChange={(event) => onCustomH(event.target.value.replace(/\D/g, ""))}
                 placeholder="720"
                 inputMode="numeric"
                 autoComplete="off"
@@ -356,7 +359,7 @@ export function QualityPanel(props: QualityPanelProps) {
               <input
                 id="custom-bitrate"
                 value={customBitrate}
-                onChange={(event) => onCustomBitrate(event.target.value)}
+                onChange={(event) => onCustomBitrate(event.target.value.replace(/\D/g, ""))}
                 placeholder="2000"
                 inputMode="numeric"
                 autoComplete="off"
@@ -367,7 +370,7 @@ export function QualityPanel(props: QualityPanelProps) {
               <input
                 id="custom-fps"
                 value={customFps}
-                onChange={(event) => onCustomFps(event.target.value)}
+                onChange={(event) => onCustomFps(event.target.value.replace(/\D/g, ""))}
                 placeholder="30"
                 inputMode="numeric"
                 autoComplete="off"
@@ -382,13 +385,7 @@ export function QualityPanel(props: QualityPanelProps) {
           {resolved.profile.bitrate_kbps} kbps · {resolved.profile.fps} fps
           {srcDims ? ` (fonte ${srcDims.w}×${srcDims.h})` : " (fonte desconhecida: sem teto de upscale)"}
         </p>
-      ) : (
-        <ul className="errors" role="alert">
-          {resolved.errors.map((message) => (
-            <li key={message}>{message}</li>
-          ))}
-        </ul>
-      )}
+      ) : null}
       <div className="row">
         <button
           type="button"
@@ -856,9 +853,9 @@ function Tile(props: TileProps) {
 
 export function RoomScreen(props: RoomProps) {
   const {
-    roomCode, nickname, snapshot, roster, selfId, selfNickname, watching,
+    roomCode, snapshot, roster, selfId, selfNickname, watching,
     source, onSource, sources, sourcesError, caps, onListSources,
-    busy, error, lastSignal, lastMedia, stats, quality, linkStats,
+    busy, error, lastSignal, lastMedia, quality, linkStats,
     onRefresh, onLeave, onShare, onStopShare, onWatch, onUnwatch,
     mock = false,
   } = props;
@@ -883,9 +880,10 @@ export function RoomScreen(props: RoomProps) {
   const { toast, show } = useToast();
 
   const sharingMembers = roster.filter((member) => member.share);
-  const pinned = pinnedId ? roster.find((member) => member.id === pinnedId) ?? null : null;
-  const gridMembers = pinned ? [pinned] : roster;
-  const stripMembers = pinned ? roster.filter((member) => member.id !== pinned.id) : [];
+  // Palco mostra SOMENTE quem compartilha; sidebar continua com todo mundo.
+  const pinned = pinnedId ? sharingMembers.find((member) => member.id === pinnedId) ?? null : null;
+  const gridMembers = pinned ? [pinned] : sharingMembers;
+  const stripMembers = pinned ? sharingMembers.filter((member) => member.id !== pinned.id) : [];
 
   const say = (message: string): void => show(message);
 
@@ -954,6 +952,16 @@ export function RoomScreen(props: RoomProps) {
             <span>Sala {roomCode ?? "sem código ainda"}</span>
             <em>· {roster.length} pessoa(s)</em>
           </span>
+          {roomCode ? (
+            <button
+              type="button"
+              className="btn ghost small"
+              onClick={copyCode}
+              title="Copia o código da sala"
+            >
+              Copiar
+            </button>
+          ) : null}
           {mock ? (
             <span
               className="mock-tag"
@@ -993,36 +1001,27 @@ export function RoomScreen(props: RoomProps) {
         <main className="stage-wrap">
           <div className="stage-head">
             <div>
-              <h1>{sharing ? "Ao vivo agora" : "Prévia da sala"}</h1>
               <p>
                 {sharingMembers.length} compartilhando · {watching.length} assistindo
               </p>
             </div>
-            <div className="stage-hint">
-              Scroll = zoom · Arrastar = mover · Duplo-clique = resetar
-            </div>
-          </div>
-
-          <div className="room-code-bar">
-            <span>Sala <strong data-testid="room-code">{roomCode ?? "sem código ainda"}</strong></span>
-            <small>{nickname}</small>
-            {roomCode ? (
-              <button type="button" className="btn ghost small" onClick={copyCode}>
-                Copiar código
+            <div className="stage-head-actions">
+              <div className="stage-hint">
+                Scroll = zoom · Arrastar = mover · Duplo-clique = resetar
+              </div>
+              <button
+                type="button"
+                className="btn ghost small"
+                onClick={() => {
+                  onRefresh();
+                  say("Sala atualizada.");
+                }}
+                disabled={busy}
+                title="Lê o snapshot do backend agora"
+              >
+                {busy ? "Atualizando…" : "Atualizar"}
               </button>
-            ) : null}
-            <button
-              type="button"
-              className="btn ghost small"
-              onClick={() => {
-                onRefresh();
-                say("Sala atualizada.");
-              }}
-              disabled={busy}
-              title="Lê o snapshot do backend agora"
-            >
-              {busy ? "Atualizando…" : "Atualizar"}
-            </button>
+            </div>
           </div>
 
           {error ? (
@@ -1030,7 +1029,7 @@ export function RoomScreen(props: RoomProps) {
           ) : null}
 
           <section className="stage" aria-label="Transmissões da sala">
-            {roster.length === 0 ? (
+            {sharingMembers.length === 0 ? (
               <div className="empty-stage">Sem transmissões</div>
             ) : (
               <>
@@ -1094,34 +1093,8 @@ export function RoomScreen(props: RoomProps) {
                     </div>
                   </>
                 ) : null}
-                {sharingMembers.length === 0 ? (
-                  <div className="empty-stage">Sem transmissões</div>
-                ) : null}
               </>
             )}
-            <span className="state" data-testid="share-state">
-              Share: {shareState ? shareLabel(shareState) : "desconhecido — toque Atualizar"}
-            </span>
-            <div className="video-placeholder" role="status">
-              <strong>
-                {links.some((link) => link.state === "connected")
-                  ? "Vídeo na janela nativa."
-                  : "Sem vídeo: nenhum link conectado."}
-              </strong>
-              <span>
-                Cada watch abre uma janela nativa do sistema com o vídeo decodificado
-                (título com o nome de quem compartilha). O que você vê aqui é o
-                estado real do link — o vídeo nunca passa pela WebView.
-              </span>
-              {stats ? (
-                <span data-testid="viewer-stats">
-                  Frames recebidos: {stats.frames} · keyframes: {stats.keyframes} · ICE:{" "}
-                  {stats.ice ? "conectado" : "negociando"} · apresentados: {stats.presented}
-                </span>
-              ) : (
-                <span>Frames recebidos: ainda sem amostra do evento de mídia.</span>
-              )}
-            </div>
           </section>
 
           <footer className="controls" data-hook="room-controls">
@@ -1299,7 +1272,7 @@ export function RoomScreen(props: RoomProps) {
 
           <section className="card" data-hook="audio-policy">
             <div className="card-head">
-              <h2>Áudio da sessão</h2>
+              <h2>Ignorar Áudio de Apps</h2>
             </div>
             <div className="audio-tools">
               <input

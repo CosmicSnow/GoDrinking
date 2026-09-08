@@ -51,6 +51,7 @@ button{font-family:inherit}
 .stage-head p{color:var(--mut);font-size:12.5px;margin-top:3px}
 .stage-hint{font-size:11.5px;color:var(--dim);background:var(--bg2);border:1px solid var(--line);
   padding:6px 10px;border-radius:8px;white-space:nowrap}
+.stage-head-actions{display:flex;align-items:center;gap:8px}
 
 /* ── Lobby ── */
 .lobby{background:linear-gradient(180deg,#26272b,#1e1f22);border:1px solid var(--line);border-radius:16px;
@@ -235,7 +236,7 @@ button{font-family:inherit}
 .modal-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
 .modal-head h2{font-size:16px}
 .icon-btn{background:var(--bg3);border:1px solid var(--line);color:var(--txt);border-radius:8px;
-  width:30px;height:30px;cursor:pointer}
+  width:30px;height:30px;cursor:pointer;display:flex;align-items:center;justify-content:center}
 .icon-btn:hover{background:#3d3f45}
 .tabs{display:flex;gap:8px;margin-bottom:14px}
 .tab{flex:1;border:1px solid var(--line);background:var(--bg3);color:var(--mut);border-radius:9px;
