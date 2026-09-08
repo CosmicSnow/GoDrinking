@@ -1,0 +1,13 @@
+{
+  "": {
+    "dependencies": "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-6551de1861351a06/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/MetalBridge.build/MetalBridge.d",
+    "object": "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-6551de1861351a06/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/MetalBridge.build/MetalBridge.o",
+    "swift-dependencies": "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-6551de1861351a06/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/MetalBridge.build/primary.swiftdeps"
+  },
+  "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/Metal/Metal.swift": {
+    "object": "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-6551de1861351a06/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/MetalBridge.build/Metal.swift.o",
+    "swiftmodule": "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-6551de1861351a06/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/MetalBridge.build/Metal~partial.swiftmodule",
+    "swift-dependencies": "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-6551de1861351a06/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/MetalBridge.build/Metal.swiftdeps",
+    "diagnostics": "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-6551de1861351a06/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/MetalBridge.build/Metal.dia"
+  }
+}

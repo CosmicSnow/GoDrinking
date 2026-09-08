@@ -1,0 +1,11 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "identifier": "default",
+  "description": "Minimal capabilities: frontend may listen to backend events and backend may emit them. Nothing else.",
+  "windows": ["main"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-emit",
+    "core:event:allow-unlisten"
+  ]
+}

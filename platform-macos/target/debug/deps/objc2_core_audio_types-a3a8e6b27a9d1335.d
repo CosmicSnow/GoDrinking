@@ -1,0 +1,8 @@
+/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/deps/objc2_core_audio_types-a3a8e6b27a9d1335.d: /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-core-audio-types-0.3.2/src/lib.rs /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-core-audio-types-0.3.2/src/base_types.rs /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-core-audio-types-0.3.2/src/generated/mod.rs /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-core-audio-types-0.3.2/src/generated/CoreAudioBaseTypes.rs
+
+/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/deps/libobjc2_core_audio_types-a3a8e6b27a9d1335.rmeta: /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-core-audio-types-0.3.2/src/lib.rs /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-core-audio-types-0.3.2/src/base_types.rs /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-core-audio-types-0.3.2/src/generated/mod.rs /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-core-audio-types-0.3.2/src/generated/CoreAudioBaseTypes.rs
+
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-core-audio-types-0.3.2/src/lib.rs:
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-core-audio-types-0.3.2/src/base_types.rs:
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-core-audio-types-0.3.2/src/generated/mod.rs:
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-core-audio-types-0.3.2/src/generated/CoreAudioBaseTypes.rs:

@@ -1,0 +1,17 @@
+{
+  "name": "golive-sala-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "GoLive Sala signaling server: RAM-only, signaling-only (JSON). Never touches media.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node test_rooms.mjs && node test_auth.mjs && node test_admit.mjs && node test_signaling.mjs && node test_limits.mjs && node test_kick.mjs && node test_succession.mjs && node test_heartbeat.mjs && node test_ratelimit.mjs && node test_nomedia.mjs"
+  },
+  "dependencies": {
+    "ws": "8.21.3"
+  }
+}

@@ -1,0 +1,3 @@
+module ScreenCaptureKitBridge {
+    header "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-6551de1861351a06/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/include/ScreenCaptureKitBridge-Swift.h"
+}

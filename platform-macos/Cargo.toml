@@ -1,0 +1,26 @@
+[package]
+name = "golive-platform-macos"
+version = "0.1.0"
+edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0"
+description = "GoLive macOS capture backend (ScreenCaptureKit). macOS only; the pure contract lives in golive-platform."
+
+[lib]
+name = "golive_platform_macos"
+crate-type = ["rlib"]
+
+[dependencies]
+golive-platform = { path = "../platform" }
+# Pure ObjC bindings (no Swift toolchain, no extra link hacks): only system
+# frameworks at runtime, which every Mac has. Versions pinned to the 0.3 line.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSArray",
+    "NSError",
+    "NSString",
+] }
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
+objc2-screen-capture-kit = "0.3"
+block2 = "0.6"
+dispatch2 = { version = "0.3", features = ["objc2"] }

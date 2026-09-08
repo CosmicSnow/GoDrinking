@@ -1,0 +1,45 @@
+[package]
+name = "golive-app"
+version = "0.1.0"
+edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0"
+description = "GoLive thin Tauri shell over golive-core. No product logic: commands drive the core, core events become Tauri events."
+
+[lib]
+name = "golive_app"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "golive-app"
+path = "src/main.rs"
+
+[[bin]]
+name = "golive-video"
+path = "src/bin/video.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# The core MUST NOT depend on Tauri; the shell depends on the core by path.
+golive-core = { path = "../core" }
+# Capture platform abstraction (pure trait/types; core never imports this).
+golive-platform = { path = "../platform" }
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+# Native video windows (helper process owns the main-thread event loop;
+# Tauri owns main in the app process). softbuffer = CPU blit, no GPU APIs,
+# no extra dylibs — trivially packable.
+winit = "0.30"
+softbuffer = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net"] }
+ureq = { version = "3", features = ["json"] }
+
+# macOS capture backend (ScreenCaptureKit). Target-gated: other platforms
+# build the shell without it (capabilities report accordingly).
+[target.'cfg(target_os = "macos")'.dependencies]
+golive-platform-macos = { path = "../platform-macos" }

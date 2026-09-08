@@ -9,6 +9,10 @@ lerna-debug.log*
 
 node_modules
 src-tauri/target
+core/target
+app/target
+gst-spike/target
+e2e-artifacts/
 dist
 dist-ssr
 *.local

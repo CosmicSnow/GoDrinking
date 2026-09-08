@@ -1,0 +1,3 @@
+module AppleCFBridge {
+    header "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/apple-cf-293b9c14459fc7be/out/swift-build/arm64-apple-macosx/release/AppleCFBridge.build/include/AppleCFBridge-Swift.h"
+}

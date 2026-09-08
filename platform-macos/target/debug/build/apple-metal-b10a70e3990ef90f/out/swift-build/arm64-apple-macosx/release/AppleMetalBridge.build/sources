@@ -1,0 +1,15 @@
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/apple-metal-0.8.8/swift-bridge/Sources/AppleMetalBridge/Advanced.swift
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/apple-metal-0.8.8/swift-bridge/Sources/AppleMetalBridge/Argument.swift
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/apple-metal-0.8.8/swift-bridge/Sources/AppleMetalBridge/Buffer.swift
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/apple-metal-0.8.8/swift-bridge/Sources/AppleMetalBridge/CommandExtras.swift
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/apple-metal-0.8.8/swift-bridge/Sources/AppleMetalBridge/CommandQueue.swift
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/apple-metal-0.8.8/swift-bridge/Sources/AppleMetalBridge/Compute.swift
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/apple-metal-0.8.8/swift-bridge/Sources/AppleMetalBridge/Core.swift
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/apple-metal-0.8.8/swift-bridge/Sources/AppleMetalBridge/Device.swift
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/apple-metal-0.8.8/swift-bridge/Sources/AppleMetalBridge/Exhaustive.swift
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/apple-metal-0.8.8/swift-bridge/Sources/AppleMetalBridge/MetalFX.swift
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/apple-metal-0.8.8/swift-bridge/Sources/AppleMetalBridge/Pipeline.swift
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/apple-metal-0.8.8/swift-bridge/Sources/AppleMetalBridge/Render.swift
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/apple-metal-0.8.8/swift-bridge/Sources/AppleMetalBridge/State.swift
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/apple-metal-0.8.8/swift-bridge/Sources/AppleMetalBridge/Support.swift
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/apple-metal-0.8.8/swift-bridge/Sources/AppleMetalBridge/Texture.swift

@@ -1,0 +1,713 @@
+{
+  "builtTestProducts" : [
+
+  ],
+  "copyCommands" : {
+
+  },
+  "explicitTargetDependencyImportCheckingMode" : {
+    "none" : {
+
+    }
+  },
+  "generatedSourceTargetSet" : [
+
+  ],
+  "pluginDescriptions" : [
+
+  ],
+  "swiftCommands" : {
+    "C.MetalBridge-arm64-apple-macosx13.0-release.module" : {
+      "executable" : "/Library/Developer/CommandLineTools/usr/bin/swiftc",
+      "fileList" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/MetalBridge.build/sources",
+      "importPath" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/Modules",
+      "inputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/Metal/Metal.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/swift-version--1AB21518FC5DEDBE.txt"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/MetalBridge.build/sources"
+        }
+      ],
+      "isLibrary" : true,
+      "moduleName" : "MetalBridge",
+      "moduleOutputPath" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/Modules/MetalBridge.swiftmodule",
+      "objects" : [
+        "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/MetalBridge.build/Metal.swift.o"
+      ],
+      "otherArguments" : [
+        "-target",
+        "arm64-apple-macosx13.0",
+        "-whole-module-optimization",
+        "-num-threads",
+        "10",
+        "-serialize-diagnostics",
+        "-O",
+        "-j10",
+        "-DSWIFT_PACKAGE",
+        "-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE",
+        "-module-cache-path",
+        "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ModuleCache",
+        "-parseable-output",
+        "-parse-as-library",
+        "-emit-objc-header",
+        "-emit-objc-header-path",
+        "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/MetalBridge.build/include/MetalBridge-Swift.h",
+        "-swift-version",
+        "5",
+        "-I",
+        "/Library/Developer/CommandLineTools/Library/Developer/Frameworks",
+        "-L",
+        "/Library/Developer/CommandLineTools/Library/Developer/Frameworks",
+        "-plugin-path",
+        "/Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing",
+        "-sdk",
+        "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+        "-g",
+        "-DSCREENCAPTUREKIT_HAS_MACOS13_1_SDK",
+        "-Xcc",
+        "-isysroot",
+        "-Xcc",
+        "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+        "-Xcc",
+        "-fPIC",
+        "-Xcc",
+        "-g",
+        "-package-name",
+        "swift_bridge"
+      ],
+      "outputFileMapPath" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/MetalBridge.build/output-file-map.json",
+      "outputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/MetalBridge.build/Metal.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/Modules/MetalBridge.swiftmodule"
+        }
+      ],
+      "prepareForIndexing" : false,
+      "sources" : [
+        "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/Metal/Metal.swift"
+      ],
+      "tempsPath" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/MetalBridge.build",
+      "wholeModuleOptimization" : true
+    },
+    "C.ScreenCaptureKitBridge-arm64-apple-macosx13.0-release.module" : {
+      "executable" : "/Library/Developer/CommandLineTools/usr/bin/swiftc",
+      "fileList" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/sources",
+      "importPath" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/Modules",
+      "inputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/AudioDevices.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/CStringBuffer.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/ContentSharingPicker.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/Core.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/CoreGraphicsStrided.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/RecordingOutput.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/ScreenshotManager.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/ShareableContent.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/Stream.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/StreamConfiguration.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/swift-version--1AB21518FC5DEDBE.txt"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/Modules/ScreenCaptureKitCoreMediaBridge.swiftmodule"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/Modules/MetalBridge.swiftmodule"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/sources"
+        }
+      ],
+      "isLibrary" : true,
+      "moduleName" : "ScreenCaptureKitBridge",
+      "moduleOutputPath" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/Modules/ScreenCaptureKitBridge.swiftmodule",
+      "objects" : [
+        "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/AudioDevices.swift.o",
+        "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/CStringBuffer.swift.o",
+        "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/ContentSharingPicker.swift.o",
+        "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/Core.swift.o",
+        "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/CoreGraphicsStrided.swift.o",
+        "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/RecordingOutput.swift.o",
+        "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/ScreenshotManager.swift.o",
+        "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/ShareableContent.swift.o",
+        "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/Stream.swift.o",
+        "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/StreamConfiguration.swift.o"
+      ],
+      "otherArguments" : [
+        "-target",
+        "arm64-apple-macosx13.0",
+        "-whole-module-optimization",
+        "-num-threads",
+        "10",
+        "-serialize-diagnostics",
+        "-O",
+        "-j10",
+        "-DSWIFT_PACKAGE",
+        "-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE",
+        "-module-cache-path",
+        "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ModuleCache",
+        "-parseable-output",
+        "-parse-as-library",
+        "-emit-objc-header",
+        "-emit-objc-header-path",
+        "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/include/ScreenCaptureKitBridge-Swift.h",
+        "-swift-version",
+        "5",
+        "-I",
+        "/Library/Developer/CommandLineTools/Library/Developer/Frameworks",
+        "-L",
+        "/Library/Developer/CommandLineTools/Library/Developer/Frameworks",
+        "-plugin-path",
+        "/Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing",
+        "-sdk",
+        "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+        "-g",
+        "-DSCREENCAPTUREKIT_HAS_MACOS13_1_SDK",
+        "-Xcc",
+        "-isysroot",
+        "-Xcc",
+        "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+        "-Xcc",
+        "-fPIC",
+        "-Xcc",
+        "-g",
+        "-package-name",
+        "swift_bridge"
+      ],
+      "outputFileMapPath" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/output-file-map.json",
+      "outputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/AudioDevices.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/CStringBuffer.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/ContentSharingPicker.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/Core.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/CoreGraphicsStrided.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/RecordingOutput.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/ScreenshotManager.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/ShareableContent.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/Stream.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/StreamConfiguration.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/Modules/ScreenCaptureKitBridge.swiftmodule"
+        }
+      ],
+      "prepareForIndexing" : false,
+      "sources" : [
+        "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/AudioDevices.swift",
+        "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/CStringBuffer.swift",
+        "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/ContentSharingPicker.swift",
+        "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/Core.swift",
+        "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/CoreGraphicsStrided.swift",
+        "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/RecordingOutput.swift",
+        "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/ScreenshotManager.swift",
+        "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/ShareableContent.swift",
+        "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/Stream.swift",
+        "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/StreamConfiguration.swift"
+      ],
+      "tempsPath" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build",
+      "wholeModuleOptimization" : true
+    },
+    "C.ScreenCaptureKitCoreMediaBridge-arm64-apple-macosx13.0-release.module" : {
+      "executable" : "/Library/Developer/CommandLineTools/usr/bin/swiftc",
+      "fileList" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitCoreMediaBridge.build/sources",
+      "importPath" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/Modules",
+      "inputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/CoreMedia/CoreMedia.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/swift-version--1AB21518FC5DEDBE.txt"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitCoreMediaBridge.build/sources"
+        }
+      ],
+      "isLibrary" : true,
+      "moduleName" : "ScreenCaptureKitCoreMediaBridge",
+      "moduleOutputPath" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/Modules/ScreenCaptureKitCoreMediaBridge.swiftmodule",
+      "objects" : [
+        "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitCoreMediaBridge.build/CoreMedia.swift.o"
+      ],
+      "otherArguments" : [
+        "-target",
+        "arm64-apple-macosx13.0",
+        "-whole-module-optimization",
+        "-num-threads",
+        "10",
+        "-serialize-diagnostics",
+        "-O",
+        "-j10",
+        "-DSWIFT_PACKAGE",
+        "-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE",
+        "-module-cache-path",
+        "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ModuleCache",
+        "-parseable-output",
+        "-parse-as-library",
+        "-emit-objc-header",
+        "-emit-objc-header-path",
+        "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitCoreMediaBridge.build/include/ScreenCaptureKitCoreMediaBridge-Swift.h",
+        "-swift-version",
+        "5",
+        "-I",
+        "/Library/Developer/CommandLineTools/Library/Developer/Frameworks",
+        "-L",
+        "/Library/Developer/CommandLineTools/Library/Developer/Frameworks",
+        "-plugin-path",
+        "/Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing",
+        "-sdk",
+        "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+        "-g",
+        "-DSCREENCAPTUREKIT_HAS_MACOS13_1_SDK",
+        "-Xcc",
+        "-isysroot",
+        "-Xcc",
+        "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+        "-Xcc",
+        "-fPIC",
+        "-Xcc",
+        "-g",
+        "-package-name",
+        "swift_bridge"
+      ],
+      "outputFileMapPath" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitCoreMediaBridge.build/output-file-map.json",
+      "outputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitCoreMediaBridge.build/CoreMedia.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/Modules/ScreenCaptureKitCoreMediaBridge.swiftmodule"
+        }
+      ],
+      "prepareForIndexing" : false,
+      "sources" : [
+        "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/CoreMedia/CoreMedia.swift"
+      ],
+      "tempsPath" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitCoreMediaBridge.build",
+      "wholeModuleOptimization" : true
+    }
+  },
+  "swiftFrontendCommands" : {
+
+  },
+  "swiftTargetScanArgs" : {
+    "MetalBridge" : [
+      "/Library/Developer/CommandLineTools/usr/bin/swiftc",
+      "-module-name",
+      "MetalBridge",
+      "-package-name",
+      "swift_bridge",
+      "-c",
+      "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/Metal/Metal.swift",
+      "-I",
+      "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/Modules",
+      "-target",
+      "arm64-apple-macosx13.0",
+      "-whole-module-optimization",
+      "-num-threads",
+      "10",
+      "-serialize-diagnostics",
+      "-O",
+      "-j10",
+      "-DSWIFT_PACKAGE",
+      "-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE",
+      "-module-cache-path",
+      "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ModuleCache",
+      "-parseable-output",
+      "-parse-as-library",
+      "-emit-objc-header",
+      "-emit-objc-header-path",
+      "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/MetalBridge.build/include/MetalBridge-Swift.h",
+      "-swift-version",
+      "5",
+      "-I",
+      "/Library/Developer/CommandLineTools/Library/Developer/Frameworks",
+      "-L",
+      "/Library/Developer/CommandLineTools/Library/Developer/Frameworks",
+      "-plugin-path",
+      "/Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing",
+      "-sdk",
+      "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+      "-g",
+      "-DSCREENCAPTUREKIT_HAS_MACOS13_1_SDK",
+      "-Xcc",
+      "-isysroot",
+      "-Xcc",
+      "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+      "-Xcc",
+      "-fPIC",
+      "-Xcc",
+      "-g",
+      "-package-name",
+      "swift_bridge",
+      "-driver-use-frontend-path",
+      "/Library/Developer/CommandLineTools/usr/bin/swiftc"
+    ],
+    "ScreenCaptureKitBridge" : [
+      "/Library/Developer/CommandLineTools/usr/bin/swiftc",
+      "-module-name",
+      "ScreenCaptureKitBridge",
+      "-package-name",
+      "swift_bridge",
+      "-c",
+      "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/AudioDevices.swift",
+      "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/CStringBuffer.swift",
+      "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/ContentSharingPicker.swift",
+      "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/Core.swift",
+      "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/CoreGraphicsStrided.swift",
+      "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/RecordingOutput.swift",
+      "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/ScreenshotManager.swift",
+      "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/ShareableContent.swift",
+      "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/Stream.swift",
+      "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/StreamConfiguration.swift",
+      "-I",
+      "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/Modules",
+      "-target",
+      "arm64-apple-macosx13.0",
+      "-whole-module-optimization",
+      "-num-threads",
+      "10",
+      "-serialize-diagnostics",
+      "-O",
+      "-j10",
+      "-DSWIFT_PACKAGE",
+      "-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE",
+      "-module-cache-path",
+      "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ModuleCache",
+      "-parseable-output",
+      "-parse-as-library",
+      "-emit-objc-header",
+      "-emit-objc-header-path",
+      "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/include/ScreenCaptureKitBridge-Swift.h",
+      "-swift-version",
+      "5",
+      "-I",
+      "/Library/Developer/CommandLineTools/Library/Developer/Frameworks",
+      "-L",
+      "/Library/Developer/CommandLineTools/Library/Developer/Frameworks",
+      "-plugin-path",
+      "/Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing",
+      "-sdk",
+      "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+      "-g",
+      "-DSCREENCAPTUREKIT_HAS_MACOS13_1_SDK",
+      "-Xcc",
+      "-isysroot",
+      "-Xcc",
+      "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+      "-Xcc",
+      "-fPIC",
+      "-Xcc",
+      "-g",
+      "-package-name",
+      "swift_bridge",
+      "-driver-use-frontend-path",
+      "/Library/Developer/CommandLineTools/usr/bin/swiftc"
+    ],
+    "ScreenCaptureKitCoreMediaBridge" : [
+      "/Library/Developer/CommandLineTools/usr/bin/swiftc",
+      "-module-name",
+      "ScreenCaptureKitCoreMediaBridge",
+      "-package-name",
+      "swift_bridge",
+      "-c",
+      "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/CoreMedia/CoreMedia.swift",
+      "-I",
+      "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/Modules",
+      "-target",
+      "arm64-apple-macosx13.0",
+      "-whole-module-optimization",
+      "-num-threads",
+      "10",
+      "-serialize-diagnostics",
+      "-O",
+      "-j10",
+      "-DSWIFT_PACKAGE",
+      "-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE",
+      "-module-cache-path",
+      "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ModuleCache",
+      "-parseable-output",
+      "-parse-as-library",
+      "-emit-objc-header",
+      "-emit-objc-header-path",
+      "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitCoreMediaBridge.build/include/ScreenCaptureKitCoreMediaBridge-Swift.h",
+      "-swift-version",
+      "5",
+      "-I",
+      "/Library/Developer/CommandLineTools/Library/Developer/Frameworks",
+      "-L",
+      "/Library/Developer/CommandLineTools/Library/Developer/Frameworks",
+      "-plugin-path",
+      "/Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing",
+      "-sdk",
+      "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+      "-g",
+      "-DSCREENCAPTUREKIT_HAS_MACOS13_1_SDK",
+      "-Xcc",
+      "-isysroot",
+      "-Xcc",
+      "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+      "-Xcc",
+      "-fPIC",
+      "-Xcc",
+      "-g",
+      "-package-name",
+      "swift_bridge",
+      "-driver-use-frontend-path",
+      "/Library/Developer/CommandLineTools/usr/bin/swiftc"
+    ]
+  },
+  "targetDependencyMap" : {
+    "MetalBridge" : [
+
+    ],
+    "ScreenCaptureKitBridge" : [
+      "MetalBridge",
+      "ScreenCaptureKitCoreMediaBridge"
+    ],
+    "ScreenCaptureKitCoreMediaBridge" : [
+
+    ]
+  },
+  "testDiscoveryCommands" : {
+
+  },
+  "testEntryPointCommands" : {
+
+  },
+  "traitConfiguration" : {
+    "default" : {
+
+    }
+  },
+  "writeCommands" : {
+    "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/MetalBridge.build/sources" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<sources-file-list>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/Metal/Metal.swift"
+        }
+      ],
+      "outputFilePath" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/MetalBridge.build/sources"
+    },
+    "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/sources" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<sources-file-list>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/AudioDevices.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/CStringBuffer.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/ContentSharingPicker.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/Core.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/CoreGraphicsStrided.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/RecordingOutput.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/ScreenshotManager.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/ShareableContent.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/Stream.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/ScreenCaptureKitBridge/StreamConfiguration.swift"
+        }
+      ],
+      "outputFilePath" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/sources"
+    },
+    "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.product/Objects.LinkFileList" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<link-file-list>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/MetalBridge.build/Metal.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/AudioDevices.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/CStringBuffer.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/ContentSharingPicker.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/Core.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/CoreGraphicsStrided.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/RecordingOutput.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/ScreenshotManager.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/ShareableContent.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/Stream.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.build/StreamConfiguration.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitCoreMediaBridge.build/CoreMedia.swift.o"
+        }
+      ],
+      "outputFilePath" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitBridge.product/Objects.LinkFileList"
+    },
+    "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitCoreMediaBridge.build/sources" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<sources-file-list>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/screencapturekit-9.0.1/swift-bridge/Sources/CoreMedia/CoreMedia.swift"
+        }
+      ],
+      "outputFilePath" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/ScreenCaptureKitCoreMediaBridge.build/sources"
+    },
+    "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/swift-version--1AB21518FC5DEDBE.txt" : {
+      "alwaysOutOfDate" : true,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<swift-get-version>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Library/Developer/CommandLineTools/usr/bin/swiftc"
+        }
+      ],
+      "outputFilePath" : "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/screencapturekit-f2eef74bb3a3e0c4/out/swift-build-arm64-sdk26-5-defines-f27efa33e1157444/arm64-apple-macosx/release/swift-version--1AB21518FC5DEDBE.txt"
+    }
+  }
+}

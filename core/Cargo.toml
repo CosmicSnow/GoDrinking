@@ -1,0 +1,30 @@
+[package]
+name = "golive-core"
+version = "0.1.0"
+edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0"
+description = "GoLive Sala core: serialized lifecycle, native WebRTC media, signaling client. No UI, no Tauri."
+
+[lib]
+name = "golive_core"
+crate-type = ["rlib"]
+
+[dependencies]
+# Native WebRTC (tokio-based). Default TLS (no openssl needed on macOS).
+webrtc = "0.14"
+# H.264 software encode/decode (Constrained Baseline). Built from source.
+openh264 = "0.9"
+# Lean tokio: only what webrtc needs + our timers/channels.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net"] }
+# Sample/Bytes types shared with the webrtc crate (same versions it uses).
+webrtc-media = "0.11"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.8"
+# Sync signaling transport over std threads (no tokio in the signal path).
+tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
+ureq = { version = "3", features = ["json"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net"] }

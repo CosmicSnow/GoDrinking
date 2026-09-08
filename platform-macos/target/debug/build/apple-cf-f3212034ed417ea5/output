@@ -1,0 +1,16 @@
+cargo:rerun-if-changed=build.rs
+cargo:rerun-if-env-changed=DOCS_RS
+cargo:rerun-if-env-changed=DEVELOPER_DIR
+cargo:rerun-if-env-changed=SDKROOT
+cargo:rustc-link-lib=framework=CoreGraphics
+cargo:rustc-link-lib=framework=IOSurface
+cargo:rustc-link-lib=framework=CoreFoundation
+cargo:rustc-link-lib=framework=CoreMedia
+cargo:rustc-link-lib=framework=CoreVideo
+cargo:rustc-link-lib=framework=Metal
+cargo:rerun-if-changed=swift-bridge
+cargo:rustc-link-search=native=/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/apple-cf-f3212034ed417ea5/out/swift-build/release
+cargo:rustc-link-lib=static=AppleCFBridge
+cargo:rustc-link-lib=framework=Foundation
+cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift
+cargo:rustc-link-arg=-Wl,-rpath,/Library/Developer/CommandLineTools/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/macosx

@@ -1,0 +1,13 @@
+{
+  "": {
+    "dependencies": "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/apple-cf-293b9c14459fc7be/out/swift-build/arm64-apple-macosx/release/AppleCFBridge.build/AppleCFBridge.d",
+    "object": "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/apple-cf-293b9c14459fc7be/out/swift-build/arm64-apple-macosx/release/AppleCFBridge.build/AppleCFBridge.o",
+    "swift-dependencies": "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/apple-cf-293b9c14459fc7be/out/swift-build/arm64-apple-macosx/release/AppleCFBridge.build/primary.swiftdeps"
+  },
+  "/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/apple-cf-0.9.3/swift-bridge/Sources/AppleCFBridge/AppleCFBridge.swift": {
+    "object": "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/apple-cf-293b9c14459fc7be/out/swift-build/arm64-apple-macosx/release/AppleCFBridge.build/AppleCFBridge.swift.o",
+    "swiftmodule": "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/apple-cf-293b9c14459fc7be/out/swift-build/arm64-apple-macosx/release/AppleCFBridge.build/AppleCFBridge~partial.swiftmodule",
+    "swift-dependencies": "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/apple-cf-293b9c14459fc7be/out/swift-build/arm64-apple-macosx/release/AppleCFBridge.build/AppleCFBridge.swiftdeps",
+    "diagnostics": "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/apple-cf-293b9c14459fc7be/out/swift-build/arm64-apple-macosx/release/AppleCFBridge.build/AppleCFBridge.dia"
+  }
+}

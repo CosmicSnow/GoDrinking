@@ -1,0 +1,8 @@
+/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/deps/objc2_av_foundation-44d35f0feece07cc.d: /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-av-foundation-0.3.2/src/lib.rs /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-av-foundation-0.3.2/src/generated/mod.rs /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-av-foundation-0.3.2/src/generated/AVMediaFormat.rs /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-av-foundation-0.3.2/src/generated/AVVideoSettings.rs
+
+/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/deps/libobjc2_av_foundation-44d35f0feece07cc.rmeta: /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-av-foundation-0.3.2/src/lib.rs /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-av-foundation-0.3.2/src/generated/mod.rs /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-av-foundation-0.3.2/src/generated/AVMediaFormat.rs /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-av-foundation-0.3.2/src/generated/AVVideoSettings.rs
+
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-av-foundation-0.3.2/src/lib.rs:
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-av-foundation-0.3.2/src/generated/mod.rs:
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-av-foundation-0.3.2/src/generated/AVMediaFormat.rs:
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/objc2-av-foundation-0.3.2/src/generated/AVVideoSettings.rs:

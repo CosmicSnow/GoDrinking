@@ -1,0 +1,14 @@
+/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/deps/serde-207c8b79ffef6a60.d: /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/serde-65f4b88965e3380a/out/private.rs
+
+/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/deps/libserde-207c8b79ffef6a60.rlib: /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/serde-65f4b88965e3380a/out/private.rs
+
+/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/deps/libserde-207c8b79ffef6a60.rmeta: /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/serde-65f4b88965e3380a/out/private.rs
+
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs:
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs:
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs:
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs:
+/Users/jouydurao/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs:
+/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/serde-65f4b88965e3380a/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/serde-65f4b88965e3380a/out
