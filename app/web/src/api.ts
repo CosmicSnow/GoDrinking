@@ -16,6 +16,8 @@
  * - watch {member} -> ()
  * - unwatch {member} -> ()
  * - get_snapshot {} -> OwnerSnapshot
+ * - get_roster {} -> RoomMember[] (pull explícito do roster guardado;
+ *   mesmos dados do evento "roster" — para a UI que montou após o emit)
  * - get_media_counters {} -> MediaCounters (links + effective autoritativo)
  * - set_server {base} -> string (base normalizada)
  * - list_sources {} -> SourceInfo[] | source_capabilities {} -> CapabilitySet
@@ -176,6 +178,15 @@ export function unwatchMember(member: string): Promise<void> {
 /** Leitura observacional. Nunca avança lifecycle. */
 export function getSnapshot(): Promise<OwnerSnapshot> {
   return invoke<OwnerSnapshot>("get_snapshot");
+}
+
+/**
+ * Pull explícito do roster guardado no backend (app/src/lib.rs
+ * `get_roster`: mesmo mapeamento RoomMember do evento "roster" do pump).
+ * Chamado só de `refresh()` — nunca de timers. Vazio fora da sala.
+ */
+export function getRoster(): Promise<RoomMember[]> {
+  return invoke<RoomMember[]>("get_roster");
 }
 
 /**

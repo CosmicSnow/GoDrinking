@@ -528,10 +528,9 @@ export interface HomeProps {
   /** Legado (mantido p/ compat): a home fiel não tem tabs. */
   tab?: "create" | "join";
   onTab?: (tab: "create" | "join") => void;
-  /** Legado (mantido p/ compat): apelido interno, sem input visível na home. */
+  /** Apelido exibido no card "Seu Nick" da home; vazio cai no default. */
   nickname?: string;
-  onNickname?: (value: string) => void;
-  password: string;
+  onNickname?: (value: string) => void;  password: string;
   onPassword: (value: string) => void;
   /** Código digitado no pane Entrar (6 letras/números). */
   code: string;
@@ -548,6 +547,7 @@ export interface HomeProps {
 
 export function HomeScreen(props: HomeProps) {
   const {
+    nickname = "", onNickname,
     password, onPassword, code, onCode, busy, error, onCreate, onJoin,
     mock = false,
   } = props;
@@ -589,6 +589,23 @@ export function HomeScreen(props: HomeProps) {
             <div className="lobby-card lobby-card--wide">
               <h2>Crie ou entre em uma Sala</h2>
               <p>Salas com código + senha. O compartilhamento só aparece dentro da sala.</p>
+
+              <section className="lobby-pane lobby-name" aria-label="Seu Nick (só pessoas na sala conseguem ver)">
+                <label className="field" htmlFor="nickname">
+                  <span>Seu Nick (só pessoas na sala conseguem ver)</span>
+                  <input
+                    className="input"
+                    id="nickname"
+                    type="text"
+                    value={nickname}
+                    onChange={(event) => onNickname?.(event.target.value)}
+                    maxLength={24}
+                    placeholder="Como te chamam na sala"
+                    autoComplete="nickname"
+                    disabled={busy}
+                  />
+                </label>
+              </section>
 
               <div className="lobby-cols">
                 <section className="lobby-pane" aria-label="Criar sala">

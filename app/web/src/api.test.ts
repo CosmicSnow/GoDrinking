@@ -13,6 +13,7 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: mockListen }));
 import {
   createRoom,
   getMediaCounters,
+  getRoster,
   getSnapshot,
   joinRoom,
   leaveRoom,
@@ -121,6 +122,16 @@ describe("intents (comando certo, args certos)", () => {
     expect(mockInvoke).toHaveBeenCalledWith("set_server", {
       base: "http://127.0.0.1:18790/",
     });
+  });
+
+  it("get_roster sem args devolve os membros no formato do evento roster", async () => {
+    const roster = [
+      { id: "m-1", nickname: "Convidado", master: true, share: false },
+      { id: "m-2", nickname: "Ana", master: false, share: true },
+    ];
+    mockInvoke.mockResolvedValueOnce(roster);
+    await expect(getRoster()).resolves.toEqual(roster);
+    expect(mockInvoke).toHaveBeenCalledWith("get_roster");
   });
 });
 

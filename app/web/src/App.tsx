@@ -14,6 +14,7 @@ import {
   createRoom,
   getE2ePlan,
   getMediaCounters,
+  getRoster,
   getSnapshot,
   joinRoom,
   leaveRoom,
@@ -97,7 +98,7 @@ export default function App() {
   const [tab, setTab] = useState<"create" | "join">("create");
   const [server, setServerBase] = useState(DEFAULT_SERVER);
   // Apelido interno (sem input visível na home fiel ao goDrinking2).
-  const [nickname, setNickname] = useState("Você");
+  const [nickname, setNickname] = useState("Convidado");
   const [password, setPassword] = useState("");
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
@@ -198,7 +199,7 @@ export default function App() {
       // mock: sem invoke — deriva tudo do estado local (share/watch/efetivo).
       const eff = effective ?? mockEffective();
       setSnapshot(mockSnapshot(mockSharing, watching));
-      setRoster(mockRoster(nickname.trim() || "Você", mockSharing));
+      setRoster(mockRoster(nickname.trim() || "Convidado", mockSharing));
       const counters = mockCounters(watching, eff);
       setLinkStats(counters.links);
       setEffective(eff);
@@ -218,6 +219,14 @@ export default function App() {
     } catch (failure) {
       setError(messageOf(failure, "Não foi ler o estado da sala."));
       return;
+    }
+    try {
+      // Pull explícito do roster guardado (o evento "roster" do join pode
+      // ter chegado antes do listen montar — eventos não têm backlog).
+      setRoster(await getRoster());
+    } catch {
+      // Roster também chega via evento; sem ele, mantém o atual.
+      setRoster((current) => current);
     }
     try {
       const counters = await getMediaCounters();
@@ -295,7 +304,7 @@ export default function App() {
       // mock: pula TODAS as validações do caminho real (apelido/senha) —
       // o lobby fiel não tem campo de apelido e a senha é opcional aqui.
       // Entra sempre com sucesso.
-      const effectiveNickname = nickname.trim() || "Você";
+      const effectiveNickname = nickname.trim() || "Convidado";
       const created = randomMockCode();
       const eff = mockEffective();
       const counters = mockCounters([], eff);
@@ -326,7 +335,7 @@ export default function App() {
       return;
     }
     // Caminho Tauri real: validações mantidas como estão.
-    const effectiveNickname = nickname.trim() || "Você";
+    const effectiveNickname = nickname.trim() || "Convidado";
     const nameError = validateNickname(effectiveNickname);
     if (nameError) {
       setError(nameError);
@@ -355,7 +364,7 @@ export default function App() {
     if (isMock) {
       // mock: pula TODAS as validações do caminho real (apelido/senha/código).
       // Usa o digitado ou gera um; entra sempre com sucesso.
-      const effectiveNickname = nickname.trim() || "Você";
+      const effectiveNickname = nickname.trim() || "Convidado";
       const joined = code.trim().toUpperCase() || randomMockCode();
       const eff = mockEffective();
       const counters = mockCounters([], eff);
@@ -386,7 +395,7 @@ export default function App() {
       return;
     }
     // Caminho Tauri real: validações mantidas como estão.
-    const effectiveNickname = nickname.trim() || "Você";
+    const effectiveNickname = nickname.trim() || "Convidado";
     const nameError = validateNickname(effectiveNickname);
     if (nameError) {
       setError(nameError);
@@ -492,7 +501,7 @@ export default function App() {
       const eff = effective ?? mockEffective();
       setMockSharing(true);
       setSnapshot(mockSnapshot(true, watching));
-      setRoster(mockRoster(nickname.trim() || "Você", true));
+      setRoster(mockRoster(nickname.trim() || "Convidado", true));
       setEffective(eff);
       setLastMedia("frame (não-preto: sim)");
       setError(null);
@@ -507,7 +516,7 @@ export default function App() {
     if (isMock) {
       setMockSharing(false);
       setSnapshot(mockSnapshot(false, watching));
-      setRoster(mockRoster(nickname.trim() || "Você", false));
+      setRoster(mockRoster(nickname.trim() || "Convidado", false));
       setLastMedia("frame (não-preto: não)");
       return;
     }
@@ -649,7 +658,7 @@ export default function App() {
   return (
     <RoomScreen
       roomCode={roomCode}
-      nickname={nickname.trim() || "você"}
+      nickname={nickname.trim() || "Convidado"}
       snapshot={snapshot}
       roster={roster}
       selfId={selfId}

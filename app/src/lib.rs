@@ -145,6 +145,19 @@ pub struct EffectiveQuality {
     pub profile: QualityProfile,
     pub generation: u64,
 }
+/// Roster member in the exact `RoomMember {id, nickname, master, share}`
+/// shape the UI consumes. Same mapping `pump` uses for the roster
+/// signal-event (`pump.rs` `Incoming::Roster`): fields copied verbatim from
+/// the stored `signal.roster()` entries — no derivation from the owner
+/// snapshot or links anywhere.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RosterMember {
+    pub id: String,
+    pub nickname: String,
+    pub master: bool,
+    pub share: bool,
+}
+
 /// Wire ids as decimal strings (adopted from envelopes, never logged).
 #[derive(Clone, Default, Debug)]
 pub struct WireIds {
@@ -935,6 +948,33 @@ impl AppState {
             .map(|inner| inner.owner.snapshot())
     }
 
+    /// Rich roster pull for the UI (explicit callers only — never polled).
+    /// Reads the same stored `signal.roster()` the pump maps into the
+    /// `roster` signal-event, so a UI that mounted after that emit (listeners
+    /// attach on room entry; Tauri events have no backlog) still sees
+    /// nicknames on entry. Empty when offline (no signal client yet) or when
+    /// the lock is poisoned — the event listener fills it in later.
+    pub fn get_roster(&self) -> Vec<RosterMember> {
+        let inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(_) => return Vec::new(),
+        };
+        match inner.signal.as_ref() {
+            Some(signal) => signal
+                .roster()
+                .entries
+                .iter()
+                .map(|e| RosterMember {
+                    id: e.id.clone(),
+                    nickname: e.nickname.clone(),
+                    master: e.master,
+                    share: e.share,
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
     /// Backend-observed media counters (observational, redacted). Pollable
     /// fallback next to push events. `presented` is summed live from the
     /// native windows (acks), the rest is bumped by forward tasks.
@@ -1208,6 +1248,11 @@ fn get_snapshot(state: State<'_, Arc<AppState>>) -> Result<OwnerSnapshot, String
 }
 
 #[tauri::command]
+fn get_roster(state: State<'_, Arc<AppState>>) -> Vec<RosterMember> {
+    state.get_roster()
+}
+
+#[tauri::command]
 fn get_media_counters(state: State<'_, Arc<AppState>>) -> Result<MediaCounters, String> {
     state.get_media_counters()
 }
@@ -1257,6 +1302,7 @@ pub fn run_with(state: Arc<AppState>) {
             watch,
             unwatch,
             get_snapshot,
+            get_roster,
             get_media_counters,
             set_server,
             get_e2e_plan,
@@ -1401,6 +1447,19 @@ mod share_source_tests {
     // exhaustively with no wildcard arm, and both capture arms go through
     // screen::start_capture_for (OS-backed, typed errors). A silent fallback
     // cannot compile here without touching that match.
+}
+
+#[cfg(test)]
+mod roster_tests {
+    use super::*;
+
+    #[test]
+    fn offline_roster_pull_is_empty_never_errors() {
+        // No signal client yet (fresh state): pull returns empty instead of
+        // erroring — the event listener fills the roster in once WS connects.
+        let state = AppState::new();
+        assert!(state.get_roster().is_empty());
+    }
 }
 
 #[cfg(test)]

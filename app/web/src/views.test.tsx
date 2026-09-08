@@ -177,8 +177,28 @@ describe("HomeScreen", () => {
     expect(visibleText).not.toContain("segredo-super");
   });
 
-  it("mostra o erro sem área muda", () => {
+  it("card de nome ligado ao apelido real", () => {
     const html = renderToStaticMarkup(
+      createElement(HomeScreen, {
+        nickname: "Jouy",
+        onNickname: noop,
+        password: "",
+        onPassword: noop,
+        code: "",
+        onCode: noop,
+        busy: false,
+        error: null,
+        onCreate: noop,
+        onJoin: noop,
+      }),
+    );
+    expect(html).toContain("Seu Nick (só pessoas na sala conseguem ver)");
+    expect(html).toContain('id="nickname"');
+    expect(html).toContain('value="Jouy"');
+    expect(html).toContain("Como te chamam na sala");
+  });
+
+  it("mostra o erro sem área muda", () => {    const html = renderToStaticMarkup(
       createElement(HomeScreen, {
         server: "",
         onServer: noop,

@@ -98,6 +98,9 @@ button{font-family:inherit}
 .app[data-state="lobby"] .layout{grid-template-columns:minmax(0,1fr)}
 /* Caixa do lobby abraça o conteúdo (item flex do stage-wrap; sala intacta) */
 .app[data-state="lobby"] .lobby{align-self:center;width:fit-content;max-width:100%}
+/* Card do nome entre o subtítulo e as panes (só home) */
+.app[data-state="lobby"] .lobby-name{margin:0 0 12px;text-align:left}
+.app[data-state="lobby"] .lobby-name .field{margin-bottom:0}
 
 /* ── Stage / tiles ── */
 .stage{background:#111214;border:1px solid #000;border-radius:16px;padding:14px;min-height:420px;display:flex;flex-direction:column;gap:10px}
