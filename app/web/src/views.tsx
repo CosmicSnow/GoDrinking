@@ -588,21 +588,8 @@ export function HomeScreen(props: HomeProps) {
 
       <div className="layout">
         <main className="stage-wrap">
-          <div className="stage-head">
-            <div>
-              <h1>Prévia da sala</h1>
-              <p>Entre para ver as transmissões da sala.</p>
-            </div>
-          </div>
-
           <div className="lobby" data-hook="room-join">
             <div className="lobby-card lobby-card--wide">
-              <div className="lobby-avatars" id="lobbyAvatars" aria-hidden="true">
-                <span style={{ ["--h" as string]: 265 }}>V</span>
-                <span style={{ ["--h" as string]: 160 }}>A</span>
-                <span style={{ ["--h" as string]: 20 }}>B</span>
-                <span style={{ ["--h" as string]: 200 }}>C</span>
-              </div>
               <h2>Crie ou entre em uma Sala</h2>
               <p>Salas com código + senha. O compartilhamento só aparece dentro da sala.</p>
 
@@ -640,7 +627,7 @@ export function HomeScreen(props: HomeProps) {
                 </section>
                 <section className="lobby-pane" aria-label="Entrar na sala">
                   <h3>Entrar</h3>
-                  <p className="pane-desc">Quem recebeu o convite entra com código + senha.</p>
+                  <p className="pane-desc">Digite o código + senha para entrar.</p>
                   <label className="field" htmlFor="joinCode">
                     <span>Código (6 letras/números)</span>
                     <input
@@ -692,7 +679,7 @@ export function HomeScreen(props: HomeProps) {
               {error ? (
                 <p className="lobby-error" id="lobbyError" role="alert">{error}</p>
               ) : null}
-              <small id="lobbyNote">Tela direto de um PC para outro. O servidor só apresenta — nunca vê o vídeo.</small>
+              <small id="lobbyNote">Tela direto de um PC para outro. O servidor só apresenta, nunca vê o vídeo.</small>
             </div>
           </div>
         </main>

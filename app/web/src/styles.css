@@ -26,6 +26,7 @@ button{font-family:inherit}
 .room-pill em{font-style:normal;color:var(--mut)}
 .pulse{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 0 0 #57f28788;animation:pulse 2s infinite}
 @keyframes pulse{70%{box-shadow:0 0 0 7px transparent}100%{box-shadow:0 0 0 0 transparent}}
+.app[data-state="lobby"] .pulse{background:var(--red);box-shadow:none;animation:none}
 .top-actions{display:flex;align-items:center;gap:10px}
 .proto-tag{font-size:10.5px;letter-spacing:1.2px;color:var(--amber);border:1px solid #fee75c44;
   padding:4px 9px;border-radius:6px;background:#fee75c0d;white-space:nowrap}
@@ -90,6 +91,12 @@ button{font-family:inherit}
 /* Lobby fiel ao goDrinking2: fora da sala não há controles; dentro, sem lobby */
 .app[data-state="lobby"] .controls{display:none}
 .app[data-state="inside"] .lobby{display:none}
+/* Lobby centralizado verticalmente na altura disponível (só home; sala intacta) */
+.app[data-state="lobby"] .stage-wrap{justify-content:center;flex:1}
+/* Lobby em coluna única centralizada: sem a trilha da sidebar (só home) */
+.app[data-state="lobby"] .layout{grid-template-columns:minmax(0,1fr)}
+/* Caixa do lobby abraça o conteúdo (item flex do stage-wrap; sala intacta) */
+.app[data-state="lobby"] .lobby{align-self:center;width:fit-content;max-width:100%}
 
 /* ── Stage / tiles ── */
 .stage{background:#111214;border:1px solid #000;border-radius:16px;padding:14px;min-height:420px;display:flex;flex-direction:column;gap:10px}
