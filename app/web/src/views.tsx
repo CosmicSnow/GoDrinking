@@ -1,9 +1,12 @@
 /**
- * Componentes puros (só props → markup). Nenhum invoke, nenhum listen,
- * nenhum timer aqui: toda decisão de produto chega pronta via props.
- * Idioma: só pt-BR neste passo (i18n é gate posterior, documentado).
+ * Componentes puros (só props → markup) com o visual goDrinking2.
+ * Estados puramente visuais (pin, mute-all, zoom/pan, modais, toast,
+ * busca/filtro de áudio) são useState locais. Dados reais (roster,
+ * snapshot, links, sources) chegam via props do App.tsx — lista vazia é
+ * estado honesto, nunca mock. Idioma: só pt-BR.
  */
 
+import { useEffect, useState } from "react";
 import type {
   CapabilitySet,
   EffectiveQuality,
@@ -495,126 +498,207 @@ export function ViewerLinksPanel({ links, watching }: ViewerLinksProps) {
 }
 
 // ---------------------------------------------------------------------------
-// Tela inicial: criar / entrar.
+// Utilidades visuais locais.
+// ---------------------------------------------------------------------------
+
+const hueOfNickname = (nickname: string): number => {
+  let h = 0;
+  for (let i = 0; i < nickname.length; i++) h = (h * 31 + nickname.charCodeAt(i)) % 360;
+  return h;
+};
+
+const initialOf = (nickname: string): string =>
+  nickname.trim().charAt(0).toUpperCase() || "?";
+
+function useToast(): { toast: string | null; show: (message: string) => void } {
+  const [toast, setToast] = useState<string | null>(null);
+  useEffect(() => {
+    if (toast === null) return;
+    const timer = setTimeout(() => setToast(null), 2200);
+    return () => clearTimeout(timer);
+  }, [toast]);
+  return { toast, show: setToast };
+}
+
+// ---------------------------------------------------------------------------
+// Tela inicial: criar / entrar (lobby 2 panes).
 // ---------------------------------------------------------------------------
 
 export interface HomeProps {
-  server: string;
-  onServer: (value: string) => void;
-  tab: "create" | "join";
-  onTab: (tab: "create" | "join") => void;
-  nickname: string;
-  onNickname: (value: string) => void;
+  /** Legado (mantido p/ compat): servidor rendezvous, hoje sempre DEFAULT_SERVER. */
+  server?: string;
+  onServer?: (value: string) => void;
+  /** Legado (mantido p/ compat): a home fiel não tem tabs. */
+  tab?: "create" | "join";
+  onTab?: (tab: "create" | "join") => void;
+  /** Legado (mantido p/ compat): apelido interno, sem input visível na home. */
+  nickname?: string;
+  onNickname?: (value: string) => void;
   password: string;
   onPassword: (value: string) => void;
+  /** Código digitado no pane Entrar (6 letras/números). */
   code: string;
   onCode: (value: string) => void;
   busy: boolean;
   error: string | null;
   onCreate: () => void;
   onJoin: () => void;
+  /** Código devolvido pelo backend (ignorado na home; só aparece na sala). */
+  createdCode?: string | null;
+  /** Selo visual discreto do modo navegador (mock, sem Tauri). Só visual. */
+  mock?: boolean;
 }
 
 export function HomeScreen(props: HomeProps) {
   const {
-    server, onServer, tab, onTab, nickname, onNickname, password, onPassword,
-    code, onCode, busy, error, onCreate, onJoin,
+    password, onPassword, code, onCode, busy, error, onCreate, onJoin,
+    mock = false,
   } = props;
+  const { toast } = useToast();
   return (
-    <div className="screen">
-      <header className="brand">
-        <h1>GoLive</h1>
-        <p className="tagline">Tela direto de um PC para outro. O servidor só apresenta — nunca vê o vídeo.</p>
+    <div className="app" data-state="lobby" data-hook="room-shell">
+      <header className="topbar">
+        <div className="brand">
+          <img className="brand-logo" src="/logo.png" alt="goDrinking" width={22} height={22} />
+          <strong>goDrinking</strong>
+          <span className="room-pill" data-hook="room-presence">
+            <span className="pulse" aria-hidden="true" />
+            <span>Nenhuma sala</span>
+          </span>
+          {mock ? (
+            <span
+              className="mock-tag"
+              data-testid="mock-tag"
+              title="Sem Tauri: dados locais de demonstração"
+              style={{
+                fontSize: 11,
+                opacity: 0.75,
+                border: "1px solid currentColor",
+                borderRadius: 999,
+                padding: "1px 8px",
+                marginLeft: 8,
+                whiteSpace: "nowrap",
+              }}
+            >
+              MODO NAVEGADOR (mock)
+            </span>
+          ) : null}
+        </div>
       </header>
 
-      <section className="panel" aria-label="Servidor">
-        <label htmlFor="server">Servidor (rendezvous)</label>
-        <input
-          id="server"
-          value={server}
-          onChange={(event) => onServer(event.target.value)}
-          placeholder="http://127.0.0.1:18790"
-          autoComplete="off"
-          disabled={busy}
-        />
-      </section>
+      <div className="layout">
+        <main className="stage-wrap">
+          <div className="stage-head">
+            <div>
+              <h1>Prévia da sala</h1>
+              <p>Entre para ver as transmissões da sala.</p>
+            </div>
+          </div>
 
-      <section className="panel" aria-label="Entrar na sala">
-        <div className="tabs" role="tablist">
-          <button
-            type="button"
-            role="tab"
-            aria-selected={tab === "create"}
-            className={tab === "create" ? "selected" : ""}
-            onClick={() => onTab("create")}
-            disabled={busy}
-          >
-            Criar sala
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={tab === "join"}
-            className={tab === "join" ? "selected" : ""}
-            onClick={() => onTab("join")}
-            disabled={busy}
-          >
-            Entrar
-          </button>
-        </div>
+          <div className="lobby" data-hook="room-join">
+            <div className="lobby-card lobby-card--wide">
+              <div className="lobby-avatars" id="lobbyAvatars" aria-hidden="true">
+                <span style={{ ["--h" as string]: 265 }}>V</span>
+                <span style={{ ["--h" as string]: 160 }}>A</span>
+                <span style={{ ["--h" as string]: 20 }}>B</span>
+                <span style={{ ["--h" as string]: 200 }}>C</span>
+              </div>
+              <h2>Crie ou entre em uma Sala</h2>
+              <p>Salas com código + senha. O compartilhamento só aparece dentro da sala.</p>
 
-        <label htmlFor="nickname">Apelido</label>
-        <input
-          id="nickname"
-          value={nickname}
-          onChange={(event) => onNickname(event.target.value)}
-          placeholder="Seu nome na sala"
-          maxLength={24}
-          autoComplete="nickname"
-          disabled={busy}
-        />
+              <div className="lobby-cols">
+                <section className="lobby-pane" aria-label="Criar sala">
+                  <h3>Criar sala</h3>
+                  <p className="pane-desc">Defina a senha e receba o código para convidar.</p>
+                  <label className="field" htmlFor="createPassword">
+                    <span>Senha da sala</span>
+                    <input
+                      className="input"
+                      id="createPassword"
+                      type="password"
+                      value={password}
+                      onChange={(event) => onPassword(event.target.value)}
+                      autoComplete="new-password"
+                      aria-label="Senha da sala para criar"
+                      maxLength={128}
+                      placeholder="Ex.: café-com-leite"
+                      disabled={busy}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") onCreate();
+                      }}
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    className="btn primary big"
+                    id="createBtn"
+                    onClick={onCreate}
+                    disabled={busy}
+                  >
+                    {busy ? "Criando…" : "Criar sala"}
+                  </button>
+                </section>
+                <section className="lobby-pane" aria-label="Entrar na sala">
+                  <h3>Entrar</h3>
+                  <p className="pane-desc">Quem recebeu o convite entra com código + senha.</p>
+                  <label className="field" htmlFor="joinCode">
+                    <span>Código (6 letras/números)</span>
+                    <input
+                      className="input code"
+                      id="joinCode"
+                      type="text"
+                      value={code}
+                      onChange={(event) => onCode(event.target.value.toUpperCase())}
+                      autoComplete="one-time-code"
+                      aria-label="Código da sala"
+                      maxLength={6}
+                      spellCheck={false}
+                      placeholder="Ex.: K7Q9XA"
+                      disabled={busy}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") onJoin();
+                      }}
+                    />
+                  </label>
+                  <label className="field" htmlFor="joinPassword">
+                    <span>Senha da sala</span>
+                    <input
+                      className="input"
+                      id="joinPassword"
+                      type="password"
+                      value={password}
+                      onChange={(event) => onPassword(event.target.value)}
+                      autoComplete="current-password"
+                      aria-label="Senha da sala para entrar"
+                      maxLength={128}
+                      placeholder="Senha combinada"
+                      disabled={busy}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") onJoin();
+                      }}
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    className="btn primary big"
+                    id="joinBtn"
+                    onClick={onJoin}
+                    disabled={busy}
+                  >
+                    {busy ? "Entrando…" : "Entrar"}
+                  </button>
+                </section>
+              </div>
+              {error ? (
+                <p className="lobby-error" id="lobbyError" role="alert">{error}</p>
+              ) : null}
+              <small id="lobbyNote">Tela direto de um PC para outro. O servidor só apresenta — nunca vê o vídeo.</small>
+            </div>
+          </div>
+        </main>
+      </div>
 
-        <label htmlFor="password">Senha da sala</label>
-        <input
-          id="password"
-          type="password"
-          value={password}
-          onChange={(event) => onPassword(event.target.value)}
-          placeholder="4 a 64 caracteres"
-          maxLength={64}
-          autoComplete={tab === "create" ? "new-password" : "current-password"}
-          disabled={busy}
-        />
-
-        {tab === "join" && (
-          <>
-            <label htmlFor="code">Código da sala</label>
-            <input
-              id="code"
-              value={code}
-              onChange={(event) => onCode(event.target.value.toUpperCase())}
-              placeholder="ABC123"
-              maxLength={8}
-              autoComplete="off"
-              disabled={busy}
-            />
-          </>
-        )}
-
-        {error ? (
-          <p className="error" role="alert">{error}</p>
-        ) : null}
-
-        {tab === "create" ? (
-          <button type="button" className="primary" onClick={onCreate} disabled={busy}>
-            {busy ? "Criando…" : "Criar sala"}
-          </button>
-        ) : (
-          <button type="button" className="primary" onClick={onJoin} disabled={busy}>
-            {busy ? "Entrando…" : "Entrar"}
-          </button>
-        )}
-      </section>
+      <div className={`toast${toast ? " show" : ""}`} role="status">{toast}</div>
     </div>
   );
 }
@@ -657,11 +741,131 @@ export interface RoomProps {
   onStopShare: () => void;
   onWatch: (id: string) => void;
   onUnwatch: (id: string) => void;
+  /** Selo visual discreto do modo navegador (mock, sem Tauri). Só visual. */
+  mock?: boolean;
 }
 
 const isSelf = (member: RoomMember, selfId: string | null, selfNickname: string): boolean =>
   (selfId !== null && member.id === selfId) ||
   (selfId === null && member.nickname === selfNickname);
+
+interface TileProps {
+  member: RoomMember;
+  self: boolean;
+  wantsWatch: boolean;
+  connected: boolean;
+  pinned: boolean;
+  muted: boolean;
+  busy: boolean;
+  onWatch: () => void;
+  onUnwatch: () => void;
+  onPin: () => void;
+  onToggleMute: () => void;
+  showToast: (message: string) => void;
+}
+
+function Tile(props: TileProps) {
+  const { member, self, wantsWatch, connected, pinned, muted, busy, onWatch, onUnwatch, onPin, onToggleMute, showToast } = props;
+  const [zoom, setZoom] = useState({ s: 1, x: 0, y: 0 });
+  const hue = hueOfNickname(member.nickname);
+  const toggleFull = (host: HTMLElement | null): void => {
+    try {
+      if (document.fullscreenElement) {
+        void document.exitFullscreen();
+      } else {
+        void host?.requestFullscreen?.();
+      }
+    } catch {
+      showToast("Tela cheia indisponível aqui.");
+    }
+  };
+  return (
+    <article
+      className="tile"
+      data-hook="tile-stream"
+      tabIndex={0}
+      aria-label={`Transmissão de ${member.nickname}`}
+    >
+      <div
+        className="viewport"
+        onWheel={(event) => {
+          const next = Math.min(3, Math.max(1, zoom.s + (event.deltaY < 0 ? 0.15 : -0.15)));
+          const s = Math.round(next * 100) / 100;
+          setZoom(s === 1 ? { s: 1, x: 0, y: 0 } : { ...zoom, s });
+        }}
+        onDoubleClick={() => {
+          setZoom({ s: 1, x: 0, y: 0 });
+          showToast("Zoom resetado.");
+        }}
+      >
+        <div
+          className="tile-art"
+          style={{
+            background: `linear-gradient(135deg, hsl(${hue} 45% 32%), hsl(${hue} 45% 12%))`,
+            transform: `translate(${zoom.x}px, ${zoom.y}px) scale(${zoom.s})`,
+          }}
+          aria-hidden="true"
+        >
+          {initialOf(member.nickname)}
+        </div>
+        {!member.share ? (
+          <div className="watch-center">
+            <span className="watch-note">Sem transmissão</span>
+          </div>
+        ) : connected ? null : (
+          <div className="watch-center">
+            <button
+              type="button"
+              className="watch-btn"
+              data-testid={`tile-view-${member.id}`}
+              onClick={(event) => {
+                event.stopPropagation();
+                if (wantsWatch) onUnwatch();
+                else onWatch();
+              }}
+              disabled={busy}
+            >
+              {wantsWatch ? "Parar de ver" : "Ver"}
+            </button>
+            <span className="watch-note">Scroll = zoom · Duplo-clique = resetar</span>
+          </div>
+        )}
+      </div>
+      {connected ? (
+        <div className="badge-live"><i />AO VIVO</div>
+      ) : null}
+      <div className="tile-top">
+        <span className="name-tag">
+          {member.nickname}
+          {member.master ? <span className="leader">LÍDER</span> : null}
+          {self ? <span className="leader">VOCÊ</span> : null}
+        </span>
+        {connected ? <span className="live-stats">conectado</span> : null}
+      </div>
+      <div className="tile-controls">
+        <button type="button" className="tbtn pin" onClick={onPin} title="Fixar vídeo">
+          {pinned ? "Desafixar" : "Fixar"}
+        </button>
+        <button
+          type="button"
+          className="tbtn full"
+          title="Tela cheia"
+          onClick={(event) => toggleFull(event.currentTarget.closest(".tile"))}
+        >
+          Ampliar
+        </button>
+        <button
+          type="button"
+          className={`tbtn mute warn${muted ? " on" : ""}`}
+          title="Mudo"
+          onClick={onToggleMute}
+        >
+          {muted ? "Mudo" : "Som"}
+        </button>
+      </div>
+    </article>
+  );
+}
 
 export function RoomScreen(props: RoomProps) {
   const {
@@ -669,245 +873,663 @@ export function RoomScreen(props: RoomProps) {
     source, onSource, sources, sourcesError, caps, onListSources,
     busy, error, lastSignal, lastMedia, stats, quality, linkStats,
     onRefresh, onLeave, onShare, onStopShare, onWatch, onUnwatch,
+    mock = false,
   } = props;
   const watchingSet = new Set(watching);
   const shareState = snapshot?.share.state ?? null;
   const sharing = shareState === "live" || shareState === "starting";
   const links = snapshot?.links ?? [];
   const liveWatchers = snapshot?.watchers ?? [];
+  const connectedIds = new Set(
+    links.filter((link) => link.state === "connected").map((link) => link.watcher),
+  );
+
+  // Estados puramente visuais.
+  const [pinnedId, setPinnedId] = useState<string | null>(null);
+  const [muteAll, setMuteAll] = useState(false);
+  const [mutedIds, setMutedIds] = useState<Set<string>>(new Set());
+  const [shareOpen, setShareOpen] = useState(false);
+  const [txOpen, setTxOpen] = useState(false);
+  const [shareTab, setShareTab] = useState<"screens" | "apps">("screens");
+  const [audioQuery, setAudioQuery] = useState("");
+  const [audioSoundOnly] = useState(false);
+  const { toast, show } = useToast();
+
+  const sharingMembers = roster.filter((member) => member.share);
+  const pinned = pinnedId ? roster.find((member) => member.id === pinnedId) ?? null : null;
+  const gridMembers = pinned ? [pinned] : roster;
+  const stripMembers = pinned ? roster.filter((member) => member.id !== pinned.id) : [];
+
+  const say = (message: string): void => show(message);
+
+  const openShare = (): void => {
+    onListSources();
+    setShareOpen(true);
+  };
+  const closeShare = (): void => setShareOpen(false);
+
+  const handleShareMain = (): void => {
+    if (sharing) {
+      onStopShare();
+      say("Compartilhamento parado.");
+    } else {
+      openShare();
+    }
+  };
+
+  const pickSource = (kind: "display" | "window", id: string, name: string): void => {
+    onSource(`${kind}:${id}`);
+    setShareOpen(false);
+    say(`Fonte escolhida: ${name}. Toque Compartilhar para ir ao ar.`);
+  };
+
+  const copyCode = (): void => {
+    if (!roomCode) {
+      say("Nenhum código para copiar ainda.");
+      return;
+    }
+    try {
+      void navigator.clipboard?.writeText(roomCode);
+      say(`Código copiado: ${roomCode}`);
+    } catch {
+      say(`Código da sala: ${roomCode}`);
+    }
+  };
+
+  const toggleMuteId = (id: string, name: string): void => {
+    setMutedIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+    say(`${name} ${mutedIds.has(id) ? "com som." : "silenciado."}`);
+  };
+
+  const visibleSources = sources.filter((item) =>
+    shareTab === "screens" ? item.kind === "display" : item.kind === "window",
+  );
+  const audioVisible: Array<{ id: string; name: string }> = [];
+  const audioFiltered = audioVisible.filter((item) => {
+    void audioSoundOnly;
+    if (audioQuery && !item.name.toLowerCase().includes(audioQuery.toLowerCase())) return false;
+    return true;
+  });
 
   return (
-    <div className="screen">
-      <header className="room-bar">
-        <div>
-          <span className="kicker">Sala</span>
-          <strong data-testid="room-code">{roomCode ?? "sem código ainda"}</strong>
-          <small>{nickname}</small>
+    <div className="app" data-state="inside" data-hook="room-shell">
+      <header className="topbar">
+        <div className="brand">
+          <img className="brand-logo" src="/logo.png" alt="goDrinking" width={22} height={22} />
+          <strong>goDrinking</strong>
+          <span className="room-pill" data-hook="room-presence">
+            <span className="pulse" aria-hidden="true" />
+            <span>Sala {roomCode ?? "sem código ainda"}</span>
+            <em>· {roster.length} pessoa(s)</em>
+          </span>
+          {mock ? (
+            <span
+              className="mock-tag"
+              data-testid="mock-tag"
+              title="Sem Tauri: dados locais de demonstração"
+              style={{
+                fontSize: 11,
+                opacity: 0.75,
+                border: "1px solid currentColor",
+                borderRadius: 999,
+                padding: "1px 8px",
+                marginLeft: 8,
+                whiteSpace: "nowrap",
+              }}
+            >
+              MODO NAVEGADOR (mock)
+            </span>
+          ) : null}
         </div>
-        <div className="room-bar-actions">
-          <button type="button" onClick={onRefresh} disabled={busy} title="Lê o snapshot do backend agora">
-            {busy ? "Atualizando…" : "Atualizar"}
+        <div className="top-actions">
+          <button
+            type="button"
+            className="btn ghost"
+            data-hook="share-open"
+            onClick={openShare}
+            disabled={busy}
+          >
+            Compartilhar
           </button>
-          <button type="button" className="danger" onClick={onLeave} disabled={busy}>
-            Sair
+          <button type="button" className="btn danger-b" onClick={onLeave} disabled={busy}>
+            Sair da sala
           </button>
         </div>
       </header>
 
-      {error ? (
-        <p className="error" role="alert">{error}</p>
-      ) : null}
-
-      <section className="panel" aria-label="Compartilhar tela">
-        <h2>Sua tela</h2>
-        <label htmlFor="source-kind">Fonte</label>
-        <select
-          id="source-kind"
-          value={sourceKindOf(source)}
-          onChange={(event) => {
-            const kind = event.target.value as SourceKindSelect;
-            if (kind === "synthetic") onSource("synthetic");
-            else if (kind === "movie") onSource("movie:");
-            else if (kind === "display") onSource("display:");
-            else onSource("window:");
-          }}
-          disabled={busy || sharing}
-        >
-          <option value="synthetic">Sintética (teste)</option>
-          <option value="movie">Arquivo de vídeo</option>
-          <option value="display" disabled={caps !== null && !caps.display.supported}>
-            Tela {caps && !caps.display.supported ? `(${caps.display.reason})` : ""}
-          </option>
-          <option value="window" disabled={caps !== null && !caps.window.supported}>
-            Janela {caps && !caps.window.supported ? `(${caps.window.reason})` : ""}
-          </option>
-        </select>
-        {sourceKindOf(source) === "movie" ? (
-          <>
-            <label htmlFor="source">Arquivo</label>
-            <input
-              id="source"
-              value={source}
-              onChange={(event) => onSource(event.target.value)}
-              placeholder="movie:/caminho/do/arquivo"
-              autoComplete="off"
-              disabled={busy || sharing}
-            />
-          </>
-        ) : null}
-        {sourceKindOf(source) === "display" || sourceKindOf(source) === "window" ? (
-          <>
-            <label htmlFor="source-pick">
-              {sourceKindOf(source) === "display" ? "Tela" : "Janela"}
-            </label>
-            <select
-              id="source-pick"
-              value={source}
-              onChange={(event) => onSource(event.target.value)}
-              disabled={busy || sharing || sources.length === 0}
-            >
-              <option value={sourceKindOf(source) + ":"}>Escolha…</option>
-              {sources
-                .filter((item) => item.kind === sourceKindOf(source))
-                .map((item) => (
-                  <option key={`${item.kind}:${item.id}`} value={`${item.kind}:${item.id}`}>
-                    {item.name}
-                  </option>
-                ))}
-            </select>
-            <div className="row">
-              <button type="button" onClick={onListSources} disabled={busy || sharing}>
-                Listar telas
-              </button>
-              {sourcesError ? (
-                <span className="error" role="alert">{sourcesError}</span>
-              ) : null}
+      <div className="layout">
+        <main className="stage-wrap">
+          <div className="stage-head">
+            <div>
+              <h1>{sharing ? "Ao vivo agora" : "Prévia da sala"}</h1>
+              <p>
+                {sharingMembers.length} compartilhando · {watching.length} assistindo
+              </p>
             </div>
-            <p className="hint">
-              A primeira listagem pode pedir permissão ao sistema. Sem permissão,
-              nada é capturado — o erro acima explica como autorizar.
-            </p>
-          </>
-        ) : null}
-        {sourceKindOf(source) === "synthetic" ? (
-          <p className="hint"><code>synthetic</code> gera a bola de teste.</p>
-        ) : null}
-        <div className="row">
-          {sharing ? (
-            <button type="button" className="danger" onClick={onStopShare} disabled={busy}>
-              {busy ? "Parando…" : "Parar de compartilhar"}
+            <div className="stage-hint">
+              Scroll = zoom · Arrastar = mover · Duplo-clique = resetar
+            </div>
+          </div>
+
+          <div className="room-code-bar">
+            <span>Sala <strong data-testid="room-code">{roomCode ?? "sem código ainda"}</strong></span>
+            <small>{nickname}</small>
+            {roomCode ? (
+              <button type="button" className="btn ghost small" onClick={copyCode}>
+                Copiar código
+              </button>
+            ) : null}
+            <button
+              type="button"
+              className="btn ghost small"
+              onClick={() => {
+                onRefresh();
+                say("Sala atualizada.");
+              }}
+              disabled={busy}
+              title="Lê o snapshot do backend agora"
+            >
+              {busy ? "Atualizando…" : "Atualizar"}
             </button>
-          ) : (
-            <button type="button" className="primary" onClick={onShare} disabled={busy}>
+          </div>
+
+          {error ? (
+            <p className="lobby-error" role="alert">{error}</p>
+          ) : null}
+
+          <section className="stage" aria-label="Transmissões da sala">
+            {roster.length === 0 ? (
+              <div className="empty-stage">Sem transmissões</div>
+            ) : (
+              <>
+                <div className={`tiles${pinned ? " solo" : ""}`} data-hook="tile-grid">
+                  {gridMembers.map((member) => {
+                    const self = isSelf(member, selfId, selfNickname);
+                    return (
+                      <Tile
+                        key={member.id}
+                        member={member}
+                        self={self}
+                        wantsWatch={watchingSet.has(member.id)}
+                        connected={connectedIds.has(member.nickname) || connectedIds.has(member.id)}
+                        pinned={pinnedId === member.id}
+                        muted={muteAll || mutedIds.has(member.id)}
+                        busy={busy}
+                        onWatch={() => {
+                          onWatch(member.id);
+                          say(`Pedindo para assistir ${member.nickname}…`);
+                        }}
+                        onUnwatch={() => {
+                          onUnwatch(member.id);
+                          say(`Parou de ver ${member.nickname}.`);
+                        }}
+                        onPin={() => {
+                          setPinnedId((current) => (current === member.id ? null : member.id));
+                          say(pinnedId === member.id
+                            ? "Vídeo desafixado — volta ao grid."
+                            : `${member.nickname} fixado na área principal.`);
+                        }}
+                        onToggleMute={() => toggleMuteId(member.id, member.nickname)}
+                        showToast={say}
+                      />
+                    );
+                  })}
+                </div>
+                {pinned ? (
+                  <>
+                    <p className="strip-label">Na sala agora — clique em desafixar para voltar ao grid</p>
+                    <div className="strip">
+                      {stripMembers.map((member) => {
+                        const self = isSelf(member, selfId, selfNickname);
+                        return (
+                          <Tile
+                            key={member.id}
+                            member={member}
+                            self={self}
+                            wantsWatch={watchingSet.has(member.id)}
+                            connected={connectedIds.has(member.nickname) || connectedIds.has(member.id)}
+                            pinned={false}
+                            muted={muteAll || mutedIds.has(member.id)}
+                            busy={busy}
+                            onWatch={() => onWatch(member.id)}
+                            onUnwatch={() => onUnwatch(member.id)}
+                            onPin={() => setPinnedId(member.id)}
+                            onToggleMute={() => toggleMuteId(member.id, member.nickname)}
+                            showToast={say}
+                          />
+                        );
+                      })}
+                    </div>
+                  </>
+                ) : null}
+                {sharingMembers.length === 0 ? (
+                  <div className="empty-stage">Sem transmissões</div>
+                ) : null}
+              </>
+            )}
+            <span className="state" data-testid="share-state">
+              Share: {shareState ? shareLabel(shareState) : "desconhecido — toque Atualizar"}
+            </span>
+            <div className="video-placeholder" role="status">
+              <strong>
+                {links.some((link) => link.state === "connected")
+                  ? "Vídeo na janela nativa."
+                  : "Sem vídeo: nenhum link conectado."}
+              </strong>
+              <span>
+                Cada watch abre uma janela nativa do sistema com o vídeo decodificado
+                (título com o nome de quem compartilha). O que você vê aqui é o
+                estado real do link — o vídeo nunca passa pela WebView.
+              </span>
+              {stats ? (
+                <span data-testid="viewer-stats">
+                  Frames recebidos: {stats.frames} · keyframes: {stats.keyframes} · ICE:{" "}
+                  {stats.ice ? "conectado" : "negociando"} · apresentados: {stats.presented}
+                </span>
+              ) : (
+                <span>Frames recebidos: ainda sem amostra do evento de mídia.</span>
+              )}
+            </div>
+          </section>
+
+          <footer className="controls" data-hook="room-controls">
+            <button
+              type="button"
+              className={`ctl${muteAll ? " muted" : ""}`}
+              onClick={() => {
+                setMuteAll((current) => !current);
+                say(muteAll ? "Áudio geral ativado." : "Tudo silenciado.");
+              }}
+              title="Silenciar tudo"
+            >
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2"><path d="M11 5 6 9H2v6h4l5 4V5z" /><path d="M22 9l-6 6M16 9l6 6" /></svg>
+              <span>Silenciar tudo</span>
+            </button>
+            <button
+              type="button"
+              className={`ctl accent${sharing ? " danger" : ""}`}
+              data-hook="share-open"
+              onClick={handleShareMain}
+              disabled={busy}
+            >
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2"><rect x="2" y="4" width="20" height="13" rx="2" /><path d="M8 21h8M12 17v4" /></svg>
+              <span>{sharing ? (busy ? "Parando…" : "Parar de compartilhar") : (busy ? "Iniciando…" : "Compartilhar")}</span>
+            </button>
+            <button
+              type="button"
+              className="ctl"
+              data-hook="share-config"
+              onClick={() => setTxOpen(true)}
+              title="Configurar transmissão"
+            >
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 8h10M18 8h2M4 16h4M12 16h8" /><circle cx="16" cy="8" r="2" /><circle cx="10" cy="16" r="2" /></svg>
+              <span>Configurar Transmissão</span>
+            </button>
+          </footer>
+
+          <section className="card" aria-label="Links de mídia">
+            <div className="card-head">
+              <h2>Links · {links.length}</h2>
+            </div>
+            {links.length === 0 ? (
+              <p className="empty" role="status">
+                Nenhum link ativo no snapshot. Links aparecem quando alguém assiste
+                ao seu share (ou quando seu watch vira link no backend).
+              </p>
+            ) : (
+              <ul className="links">
+                {links.map((link) => (
+                  <li key={link.id}>
+                    <code>{link.watcher}</code>
+                    <span className="state">{linkLabel(link.state)}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {liveWatchers.length > 0 ? (
+              <p className="hint">Assistindo agora: {liveWatchers.join(", ")}</p>
+            ) : null}
+            <ViewerLinksPanel links={linkStats} watching={watching} />
+          </section>
+
+          <section className="card" aria-label="Diagnóstico">
+            <div className="card-head">
+              <h2>Diagnóstico</h2>
+            </div>
+            <dl className="diag">
+              <div>
+                <dt>Sala</dt>
+                <dd data-testid="sala-state">
+                  {snapshot ? salaLabel(snapshot.session.state) : "sem snapshot — toque Atualizar"}
+                </dd>
+              </div>
+              <div>
+                <dt>Share</dt>
+                <dd>{snapshot ? shareLabel(snapshot.share.state) : "—"}</dd>
+              </div>
+              <div>
+                <dt>Links</dt>
+                <dd>{snapshot ? `${links.length} ativo(s)` : "—"}</dd>
+              </div>
+              <div>
+                <dt>Último evento (sinal)</dt>
+                <dd>{lastSignal ?? "nenhum ainda"}</dd>
+              </div>
+              <div>
+                <dt>Último evento (mídia)</dt>
+                <dd>{lastMedia ?? "nenhum ainda"}</dd>
+              </div>
+              <div>
+                <dt>Último erro</dt>
+                <dd className={error ? "is-error" : ""}>{error ?? "nenhum"}</dd>
+              </div>
+            </dl>
+          </section>
+        </main>
+
+        <aside className="side">
+          <section className="card" data-hook="room-presence">
+            <div className="card-head">
+              <h2>Pessoas <span className="count">{roster.length}</span></h2>
+              <span className="mini">{sharingMembers.length} compartilhando</span>
+            </div>
+            {roster.length <= 1 ? (
+              <p className="card-note">Só você aqui.</p>
+            ) : null}
+            {roster.length === 0 ? (
+              <ul className="people roster">
+                <li className="person ghost">
+                  <span className="who">
+                    <small>Nenhum membro visível ainda. O roster chega pelo evento do servidor — aguarde um instante ou toque <strong>Atualizar</strong>.</small>
+                  </span>
+                </li>
+              </ul>
+            ) : (
+              <ul className="people roster">
+                {roster.map((member) => {
+                  const self = isSelf(member, selfId, selfNickname);
+                  const wantsWatch = watchingSet.has(member.id);
+                  const hue = hueOfNickname(member.nickname);
+                  return (
+                    <li key={member.id} className={`person${self ? " is-self" : ""}`}>
+                      <span className="avatar" style={{ ["--h" as string]: hue }}>
+                        {initialOf(member.nickname)}
+                      </span>
+                      <span className="who">
+                        <b>
+                          <span className="member-name">
+                            {member.master ? <span title="Master">♛ </span> : null}
+                            {member.nickname}
+                            {self ? <small> (você)</small> : null}
+                          </span>
+                          {member.master && !self ? <span className="leader-tag">LÍDER</span> : null}
+                        </b>
+                        <small>{member.share ? "Compartilhando" : wantsWatch ? "Assistindo" : "Na sala"}</small>
+                      </span>
+                      <span className="badges">
+                        {member.share ? <span className="badge live">compartilhando</span> : null}
+                        {wantsWatch ? <span className="badge">pedido de watch</span> : null}
+                      </span>
+                      <span className={`dot ${member.share ? "live" : "watch"}`} aria-hidden="true" />
+                      {!self && member.share ? (
+                        wantsWatch ? (
+                          <button
+                            type="button"
+                            data-testid="roster-watch"
+                            onClick={() => {
+                              onUnwatch(member.id);
+                              say(`Parou de ver ${member.nickname}.`);
+                            }}
+                            disabled={busy}
+                          >
+                            Parar de ver
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            data-testid="roster-watch"
+                            onClick={() => {
+                              onWatch(member.id);
+                              say(`Pedindo para assistir ${member.nickname}…`);
+                            }}
+                            disabled={busy}
+                          >
+                            Assistir
+                          </button>
+                        )
+                      ) : null}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </section>
+
+          <section className="card" data-hook="audio-policy">
+            <div className="card-head">
+              <h2>Áudio da sessão</h2>
+            </div>
+            <div className="audio-tools">
+              <input
+                className="input small"
+                type="search"
+                autoComplete="off"
+                aria-label="Buscar aplicativo"
+                placeholder="Buscar app…"
+                value={audioQuery}
+                onChange={(event) => setAudioQuery(event.target.value)}
+              />
+              <button type="button" className="btn ghost small" aria-pressed="false" disabled>
+                App com Som
+              </button>
+            </div>
+            <p className="card-desc">
+              O áudio da sessão segue o share ativo. Sem apps mapeados pelo backend por aqui.
+            </p>
+            {audioFiltered.length === 0 ? (
+              <p className="empty-sources">Nenhum app encontrado.</p>
+            ) : null}
+          </section>
+
+          <p className="foot-note">
+            Cada watch abre uma janela nativa com o vídeo. O estado acima é o real do backend.
+          </p>
+        </aside>
+      </div>
+
+      {/* Modal Compartilhar — sempre no DOM (hidden quando fechado) */}
+      <div className="modal-back" hidden={!shareOpen} data-hook="share-enumeration">
+        <div className="modal" role="dialog" aria-modal="true" aria-label="Compartilhar tela">
+          <div className="modal-head">
+            <h2>Compartilhar</h2>
+            <button type="button" className="icon-btn" aria-label="Fechar" onClick={closeShare}>
+              ✕
+            </button>
+          </div>
+          <div className="tabs">
+            <button
+              type="button"
+              className={shareTab === "screens" ? "tab active" : "tab"}
+              onClick={() => setShareTab("screens")}
+            >
+              Telas
+            </button>
+            <button
+              type="button"
+              className={shareTab === "apps" ? "tab active" : "tab"}
+              onClick={() => setShareTab("apps")}
+            >
+              Aplicativos
+            </button>
+          </div>
+          <label htmlFor="source-kind">Fonte</label>
+          <select
+            id="source-kind"
+            value={sourceKindOf(source)}
+            onChange={(event) => {
+              const kind = event.target.value as SourceKindSelect;
+              if (kind === "synthetic") onSource("synthetic");
+              else if (kind === "movie") onSource("movie:");
+              else if (kind === "display") onSource("display:");
+              else onSource("window:");
+            }}
+            disabled={busy || sharing}
+          >
+            <option value="synthetic">Sintética (teste)</option>
+            <option value="movie">Arquivo de vídeo</option>
+            <option value="display" disabled={caps !== null && !caps.display.supported}>
+              Tela {caps && !caps.display.supported ? `(${caps.display.reason})` : ""}
+            </option>
+            <option value="window" disabled={caps !== null && !caps.window.supported}>
+              Janela {caps && !caps.window.supported ? `(${caps.window.reason})` : ""}
+            </option>
+          </select>
+          {sourceKindOf(source) === "movie" ? (
+            <>
+              <label htmlFor="source">Arquivo</label>
+              <input
+                className="input"
+                id="source"
+                value={source}
+                onChange={(event) => onSource(event.target.value)}
+                placeholder="movie:/caminho/do/arquivo"
+                autoComplete="off"
+                disabled={busy || sharing}
+              />
+            </>
+          ) : null}
+          {sourceKindOf(source) === "display" || sourceKindOf(source) === "window" ? (
+            <>
+              <label htmlFor="source-pick">
+                {sourceKindOf(source) === "display" ? "Tela" : "Janela"}
+              </label>
+              <select
+                id="source-pick"
+                value={source}
+                onChange={(event) => onSource(event.target.value)}
+                disabled={busy || sharing || sources.length === 0}
+              >
+                <option value={`${sourceKindOf(source)}:`}>Escolha…</option>
+                {sources
+                  .filter((item) => item.kind === sourceKindOf(source))
+                  .map((item) => (
+                    <option key={`${item.kind}:${item.id}`} value={`${item.kind}:${item.id}`}>
+                      {item.name}
+                    </option>
+                  ))}
+              </select>
+              <div className="row">
+                <button type="button" className="btn ghost small" onClick={onListSources} disabled={busy || sharing}>
+                  Listar telas
+                </button>
+                {sourcesError ? (
+                  <span className="error" role="alert">{sourcesError}</span>
+                ) : null}
+              </div>
+              <p className="hint">
+                A primeira listagem pode pedir permissão ao sistema. Sem permissão,
+                nada é capturado — o erro acima explica como autorizar.
+              </p>
+            </>
+          ) : null}
+          {sourceKindOf(source) === "synthetic" ? (
+            <p className="hint"><code>synthetic</code> gera a bola de teste.</p>
+          ) : null}
+          <div className="source-grid" style={{ marginTop: 12 }}>
+            {visibleSources.length === 0 ? (
+              <p className="empty-sources">
+                Sem fontes ainda.
+                <br />
+                <button
+                  type="button"
+                  className="btn ghost small"
+                  style={{ marginTop: 8 }}
+                  onClick={onListSources}
+                  disabled={busy || sharing}
+                >
+                  Listar telas
+                </button>
+                <span className="hint" style={{ display: "block", marginTop: 8 }}>
+                  A primeira listagem pode pedir permissão ao sistema.
+                </span>
+                {sourcesError ? (
+                  <span className="error" role="alert" style={{ display: "block", marginTop: 8 }}>
+                    {sourcesError}
+                  </span>
+                ) : null}
+              </p>
+            ) : (
+              visibleSources.map((item) => (
+                <button
+                  key={`${item.kind}:${item.id}`}
+                  type="button"
+                  className={`source${source === `${item.kind}:${item.id}` ? " sel" : ""}`}
+                  onClick={() => pickSource(item.kind, item.id, item.name)}
+                >
+                  <span
+                    className="thumb"
+                    style={{
+                      background: `linear-gradient(135deg, hsl(${hueOfNickname(item.id)} 45% 35%), hsl(${hueOfNickname(item.id)} 45% 12%))`,
+                    }}
+                  >
+                    FONTE
+                  </span>
+                  <b>{item.name}</b>
+                  <small>{item.w} × {item.h}</small>
+                </button>
+              ))
+            )}
+          </div>
+          <p className="modal-note">
+            A enumeração vem do backend (<code>list_sources</code>); sem permissão, a lista vem vazia.
+          </p>
+          <div className="modal-foot">
+            <button type="button" className="btn ghost" onClick={closeShare}>
+              Cancelar
+            </button>
+            <button
+              type="button"
+              className="btn primary"
+              onClick={() => {
+                onShare();
+                setShareOpen(false);
+                say("Iniciando compartilhamento…");
+              }}
+              disabled={busy}
+            >
               {busy ? "Iniciando…" : "Compartilhar"}
             </button>
-          )}
-          <span className="state" data-testid="share-state">
-            Share: {shareState ? shareLabel(shareState) : "desconhecido — toque Atualizar"}
-          </span>
+          </div>
         </div>
-      </section>
+      </div>
 
-      <section className="panel" aria-label="Qualidade do share">
-        <h2>Qualidade</h2>
-        <QualityPanel {...quality} />
-      </section>
-
-      <section className="panel" aria-label="Quem está na sala">
-        <h2>Na sala · {roster.length}</h2>
-        {roster.length === 0 ? (
-          <p className="empty" role="status">
-            Nenhum membro visível ainda. O roster chega pelo evento do servidor —
-            aguarde um instante ou toque <strong>Atualizar</strong>.
+      {/* Modal TX Config — sempre no DOM (hidden quando fechado) */}
+      <div className="modal-back" hidden={!txOpen} data-hook="share-config">
+        <div className="modal small" role="dialog" aria-modal="true" aria-label="Configurar transmissão">
+          <div className="modal-head">
+            <h2>Configurar Transmissão</h2>
+            <button type="button" className="icon-btn" aria-label="Fechar" onClick={() => setTxOpen(false)}>
+              ✕
+            </button>
+          </div>
+          <p className="modal-note top">
+            Padrão automático: resolução máxima da fonte com bitrate saudável.
           </p>
-        ) : (
-          <ul className="roster">
-            {roster.map((member) => {
-              const self = isSelf(member, selfId, selfNickname);
-              const wantsWatch = watchingSet.has(member.id);
-              return (
-                <li key={member.id} className={self ? "is-self" : ""}>
-                  <span className="member-name">
-                    {member.master ? <span title="Master">♛ </span> : null}
-                    {member.nickname}
-                    {self ? <small> (você)</small> : null}
-                  </span>
-                  <span className="badges">
-                    {member.share ? <span className="badge live">compartilhando</span> : null}
-                    {wantsWatch ? <span className="badge">pedido de watch</span> : null}
-                  </span>
-                  {!self && member.share ? (
-                    wantsWatch ? (
-                      <button type="button" onClick={() => onUnwatch(member.id)} disabled={busy}>
-                        Parar de ver
-                      </button>
-                    ) : (
-                      <button type="button" onClick={() => onWatch(member.id)} disabled={busy}>
-                        Assistir
-                      </button>
-                    )
-                  ) : null}
-                </li>
-              );
-            })}
-          </ul>
-        )}
-      </section>
-
-      <section className="panel" aria-label="Links de mídia">
-        <h2>Links · {links.length}</h2>
-        {links.length === 0 ? (
-          <p className="empty" role="status">
-            Nenhum link ativo no snapshot. Links aparecem quando alguém assiste
-            ao seu share (ou quando seu watch vira link no backend).
-          </p>
-        ) : (
-          <ul className="links">
-            {links.map((link) => (
-              <li key={link.id}>
-                <code>{link.watcher}</code>
-                <span className="state">{linkLabel(link.state)}</span>
-              </li>
-            ))}
-          </ul>
-        )}
-        {liveWatchers.length > 0 ? (
-          <p className="hint">Assistindo agora: {liveWatchers.join(", ")}</p>
-        ) : null}
-        <ViewerLinksPanel links={linkStats} watching={watching} />
-        <div className="video-placeholder" role="status">
-          <strong>
-            {links.some((link) => link.state === "connected")
-              ? "Vídeo na janela nativa."
-              : "Sem vídeo: nenhum link conectado."}
-          </strong>
-          <span>
-            Cada watch abre uma janela nativa do sistema com o vídeo decodificado
-            (título com o nome de quem compartilha). O que você vê aqui é o
-            estado real do link — o vídeo nunca passa pela WebView.
-          </span>
-          {stats ? (
-            <span data-testid="viewer-stats">
-              Frames recebidos: {stats.frames} · keyframes: {stats.keyframes} · ICE:{" "}
-              {stats.ice ? "conectado" : "negociando"} · apresentados: {stats.presented}
-            </span>
-          ) : (
-            <span>Frames recebidos: ainda sem amostra do evento de mídia.</span>
-          )}
+          <QualityPanel {...quality} />
+          <div className="modal-foot">
+            <button type="button" className="btn ghost" onClick={() => setTxOpen(false)}>
+              Fechar
+            </button>
+          </div>
         </div>
-      </section>
+      </div>
 
-      <section className="panel" aria-label="Diagnóstico">
-        <h2>Diagnóstico</h2>
-        <dl className="diag">
-          <div>
-            <dt>Sala</dt>
-            <dd data-testid="sala-state">
-              {snapshot ? salaLabel(snapshot.session.state) : "sem snapshot — toque Atualizar"}
-            </dd>
-          </div>
-          <div>
-            <dt>Share</dt>
-            <dd>{snapshot ? shareLabel(snapshot.share.state) : "—"}</dd>
-          </div>
-          <div>
-            <dt>Links</dt>
-            <dd>{snapshot ? `${links.length} ativo(s)` : "—"}</dd>
-          </div>
-          <div>
-            <dt>Último evento (sinal)</dt>
-            <dd>{lastSignal ?? "nenhum ainda"}</dd>
-          </div>
-          <div>
-            <dt>Último evento (mídia)</dt>
-            <dd>{lastMedia ?? "nenhum ainda"}</dd>
-          </div>
-          <div>
-            <dt>Último erro</dt>
-            <dd className={error ? "is-error" : ""}>{error ?? "nenhum"}</dd>
-          </div>
-        </dl>
-      </section>
+      <div className={`toast${toast ? " show" : ""}`} role="status">{toast}</div>
     </div>
   );
 }

@@ -40,6 +40,17 @@ import {
 } from "./api";
 import { runE2ePlan, type E2eReport } from "./e2e";
 import {
+  MOCK_SELF_ID,
+  isTauriMissing,
+  mockCaps,
+  mockCounters,
+  mockEffective,
+  mockRoster,
+  mockSnapshot,
+  mockSources,
+  randomMockCode,
+} from "./mock";
+import {
   HomeScreen,
   RoomScreen,
   resolveDesired,
@@ -85,7 +96,8 @@ export default function App() {
   const [screen, setScreen] = useState<"home" | "room">("home");
   const [tab, setTab] = useState<"create" | "join">("create");
   const [server, setServerBase] = useState(DEFAULT_SERVER);
-  const [nickname, setNickname] = useState("");
+  // Apelido interno (sem input visível na home fiel ao goDrinking2).
+  const [nickname, setNickname] = useState("Você");
   const [password, setPassword] = useState("");
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
@@ -128,9 +140,18 @@ export default function App() {
   // Modo autodirigido test-only: só ativa com `--e2e-plan` (get_e2e_plan
   // devolve null no app normal e nada aqui executa). Guarda contra
   // mount duplo; o driver é headless e reporta via status + título.
+  // Modo mock automático no navegador puro (sem Tauri): `isMock` congela na
+  // montagem via `isTauriMissing()` (ausência de `window.__TAURI__` /
+  // `window.__TAURI_INTERNALS__`). Quando true, nenhum `invoke`/`listen` é
+  // chamado — tudo é estado local via `mock.ts`.
+  const [isMock] = useState(() => isTauriMissing());
+  // Share mock (fonte de verdade do snapshot mock; o backend real usa o
+  // snapshot para isso, aqui o toggle local alimenta `mockSnapshot`).
+  const [mockSharing, setMockSharing] = useState(true);
   const [e2ePlan, setE2ePlan] = useState<E2ePlan | null>(null);
   const [e2eReport, setE2eReport] = useState<E2eReport | null>(null);
   useEffect(() => {
+    if (isMock) return; // mock: sem Tauri, sem e2e, sem invoke
     let live = true;
     let started = false;
     getE2ePlan()
@@ -163,7 +184,7 @@ export default function App() {
     return () => {
       live = false;
     };
-  }, []);
+  }, [isMock]);
 
   const messageOf = (failure: unknown, fallback: string): string => {
     if (failure instanceof Error) return failure.message;
@@ -173,7 +194,26 @@ export default function App() {
 
   /** Lê snapshot + contadores agora (botão, pós-intent, pós-evento). */
   const refresh = async (): Promise<void> => {
-    try {
+    if (isMock) {
+      // mock: sem invoke — deriva tudo do estado local (share/watch/efetivo).
+      const eff = effective ?? mockEffective();
+      setSnapshot(mockSnapshot(mockSharing, watching));
+      setRoster(mockRoster(nickname.trim() || "Você", mockSharing));
+      const counters = mockCounters(watching, eff);
+      setLinkStats(counters.links);
+      setEffective(eff);
+      setBackend(counters.backend ?? null);
+      setBackendNote(counters.backend_note ?? null);
+      setStats((current) =>
+        current ?? {
+          frames: counters.frames,
+          keyframes: counters.keyframes,
+          ice: counters.connected,
+          presented: counters.presented,
+        },
+      );
+      return;
+    }    try {
       setSnapshot(await getSnapshot());
     } catch (failure) {
       setError(messageOf(failure, "Não foi ler o estado da sala."));
@@ -197,6 +237,7 @@ export default function App() {
   // fresco — dirigido a evento, nunca a timer.
   useEffect(() => {
     if (screen !== "room") return;
+    if (isMock) return; // mock: onSignal/onMedia viram no-op (dados já locais)
     let cancelled = false;
     const unlistens: Array<() => void> = [];
     void onSignalEvent((event) => {
@@ -250,7 +291,43 @@ export default function App() {
   };
 
   const handleCreate = (): void => {
-    const nameError = validateNickname(nickname);
+    if (isMock) {
+      // mock: pula TODAS as validações do caminho real (apelido/senha) —
+      // o lobby fiel não tem campo de apelido e a senha é opcional aqui.
+      // Entra sempre com sucesso.
+      const effectiveNickname = nickname.trim() || "Você";
+      const created = randomMockCode();
+      const eff = mockEffective();
+      const counters = mockCounters([], eff);
+      setRoomCode(created);
+      setNickname(effectiveNickname);
+      setSelfId(MOCK_SELF_ID);
+      setMockSharing(true);
+      setSnapshot(mockSnapshot(true, []));
+      setRoster(mockRoster(effectiveNickname, true));
+      setWatching([]);
+      setEffective(eff);
+      setLinkStats(counters.links);
+      setBackend(counters.backend ?? null);
+      setBackendNote(counters.backend_note ?? null);
+      setStats({
+        frames: counters.frames,
+        keyframes: counters.keyframes,
+        ice: counters.connected,
+        presented: counters.presented,
+      });
+      setCaps(mockCaps());
+      setSources([]);
+      setSourcesError(null);
+      setLastSignal("roster (4 membro(s))");
+      setLastMedia(null);
+      setError(null);
+      setScreen("room");
+      return;
+    }
+    // Caminho Tauri real: validações mantidas como estão.
+    const effectiveNickname = nickname.trim() || "Você";
+    const nameError = validateNickname(effectiveNickname);
     if (nameError) {
       setError(nameError);
       return;
@@ -263,9 +340,9 @@ export default function App() {
     const base = server.trim() || DEFAULT_SERVER;
     void runIntent(async () => {
       await setServer(base);
-      const created = await createRoom(nickname.trim(), password);
+      const created = await createRoom(effectiveNickname, password);
       setRoomCode(created);
-      setCode(created);
+      setNickname(effectiveNickname);
       setSelfId(null); // create devolve código; nosso id chega no roster
       setScreen("room");
       // Capacidades são fatos de compilação (sem SO): seguro buscar ao entrar.
@@ -275,7 +352,42 @@ export default function App() {
   };
 
   const handleJoin = (): void => {
-    const nameError = validateNickname(nickname);
+    if (isMock) {
+      // mock: pula TODAS as validações do caminho real (apelido/senha/código).
+      // Usa o digitado ou gera um; entra sempre com sucesso.
+      const effectiveNickname = nickname.trim() || "Você";
+      const joined = code.trim().toUpperCase() || randomMockCode();
+      const eff = mockEffective();
+      const counters = mockCounters([], eff);
+      setRoomCode(joined);
+      setNickname(effectiveNickname);
+      setSelfId(MOCK_SELF_ID);
+      setMockSharing(true);
+      setSnapshot(mockSnapshot(true, []));
+      setRoster(mockRoster(effectiveNickname, true));
+      setWatching([]);
+      setEffective(eff);
+      setLinkStats(counters.links);
+      setBackend(counters.backend ?? null);
+      setBackendNote(counters.backend_note ?? null);
+      setStats({
+        frames: counters.frames,
+        keyframes: counters.keyframes,
+        ice: counters.connected,
+        presented: counters.presented,
+      });
+      setCaps(mockCaps());
+      setSources([]);
+      setSourcesError(null);
+      setLastSignal("roster (4 membro(s))");
+      setLastMedia(null);
+      setError(null);
+      setScreen("room");
+      return;
+    }
+    // Caminho Tauri real: validações mantidas como estão.
+    const effectiveNickname = nickname.trim() || "Você";
+    const nameError = validateNickname(effectiveNickname);
     if (nameError) {
       setError(nameError);
       return;
@@ -293,8 +405,9 @@ export default function App() {
     const base = server.trim() || DEFAULT_SERVER;
     void runIntent(async () => {
       await setServer(base);
-      const memberId = await joinRoom(code.trim().toUpperCase(), nickname.trim(), password);
+      const memberId = await joinRoom(code.trim().toUpperCase(), effectiveNickname, password);
       setRoomCode(code.trim().toUpperCase());
+      setNickname(effectiveNickname);
       setSelfId(memberId);
       setScreen("room");
       sourceCapabilities().then(setCaps, () => undefined);
@@ -302,6 +415,28 @@ export default function App() {
   };
 
   const handleLeave = (): void => {
+    if (isMock) {
+      // mock: só limpa o estado local.
+      setScreen("home");
+      setSnapshot(null);
+      setRoster([]);
+      setWatching([]);
+      setStats(null);
+      setLinkStats(null);
+      setEffective(null);
+      setApplying(false);
+      setApplyError(null);
+      setSources([]);
+      setSourcesError(null);
+      setCaps(null);
+      setLastSignal(null);
+      setLastMedia(null);
+      setRoomCode(null);
+      setSelfId(null);
+      setPassword("");
+      setMockSharing(true);
+      return;
+    }
     void runIntent(async () => {
       await leaveRoom().catch(() => undefined);
       setScreen("home");
@@ -325,6 +460,12 @@ export default function App() {
   };
 
   const handleListSources = (): void => {
+    if (isMock) {
+      // mock: lista local, sem pedir permissão ao SO.
+      setSourcesError(null);
+      setSources(mockSources());
+      return;
+    }
     setSourcesError(null);
     listSources().then(
       (listed) => {
@@ -346,12 +487,30 @@ export default function App() {
       setError(sourceError);
       return;
     }
+    if (isMock) {
+      // mock: só atualiza o estado local (snapshot/roster/efetivo).
+      const eff = effective ?? mockEffective();
+      setMockSharing(true);
+      setSnapshot(mockSnapshot(true, watching));
+      setRoster(mockRoster(nickname.trim() || "Você", true));
+      setEffective(eff);
+      setLastMedia("frame (não-preto: sim)");
+      setError(null);
+      return;
+    }
     void runIntent(async () => {
       await startShare(source.trim());
     });
   };
 
   const handleStopShare = (): void => {
+    if (isMock) {
+      setMockSharing(false);
+      setSnapshot(mockSnapshot(false, watching));
+      setRoster(mockRoster(nickname.trim() || "Você", false));
+      setLastMedia("frame (não-preto: não)");
+      return;
+    }
     void runIntent(async () => {
       await stopShare();
     });
@@ -377,6 +536,17 @@ export default function App() {
       setApplyError(resolved.errors.join(" "));
       return;
     }
+    if (isMock) {
+      // mock: aplica localmente com bump de geração, sem comando.
+      setEffective({
+        profile: resolved.profile,
+        generation: (effective?.generation ?? 0) + 1,
+      });
+      setApplying(false);
+      setApplyError(null);
+      setLastMedia("qualidade (geração mock)");
+      return;
+    }
     setApplying(true);
     setApplyError(null);
     const preset = quality === "custom" ? undefined : quality;
@@ -394,6 +564,16 @@ export default function App() {
   };
 
   const handleWatch = (id: string): void => {
+    if (isMock) {
+      // mock: só atualiza o estado local (links/contadores derivam daqui).
+      const next = watching.includes(id) ? watching : [...watching, id];
+      const eff = effective ?? mockEffective();
+      setWatching(next);
+      setSnapshot(mockSnapshot(mockSharing, next));
+      setLinkStats(mockCounters(next, eff).links);
+      setLastSignal(`watch de ${id}`);
+      return;
+    }
     void runIntent(async () => {
       await watchMember(id);
       setWatching((current) => (current.includes(id) ? current : [...current, id]));
@@ -401,6 +581,15 @@ export default function App() {
   };
 
   const handleUnwatch = (id: string): void => {
+    if (isMock) {
+      const next = watching.filter((item) => item !== id);
+      const eff = effective ?? mockEffective();
+      setWatching(next);
+      setSnapshot(mockSnapshot(mockSharing, next));
+      setLinkStats(mockCounters(next, eff).links);
+      setLastSignal(`unwatch de ${id}`);
+      return;
+    }
     void runIntent(async () => {
       await unwatchMember(id);
       setWatching((current) => current.filter((item) => item !== id));
@@ -442,6 +631,8 @@ export default function App() {
         error={error}
         onCreate={handleCreate}
         onJoin={handleJoin}
+        createdCode={roomCode}
+        mock={isMock}
       />
     );
   }
@@ -505,6 +696,7 @@ export default function App() {
       onStopShare={handleStopShare}
       onWatch={handleWatch}
       onUnwatch={handleUnwatch}
+      mock={isMock}
     />
   );
 }
