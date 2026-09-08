@@ -350,6 +350,9 @@ struct Viewer {
     keyframe: bool,
     non_black_frames: u32,
     motion_frames: u32,
+    /// A viewer Stats snapshot carried a non-empty ICE census (shared
+    /// trickle cell → Stats plumbing, kinds/counts only).
+    census_seen: bool,
 }
 
 struct World {
@@ -643,6 +646,14 @@ impl World {
                     self.run.milestone("keyframe");
                 }
             }
+            MediaEvent::Stats(stats) => {
+                let total =
+                    stats.census.host + stats.census.srflx + stats.census.other_typ;
+                if total > 0 && !self.viewer.census_seen {
+                    self.viewer.census_seen = true;
+                    self.run.milestone("ice-census");
+                }
+            }
             MediaEvent::VideoFrame { non_black, motion } => {
                 if non_black {
                     self.viewer.non_black_frames += 1;
@@ -853,6 +864,7 @@ async fn run_two_peer(
             keyframe: false,
             non_black_frames: 0,
             motion_frames: 0,
+            census_seen: false,
         },
         pending_host_sends: VecDeque::new(),
         pending_viewer_sends: VecDeque::new(),
@@ -1088,6 +1100,17 @@ async fn negotiate_and_flow(
         .is_err()
     {
         return fail(world, "no decoded picture".into());
+    }
+    if world
+        .pump_until(
+            Duration::from_secs(15),
+            "no ICE census in stats",
+            |w| w.viewer.census_seen,
+        )
+        .await
+        .is_err()
+    {
+        return fail(world, "no ICE census in stats".into());
     }
     Ok(())
 }

@@ -5,19 +5,73 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { createElement } from "react";
 import {
   HomeScreen,
+  QUALITY_DISABLED_REASON,
+  QUALITY_PRESETS,
   RoomScreen,
+  WINDOW_HINT,
+  formatBps,
+  formatDelayMs,
+  formatFps,
   linkLabel,
+  resolveDesired,
   salaLabel,
   shareLabel,
   sourceKindOf,
+  validateBitrate,
   validateCode,
+  validateCustomDim,
+  validateFps,
   validateNickname,
   validatePassword,
   validateSource,
+  type QualityPanelProps,
 } from "./views";
-import type { OwnerSnapshot, RoomMember } from "./api";
+import type { LinkStats, OwnerSnapshot, RoomMember } from "./api";
 
 const noop = (..._args: unknown[]): void => undefined;
+
+const qualityFixture = (overrides: Partial<QualityPanelProps> = {}): QualityPanelProps => ({
+  shareLive: true,
+  busy: false,
+  effective: null,
+  backend: null,
+  backendNote: null,
+  applying: false,
+  applyError: null,
+  resolution: "720p",
+  onResolution: noop,
+  customW: "",
+  onCustomW: noop,
+  customH: "",
+  onCustomH: noop,
+  quality: "medium",
+  onQuality: noop,
+  customBitrate: "",
+  onCustomBitrate: noop,
+  customFps: "",
+  onCustomFps: noop,
+  srcDims: null,
+  onApply: noop,
+  ...overrides,
+});
+
+const linkFixture = (overrides: Partial<LinkStats> = {}): LinkStats => ({
+  member: "m-2",
+  title: "Bia",
+  codec: "H.264 Constrained Baseline",
+  width: 1280,
+  height: 720,
+  decoded: 120,
+  presented: 118,
+  dropped: 2,
+  render_fps: 29.7,
+  bitrate_bps: 1_800_000,
+  bitrate_note: "medido em bytes RGBA apresentados (pos-decode)",
+  delay_estimate_ms: null,
+  delay_note: "estimativa indisponivel: RTT do par ICE nao exposto pelo core",
+  dropped_note: "aproximacao: decodificados menos apresentados",
+  ...overrides,
+});
 
 const snapshotFixture = (overrides: Partial<OwnerSnapshot> = {}): OwnerSnapshot => ({
   session: { id: "sess:1", state: "open" },
@@ -46,6 +100,8 @@ const roomProps = (overrides: Partial<Parameters<typeof RoomScreen>[0]> = {}) =>
   lastSignal: null as string | null,
   lastMedia: null as string | null,
   stats: null,
+  quality: qualityFixture(),
+  linkStats: null as LinkStats[] | null,
   onListSources: noop,
   onRefresh: noop,
   onLeave: noop,
@@ -285,5 +341,287 @@ describe("fontes de captura (select + capacidades)", () => {
       ),
     );
     expect(html).toContain("Display 1 · 2560x1440");
+  });
+});
+
+describe("qualidade (espelha QualityProfile; fio bloqueado)", () => {
+  it("presets seguem o backend (HIGH = 10000 kbps)", () => {
+    expect(QUALITY_PRESETS.low).toMatchObject({ w: 854, h: 480, bitrate_kbps: 800, fps: 15 });
+    expect(QUALITY_PRESETS.medium).toMatchObject({ w: 1280, h: 720, bitrate_kbps: 2000, fps: 30 });
+    expect(QUALITY_PRESETS.high).toMatchObject({ w: 1920, h: 1080, bitrate_kbps: 10000, fps: 30 });
+  });
+
+  it("dimensão custom: inteira, par, 2–4096", () => {
+    expect(validateCustomDim("", "largura")).not.toBeNull();
+    expect(validateCustomDim("12.5", "largura")).not.toBeNull();
+    expect(validateCustomDim("0", "largura")).not.toBeNull();
+    expect(validateCustomDim("1", "altura")).not.toBeNull();
+    expect(validateCustomDim("4097", "largura")).not.toBeNull();
+    expect(validateCustomDim("641", "largura")).toContain("par");
+    expect(validateCustomDim("640", "largura")).toBeNull();
+    expect(validateCustomDim("4096", "altura")).toBeNull();
+  });
+
+  it("bitrate 100–20000 kbps, fps 1–60", () => {
+    expect(validateBitrate("99")).not.toBeNull();
+    expect(validateBitrate("100")).toBeNull();
+    expect(validateBitrate("20000")).toBeNull();
+    expect(validateBitrate("20001")).not.toBeNull();
+    expect(validateFps("0")).not.toBeNull();
+    expect(validateFps("1")).toBeNull();
+    expect(validateFps("60")).toBeNull();
+    expect(validateFps("61")).not.toBeNull();
+  });
+
+  it("resolve preset + custom válido", () => {
+    const preset = resolveDesired({
+      resolution: "720p",
+      customW: "",
+      customH: "",
+      quality: "medium",
+      customBitrate: "",
+      customFps: "",
+      srcDims: null,
+    });
+    expect(preset).toEqual({ profile: { w: 1280, h: 720, bitrate_kbps: 2000, fps: 30 } });
+
+    const custom = resolveDesired({
+      resolution: "custom",
+      customW: "640",
+      customH: "360",
+      quality: "custom",
+      customBitrate: "1000",
+      customFps: "24",
+      srcDims: { w: 1920, h: 1080 },
+    });
+    expect(custom).toEqual({ profile: { w: 640, h: 360, bitrate_kbps: 1000, fps: 24 } });
+  });
+
+  it("barra upscale além da fonte conhecida; sem fonte, sem teto extra", () => {
+    const over = resolveDesired({
+      resolution: "custom",
+      customW: "3840",
+      customH: "2160",
+      quality: "low",
+      customBitrate: "",
+      customFps: "",
+      srcDims: { w: 1920, h: 1080 },
+    });
+    expect("errors" in over && over.errors.join(" ")).toContain("sem upscale");
+
+    const unknown = resolveDesired({
+      resolution: "custom",
+      customW: "3840",
+      customH: "2160",
+      quality: "low",
+      customBitrate: "",
+      customFps: "",
+      srcDims: null,
+    });
+    expect(unknown).toEqual({ profile: { w: 3840, h: 2160, bitrate_kbps: 800, fps: 15 } });
+  });
+
+  it("custom incompleto lista todos os erros", () => {
+    const result = resolveDesired({
+      resolution: "custom",
+      customW: "641",
+      customH: "",
+      quality: "custom",
+      customBitrate: "50",
+      customFps: "0",
+      srcDims: null,
+    });
+    expect("errors" in result && result.errors.length).toBeGreaterThanOrEqual(4);
+  });
+});
+
+describe("formatadores de contadores", () => {
+  it("bps em pt-BR, delay honesto", () => {
+    expect(formatBps(800)).toBe("800 bps");
+    expect(formatBps(1800)).toContain("kbps");
+    expect(formatBps(1_800_000)).toContain("Mbps");
+    expect(formatBps(-1)).toBe("—");
+    expect(formatFps(29.7)).toBe("29.7 fps");
+    expect(formatDelayMs(null)).toBe("—");
+    expect(formatDelayMs(42)).toBe("42 ms");
+  });
+});
+
+describe("QualityPanel (integrado na sala)", () => {
+  it("share inativo: tudo desabilitado com motivo", () => {
+    const html = renderToStaticMarkup(
+      createElement(RoomScreen, roomProps({ quality: qualityFixture({ shareLive: false }) })),
+    );
+    expect(html).toContain(QUALITY_DISABLED_REASON);
+    expect(html).toContain("disabled");
+  });
+
+  it("share no ar: desejo + botão Aplicar + efetivo do backend", () => {
+    const html = renderToStaticMarkup(createElement(RoomScreen, roomProps()));
+    expect(html).toContain("Desejado: 1280×720 @ 2000 kbps · 30 fps");
+    expect(html).toContain("Aplicar qualidade");
+    // Sem leitura ainda: honesto, sem número inventado.
+    expect(html).toContain("Efetivo no backend: ainda sem leitura");
+  });
+
+  it("efetivo autoritativo mostra perfil + geração", () => {
+    const html = renderToStaticMarkup(
+      createElement(
+        RoomScreen,
+        roomProps({
+          quality: qualityFixture({
+            effective: { profile: { w: 640, h: 360, bitrate_kbps: 1000, fps: 24 }, generation: 3 },
+          }),
+        }),
+      ),
+    );
+    expect(html).toContain("Efetivo no backend: 640×360 @ 1000 kbps · 24 fps · geração 3");
+    // O staged continua visível, mas não se passa por efetivo.
+    expect(html).toContain("Desejado: 1280×720 @ 2000 kbps · 30 fps");
+  });
+
+  it("selo do codificador: hardware, software com motivo, sem leitura", () => {
+    const hw = renderToStaticMarkup(
+      createElement(RoomScreen, roomProps({ quality: qualityFixture({ backend: "videotoolbox" }) })),
+    );
+    expect(hw).toContain("Codificador: VideoToolbox (hardware)");
+    const sw = renderToStaticMarkup(
+      createElement(
+        RoomScreen,
+        roomProps({
+          quality: qualityFixture({
+            backend: "openh264",
+            backendNote: "probe de hardware falhou — ver log de sessão",
+          }),
+        }),
+      ),
+    );
+    expect(sw).toContain("Codificador: OpenH264 (software)");
+    expect(sw).toContain("probe de hardware falhou");
+    const plain = renderToStaticMarkup(
+      createElement(
+        RoomScreen,
+        roomProps({ quality: qualityFixture({ backend: "openh264", backendNote: null }) }),
+      ),
+    );
+    expect(plain).toContain("Codificador: OpenH264 (software)");
+    expect(plain).toContain(
+      'data-testid="encode-backend">Codificador: OpenH264 (software)<',
+    );
+    const none = renderToStaticMarkup(createElement(RoomScreen, roomProps()));
+    expect(none).toContain("Codificador: ainda sem leitura");
+  });
+
+  it("selo nunca inventa rótulo para backend desconhecido", () => {
+    const html = renderToStaticMarkup(
+      createElement(RoomScreen, roomProps({ quality: qualityFixture({ backend: "nvenc" }) })),
+    );
+    expect(html).toContain("Codificador: ainda sem leitura");
+    expect(html).not.toContain("nvenc");
+  });
+
+  it("aplicando mostra progresso; erro do comando sai verbatim", () => {
+    const busy = renderToStaticMarkup(
+      createElement(RoomScreen, roomProps({ quality: qualityFixture({ applying: true }) })),
+    );
+    expect(busy).toContain("Aplicando…");
+
+    const failed = renderToStaticMarkup(
+      createElement(
+        RoomScreen,
+        roomProps({ quality: qualityFixture({ applyError: "qualidade: share parado" }) }),
+      ),
+    );
+    expect(failed).toContain("qualidade: share parado");
+  });
+
+  it("perfil inválido desabilita o Aplicar", () => {
+    const html = renderToStaticMarkup(
+      createElement(
+        RoomScreen,
+        roomProps({
+          quality: qualityFixture({ resolution: "custom", customW: "641", customH: "" }),
+        }),
+      ),
+    );
+    // Botão existe mas desabilitado (fieldset + botão desabilitados).
+    expect(html).toContain("Aplicar qualidade");
+    expect(html).toContain("disabled");
+  });
+
+  it("custom mostra os campos editáveis", () => {
+    const html = renderToStaticMarkup(
+      createElement(
+        RoomScreen,
+        roomProps({
+          quality: qualityFixture({
+            resolution: "custom",
+            customW: "640",
+            customH: "360",
+            quality: "custom",
+            customBitrate: "1000",
+            customFps: "24",
+          }),
+        }),
+      ),
+    );
+    expect(html).toContain("custom-w");
+    expect(html).toContain("custom-bitrate");
+    expect(html).toContain("Desejado: 640×360 @ 1000 kbps · 24 fps");
+  });
+
+  it("custom inválido lista erros em vez de perfil", () => {
+    const html = renderToStaticMarkup(
+      createElement(
+        RoomScreen,
+        roomProps({
+          quality: qualityFixture({ resolution: "custom", customW: "641", customH: "" }),
+        }),
+      ),
+    );
+    expect(html).toContain("par");
+    expect(html).not.toContain("Desejado:");
+  });
+});
+
+describe("ViewerLinksPanel (por link, só backend)", () => {
+  it("renderiza FPS, delay honesto, codec, bitrate, resolução e contadores", () => {
+    const html = renderToStaticMarkup(
+      createElement(RoomScreen, roomProps({ linkStats: [linkFixture()], watching: ["m-2"] })),
+    );
+    expect(html).toContain("Bia");
+    expect(html).toContain("H.264 Constrained Baseline");
+    expect(html).toContain("29.7 fps");
+    expect(html).toContain("1280×720");
+    expect(html).toContain("120");
+    expect(html).toContain("118");
+    // Delay None do backend: "—" + nota honesta como hint.
+    expect(html).toContain("—");
+    expect(html).toContain("RTT do par ICE nao exposto pelo core");
+    expect(html).toContain(WINDOW_HINT);
+  });
+
+  it("delay presente mostra ms", () => {
+    const html = renderToStaticMarkup(
+      createElement(RoomScreen, roomProps({ linkStats: [linkFixture({ delay_estimate_ms: 42 })] })),
+    );
+    expect(html).toContain("42 ms");
+  });
+
+  it("sem amostra: diagnóstico, nunca zeros inventados", () => {
+    const html = renderToStaticMarkup(createElement(RoomScreen, roomProps({ linkStats: null })));
+    expect(html).toContain("Sem amostra de contadores ainda");
+  });
+
+  it("watch pedido sem link: aguardando backend", () => {
+    const html = renderToStaticMarkup(
+      createElement(RoomScreen, roomProps({ linkStats: [], watching: ["m-2"] })),
+    );
+    expect(html).toContain("aguardando o link do backend");
+  });
+
+  it("nada assistido: como assistir", () => {
+    const html = renderToStaticMarkup(createElement(RoomScreen, roomProps({ linkStats: [] })));
+    expect(html).toContain("Nenhum link assistido");
   });
 });

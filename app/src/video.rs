@@ -25,12 +25,13 @@
 //! EOF on the socket is a clean shutdown request for the helper.
 
 use golive_core::media::PresentedFrame;
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const HELPER_NAME: &str = "golive-video";
 pub const PROTOCOL_MAGIC: &[u8; 4] = b"GLV1";
@@ -110,6 +111,323 @@ pub fn rgba_to_xrgb8888(rgba: &[u8]) -> Vec<u32> {
 }
 
 // ---------------------------------------------------------------------------
+// View controls (pure math, unit tested): zoom, pan, fullscreen state.
+// The helper (`golive-video`) owns all input; the shell sends no commands.
+// ---------------------------------------------------------------------------
+
+/// Zoom bounds enforced on every scroll step.
+pub const MIN_ZOOM: f32 = 1.0;
+pub const MAX_ZOOM: f32 = 4.0;
+/// Zoom factor per scroll-notch (line delta of ±1).
+const ZOOM_LINE_BASE: f32 = 1.15;
+/// Manual double-click gate (winit 0.30 reports clicks, not gestures).
+pub const DOUBLE_CLICK_MAX: Duration = Duration::from_millis(400);
+pub const DOUBLE_CLICK_PX: f32 = 6.0;
+/// Help overlay stays up this long after any interaction (or window open).
+pub const HELP_VISIBLE_FOR: Duration = Duration::from_secs(3);
+
+/// Viewport state for one helper window. Offsets (`ox`, `oy`) are in
+/// physical pixels of the zoomed picture: the visible window onto it starts
+/// at (`ox`, `oy`) and spans the letterboxed rect. At 1x both are zero.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewState {
+    pub zoom: f32,
+    pub ox: f32,
+    pub oy: f32,
+    pub fullscreen: bool,
+}
+
+impl ViewState {
+    pub fn new() -> Self {
+        Self { zoom: MIN_ZOOM, ox: 0.0, oy: 0.0, fullscreen: false }
+    }
+
+    /// Scaled picture size for `rect` at the current zoom.
+    pub fn scaled(&self, rect: Rect) -> (f32, f32) {
+        (rect.w as f32 * self.zoom, rect.h as f32 * self.zoom)
+    }
+
+    /// Zoom keeping the content point under `cursor` stable. `cursor` and
+    /// `rect` share window coordinates. Zooming back to 1x clears the pan.
+    pub fn zoom_by(&mut self, rect: Rect, cursor: (f32, f32), factor: f32) {
+        if !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
+        let next = clamp_zoom(self.zoom * factor);
+        if next <= MIN_ZOOM {
+            self.zoom = MIN_ZOOM;
+            self.ox = 0.0;
+            self.oy = 0.0;
+            return;
+        }
+        let s = next / self.zoom;
+        let (cx, cy) = cursor;
+        let px = self.ox + (cx - rect.x as f32);
+        let py = self.oy + (cy - rect.y as f32);
+        self.zoom = next;
+        self.ox = px * s - (cx - rect.x as f32);
+        self.oy = py * s - (cy - rect.y as f32);
+        let (ox, oy) = clamp_offset(self.ox, self.oy, rect, self.zoom);
+        self.ox = ox;
+        self.oy = oy;
+    }
+
+    /// Drag-pan by a cursor delta (window pixels). No-op at 1x.
+    pub fn pan_by(&mut self, rect: Rect, dx: f32, dy: f32) {
+        if self.zoom <= MIN_ZOOM || !dx.is_finite() || !dy.is_finite() {
+            return;
+        }
+        let (ox, oy) = clamp_offset(self.ox + dx, self.oy + dy, rect, self.zoom);
+        self.ox = ox;
+        self.oy = oy;
+    }
+
+    pub fn toggle_fullscreen(&mut self) {
+        self.fullscreen = !self.fullscreen;
+    }
+
+    /// Whether any zoom is applied (pan only matters then).
+    pub fn zoomed(&self) -> bool {
+        self.zoom > MIN_ZOOM
+    }
+
+    /// Leaves fullscreen. Returns whether we were in it.
+    pub fn exit_fullscreen(&mut self) -> bool {
+        let was = self.fullscreen;
+        self.fullscreen = false;
+        was
+    }
+}
+
+impl Default for ViewState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Clamps a zoom level into `[MIN_ZOOM, MAX_ZOOM]` (non-finite snaps to 1x).
+pub fn clamp_zoom(z: f32) -> f32 {
+    if !z.is_finite() {
+        return MIN_ZOOM;
+    }
+    z.clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+/// Clamps pan offsets so the zoomed picture always covers the rect.
+pub fn clamp_offset(ox: f32, oy: f32, rect: Rect, zoom: f32) -> (f32, f32) {
+    let zoom = clamp_zoom(zoom);
+    let max_ox = (rect.w as f32 * zoom - rect.w as f32).max(0.0);
+    let max_oy = (rect.h as f32 * zoom - rect.h as f32).max(0.0);
+    (
+        ox.clamp(0.0, max_ox),
+        oy.clamp(0.0, max_oy),
+    )
+}
+
+/// Zoom factor for a line-based scroll delta (`dy > 0` zooms in).
+pub fn wheel_factor_line(dy: f32) -> f32 {
+    if !dy.is_finite() {
+        return 1.0;
+    }
+    ZOOM_LINE_BASE.powf(dy.clamp(-4.0, 4.0))
+}
+
+/// Zoom factor for a pixel-based (trackpad) scroll delta.
+pub fn wheel_factor_pixel(dy: f64) -> f32 {
+    if !dy.is_finite() {
+        return 1.0;
+    }
+    ((dy as f32) / 400.0).exp().clamp(0.5, 2.0)
+}
+
+/// Double-click gate over click spacing + cursor travel.
+pub fn is_double_click(dt: Duration, dist_px: f32) -> bool {
+    dt <= DOUBLE_CLICK_MAX && dist_px <= DOUBLE_CLICK_PX
+}
+
+/// Help overlay visibility: shown within `HELP_VISIBLE_FOR` of interaction.
+pub fn help_visible(since_interact: Duration) -> bool {
+    since_interact < HELP_VISIBLE_FOR
+}
+
+// ---------------------------------------------------------------------------
+// Help overlay text: hand-authored 3x5 block capitals (ASCII only, no font
+// dependency — softbuffer has no text API). Unknown chars render blank.
+// ---------------------------------------------------------------------------
+
+/// 5 rows × 3 cols per glyph, low 3 bits per row, top row first.
+fn glyph_3x5(c: char) -> [u8; 5] {
+    match c {
+        'A' => [0b010, 0b101, 0b111, 0b101, 0b101],
+        'B' => [0b110, 0b101, 0b110, 0b101, 0b110],
+        'C' => [0b011, 0b100, 0b100, 0b100, 0b011],
+        'D' => [0b110, 0b101, 0b101, 0b101, 0b110],
+        'E' => [0b111, 0b100, 0b110, 0b100, 0b111],
+        'F' => [0b111, 0b100, 0b110, 0b100, 0b100],
+        'G' => [0b011, 0b100, 0b101, 0b101, 0b011],
+        'H' => [0b101, 0b101, 0b111, 0b101, 0b101],
+        'I' => [0b111, 0b010, 0b010, 0b010, 0b111],
+        'K' => [0b101, 0b101, 0b110, 0b101, 0b101],
+        'L' => [0b100, 0b100, 0b100, 0b100, 0b111],
+        'M' => [0b101, 0b111, 0b111, 0b101, 0b101],
+        'N' => [0b110, 0b101, 0b101, 0b101, 0b101],
+        'O' => [0b010, 0b101, 0b101, 0b101, 0b010],
+        'P' => [0b110, 0b101, 0b110, 0b100, 0b100],
+        'R' => [0b110, 0b101, 0b110, 0b101, 0b101],
+        'S' => [0b011, 0b100, 0b010, 0b001, 0b110],
+        'T' => [0b111, 0b010, 0b010, 0b010, 0b010],
+        'U' => [0b101, 0b101, 0b101, 0b101, 0b111],
+        'W' => [0b101, 0b101, 0b111, 0b111, 0b101],
+        'X' => [0b101, 0b101, 0b010, 0b101, 0b101],
+        'Z' => [0b111, 0b001, 0b010, 0b100, 0b111],
+        ':' => [0b000, 0b010, 0b000, 0b010, 0b000],
+        '/' => [0b001, 0b001, 0b010, 0b100, 0b100],
+        '-' => [0b000, 0b000, 0b111, 0b000, 0b000],
+        _ => [0, 0, 0, 0, 0],
+    }
+}
+
+/// One-line help copy (single line, ASCII only by construction).
+pub const HELP_LINE: &str = "WHEEL: ZOOM  DRAG: PAN  F / DBL-CLICK: FULLSCREEN  ESC: EXIT";
+
+/// Pixel width of `text` at `scale` (3px glyph + 1px tracking).
+pub fn text_width_px(text: &str, scale: u32) -> u32 {
+    if text.is_empty() || scale == 0 {
+        return 0;
+    }
+    (text.chars().count() as u32 * 4 - 1) * scale
+}
+
+/// Pixel height of one text line at `scale`.
+pub fn text_height_px(scale: u32) -> u32 {
+    5 * scale
+}
+
+/// Draws `text` into an XRGB buffer. Clip-safe: out-of-bounds pixels are
+/// skipped, never panic. `stride` is the buffer width in pixels.
+pub fn draw_text(
+    buf: &mut [u32],
+    stride: u32,
+    buf_h: u32,
+    x0: u32,
+    y0: u32,
+    scale: u32,
+    text: &str,
+    color: u32,
+) {
+    if scale == 0 || stride == 0 || buf_h == 0 {
+        return;
+    }
+    for (idx, c) in text.chars().enumerate() {
+        let glyph = glyph_3x5(c);
+        let gx = x0 + idx as u32 * 4 * scale;
+        for (row, bits) in glyph.iter().enumerate() {
+            for col in 0..3u32 {
+                if bits & (1 << (2 - col)) == 0 {
+                    continue;
+                }
+                for sy in 0..scale {
+                    for sx in 0..scale {
+                        let x = gx + col * scale + sx;
+                        let y = y0 + row as u32 * scale + sy;
+                        if x < stride && y < buf_h {
+                            let at = y as usize * stride as usize + x as usize;
+                            if at < buf.len() {
+                                buf[at] = color;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transmission stats (per link, computed on event/frame — no polling).
+// ---------------------------------------------------------------------------
+
+/// Moving window for render fps + measured bitrate.
+pub const STATS_WINDOW_SECS: f32 = 3.0;
+/// Codec contract label (matches the core's H.264 Constrained Baseline).
+pub const LINK_CODEC: &str = "H.264 Constrained Baseline";
+/// Delay note: an RTT-based estimate needs core PC stats, which the core
+/// does not expose — this stays `None` (BLOQUEADO on core telemetry).
+pub const DELAY_NOTE: &str =
+    "estimativa indisponivel: RTT do par ICE nao exposto pelo core";
+/// Bitrate note: measured on presented RGBA bytes (post-decode), not the
+/// wire H.264 bitrate (also needs core telemetry).
+pub const BITRATE_NOTE: &str = "medido em bytes RGBA apresentados (pos-decode)";
+/// Dropped note: latest-only slot evicts stale frames; dropped is decoded
+/// minus presented (an approximation: one frame may still be in flight).
+pub const DROPPED_NOTE: &str = "aproximacao: decodificados menos apresentados";
+
+/// Presented-frame samples feeding render fps + bitrate. Pushed on every
+/// ack (presentation evidence), pruned to the moving window.
+#[derive(Debug, Default)]
+pub struct PresentStats {
+    events: VecDeque<(Instant, u64)>,
+}
+
+impl PresentStats {
+    pub fn push(&mut self, at: Instant, bytes: u64) {
+        self.events.push_back((at, bytes));
+        self.prune(at);
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while let Some(&(t, _)) = self.events.front() {
+            if now.duration_since(t).as_secs_f32() <= STATS_WINDOW_SECS {
+                break;
+            }
+            self.events.pop_front();
+        }
+    }
+
+    pub fn render_fps(&mut self, now: Instant) -> f32 {
+        self.prune(now);
+        self.events.len() as f32 / STATS_WINDOW_SECS
+    }
+
+    pub fn bitrate_bps(&mut self, now: Instant) -> u64 {
+        self.prune(now);
+        let bytes: u64 = self.events.iter().map(|(_, b)| b).sum();
+        (bytes as f64 * 8.0 / STATS_WINDOW_SECS as f64) as u64
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.events.len()
+    }
+}
+
+/// Per-link transmission stats (one entry per watched member). Consumed by
+/// the future UI lane; the web side is untouched by this change.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct LinkStats {
+    pub member: String,
+    pub title: String,
+    pub codec: String,
+    pub width: u32,
+    pub height: u32,
+    /// Frames decoded by the core (observed in the `on_frame` callback).
+    pub decoded: u64,
+    /// Frames acked as presented by the helper window.
+    pub presented: u64,
+    /// Estimate, see [`DROPPED_NOTE`].
+    pub dropped: u64,
+    /// Presented frames per second over [`STATS_WINDOW_SECS`].
+    pub render_fps: f32,
+    /// Measured bits/s over [`STATS_WINDOW_SECS`], see [`BITRATE_NOTE`].
+    pub bitrate_bps: u64,
+    pub bitrate_note: String,
+    /// Always `None` until the core exposes ICE RTT (BLOQUEADO).
+    pub delay_estimate_ms: Option<u64>,
+    pub delay_note: String,
+    pub dropped_note: String,
+}
+
+// ---------------------------------------------------------------------------
 // Helper discovery + process management.
 // ---------------------------------------------------------------------------
 
@@ -135,9 +453,16 @@ pub struct VideoWindow {
     feeder: Option<std::thread::JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     presented: Arc<AtomicU64>,
+    /// Frames handed to the feed (decoded, via `on_frame`). Dropped is
+    /// `pushed - presented` (see [`DROPPED_NOTE`]).
+    pushed: Arc<AtomicU64>,
+    /// Presentation timestamps + byte sizes feeding fps/bitrate.
+    stats: Arc<Mutex<PresentStats>>,
     healthy: Arc<AtomicBool>,
     sock_path: PathBuf,
     title: String,
+    w: u32,
+    h: u32,
 }
 
 impl VideoWindow {
@@ -165,6 +490,8 @@ impl VideoWindow {
         let (push, slot) = FrameSlot::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let healthy = Arc::new(AtomicBool::new(true));
+        let pushed = push.counter();
+        let stats = Arc::new(Mutex::new(PresentStats::default()));
         let sock_path = std::env::temp_dir().join(format!(
             "golive-video-{}-{}.sock",
             std::process::id(),
@@ -176,12 +503,13 @@ impl VideoWindow {
             let stop = Arc::clone(&stop);
             let healthy = Arc::clone(&healthy);
             let presented = Arc::clone(&presented);
+            let stats = Arc::clone(&stats);
             let sock_path = sock_path.clone();
             let title = title.clone();
             std::thread::Builder::new()
                 .name("golive-video-feed".into())
                 .spawn(move || {
-                    feed_loop(sock_path, helper, title, w, h, slot, &stop, &presented, &healthy);
+                    feed_loop(sock_path, helper, title, w, h, slot, &stop, &presented, &stats, &healthy);
                 })
                 .ok()
         };
@@ -190,9 +518,13 @@ impl VideoWindow {
                 feeder,
                 stop,
                 presented,
+                pushed,
+                stats,
                 healthy,
                 sock_path,
                 title,
+                w: w as u32,
+                h: h as u32,
             },
             push,
         )
@@ -200,6 +532,29 @@ impl VideoWindow {
 
     pub fn presented(&self) -> u64 {
         self.presented.load(Ordering::Relaxed)
+    }
+
+    /// Frames handed to the feed (decoded via `on_frame`).
+    pub fn pushed(&self) -> u64 {
+        self.pushed.load(Ordering::Relaxed)
+    }
+
+    /// Render fps over the moving window (no polling: computed on read from
+    /// ack-stamped samples).
+    pub fn render_fps(&self) -> f32 {
+        let now = Instant::now();
+        self.stats.lock().map(|mut s| s.render_fps(now)).unwrap_or(0.0)
+    }
+
+    /// Measured bits/s over the moving window (presented RGBA bytes).
+    pub fn bitrate_bps(&self) -> u64 {
+        let now = Instant::now();
+        self.stats.lock().map(|mut s| s.bitrate_bps(now)).unwrap_or(0)
+    }
+
+    /// Contracted resolution (handshake dims; the title carries it too).
+    pub fn resolution(&self) -> (u32, u32) {
+        (self.w, self.h)
     }
 
     pub fn healthy(&self) -> bool {
@@ -236,6 +591,7 @@ impl Drop for VideoWindow {
 pub struct FramePush {
     slot: Arc<Mutex<Option<PresentedFrame>>>,
     ping: mpsc::Sender<()>,
+    pushed: Arc<AtomicU64>,
 }
 
 /// Feeder side (single owner: the feeder thread).
@@ -252,6 +608,7 @@ impl FrameSlot {
             FramePush {
                 slot: Arc::clone(&slot),
                 ping,
+                pushed: Arc::new(AtomicU64::new(0)),
             },
             FrameSlot { slot, ping_rx },
         )
@@ -265,7 +622,13 @@ impl FramePush {
         if let Ok(mut slot) = self.slot.lock() {
             *slot = Some(frame);
         }
+        self.pushed.fetch_add(1, Ordering::Relaxed);
         let _ = self.ping.send(());
+    }
+
+    /// Shared push counter (the owning window reads it for dropped stats).
+    pub fn counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.pushed)
     }
 }
 
@@ -281,6 +644,7 @@ fn feed_loop(
     slot: FrameSlot,
     stop: &AtomicBool,
     presented: &AtomicU64,
+    present_stats: &Mutex<PresentStats>,
     healthy: &AtomicBool,
 ) {
     // Phase 1: block for the first frame (window opens here, never before).
@@ -371,11 +735,15 @@ fn feed_loop(
         if stop.load(Ordering::Acquire) {
             return;
         }
+        let bytes = frame.rgba.len() as u64;
         if write_frame(&mut sock, &frame).is_err() || read_ack(&mut sock).is_err() {
             healthy.store(false, Ordering::Release);
             return;
         }
         presented.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut stats) = present_stats.lock() {
+            stats.push(Instant::now(), bytes);
+        }
         match slot.wait(IDLE_TICK) {
             SlotWait::Frame(next) => frame = next,
             // No fresh frame: idle (the helper freezes on its own clock).
@@ -613,5 +981,196 @@ mod tests {
         }
         assert!(shown > 0, "helper presented frames");
         assert!(healthy, "feeder stayed healthy");
+    }
+
+    // -- view controls: pure zoom/pan/fullscreen math ---------------------
+
+    #[test]
+    fn zoom_clamps_to_1x_4x() {
+        assert_eq!(clamp_zoom(1.0), 1.0);
+        assert_eq!(clamp_zoom(0.2), MIN_ZOOM);
+        assert_eq!(clamp_zoom(9.0), MAX_ZOOM);
+        assert_eq!(clamp_zoom(f32::NAN), MIN_ZOOM);
+        assert_eq!(clamp_zoom(f32::INFINITY), MIN_ZOOM);
+    }
+
+    #[test]
+    fn zoom_by_keeps_cursor_point_stable() {
+        let rect = Rect { x: 100, y: 50, w: 400, h: 300 };
+        let mut view = ViewState::new();
+        let cursor = (300.0, 200.0);
+        // Content point under the cursor before zoom (1x: offset zero).
+        let before = (cursor.0 - rect.x as f32, cursor.1 - rect.y as f32);
+        view.zoom_by(rect, cursor, 2.0);
+        assert_eq!(view.zoom, 2.0);
+        // After zoom, that content point (scaled 2x) is still under cursor.
+        let after = (
+            (view.ox + (cursor.0 - rect.x as f32)) / view.zoom,
+            (view.oy + (cursor.1 - rect.y as f32)) / view.zoom,
+        );
+        assert!((after.0 - before.0).abs() < 0.01, "x stable: {after:?} vs {before:?}");
+        assert!((after.1 - before.1).abs() < 0.01, "y stable: {after:?} vs {before:?}");
+    }
+
+    #[test]
+    fn zoom_out_to_1x_clears_pan() {
+        let rect = Rect { x: 0, y: 0, w: 400, h: 300 };
+        let mut view = ViewState::new();
+        view.zoom_by(rect, (200.0, 150.0), 3.0);
+        view.pan_by(rect, 50.0, 40.0);
+        assert!(view.ox > 0.0 && view.oy > 0.0);
+        view.zoom_by(rect, (200.0, 150.0), 0.05);
+        assert_eq!((view.zoom, view.ox, view.oy), (1.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn pan_clamps_inside_zoomed_picture() {
+        let rect = Rect { x: 0, y: 0, w: 400, h: 300 };
+        let mut view = ViewState::new();
+        // No-op at 1x.
+        view.pan_by(rect, 500.0, 500.0);
+        assert_eq!((view.ox, view.oy), (0.0, 0.0));
+        view.zoom_by(rect, (200.0, 150.0), 4.0);
+        // Way past the edge: clamped to (1200, 900), never negative.
+        view.pan_by(rect, 10_000.0, 10_000.0);
+        assert_eq!((view.ox, view.oy), (1200.0, 900.0));
+        view.pan_by(rect, -10_000.0, -10_000.0);
+        assert_eq!((view.ox, view.oy), (0.0, 0.0));
+    }
+
+    #[test]
+    fn wheel_factors_zoom_in_on_positive() {
+        assert!(wheel_factor_line(1.0) > 1.0);
+        assert!(wheel_factor_line(-1.0) < 1.0);
+        assert_eq!(wheel_factor_line(0.0), 1.0);
+        assert!(wheel_factor_pixel(120.0) > 1.0);
+        assert!(wheel_factor_pixel(-120.0) < 1.0);
+        assert_eq!(wheel_factor_pixel(0.0), 1.0);
+    }
+
+    #[test]
+    fn fullscreen_state_toggles_and_exits() {
+        let mut view = ViewState::new();
+        assert!(!view.fullscreen);
+        view.toggle_fullscreen();
+        assert!(view.fullscreen);
+        view.toggle_fullscreen();
+        assert!(!view.fullscreen);
+        view.toggle_fullscreen();
+        assert!(view.exit_fullscreen());
+        assert!(!view.fullscreen);
+        assert!(!view.exit_fullscreen(), "exiting twice reports false");
+    }
+
+    #[test]
+    fn double_click_gate_needs_time_and_proximity() {
+        assert!(is_double_click(Duration::from_millis(200), 3.0));
+        assert!(!is_double_click(Duration::from_millis(800), 3.0));
+        assert!(!is_double_click(Duration::from_millis(200), 40.0));
+    }
+
+    #[test]
+    fn help_shows_three_seconds_after_interaction() {
+        assert!(help_visible(Duration::from_secs(0)));
+        assert!(help_visible(Duration::from_millis(2999)));
+        assert!(!help_visible(Duration::from_secs(3)));
+        assert!(!help_visible(Duration::from_secs(60)));
+    }
+
+    // -- overlay text ------------------------------------------------------
+
+    #[test]
+    fn overlay_glyph_e_has_ten_pixels() {
+        // E = 111/100/110/100/111: 3+1+2+1+3 lit pixels.
+        let mut buf = vec![0u32; 3 * 5];
+        draw_text(&mut buf, 3, 5, 0, 0, 1, "E", 0x00FFFFFF);
+        assert_eq!(buf.iter().filter(|p| **p != 0).count(), 10);
+    }
+
+    #[test]
+    fn overlay_text_clips_without_panic() {
+        // Tiny buffer, huge text at 2x starting off-screen: no panic, no OOB.
+        let mut buf = vec![0u32; 4 * 4];
+        draw_text(&mut buf, 4, 4, 2, 2, 2, HELP_LINE, 0x00FFFFFF);
+        assert!(buf.iter().any(|p| *p != 0), "some pixels land inside");
+        assert_eq!(text_width_px(HELP_LINE, 2), HELP_LINE.chars().count() as u32 * 4 * 2 - 2);
+        assert_eq!(text_width_px("", 2), 0);
+        assert_eq!(text_height_px(2), 10);
+    }
+
+    // -- transmission stats ------------------------------------------------
+
+    #[test]
+    fn present_stats_fps_and_bitrate_over_window() {
+        let start = Instant::now();
+        let mut stats = PresentStats::default();
+        // 90 presents of 1000 bytes across 3 s => 30 fps, 240_000 bits/s.
+        for n in 0..90 {
+            stats.push(start + Duration::from_millis(n * 1000 / 30), 1000);
+        }
+        let now = start + Duration::from_secs(3);
+        assert!((stats.render_fps(now) - 30.0).abs() < 0.5, "fps {}", stats.render_fps(now));
+        assert_eq!(stats.bitrate_bps(now), 240_000);
+        // Window slides: samples older than 3 s fall off.
+        let later = start + Duration::from_secs(6);
+        assert_eq!(stats.render_fps(later), 0.0);
+        assert_eq!(stats.bitrate_bps(later), 0);
+        assert_eq!(stats.len(), 0);
+    }
+
+    #[test]
+    fn push_counter_feeds_dropped_estimate() {
+        let (push, _slot) = FrameSlot::channel();
+        assert_eq!(push.counter().load(Ordering::Relaxed), 0);
+        let mk = || PresentedFrame { w: 1, h: 1, rgba: vec![0, 0, 0, 255] };
+        push.push(mk());
+        push.push(mk());
+        assert_eq!(push.counter().load(Ordering::Relaxed), 2);
+    }
+
+    // -- protocol v1 ---------------------------------------------------------
+
+    #[test]
+    fn handshake_bytes_carry_magic_dims_and_title() {
+        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+        write_handshake(&mut a, "nick", 1280, 720).unwrap();
+        let mut header = [0u8; 16];
+        b.read_exact(&mut header).unwrap();
+        assert_eq!(&header[0..4], b"GLV1");
+        assert_eq!(u32::from_le_bytes(header[4..8].try_into().unwrap()), 1280);
+        assert_eq!(u32::from_le_bytes(header[8..12].try_into().unwrap()), 720);
+        let title_len = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+        assert_eq!(title_len, 4);
+        let mut title = vec![0u8; title_len];
+        b.read_exact(&mut title).unwrap();
+        assert_eq!(&title, b"nick");
+    }
+
+    #[test]
+    fn handshake_truncates_long_titles_at_256() {
+        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+        write_handshake(&mut a, &"n".repeat(300), 640, 480).unwrap();
+        let mut header = [0u8; 16];
+        b.read_exact(&mut header).unwrap();
+        let title_len = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+        assert_eq!(title_len, 256);
+    }
+
+    #[test]
+    fn frame_roundtrip_and_ack_shape() {
+        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let frame = PresentedFrame { w: 2, h: 1, rgba: vec![9u8; 8] };
+        write_frame(&mut a, &frame).unwrap();
+        let mut len = [0u8; 4];
+        b.read_exact(&mut len).unwrap();
+        assert_eq!(u32::from_le_bytes(len) as usize, 8);
+        // Size mismatch never hits the wire.
+        let bad = PresentedFrame { w: 2, h: 1, rgba: vec![0u8; 4] };
+        assert!(write_frame(&mut a, &bad).is_err());
+        // Ack shape: exactly 0x01 accepted.
+        b.write_all(&[0x01]).unwrap();
+        assert!(read_ack(&mut a).is_ok());
+        b.write_all(&[0x02]).unwrap();
+        assert!(read_ack(&mut a).is_err());
     }
 }

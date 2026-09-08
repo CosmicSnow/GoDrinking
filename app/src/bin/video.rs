@@ -6,6 +6,11 @@
 //! blit (no GPU APIs, no extra dylibs): aspect preserved with letterbox,
 //! `present` is vsync-backed where the platform supports it.
 //!
+//! Controls (all local to this window — the shell sends no commands):
+//! scroll zooms 1x–4x centered on the cursor, left-drag pans while zoomed,
+//! `F` or double-click toggles fullscreen, `Esc` leaves fullscreen. A
+//! one-line help overlay shows for 3 s after any interaction.
+//!
 //! Wire protocol v1 (little-endian, exact-size reads; see `golive_app::video`):
 //! handshake `GLV1` + u32 w + u32 h + u32 title_len + title, then per frame
 //! u32 len + RGBA bytes, acking `0x01` after each present. EOF = clean exit.
@@ -13,7 +18,10 @@
 //! a window never presents an old frame as new, and never spins an idle
 //! black window (the shell only spawns us on the first frame).
 
-use golive_app::video::{letterbox, rgba_to_xrgb8888, scale_rgba_nearest, WINDOW_H, WINDOW_W};
+use golive_app::video::{
+    draw_text, help_visible, is_double_click, letterbox, rgba_to_xrgb8888, scale_rgba_nearest,
+    text_height_px, text_width_px, ViewState, HELP_LINE, WINDOW_H, WINDOW_W,
+};
 use std::io::{Read, Write};
 use std::num::NonZeroU32;
 use std::os::unix::net::UnixStream;
@@ -21,9 +29,10 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{Window, WindowId};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::{Fullscreen, Window, WindowId};
 
 /// No frame within this long: freeze + "(congelado)" title suffix.
 const FROZEN_AFTER: Duration = Duration::from_secs(1);
@@ -50,6 +59,10 @@ enum UserWake {
     Tick,
 }
 
+/// Help overlay text scale + padding (single bottom bar line).
+const HELP_SCALE: u32 = 2;
+const HELP_PAD: u32 = 6;
+
 struct App {
     window: Option<Arc<Window>>,
     surface: Option<Surf>,
@@ -64,58 +77,137 @@ struct App {
     gone: bool,
     src_w: u32,
     src_h: u32,
+    view: ViewState,
+    cursor: (f32, f32),
+    dragging: bool,
+    drag_last: (f32, f32),
+    last_press: Option<(Instant, f32, f32)>,
+    interacted_at: Instant,
+    help_active: bool,
+    /// Latest frame, kept for zoom/pan/fullscreen re-renders (re-blits send
+    /// no ack and touch no clock: only newly presented frames do).
+    last: Option<Vec<u8>>,
 }
 
 impl App {
     fn render_frame(&mut self, rgba: &[u8]) {
+        self.last = Some(rgba.to_vec());
+        if self.blit() {
+            self.last_present = Instant::now();
+            if self.frozen {
+                self.frozen = false;
+                if let Some(window) = self.window.as_ref() {
+                    window.set_title(&self.base_title);
+                }
+            }
+            if let Some(ack) = self.ack.as_mut() {
+                // Best effort: a failed ack means the shell is gone;
+                // the reader thread will notice EOF and end us.
+                let _ = ack.write_all(&[0x01]);
+            }
+        }
+    }
+
+    /// Re-blits the latest frame (zoom/pan/fullscreen/resize/frozen-tick).
+    /// Never acks, never touches the frozen clock.
+    fn render_last(&mut self) {
+        if self.last.is_some() {
+            self.blit();
+        }
+    }
+
+    /// Zoom-aware blit + one-line help overlay. Returns whether a buffer was
+    /// presented.
+    fn blit(&mut self) -> bool {
         let (window, surface) = match (self.window.as_ref(), self.surface.as_mut()) {
             (Some(window), Some(surface)) => (window, surface),
-            _ => return,
+            _ => return false,
         };
         let size = window.inner_size();
         let (vw, vh) = (size.width, size.height);
         if vw == 0 || vh == 0 {
-            return;
+            return false;
         }
+        let rgba = match self.last.clone() {
+            Some(rgba) => rgba,
+            None => return false,
+        };
         let rect = letterbox(self.src_w, self.src_h, vw, vh);
         if rect.w == 0 || rect.h == 0 {
-            return;
+            return false;
         }
-        // Scale the frame to the letterboxed rect, then blit centered.
-        let scaled = if rect.w == self.src_w && rect.h == self.src_h {
-            rgba.to_vec()
+        // Zoomed picture size, then the visible window onto it at (ox, oy).
+        let sw = (rect.w as f32 * self.view.zoom).round() as u32;
+        let sh = (rect.h as f32 * self.view.zoom).round() as u32;
+        if sw == 0 || sh == 0 {
+            return false;
+        }
+        let scaled = if sw == self.src_w && sh == self.src_h {
+            rgba
         } else {
-            scale_rgba_nearest(rgba, self.src_w, self.src_h, rect.w, rect.h)
+            scale_rgba_nearest(&rgba, self.src_w, self.src_h, sw, sh)
         };
         let pixels = rgba_to_xrgb8888(&scaled);
-        if let Ok(mut buffer) = surface.buffer_mut() {
-            // Black bars are the default: fill all, then blit the rect.
-            buffer.fill(0);
-            let stride = vw as usize;
-            for (row, chunk) in pixels.chunks_exact(rect.w as usize).enumerate() {
-                let y = rect.y as usize + row;
-                if y >= vh as usize {
-                    break;
-                }
-                let start = y * stride + rect.x as usize;
-                let end = (start + chunk.len()).min(buffer.len());
-                if start < end {
-                    buffer[start..end].copy_from_slice(&chunk[..end - start]);
-                }
-            }
-            if buffer.present().is_ok() {
-                self.last_present = Instant::now();
-                if self.frozen {
-                    self.frozen = false;
-                    window.set_title(&self.base_title);
-                }
-                if let Some(ack) = self.ack.as_mut() {
-                    // Best effort: a failed ack means the shell is gone;
-                    // the reader thread will notice EOF and end us.
-                    let _ = ack.write_all(&[0x01]);
-                }
-            }
+        if pixels.len() != sw as usize * sh as usize {
+            return false;
         }
+        let presented = if let Ok(mut buffer) = surface.buffer_mut() {
+            // Black bars are the default: fill all, then blit the visible
+            // slice of the zoomed picture.
+            buffer.fill(0);
+            let ox = self.view.ox.round() as i64;
+            let oy = self.view.oy.round() as i64;
+            let dx0 = rect.x as i64 - ox;
+            let dy0 = rect.y as i64 - oy;
+            let stride = vw as usize;
+            for (row, chunk) in pixels.chunks_exact(sw as usize).enumerate() {
+                let y = dy0 + row as i64;
+                if y < 0 || y >= vh as i64 {
+                    continue;
+                }
+                let skip = (-dx0).max(0) as usize;
+                let dst_x = dx0.max(0) as usize;
+                if skip >= chunk.len() || dst_x >= stride {
+                    continue;
+                }
+                let len = (chunk.len() - skip).min(stride - dst_x);
+                let start = y as usize * stride + dst_x;
+                if start + len <= buffer.len() {
+                    buffer[start..start + len].copy_from_slice(&chunk[skip..skip + len]);
+                }
+            }
+            // One-line help bar (bottom, 3 s after any interaction).
+            if self.help_active && help_visible(self.interacted_at.elapsed()) {
+                let bar_h = text_height_px(HELP_SCALE) + HELP_PAD * 2;
+                if vh >= bar_h && vw > 20 {
+                    let y0 = vh - bar_h;
+                    for y in y0..vh {
+                        let row = y as usize * stride;
+                        for x in 0..vw as usize {
+                            if row + x < buffer.len() {
+                                buffer[row + x] = 0x00111111;
+                            }
+                        }
+                    }
+                    let tw = text_width_px(HELP_LINE, HELP_SCALE);
+                    let tx = HELP_PAD.min(vw.saturating_sub(tw + HELP_PAD));
+                    draw_text(
+                        &mut buffer[..],
+                        vw,
+                        vh,
+                        tx,
+                        y0 + HELP_PAD,
+                        HELP_SCALE,
+                        HELP_LINE,
+                        0x00FFFFFF,
+                    );
+                }
+            }
+            buffer.present().is_ok()
+        } else {
+            false
+        };
+        presented
     }
 
     fn check_frozen(&mut self) {
@@ -124,8 +216,31 @@ impl App {
         }
         self.frozen = true;
         if let Some(window) = self.window.as_ref() {
-            window.set_title(&format!("{} — congelado", self.base_title));
+            window.set_title(&format!("{} (congelado)", self.base_title));
         }
+    }
+
+    /// Marks a user interaction (restarts the 3 s help overlay).
+    fn touch_help(&mut self) {
+        self.interacted_at = Instant::now();
+        self.help_active = true;
+    }
+
+    fn apply_fullscreen(&mut self) {
+        if let Some(window) = self.window.as_ref() {
+            window.set_fullscreen(if self.view.fullscreen {
+                Some(Fullscreen::Borderless(None))
+            } else {
+                None
+            });
+        }
+    }
+
+    fn letterbox_rect(&self) -> Option<golive_app::video::Rect> {
+        self.window.as_ref().map(|window| {
+            let size = window.inner_size();
+            letterbox(self.src_w, self.src_h, size.width, size.height)
+        })
     }
 
     fn shutdown(&mut self, event_loop: &ActiveEventLoop) {
@@ -187,8 +302,113 @@ impl ApplicationHandler<UserWake> for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
-        if matches!(event, WindowEvent::CloseRequested) {
-            self.shutdown(event_loop);
+        match event {
+            WindowEvent::CloseRequested => self.shutdown(event_loop),
+            WindowEvent::Resized(size) => {
+                if let Some(surface) = self.surface.as_mut() {
+                    if let (Some(w), Some(h)) =
+                        (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+                    {
+                        let _ = surface.resize(w, h);
+                    }
+                }
+                self.render_last();
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let (x, y) = (position.x as f32, position.y as f32);
+                if self.dragging {
+                    let dx = x - self.drag_last.0;
+                    let dy = y - self.drag_last.1;
+                    if dx != 0.0 || dy != 0.0 {
+                        if let Some(rect) = self.letterbox_rect() {
+                            self.view.pan_by(rect, dx, dy);
+                        }
+                        self.touch_help();
+                        self.render_last();
+                    }
+                    self.drag_last = (x, y);
+                }
+                self.cursor = (x, y);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let factor = match delta {
+                    MouseScrollDelta::LineDelta(_, dy) => {
+                        golive_app::video::wheel_factor_line(dy)
+                    }
+                    MouseScrollDelta::PixelDelta(pos) => {
+                        golive_app::video::wheel_factor_pixel(pos.y)
+                    }
+                };
+                if factor != 1.0 {
+                    if let Some(rect) = self.letterbox_rect() {
+                        let cursor = self.cursor;
+                        self.view.zoom_by(rect, cursor, factor);
+                    }
+                    // Re-anchor an in-progress drag onto the new zoom.
+                    self.drag_last = self.cursor;
+                    self.touch_help();
+                    self.render_last();
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if button != MouseButton::Left {
+                    return;
+                }
+                match state {
+                    ElementState::Pressed => {
+                        let now = Instant::now();
+                        let (x, y) = self.cursor;
+                        let dbl = match self.last_press {
+                            Some((t, lx, ly)) => {
+                                let dist = ((x - lx).powi(2) + (y - ly).powi(2)).sqrt();
+                                is_double_click(now.duration_since(t), dist)
+                            }
+                            None => false,
+                        };
+                        if dbl {
+                            self.last_press = None;
+                            self.view.toggle_fullscreen();
+                            self.apply_fullscreen();
+                            self.touch_help();
+                            self.render_last();
+                        } else {
+                            self.last_press = Some((now, x, y));
+                            if self.view.zoomed() {
+                                self.dragging = true;
+                                self.drag_last = (x, y);
+                            }
+                        }
+                    }
+                    ElementState::Released => {
+                        self.dragging = false;
+                    }
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state != ElementState::Pressed || event.repeat {
+                    return;
+                }
+                match event.physical_key {
+                    PhysicalKey::Code(KeyCode::KeyF) => {
+                        self.view.toggle_fullscreen();
+                        self.apply_fullscreen();
+                        self.touch_help();
+                        self.render_last();
+                    }
+                    PhysicalKey::Code(KeyCode::Escape) => {
+                        if self.view.exit_fullscreen() {
+                            self.apply_fullscreen();
+                            self.touch_help();
+                            self.render_last();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                self.render_last();
+            }
+            _ => {}
         }
     }
 
@@ -204,6 +424,11 @@ impl ApplicationHandler<UserWake> for App {
         if self.gone_flag() {
             self.shutdown(event_loop);
             return;
+        }
+        // Help overlay expiry repaints without a new frame.
+        if self.help_active && !help_visible(self.interacted_at.elapsed()) {
+            self.help_active = false;
+            self.render_last();
         }
         self.check_frozen();
     }
@@ -287,7 +512,7 @@ fn run() -> Result<(), String> {
         window: None,
         surface: None,
         _context: None,
-        base_title: format!("GoLive — {title}"),
+        base_title: format!("GoLive — {title} · {src_w}x{src_h}"),
         frozen: false,
         last_present: Instant::now(),
         ack: Some(ack),
@@ -295,6 +520,14 @@ fn run() -> Result<(), String> {
         gone: false,
         src_w,
         src_h,
+        view: ViewState::new(),
+        cursor: (0.0, 0.0),
+        dragging: false,
+        drag_last: (0.0, 0.0),
+        last_press: None,
+        interacted_at: Instant::now(),
+        help_active: true,
+        last: None,
     };
     event_loop.set_control_flow(ControlFlow::Wait);
     event_loop

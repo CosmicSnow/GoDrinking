@@ -13,14 +13,15 @@
 
 pub mod pump;
 pub mod screen;
+pub mod session_log;
 pub mod video;
 
-use golive_core::media::{NativeViewer, Publisher, Quality, VideoSource};
+use golive_core::media::{NativeViewer, Publisher, Quality, QualityProfile, VideoSource};
 use golive_core::owner::{Fence, Owner, OwnerSnapshot};
 use golive_core::signal::SignalClient;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::mpsc;
 
 pub const DEFAULT_SERVER: &str = "http://127.0.0.1:18790";
@@ -63,6 +64,23 @@ impl ShareSource {
     }
 }
 
+/// `set_quality` payload (UI lane builds it via `resolveDesired`).
+/// Numerics are authoritative; `preset`, when present, must name a known
+/// preset (`low|medium|high`) and is echoed for display only.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct SetQualityArgs {
+    pub w: u32,
+    pub h: u32,
+    /// Accepts the canonical snake_case and the legacy camelCase spelling
+    /// (older packaged frontends send `bitrateKbps`); both bind here so a
+    /// stale UI never fails deserialization against a new backend.
+    #[serde(alias = "bitrateKbps")]
+    pub bitrate_kbps: u32,
+    pub fps: u32,
+    #[serde(default)]
+    pub preset: Option<String>,
+}
+
 /// Redacted media counters observed by forward tasks (pollable fallback
 /// next to push events; kinds and counts only).
 #[derive(Clone, Default, Debug, serde::Serialize)]
@@ -74,6 +92,58 @@ pub struct MediaCounters {
     /// Frames actually presented in native windows (acks from helpers).
     /// Distinct from `frames` (decoded): this is the presentation evidence.
     pub presented: u64,
+    /// Per-link transmission stats (one entry per watched member with a
+    /// native window). Consumed by the future UI lane; empty when idle.
+    #[serde(default)]
+    pub links: Vec<video::LinkStats>,
+    /// Effective share quality (authoritative snapshot for the UI lane).
+    /// `None` when not sharing. Generation bumps async via `media-event`.
+    #[serde(default)]
+    pub effective: Option<EffectiveQuality>,
+    /// Live encode backend (`videotoolbox`/`openh264`) for the UI badge
+    /// and diagnostics. First publisher reporting wins; `None` until the
+    /// encode thread finishes its first build. Read on snapshot/event —
+    /// never polled.
+    #[serde(default)]
+    pub backend: Option<String>,
+    /// Why the software fallback, when `backend` is `openh264`.
+    /// Triaged in-app (deterministic, no probe access needed): test hook,
+    /// platform without VideoToolbox, or a failed probe (details in the
+    /// session log). `None` for hardware or when there is no backend yet.
+    #[serde(default)]
+    pub backend_note: Option<String>,
+}
+
+/// Fallback reason for the UI badge. Deterministic triage from facts the
+/// app owns (no probe access needed): test hook, platform, else the probe
+/// itself failed (exact status lives in the session log). Pure + tested.
+pub fn backend_note_for(backend: Option<&str>) -> Option<String> {
+    match backend {
+        None | Some("videotoolbox") => None,
+        Some("openh264") => Some(
+            if cfg!(not(target_os = "macos")) {
+                "sem VideoToolbox nesta plataforma".to_owned()
+            } else if std::env::var_os("GOLIVE_DISABLE_HW").is_some() {
+                "hardware desabilitado (GOLIVE_DISABLE_HW)".to_owned()
+            } else {
+                "probe de hardware falhou — ver log de sessão".to_owned()
+            },
+        ),
+        Some(_) => None,
+    }
+}
+
+/// Effective share quality: the last profile accepted by `set_quality`
+/// (or the `start_share` default) plus the encode generation fence.
+/// Generation counts APPLIED reconfigs (rollbacks included) and arrives
+/// async — see the `quality` media-event.
+///
+/// Note: odd requested dims are accepted and floored to even inside the
+/// encoder (see `normalize_dims`) — the stored profile echoes the request.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub struct EffectiveQuality {
+    pub profile: QualityProfile,
+    pub generation: u64,
 }
 /// Wire ids as decimal strings (adopted from envelopes, never logged).
 #[derive(Clone, Default, Debug)]
@@ -97,6 +167,10 @@ pub struct PublishSession {
 /// tests can hold it without a Tauri app.
 pub struct AppState {
     inner: Mutex<Inner>,
+    /// Session file log (packaged verification). Disabled until `run_with`
+    /// inits it from the platform log dir; silent no-op before that (and
+    /// in every unit test).
+    session_log: Mutex<session_log::SessionLog>,
 }
 
 /// Self-driving test plan. ONLY constructible from the `--e2e-plan` CLI
@@ -172,6 +246,32 @@ struct Inner {
     /// N links mean N independent windows; a dead helper fails one link.
     video_windows: HashMap<String, video::VideoWindow>,
     video_feeds: HashMap<String, video::FramePush>,
+    /// Per-link decode observations (bumped in the `on_frame` callback:
+    /// decoded count + latest dims). Joined with the windows above into
+    /// [`video::LinkStats`] on snapshot/emit — no polling anywhere.
+    link_tracks: HashMap<String, LinkTrack>,
+    /// Effective share quality (last accepted `set_quality` profile, or the
+    /// `start_share` default). `None` when not sharing; generation bumps
+    /// async as the encode thread applies reconfigs (see `media-event`
+    /// `quality`). Cleared on stop/leave with the publishers.
+    share_profile: Option<EffectiveQuality>,
+    /// Live capture profile shared with the screen bridge (fps clamp +
+    /// target dims, re-clamped by `set_quality` without restarting the OS
+    /// stream). `None` for synthetic/movie (no bridge) and when idle.
+    share_capture: Option<Arc<Mutex<QualityProfile>>>,
+    /// Session-log dedupe: last backend name logged + whether the ICE
+    /// census line went out (log once per process, not per Stats event).
+    last_logged_backend: Option<String>,
+    census_logged: bool,
+}
+
+/// Decode-side observation for one watched member.
+#[derive(Clone, Debug, Default)]
+pub struct LinkTrack {
+    pub title: String,
+    pub decoded: u64,
+    pub w: u32,
+    pub h: u32,
 }
 
 impl AppState {
@@ -193,8 +293,28 @@ impl AppState {
                 media_counters: MediaCounters::default(),
                 video_windows: HashMap::new(),
                 video_feeds: HashMap::new(),
+                link_tracks: HashMap::new(),
+                share_profile: None,
+                share_capture: None,
+                last_logged_backend: None,
+                census_logged: false,
                 screen_bridge: None,
             }),
+            session_log: Mutex::new(session_log::SessionLog::disabled()),
+        }
+    }
+
+    /// Installs the session file log (called once from `run_with` setup).
+    pub fn set_session_log(&self, log: session_log::SessionLog) {
+        if let Ok(mut slot) = self.session_log.lock() {
+            *slot = log;
+        }
+    }
+
+    /// One redacted milestone line (no-op until `set_session_log`).
+    pub fn session_log(&self, line: String) {
+        if let Ok(guard) = self.session_log.lock() {
+            guard.log(&line);
         }
     }
 
@@ -331,6 +451,8 @@ impl AppState {
             if let Some(task) = inner.viewer_media_task.take() {
                 task.abort();
             }
+            inner.share_profile = None;
+            inner.share_capture = None;
             (
                 inner.signal.take(),
                 std::mem::take(&mut inner.publishers),
@@ -366,6 +488,8 @@ impl AppState {
         if let Ok(close) = inner.owner.begin_close() {
             let _ = inner.owner.complete_closed(&close);
         }
+        drop(inner);
+        self.session_log("leave".to_string());
         Ok(())
     }
 
@@ -377,6 +501,9 @@ impl AppState {
         source: &str,
     ) -> Result<(), String> {
         let source = ShareSource::parse(source)?;
+        // Live capture profile for the bridge (starts at the default; the
+        // bridge thread shares it so `set_quality` re-clamps mid-share).
+        let live_profile = Arc::new(Mutex::new(Quality::P720.profile()));
         // Resolve the core source BEFORE touching lifecycle (pre-flight):
         // bridge setup may prompt/fail, and a failure must leave no
         // half-started share behind (Starting has no path back to Stopped).
@@ -399,6 +526,8 @@ impl AppState {
                 let (rx, bridge, label) = screen::start_capture_for(
                     golive_platform::SourceKind::Display,
                     id,
+                    Quality::P720.profile(),
+                    Arc::clone(&live_profile),
                 )
                 .map_err(|e| e.to_string())?;
                 Resolved::Bridged {
@@ -412,6 +541,8 @@ impl AppState {
                 let (rx, bridge, label) = screen::start_capture_for(
                     golive_platform::SourceKind::Window,
                     id,
+                    Quality::P720.profile(),
+                    Arc::clone(&live_profile),
                 )
                 .map_err(|e| e.to_string())?;
                 Resolved::Bridged {
@@ -490,6 +621,14 @@ impl AppState {
                     pending_remote: Vec::new(),
                 },
             );
+            // Default effective quality: MEDIUM (== Quality::P720, the fixed
+            // start profile). `set_quality` moves it live from here.
+            inner.share_profile = Some(EffectiveQuality {
+                profile: Quality::P720.profile(),
+                generation: 0,
+            });
+            // The bridge (if any) shares the live profile from here on.
+            inner.share_capture = bridge.is_some().then(|| Arc::clone(&live_profile));
             // Own the bridge from here: stop_share/leave always tear it down.
             // (A previous bridge cannot exist: stop clears it, and start
             // while live fails at begin_share_start above. Defensive stop
@@ -500,6 +639,18 @@ impl AppState {
                 stale.stop();
             }
         }
+        // Milestone: source KIND only (never paths/ids) + start profile.
+        let kind = match &source {
+            ShareSource::Synthetic => "synthetic",
+            ShareSource::Movie(_) => "movie",
+            ShareSource::Display(_) => "display",
+            ShareSource::Window(_) => "window",
+        };
+        let start_profile = Quality::P720.profile();
+        self.session_log(format!(
+            "share start kind={kind} profile={}x{}@{}",
+            start_profile.w, start_profile.h, start_profile.fps
+        ));
         Ok(())
     }
 
@@ -511,6 +662,8 @@ impl AppState {
                 .inner
                 .lock()
                 .map_err(|_| "state lock poisoned".to_string())?;
+            inner.share_profile = None;
+            inner.share_capture = None;
             std::mem::take(&mut inner.publishers)
         };
         for (_, session) in publishers {
@@ -543,7 +696,156 @@ impl AppState {
         if let Some(signal) = inner.signal.as_ref() {
             let _ = signal.announce_share(false);
         }
+        drop(inner);
+        self.session_log("share stop".to_string());
         Ok(())
+    }
+
+    /// Live quality switch without re-signaling.
+    ///
+    /// Why a separate command (and `start_share` keeps its `{source}`-only
+    /// wire shape): starting owns irreversible lifecycle pre-flight (owner
+    /// fence Starting→Live has no path back, bridge acquisition, atomic
+    /// teardown on failure). Quality is a property of a LIVE share; mixing
+    /// profile validation into start would entangle it with those teardown
+    /// paths. `set_quality` covers both the pre-watch template publisher
+    /// and adopted per-watcher links.
+    ///
+    /// Semantics: validate-first via [`QualityProfile::validate`] (typed,
+    /// redacted — numbers only), then transactional reconfig on every live
+    /// publisher (core rebuilds + forces IDR + bumps the generation fence;
+    /// same m-line, no re-signaling). Core apply is atomic per encoder
+    /// (build-new-then-swap: a failed rebuild keeps the old encoder
+    /// running). On partial multi-publisher failure this rolls back the
+    /// ones that succeeded (best-effort, each rollback is itself a fenced
+    /// reconfig) and leaves `share_profile` untouched — the encoder is
+    /// never left in an intermediate state.
+    ///
+    /// Returns the new effective profile (pre-bump generation); the
+    /// authoritative generation arrives async via `media-event` `quality`
+    /// (emitted here optimistically and again by the forward task when it
+    /// observes the fence bump) and via `get_media_counters.effective`.
+    pub async fn set_quality(
+        self: &Arc<Self>,
+        app: Option<AppHandle>,
+        args: SetQualityArgs,
+    ) -> Result<EffectiveQuality, String> {
+        if let Some(preset) = args.preset.as_deref() {
+            match preset {
+                "low" | "medium" | "high" => {}
+                _ => return Err(format!("unknown preset '{preset}' (low|medium|high)")),
+            }
+        }
+        let profile = QualityProfile {
+            w: args.w,
+            h: args.h,
+            bitrate_kbps: args.bitrate_kbps,
+            fps: args.fps,
+        };
+        profile
+            .validate()
+            .map_err(|e| format!("qualidade: {e}"))?;
+        // Snapshot publishers + previous effective under one short lock;
+        // no lock is held across the awaits below.
+        let (publishers, previous) = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| "state lock poisoned".to_string())?;
+            if inner.publishers.is_empty() {
+                return Err("not sharing".into());
+            }
+            let publishers: Vec<Arc<tokio::sync::Mutex<Publisher>>> = inner
+                .publishers
+                .values()
+                .map(|session| Arc::clone(&session.publisher))
+                .collect();
+            let previous = inner.share_profile.unwrap_or(EffectiveQuality {
+                profile: Quality::P720.profile(),
+                generation: 0,
+            });
+            (publishers, previous)
+        };
+        // Apply to every live publisher (template + adopted links).
+        let mut applied = 0usize;
+        let mut apply_error: Option<String> = None;
+        for publisher in &publishers {
+            match publisher.lock().await.reconfigure(profile) {
+                Ok(()) => applied += 1,
+                Err(e) => {
+                    apply_error = Some(format!("qualidade: {e}"));
+                    break;
+                }
+            }
+        }
+        if let Some(error) = apply_error {
+            // Best-effort rollback: restore the previous profile on the
+            // publishers that already moved (each rollback is fenced too).
+            for publisher in publishers.iter().take(applied) {
+                let _ = publisher.lock().await.reconfigure(previous.profile);
+            }
+            return Err(error);
+        }
+        // Restart the capture stream at the new profile (if bridged).
+        // Transactional: the new SCK stream starts first, so a failure
+        // leaves the old stream running and only needs a publisher
+        // rollback. The handle is taken out for the blocking call (no
+        // long-held lock) and put back after, unless the share died
+        // under us (leave raced: stop instead of resurrecting).
+        let mut bridge = {
+            match self.inner.lock() {
+                Ok(mut inner) => inner.screen_bridge.take(),
+                Err(_) => None,
+            }
+        };
+        if let Some(handle) = bridge.as_mut() {
+            if let Err(e) = handle.reconfigure(profile) {
+                for publisher in publishers.iter().take(applied) {
+                    let _ = publisher.lock().await.reconfigure(previous.profile);
+                }
+                if let Ok(mut inner) = self.inner.lock() {
+                    inner.screen_bridge = bridge;
+                }
+                return Err(format!("qualidade: captura: {e}"));
+            }
+        }
+        let effective = EffectiveQuality { profile, generation: previous.generation };
+        {
+            if let Ok(mut inner) = self.inner.lock() {
+                if inner.publishers.is_empty() {
+                    // Share died mid-switch: stop the (reconfigured) bridge
+                    // instead of resurrecting it, report cleanly.
+                    if let Some(mut handle) = bridge.take() {
+                        handle.stop();
+                    }
+                    inner.screen_bridge = None;
+                    return Err("not sharing".into());
+                }
+                inner.share_profile = Some(effective);
+                // Re-clamp capture in place (bridge reads it per tick).
+                if let Some(live) = inner.share_capture.as_ref() {
+                    if let Ok(mut guard) = live.lock() {
+                        *guard = profile;
+                    }
+                }
+                inner.screen_bridge = bridge;
+            }
+        }
+        if let Some(app) = app {
+            let _ = app.emit(
+                "media-event",
+                &serde_json::json!({
+                    "kind": "quality",
+                    "profile": profile,
+                    "generation": effective.generation,
+                }),
+            );
+        }
+        self.session_log(format!(
+            "quality profile={}x{}@{} generation={}",
+            profile.w, profile.h, profile.fps, effective.generation
+        ));
+        Ok(effective)
     }
 
     /// Registers watch intent for a member (viewer side).
@@ -570,6 +872,7 @@ impl AppState {
                 return Err("not in a room".into());
             }
         }
+        self.session_log(format!("watch member={}", session_log::short_id(member)));
         Ok(())
     }
 
@@ -601,6 +904,8 @@ impl AppState {
         inner.viewer_fence = None;
         inner.viewer_remote_ready = false;
         inner.viewer_pending_remote.clear();
+        drop(inner);
+        self.session_log(format!("unwatch member={}", session_log::short_id(member)));
         Ok(())
     }
 
@@ -640,8 +945,84 @@ impl AppState {
             .map(|inner| {
                 let mut counters = inner.media_counters.clone();
                 counters.presented = inner.video_windows.values().map(|w| w.presented()).sum();
+                counters.links = Self::link_stats_locked(&inner);
+                counters.effective = inner.share_profile;
+                counters.backend = Self::encode_backend_locked(&inner);
+                counters.backend_note = backend_note_for(counters.backend.as_deref());
                 counters
             })
+    }
+
+    /// First live encoder backend across publishers (non-blocking read;
+    /// `None` until a build lands). All publishers share the engine, so
+    /// first-reporter is representative.
+    fn encode_backend_locked(inner: &Inner) -> Option<String> {
+        inner
+            .publishers
+            .values()
+            .filter_map(|session| session.publisher.try_lock().ok())
+            .filter_map(|publisher| publisher.backend())
+            .map(|name| name.to_owned())
+            .next()
+    }
+
+    /// Builds per-link stats from decode tracks + native windows. Sorted by
+    /// member for stable snapshots.
+    fn link_stats_locked(inner: &Inner) -> Vec<video::LinkStats> {
+        let mut links: Vec<video::LinkStats> = inner
+            .video_windows
+            .iter()
+            .map(|(member, window)| {
+                let track = inner.link_tracks.get(member);
+                let decoded = track.map(|t| t.decoded).unwrap_or_else(|| window.pushed());
+                let presented = window.presented();
+                let (w, h) = window.resolution();
+                video::LinkStats {
+                    member: member.clone(),
+                    title: track
+                        .map(|t| t.title.clone())
+                        .unwrap_or_else(|| window.title().to_owned()),
+                    codec: video::LINK_CODEC.to_owned(),
+                    width: track.map(|t| t.w).filter(|w| *w > 0).unwrap_or(w),
+                    height: track.map(|t| t.h).filter(|h| *h > 0).unwrap_or(h),
+                    decoded,
+                    presented,
+                    dropped: decoded.saturating_sub(presented),
+                    render_fps: window.render_fps(),
+                    bitrate_bps: window.bitrate_bps(),
+                    bitrate_note: video::BITRATE_NOTE.to_owned(),
+                    delay_estimate_ms: None,
+                    delay_note: video::DELAY_NOTE.to_owned(),
+                    dropped_note: video::DROPPED_NOTE.to_owned(),
+                }
+            })
+            .collect();
+        links.sort_by(|a, b| a.member.cmp(&b.member));
+        links
+    }
+
+    /// Per-link stats for one member (used by the stats event emit).
+    pub fn link_stats_for(&self, member: &str) -> Option<video::LinkStats> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|inner| Self::link_stats_locked(&inner).into_iter().find(|l| l.member == member))
+    }
+
+    /// Records one decoded frame for a watched member (called from the
+    /// `on_frame` present callback: event-driven, never polled).
+    pub fn note_link_frame(&self, member: &str, title: &str, w: u32, h: u32) {
+        if let Ok(mut inner) = self.inner.lock() {
+            let track = inner.link_tracks.entry(member.to_owned()).or_default();
+            track.decoded += 1;
+            if track.title.is_empty() {
+                track.title = title.to_owned();
+            }
+            if w > 0 && h > 0 {
+                track.w = w;
+                track.h = h;
+            }
+        }
     }
 
     /// Tears down (and forgets) the video window + feed for one member.
@@ -651,6 +1032,7 @@ impl AppState {
             match self.inner.lock() {
                 Ok(mut inner) => {
                     inner.video_feeds.remove(member);
+                    inner.link_tracks.remove(member);
                     inner.video_windows.remove(member)
                 }
                 Err(_) => None,
@@ -666,6 +1048,7 @@ impl AppState {
         let mut windows = match self.inner.lock() {
             Ok(mut inner) => {
                 inner.video_feeds.clear();
+                inner.link_tracks.clear();
                 std::mem::take(&mut inner.video_windows)
             }
             Err(_) => return,
@@ -785,6 +1168,21 @@ async fn stop_share(state: State<'_, Arc<AppState>>) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn set_quality(
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+    w: u32,
+    h: u32,
+    bitrate_kbps: u32,
+    fps: u32,
+    preset: Option<String>,
+) -> Result<EffectiveQuality, String> {
+    state
+        .set_quality(Some(app), SetQualityArgs { w, h, bitrate_kbps, fps, preset })
+        .await
+}
+
+#[tauri::command]
 async fn list_sources(state: State<'_, Arc<AppState>>) -> Result<Vec<screen::ListedSource>, String> {
     state.list_sources().await
 }
@@ -836,14 +1234,24 @@ fn e2e_read_code(state: State<'_, Arc<AppState>>) -> Result<String, String> {
 
 /// Tauri entry point with an explicit state (tests inject their own).
 pub fn run_with(state: Arc<AppState>) {
+    let log_state = Arc::clone(&state);
     tauri::Builder::default()
         .manage(state)
+        .setup(move |app| {
+            match app.path().app_log_dir() {
+                Ok(dir) => log_state.set_session_log(session_log::SessionLog::init_in(&dir)),
+                Err(e) => eprintln!("golive: log dir unavailable: {e}"),
+            }
+            log_state.session_log("session start".to_string());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             create_room,
             join_room,
             leave,
             start_share,
             stop_share,
+            set_quality,
             list_sources,
             source_capabilities,
             watch,
@@ -993,4 +1401,240 @@ mod share_source_tests {
     // exhaustively with no wildcard arm, and both capture arms go through
     // screen::start_capture_for (OS-backed, typed errors). A silent fallback
     // cannot compile here without touching that match.
+}
+
+#[cfg(test)]
+mod quality_tests {
+    use super::*;
+    use golive_core::media::EngineKind;
+    use std::time::Duration;
+
+    fn args(w: u32, h: u32, bitrate_kbps: u32, fps: u32) -> SetQualityArgs {
+        SetQualityArgs { w, h, bitrate_kbps, fps, preset: None }
+    }
+
+    /// Wire regression: canonical snake_case and legacy camelCase spellings
+    /// deserialize to the same args struct (kept tolerant for any caller).
+
+    /// Payload tolerance: flat snake and legacy camel spellings bind.
+
+    /// Seeds one live software publisher (synthetic) + default effective,
+    /// bypassing room/signal: `set_quality` only touches publishers.
+    /// Returns the state plus the publisher's event channel (proves IDR +
+    /// fence without any forward task).
+    async fn live_state() -> (
+        Arc<AppState>,
+        tokio::sync::mpsc::UnboundedReceiver<golive_core::media::MediaEvent>,
+    ) {
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let publisher = Publisher::start_with_profile(
+            VideoSource::SyntheticBall,
+            Quality::P720.profile(),
+            EngineKind::Software,
+            None,
+            event_tx,
+        )
+        .await
+        .expect("test publisher starts");
+        let state = Arc::new(AppState::new());
+        {
+            let mut inner = state.inner.lock().expect("state lock");
+            inner.publishers.insert(
+                "watcher".into(),
+                PublishSession {
+                    publisher: Arc::new(tokio::sync::Mutex::new(publisher)),
+                    owner_fence: Fence::idle(),
+                    wire: WireIds::default(),
+                    remote_ready: false,
+                    pending_remote: Vec::new(),
+                },
+            );
+            inner.share_profile = Some(EffectiveQuality {
+                profile: Quality::P720.profile(),
+                generation: 0,
+            });
+        }
+        (state, event_rx)
+    }
+
+    async fn recv_timeout(
+        event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<golive_core::media::MediaEvent>,
+        secs: u64,
+    ) -> Option<golive_core::media::MediaEvent> {
+        tokio::time::timeout(Duration::from_secs(secs), event_rx.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    #[tokio::test]
+    async fn valid_applies_with_idr_and_fence_snapshot_reflects() {
+        let (state, mut event_rx) = live_state().await;
+        // Liveness first (initial IDR), so the post-reconfig IDR is
+        // attributable below.
+        let mut live = false;
+        for _ in 0..150 {
+            match recv_timeout(&mut event_rx, 1).await {
+                Some(golive_core::media::MediaEvent::Keyframe) => {
+                    live = true;
+                    break;
+                }
+                Some(golive_core::media::MediaEvent::Error(detail)) => {
+                    panic!("encode failed: {detail}")
+                }
+                _ => {}
+            }
+        }
+        assert!(live, "stream alive before set_quality");
+        // Valid profile applies through the command method (no AppHandle).
+        let effective = state
+            .set_quality(None, args(640, 360, 1000, 15))
+            .await
+            .expect("valid profile applies");
+        assert_eq!((effective.profile.w, effective.profile.h), (640, 360));
+        assert_eq!(effective.profile.bitrate_kbps, 1000);
+        // Fence + forced IDR land on the publisher's own channel.
+        let mut gen_seen = false;
+        let mut post_idr = false;
+        for _ in 0..200 {
+            match recv_timeout(&mut event_rx, 1).await {
+                Some(golive_core::media::MediaEvent::Stats(stats)) => {
+                    if stats.generation == 1 {
+                        gen_seen = true;
+                    }
+                }
+                Some(golive_core::media::MediaEvent::Keyframe) => {
+                    if gen_seen {
+                        post_idr = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            if gen_seen && post_idr {
+                break;
+            }
+        }
+        assert!(gen_seen, "generation fence bumps");
+        assert!(post_idr, "forced IDR after apply");
+        // Snapshot reflects the effective profile (generation follows via
+        // the forward task; the stored profile is authoritative here) plus
+        // the live encode backend for the UI badge/diagnostics.
+        let counters = state.get_media_counters().expect("counters");
+        let stored = counters.effective.expect("effective present");
+        assert_eq!((stored.profile.w, stored.profile.h), (640, 360));
+        assert_eq!(counters.backend.as_deref(), Some("openh264"));
+        // Teardown: stop the publisher explicitly (encode thread joins).
+        let publisher = {
+            state
+                .inner
+                .lock()
+                .expect("state lock")
+                .publishers
+                .remove("watcher")
+                .map(|session| session.publisher)
+        };
+        if let Some(publisher) = publisher {
+            publisher.lock().await.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_rejects_without_touching_stream() {
+        let (state, _event_rx) = live_state().await;
+        // Odd dims are ACCEPTED (core floors to even in the encoder); only
+        // ranges + unknown presets reject. Errors are typed + redacted.
+        let odd = state
+            .set_quality(None, args(641, 360, 1000, 15))
+            .await
+            .expect("odd dims accepted, normalized downstream");
+        assert_eq!(odd.profile.w, 641);
+        // Out-of-range bitrate/fps + unknown preset reject without touching
+        // the stream.
+        let err = state
+            .set_quality(None, args(640, 360, 50, 15))
+            .await
+            .expect_err("bitrate range rejected");
+        assert!(err.starts_with("qualidade:"), "{err}");
+        assert!(state.set_quality(None, args(640, 360, 50, 15)).await.is_err());
+        assert!(state.set_quality(None, args(640, 360, 1000, 0)).await.is_err());
+        assert!(
+            state
+                .set_quality(
+                    None,
+                    SetQualityArgs { preset: Some("ultra".into()), ..args(640, 360, 1000, 15) }
+                )
+                .await
+                .is_err()
+        );
+        // Effective tracks the last ACCEPTED profile (odd included); the
+        // rejects above left it untouched, and the encoder still runs:
+        // a later valid switch applies cleanly.
+        let stored = state
+            .get_media_counters()
+            .expect("counters")
+            .effective
+            .expect("effective present");
+        assert_eq!((stored.profile.w, stored.profile.h), (641, 360));
+        assert_eq!(stored.generation, 0);
+        state
+            .set_quality(None, args(480, 270, 800, 15))
+            .await
+            .expect("encoder alive: later valid applies");
+        let stored = state
+            .get_media_counters()
+            .expect("counters")
+            .effective
+            .expect("effective present");
+        assert_eq!((stored.profile.w, stored.profile.h), (480, 270));
+        let publisher = {
+            state
+                .inner
+                .lock()
+                .expect("state lock")
+                .publishers
+                .remove("watcher")
+                .map(|session| session.publisher)
+        };
+        if let Some(publisher) = publisher {
+            publisher.lock().await.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_when_not_sharing() {
+        let state = Arc::new(AppState::new());
+        let err = state
+            .set_quality(None, args(640, 360, 1000, 15))
+            .await
+            .expect_err("no publishers");
+        assert_eq!(err, "not sharing");
+        assert!(state.get_media_counters().expect("counters").effective.is_none());
+    }
+
+    #[test]
+    fn backend_note_triages_fallback_deterministically() {
+        // Hardware and absence carry no note.
+        assert_eq!(backend_note_for(None), None);
+        assert_eq!(backend_note_for(Some("videotoolbox")), None);
+        assert_eq!(backend_note_for(Some("whatever")), None);
+        // Software fallback always explains itself, never with secrets.
+        let hook_was_set = std::env::var_os("GOLIVE_DISABLE_HW").is_some();
+        std::env::set_var("GOLIVE_DISABLE_HW", "1");
+        let hooked = backend_note_for(Some("openh264")).expect("note");
+        assert!(hooked.contains("GOLIVE_DISABLE_HW"), "{hooked}");
+        if hook_was_set {
+            std::env::set_var("GOLIVE_DISABLE_HW", "1");
+        } else {
+            std::env::remove_var("GOLIVE_DISABLE_HW");
+        }
+        let plain = backend_note_for(Some("openh264")).expect("note");
+        assert!(!plain.is_empty());
+        for note in [hooked, plain] {
+            let lower = note.to_lowercase();
+            for banned in ["sdp", "candidate", "token", "password", "192.168"] {
+                assert!(!lower.contains(banned), "secret-adjacent in note: {note}");
+            }
+        }
+    }
 }

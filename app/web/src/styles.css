@@ -1,4 +1,23 @@
 /* Sala mínima: legível, sóbria, sem firula. Polimento vem depois. */
+.quality { display: grid; gap: 10px; }
+.quality fieldset { border: 0; margin: 0; padding: 0; display: grid; gap: 10px; min-width: 0; }
+.quality fieldset:disabled { opacity: 0.55; }
+.field { display: grid; gap: 6px; flex: 1; min-width: 0; }
+.panel select {
+  width: 100%;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #0e1216;
+  color: var(--text);
+  font: inherit;
+}
+.panel select:disabled { opacity: 0.55; }
+.errors { margin: 0; padding: 10px 12px 10px 28px; border: 1px solid #6b4433; border-radius: 6px; background: #241a16; color: #ffd2bf; font-size: 13px; }
+.viewer-links { display: grid; gap: 10px; }
+.link-card { border: 1px solid var(--line); border-radius: 7px; background: #0e1216; padding: 10px 12px; display: grid; gap: 8px; }
+.link-card header { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+.link-stats { gap: 6px; }
 :root {
   --bg: #101418;
   --panel: #171d23;

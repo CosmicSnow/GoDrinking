@@ -76,6 +76,23 @@ describe("runE2ePlan host", () => {
           return Promise.resolve("ABC123");
         case "start_share":
           return Promise.resolve(undefined);
+        case "set_quality":
+          return Promise.resolve({
+            profile: { w: 640, h: 360, bitrate_kbps: 1000, fps: 15 },
+            generation: 0,
+          });
+        case "get_media_counters":
+          return Promise.resolve({
+            connected: true,
+            frames: 0,
+            keyframes: 1,
+            keyframes_seen: true,
+            presented: 0,
+            effective: {
+              profile: { w: 640, h: 360, bitrate_kbps: 1000, fps: 15 },
+              generation: 1,
+            },
+          });
         case "e2e_status":
           return Promise.resolve(undefined);
         case "get_snapshot":
@@ -99,13 +116,22 @@ describe("runE2ePlan host", () => {
       password: "pw",
     });
     expect(mockInvoke).toHaveBeenCalledWith("start_share", { source: "synthetic" });
+    // Caminho real do aplicar-qualidade: intent exato (Tauri converte o
+    // snake_case Rust para camelCase no IPC — ver api.setQuality), geração bumpada.
+    expect(mockInvoke).toHaveBeenCalledWith("set_quality", {
+      w: 640,
+      h: 360,
+      bitrateKbps: 1000,
+      fps: 15,
+    });
     // Code publicado no status (sem segredos além do code, que é local).
     const room = mockInvoke.mock.calls.find((c) => c[0] === "e2e_status");
     expect(JSON.parse(room?.[1].payload as string).code).toBe("ABC123");
     const last = reports[reports.length - 1];
-    expect(last.phase).toBe("connected");
+    expect(last.phase).toBe("quality-applied");
     expect(last.connected).toBe(true);
     expect(last.keyframesSeen).toBe(true);
+    expect(last.qualityApplied).toBe(true);
   });
 });
 

@@ -87,12 +87,13 @@ except Exception:
     pass
 checks = [
     ("host-room", bool(code)),
-    ("host-connected", host.get("state") == "connected" and host.get("connected") is True),
+    ("host-connected", host.get("state") in ("connected", "quality-applied") and host.get("connected") is True),
     ("host-keyframe", host.get("keyframesSeen") is True),
     ("viewer-joined", viewer.get("state") in ("joined", "watching", "connected")),
     ("viewer-connected", viewer.get("state") == "connected" and viewer.get("connected") is True),
     ("viewer-frames", isinstance(viewer.get("frames"), int) and viewer["frames"] > 0),
     ("viewer-presented", isinstance(viewer.get("presented"), int) and viewer["presented"] > 0),
+    ("host-quality", host.get("qualityApplied") is True),
 ]
 for name, ok in checks:
     if not ok:

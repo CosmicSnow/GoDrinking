@@ -18,7 +18,10 @@
 //!   milestones. Never SDP, candidates, IPs or pixels in logs.
 //! - Sessions are single-use with bounded idempotent stop (flag + aborts +
 //!   timed `close()`; never a wedged state).
+//! - Capture GPU buffers cross as opaque platform handles (types-only
+//!   dependency — still zero OS bindings in this crate's own code).
 
+use golive_platform::GpuPixelBuffer;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -53,6 +56,9 @@ use webrtc_media::Sample;
 // ---------------------------------------------------------------------------
 
 /// Share quality. 30 fps always; the viewer validates full-res frames.
+///
+/// Legacy selector kept working: `P720` maps to the MEDIUM profile and
+/// `P1080` to HIGH (see [`QualityProfile`]). New code prefers profiles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Quality {
     P720,
@@ -73,12 +79,150 @@ impl Quality {
             Quality::P1080 => Level::Level_4_0,
         }
     }
+
+    /// Legacy mapping. P720 is byte-identical to the historical defaults
+    /// (2 Mbps, 30 fps); P1080 follows HIGH.
+    pub fn profile(self) -> QualityProfile {
+        match self {
+            Quality::P720 => QualityProfile::medium(),
+            Quality::P1080 => QualityProfile::high(),
+        }
+    }
+}
+
+/// Validated quality profile: resolution + bitrate + frame rate.
+///
+/// Preset ladder (documented choices):
+/// - LOW `854x480 @ 800 kbps @ 15 fps`: floor for weak machines and
+///   congested networks; software 480p15 costs single-digit ms/frame.
+/// - MEDIUM `1280x720 @ 2000 kbps @ 30 fps`: the historical defaults,
+///   byte-identical to the previous hardcoded contract.
+/// - HIGH `1920x1080 @ 10000 kbps @ 30 fps`: spec bitrate; 30 fps (not 60)
+///   because software 1080p60 does not hold on most machines — use the
+///   hardware engine for headroom (see `EngineKind`).
+///
+/// Validation ranges: dims `2..=4096` (any parity in, even out — see
+/// [`normalize_dims`]); bitrate `100..=20000` kbps (below 100 the control
+/// loop starves at HD sizes); fps `1..=60` (decoder/player sanity plus
+/// encoder throughput; above 60 is rejected, never silently clamped).
+/// Invalid profiles are `Err` before any encoder exists — never black.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QualityProfile {
+    pub w: u32,
+    pub h: u32,
+    pub bitrate_kbps: u32,
+    pub fps: u32,
+}
+
+impl QualityProfile {
+    pub fn low() -> Self {
+        Self { w: 854, h: 480, bitrate_kbps: 800, fps: 15 }
+    }
+
+    pub fn medium() -> Self {
+        Self { w: 1280, h: 720, bitrate_kbps: 2000, fps: 30 }
+    }
+
+    pub fn high() -> Self {
+        Self { w: 1920, h: 1080, bitrate_kbps: 10_000, fps: 30 }
+    }
+
+    pub fn custom(w: u32, h: u32, bitrate_kbps: u32, fps: u32) -> Result<Self, QualityError> {
+        let profile = Self { w, h, bitrate_kbps, fps };
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    pub fn validate(&self) -> Result<(), QualityError> {
+        if self.w < 2 || self.w > 4096 || self.h < 2 || self.h > 4096 {
+            return Err(QualityError::InvalidDimensions { w: self.w, h: self.h });
+        }
+        if !(100..=20_000).contains(&self.bitrate_kbps) {
+            return Err(QualityError::BitrateOutOfRange(self.bitrate_kbps));
+        }
+        if !(1..=60).contains(&self.fps) {
+            return Err(QualityError::FpsOutOfRange(self.fps));
+        }
+        Ok(())
+    }
+
+    /// Effective encode dims for a source: fit inside the request preserving
+    /// aspect (never upscale beyond the source), then floor to even (at most
+    /// a 1px crop — what makes odd dims backend-valid). Idempotent.
+    pub fn normalized_dims(&self, src_w: u32, src_h: u32) -> (u32, u32) {
+        normalize_dims(src_w, src_h, self.w, self.h)
+    }
+
+    /// Per-frame pacing interval for this profile.
+    pub fn frame_duration(&self) -> Duration {
+        Duration::from_micros(1_000_000 / self.fps.max(1) as u64)
+    }
+
+    /// Sane keyframe cadence: one IDR every ~2 s of frames.
+    pub fn keyframe_interval_frames(&self) -> u32 {
+        (2 * self.fps).max(2)
+    }
+}
+
+/// Fit `(src)` into `(req)` preserving aspect, never upscaling, then floor
+/// each axis to even. Pure; see [`QualityProfile::normalized_dims`].
+pub fn normalize_dims(src_w: u32, src_h: u32, req_w: u32, req_h: u32) -> (u32, u32) {
+    if src_w == 0 || src_h == 0 || req_w == 0 || req_h == 0 {
+        return (2, 2);
+    }
+    let scale = ((req_w as f64 / src_w as f64).min(req_h as f64 / src_h as f64)).min(1.0);
+    let w = (((src_w as f64 * scale) as u32).max(2)) & !1;
+    let h = (((src_h as f64 * scale) as u32).max(2)) & !1;
+    (w.max(2), h.max(2))
+}
+
+/// Profile validation failures. Numbers only, no secrets possible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QualityError {
+    InvalidDimensions { w: u32, h: u32 },
+    BitrateOutOfRange(u32),
+    FpsOutOfRange(u32),
+}
+
+impl std::fmt::Display for QualityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QualityError::InvalidDimensions { w, h } => {
+                write!(f, "dimensions out of range 2..=4096: {w}x{h}")
+            }
+            QualityError::BitrateOutOfRange(bps) => {
+                write!(f, "bitrate out of range 100..=20000 kbps: {bps}")
+            }
+            QualityError::FpsOutOfRange(fps) => write!(f, "fps out of range 1..=60: {fps}"),
+        }
+    }
+}
+
+impl std::error::Error for QualityError {}
+
+/// Requested encoder backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EngineKind {
+    /// Probe hardware, use it if present, else software (logged).
+    Auto,
+    /// OpenH264 software, always. Deterministic everywhere.
+    Software,
+    /// VideoToolbox, hard fail (`HwUnavailable`) if absent. Never silent.
+    Hardware,
+}
+
+/// Rough uplink estimate: bitrate × watchers, saturating. Pure planning
+/// helper for UI claim-checks (the transport sends one full copy per
+/// watcher — encode once, fanout free does not apply to the wire).
+pub fn upload_estimate_bps(bitrate_bps: u32, watchers: usize) -> u64 {
+    (bitrate_bps as u64).saturating_mul(watchers as u64)
 }
 
 /// Frame sources. Synthetic and movie are self-contained; screen capture
-/// arrives injected (see `ExternalSource`): the core never imports platform
-/// or OS bindings — frames cross as plain channel data, and tests inject
-/// without any OS involved.
+/// arrives injected (see `ExternalSource`): the core imports platform
+/// TYPES only (opaque GPU handles) — still zero OS bindings of its own.
+/// Frames cross as plain channel data, and tests inject without any OS
+/// involved.
 pub enum VideoSource {
     /// Gradient + bouncing square + counter bar at 30 fps.
     SyntheticBall,
@@ -88,11 +232,19 @@ pub enum VideoSource {
     External(ExternalSource),
 }
 
-/// Injected frame feed. `rx` yields contract-agnostic I420 frames (the core
-/// scales to the share size); `label` is an opaque human tag for logs
-/// (never pixels, never tokens).
+/// One injected frame: decoded CPU pixels or a retained GPU buffer for
+/// zero-copy submit. The app bridge produces both; the encoder routes.
+pub enum ExternalFrame {
+    Cpu(I420Frame),
+    Gpu(GpuPixelBuffer),
+}
+
+/// Injected frame feed. `rx` yields CPU frames (the core scales to the
+/// share size) or retained GPU buffers (zero-copy submit when the encoder
+/// is hardware at matching dims, one conversion otherwise); `label` is an
+/// opaque human tag for logs (never pixels, never tokens).
 pub struct ExternalSource {
-    pub rx: std::sync::mpsc::Receiver<I420Frame>,
+    pub rx: std::sync::mpsc::Receiver<ExternalFrame>,
     pub label: String,
 }
 
@@ -150,6 +302,11 @@ pub struct MediaStats {
     pub ice_connected: bool,
     pub frames_decoded: u64,
     pub keyframes_decoded: u64,
+    /// Encode generation (fence token): starts at 0, +1 per applied
+    /// reconfiguration. Upper layers discard work from older generations.
+    /// Adding a field is reader-compatible (no new event variant needed,
+    /// which keeps downstream matches compiling).
+    pub generation: u64,
 }
 
 /// Redacted ICE census: kinds and families, never addresses.
@@ -196,6 +353,9 @@ pub enum MediaError {
     Codec(String),
     Transport(String),
     Source(String),
+    /// Explicit hardware was demanded and is absent. Fail-high by design:
+    /// callers must fall back (or abort) explicitly — never silent software.
+    HwUnavailable(String),
     Closed,
 }
 
@@ -205,6 +365,7 @@ impl std::fmt::Display for MediaError {
             MediaError::Codec(detail) => write!(f, "codec: {detail}"),
             MediaError::Transport(detail) => write!(f, "transport: {detail}"),
             MediaError::Source(detail) => write!(f, "source: {detail}"),
+            MediaError::HwUnavailable(detail) => write!(f, "hw unavailable: {detail}"),
             MediaError::Closed => write!(f, "session closed"),
         }
     }
@@ -385,6 +546,32 @@ impl H264Encoder {
         Ok(Self { enc, w, h })
     }
 
+    /// Profile-driven constructor. `w`/`h` are the EFFECTIVE encode dims
+    /// (already normalized even); frames must match exactly.
+    pub fn new_with_profile(profile: &QualityProfile, w: usize, h: usize) -> Result<Self, MediaError> {
+        profile.validate().map_err(|e| MediaError::Codec(format!("profile: {e}")))?;
+        if w < 2 || h < 2 || w > 4096 || h > 4096 || w % 2 != 0 || h % 2 != 0 {
+            return Err(MediaError::Codec(format!("backend dims must be even 2..=4096: {w}x{h}")));
+        }
+        let config = EncoderConfig::new()
+            .bitrate(BitRate::from_bps(profile.bitrate_kbps * 1000))
+            .max_frame_rate(FrameRate::from_hz(profile.fps as f32))
+            .intra_frame_period(IntraFramePeriod::from_num_frames(
+                profile.keyframe_interval_frames(),
+            ))
+            .profile(Profile::Baseline)
+            .level(level_for(w, h))
+            .skip_frames(false);
+        let enc = Encoder::with_api_config(openh264::OpenH264API::from_source(), config)
+            .map_err(|e| MediaError::Codec(format!("encoder init: {e}")))?;
+        Ok(Self { enc, w, h })
+    }
+
+    /// Force the next unit to start with an IDR (reconfig, error recovery).
+    pub fn force_intra(&mut self) {
+        self.enc.force_intra_frame();
+    }
+
     /// Encode one frame; returns an Annex-B access unit (start codes added
     /// explicitly per NAL — never depends on encoder defaults).
     pub fn encode(&mut self, frame: &I420Frame) -> Result<Vec<u8>, MediaError> {
@@ -416,6 +603,150 @@ impl H264Encoder {
     }
 }
 
+/// Encoder backend: software everywhere, hardware where probed.
+pub enum VideoEncoder {
+    Software(H264Encoder),
+    #[cfg(target_os = "macos")]
+    Hardware(crate::vt::VtEncoder),
+}
+
+/// One real probe per process (a VT session + frame costs single-digit ms,
+/// but every reconfig rebuild would repay it). The `GOLIVE_DISABLE_HW`
+/// hook bypasses the cache so forced-fallback tests stay deterministic.
+static PROBE_OUTCOME: std::sync::OnceLock<(bool, String)> = std::sync::OnceLock::new();
+
+fn probe_cached() -> (bool, String) {
+    if std::env::var_os("GOLIVE_DISABLE_HW").is_some() {
+        return match probe_hardware() {
+            Ok(()) => (true, String::new()),
+            Err(e) => (false, e.to_string()),
+        };
+    }
+    PROBE_OUTCOME
+        .get_or_init(|| match probe_hardware() {
+            Ok(()) => (true, String::new()),
+            Err(e) => (false, e.to_string()),
+        })
+        .clone()
+}
+
+/// Pure decision (tested): a working probe selects hardware, anything else
+/// is explicit software. `Hardware` requested directly never passes here
+/// (fail-high at the call site).
+fn decide_engine(hw_available: bool) -> EngineKind {
+    if hw_available {
+        EngineKind::Hardware
+    } else {
+        EngineKind::Software
+    }
+}
+
+impl VideoEncoder {
+    pub fn new(
+        profile: &QualityProfile,
+        w: usize,
+        h: usize,
+        engine: EngineKind,
+    ) -> Result<Self, MediaError> {
+        match engine {
+            EngineKind::Software => Ok(Self::Software(H264Encoder::new_with_profile(
+                profile, w, h,
+            )?)),
+            EngineKind::Hardware => {
+                #[cfg(target_os = "macos")]
+                {
+                    Ok(Self::Hardware(crate::vt::VtEncoder::new(
+                        w,
+                        h,
+                        profile.bitrate_kbps * 1000,
+                        profile.fps,
+                        true,
+                    )?))
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = (profile, w, h);
+                    Err(MediaError::HwUnavailable("VideoToolbox is macOS-only".into()))
+                }
+            }
+            EngineKind::Auto => {
+                let (hw, reason) = probe_cached();
+                let selected = decide_engine(hw);
+                match Self::new(profile, w, h, selected) {
+                    Ok(encoder) => {
+                        // ONE decision log line (backend + target + motive).
+                        // Reasons are redacted kinds only — never SDP,
+                        // candidates, pixels or tokens.
+                        let motive = if hw {
+                            "probe ok".to_owned()
+                        } else {
+                            format!("probe failed ({reason}); software fallback")
+                        };
+                        eprintln!(
+                            "golive: encode backend={} target={}x{} ({motive})",
+                            encoder.backend_name(),
+                            w,
+                            h
+                        );
+                        Ok(encoder)
+                    }
+                    // Unreachable for Software; explicit Hardware fail-high
+                    // surfaces here unchanged.
+                    Err(e) => Err(e),
+                }
+            }
+        }
+    }
+
+    /// Encode one frame; `Ok(None)` is a transient skip (capped upstream),
+    /// `Err` is fatal. Units are Annex-B either way.
+    pub fn encode_frame(&mut self, frame: &I420Frame) -> Result<Option<Vec<u8>>, MediaError> {
+        match self {
+            Self::Software(enc) => enc.encode(frame).map(Some),
+            #[cfg(target_os = "macos")]
+            Self::Hardware(enc) => {
+                let nv12 = crate::vt::i420_to_nv12(
+                    frame.w,
+                    frame.h,
+                    &frame.data[..frame.w * frame.h],
+                    &frame.data[frame.w * frame.h..frame.w * frame.h + frame.w * frame.h / 4],
+                    &frame.data[frame.w * frame.h + frame.w * frame.h / 4..],
+                );
+                enc.encode_nv12(&nv12)
+            }
+        }
+    }
+
+    pub fn force_intra(&mut self) {
+        match self {
+            Self::Software(enc) => enc.force_intra(),
+            #[cfg(target_os = "macos")]
+            Self::Hardware(enc) => enc.force_intra(),
+        }
+    }
+
+    pub fn backend_name(&self) -> &'static str {
+        match self {
+            Self::Software(_) => "openh264",
+            #[cfg(target_os = "macos")]
+            Self::Hardware(_) => "videotoolbox",
+        }
+    }
+}
+
+/// Hardware probe: `Ok` iff a real HW H.264 encode completes. Env hook
+/// `GOLIVE_DISABLE_HW=1` forces failure (deterministic fallback tests).
+pub fn probe_hardware() -> Result<(), MediaError> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::vt::probe_hardware()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(MediaError::HwUnavailable("VideoToolbox is macOS-only".into()))
+    }
+}
+
 fn strip_start_code(nal: &[u8]) -> &[u8] {
     if nal.starts_with(&[0, 0, 0, 1]) {
         &nal[4..]
@@ -423,6 +754,49 @@ fn strip_start_code(nal: &[u8]) -> &[u8] {
         &nal[3..]
     } else {
         nal
+    }
+}
+
+/// H.264 level tier by pixel count: HD and below is 3.1, above is 4.0.
+/// Matches the historical mapping (720p→3.1, 1080p→4.0).
+fn level_for(w: usize, h: usize) -> Level {
+    if (w as u64) * (h as u64) <= 1280 * 720 {
+        Level::Level_3_1
+    } else {
+        Level::Level_4_0
+    }
+}
+
+/// Latest-only unit slot between the encode thread and the RTP pump: at
+/// most ONE access unit is ever queued. Publishing replaces stale; taking
+/// consumes. Under congestion the viewer gets the freshest decodable unit
+/// (gaps are packet-loss-shaped, which the decoder already survives) and
+/// the encoder never blocks on a slow peer — the anti-jank root fix.
+/// An empty unit is the poison pill (encoders never emit empty units).
+#[derive(Debug, Default)]
+struct FrameSlot {
+    slot: std::sync::Mutex<Option<(Vec<u8>, Duration)>>,
+    notify: tokio::sync::Notify,
+}
+
+impl FrameSlot {
+    fn publish(&self, unit: Vec<u8>, duration: Duration) {
+        *self.slot.lock().expect("frame slot poisoned") = Some((unit, duration));
+        self.notify.notify_one();
+    }
+
+    fn poison(&self) {
+        *self.slot.lock().expect("frame slot poisoned") = Some((Vec::new(), Duration::ZERO));
+        self.notify.notify_one();
+    }
+
+    async fn take(&self) -> (Vec<u8>, Duration) {
+        loop {
+            if let Some(item) = self.slot.lock().expect("frame slot poisoned").take() {
+                return item;
+            }
+            self.notify.notified().await;
+        }
     }
 }
 
@@ -574,16 +948,49 @@ pub struct Publisher {
     encode_stop: Arc<AtomicBool>,
     encode_thread: Option<std::thread::JoinHandle<()>>,
     stopped: Arc<AtomicBool>,
+    reconfig_tx: Option<std::sync::mpsc::Sender<QualityProfile>>,
+    slot: Arc<FrameSlot>,
+    /// Live encoder backend (`None` until the encode thread builds it).
+    /// Written on every build/rebuild; read for counters/diagnostics.
+    backend: Arc<std::sync::Mutex<Option<&'static str>>>,
 }
 
 impl Publisher {
-    /// Starts publishing `source` at `quality`. Needs a running tokio runtime.
+    /// Starts publishing `source` at `quality` with automatic engine
+    /// selection (hardware where the probe passes, explicit software
+    /// fallback otherwise). Needs a running tokio runtime.
     pub async fn start(
         source: VideoSource,
         quality: Quality,
         ice_servers: Option<Vec<String>>,
         event_tx: mpsc::UnboundedSender<MediaEvent>,
     ) -> Result<Self, MediaError> {
+        Self::start_with_profile(
+            source,
+            quality.profile(),
+            EngineKind::Auto,
+            ice_servers,
+            event_tx,
+        )
+        .await
+    }
+
+    /// Starts publishing at an explicit profile + engine. Needs a running
+    /// tokio runtime. Profile validation fails fast and typed, before any
+    /// peer connection exists.
+    pub async fn start_with_profile(
+        source: VideoSource,
+        profile: QualityProfile,
+        engine: EngineKind,
+        ice_servers: Option<Vec<String>>,
+        event_tx: mpsc::UnboundedSender<MediaEvent>,
+    ) -> Result<Self, MediaError> {
+        profile
+            .validate()
+            .map_err(|e| MediaError::Codec(format!("profile: {e}")))?;
+        // Shared redacted ICE census: trickle handler bumps it, loops
+        // snapshot it into Stats. Kinds/families only, never addresses.
+        let census = Arc::new(std::sync::Mutex::new(CandidateCensus::default()));
         let api = build_api()?;
         let pc = Arc::new(
             api.new_peer_connection(rtc_config(ice_servers))
@@ -607,39 +1014,51 @@ impl Publisher {
                 )
                 .await;
         }
-        wire_ice_events(&pc, &event_tx);
+        wire_ice_events(&pc, &event_tx, &census);
 
-        // Encode on a blocking thread; bridge into tokio via blocking_send.
-        // Backpressure (cap 8) instead of unbounded growth.
-        let (sample_tx, mut sample_rx) = mpsc::channel::<Vec<u8>>(8);
+        // Encode on a blocking thread; latest-only slot into tokio (see
+        // FrameSlot: at most one unit queued, stale replaced, never block).
+        let slot = Arc::new(FrameSlot::default());
+        let backend = Arc::new(std::sync::Mutex::new(None));
+        let (reconfig_tx, reconfig_rx) = std::sync::mpsc::channel::<QualityProfile>();
         let encode_stop = Arc::new(AtomicBool::new(false));
-        let (w, h) = quality.dims();
         let encode_thread = {
             let stop = Arc::clone(&encode_stop);
             let event_tx = event_tx.clone();
+            let slot = Arc::clone(&slot);
+            let backend = Arc::clone(&backend);
+            let census = Arc::clone(&census);
             std::thread::Builder::new()
                 .name("golive-encode".into())
                 .spawn(move || {
-                    encode_loop(source, quality, w, h, &stop, &sample_tx, &event_tx);
+                    encode_loop(source, profile, engine, &stop, &slot, &backend, &census, &event_tx, &reconfig_rx);
                 })
                 .map_err(|e| MediaError::Codec(format!("encode thread: {e}")))?
         };
-        // Pump encoded units into the track with anchored durations.
-        tokio::spawn(async move {
-            while let Some(unit) = sample_rx.recv().await {
-                let sample = Sample {
-                    data: Bytes::from(unit),
-                    timestamp: SystemTime::now(),
-                    duration: FRAME_DURATION,
-                    packet_timestamp: 0,
-                    prev_dropped_packets: 0,
-                    prev_padding_packets: 0,
-                };
-                if track.write_sample(&sample).await.is_err() {
-                    break;
+        // Pump freshest units into the track with per-sample durations from
+        // the live profile (reconfig may change fps mid-share).
+        {
+            let slot = Arc::clone(&slot);
+            tokio::spawn(async move {
+                loop {
+                    let (unit, duration) = slot.take().await;
+                    if unit.is_empty() {
+                        break; // poison pill from stop()
+                    }
+                    let sample = Sample {
+                        data: Bytes::from(unit),
+                        timestamp: SystemTime::now(),
+                        duration,
+                        packet_timestamp: 0,
+                        prev_dropped_packets: 0,
+                        prev_padding_packets: 0,
+                    };
+                    if track.write_sample(&sample).await.is_err() {
+                        break;
+                    }
                 }
-            }
-        });
+            });
+        }
 
         Ok(Self {
             pc,
@@ -647,7 +1066,32 @@ impl Publisher {
             encode_stop,
             encode_thread: Some(encode_thread),
             stopped: Arc::new(AtomicBool::new(false)),
+            reconfig_tx: Some(reconfig_tx),
+            slot,
+            backend,
         })
+    }
+
+    /// Live encoder backend for counters/diagnostics (`None` until the
+    /// encode thread finishes its first build). Non-blocking read.
+    pub fn backend(&self) -> Option<&'static str> {
+        self.backend.lock().ok().and_then(|guard| *guard)
+    }
+
+    /// Transactional reconfig without re-signaling: validates first (typed
+    /// failure, current profile untouched), then hands to the encode thread,
+    /// which rebuilds + forces IDR + bumps the generation fence. Same
+    /// m-line, SPS in-band — WebRTC resolves it.
+    pub fn reconfigure(&self, profile: QualityProfile) -> Result<(), MediaError> {
+        profile
+            .validate()
+            .map_err(|e| MediaError::Codec(format!("profile: {e}")))?;
+        self.reconfig_tx
+            .as_ref()
+            .ok_or(MediaError::Closed)?
+            .send(profile)
+            .map_err(|_| MediaError::Closed)?;
+        Ok(())
     }
 
     pub async fn create_offer(&self) -> Result<String, MediaError> {
@@ -687,13 +1131,15 @@ impl Publisher {
         Ok(())
     }
 
-    /// Bounded idempotent stop: flag, timed PC close, thread join. Never wedges.
+    /// Bounded idempotent stop: flag, timed PC close, poison the pump so it
+    /// cannot park in `take()` forever, thread join. Never wedges.
     pub async fn stop(&mut self) {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
         }
         self.encode_stop.store(true, Ordering::Release);
         let _ = tokio::time::timeout(Duration::from_secs(5), self.pc.close()).await;
+        self.slot.poison();
         if let Some(thread) = self.encode_thread.take() {
             let _ = thread.join();
         }
@@ -701,27 +1147,27 @@ impl Publisher {
     }
 }
 
-/// Encode loop: deterministic pacing from a frame counter (never wall-clock
-/// absolute near RTP). Skips sleep on overrun (catch-up, no burst).
+/// Encode loop: profile-paced frames, transactional reconfig, latest-only
+/// output. Deterministic pacing from the profile fps (never wall-clock
+/// absolute near RTP): each tick targets start+n*interval; overruns skip
+/// sleep (catch-up, no burst). Reconfigs drain to latest and apply atomically
+/// (rebuild + forced IDR + new generation + fresh Stats) without touching
+/// signaling — WebRTC resolves it: same m-line, SPS in-band.
 fn encode_loop(
     source: VideoSource,
-    quality: Quality,
-    w: usize,
-    h: usize,
+    mut profile: QualityProfile,
+    engine: EngineKind,
     stop: &AtomicBool,
-    sample_tx: &mpsc::Sender<Vec<u8>>,
+    slot: &Arc<FrameSlot>,
+    backend: &Arc<std::sync::Mutex<Option<&'static str>>>,
+    census: &Arc<std::sync::Mutex<CandidateCensus>>,
     event_tx: &mpsc::UnboundedSender<MediaEvent>,
+    reconfig_rx: &std::sync::mpsc::Receiver<QualityProfile>,
 ) {
-    let mut encoder = match H264Encoder::new(quality) {
-        Ok(enc) => enc,
-        Err(e) => {
-            let _ = event_tx.send(MediaEvent::Error(e.to_string()));
-            return;
-        }
-    };
-    // Movie frames are pre-decoded once (bounded: 300), then cycled.
+    // 0. Movie preload (native size, capped — see preload_movie). The
+    // bridge/setup failures below are fatal + loud (typed errors).
     let movie_frames: Option<Vec<I420Frame>> = match &source {
-        VideoSource::MovieFile(path) => match preload_movie(path, w, h) {
+        VideoSource::MovieFile(path) => match preload_movie(path) {
             Ok(frames) => Some(frames),
             Err(e) => {
                 let _ = event_tx.send(MediaEvent::Error(e.to_string()));
@@ -730,28 +1176,71 @@ fn encode_loop(
         },
         VideoSource::SyntheticBall | VideoSource::External(_) => None,
     };
-    // External feeds repeat their last frame across pacing gaps (capture
-    // hiccups must not stall the stream); disconnect ends the share.
+    // 1. Initial target + encoder (target computed inside from native dims).
+    let (mut encoder, mut target) =
+        match build_encoder(&profile, &source, engine, movie_frames.as_ref()) {
+            Ok(built) => built,
+            Err(e) => {
+                let _ = event_tx.send(MediaEvent::Error(e.to_string()));
+                return;
+            }
+        };
+    note_backend(backend, encoder.backend_name());
+    let mut generation: u64 = 0;
     let mut ext_last: Option<I420Frame> = None;
+    let mut consecutive_skips: u32 = 0;
     let start = Instant::now();
     let mut n: u64 = 0;
     while !stop.load(Ordering::Acquire) {
-        let base: I420Frame = match &source {
+        // 1. Drain reconfigs to latest; apply atomically.
+        if let Some(next) = drain_reconfigs(reconfig_rx) {
+            if next != profile {
+                match apply_reconfig(&next, &source, movie_frames.as_ref(), engine) {
+                    Ok((new_encoder, new_target)) => {
+                        encoder = new_encoder;
+                        target = new_target;
+                        profile = next;
+                        generation = generation.wrapping_add(1);
+                        encoder.force_intra();
+                        note_backend(backend, encoder.backend_name());
+                        let _ = event_tx.send(MediaEvent::Stats(MediaStats {
+                            census: census_snapshot(census),
+                            generation,
+                            ..Default::default()
+                        }));
+                    }
+                    Err(e) => {
+                        let _ = event_tx.send(MediaEvent::Error(e.to_string()));
+                    }
+                }
+            }
+        }
+        // 2. Fetch one frame at the current target dims. CPU frames scale
+        // here; GPU buffers stay retained until the encode step routes
+        // them (zero-copy submit or one conversion — see below).
+        enum PendingFrame {
+            Cpu(I420Frame),
+            Gpu(GpuPixelBuffer),
+        }
+        let frame: PendingFrame = match &source {
             VideoSource::MovieFile(_) => {
                 let frames = movie_frames.as_ref().expect("preloaded above");
-                scale_frame(&frames[(n as usize) % frames.len()], w, h)
+                PendingFrame::Cpu(scale_frame(&frames[(n as usize) % frames.len()], target.0, target.1))
             }
-            VideoSource::SyntheticBall => synthetic_frame(w, h, n),
+            VideoSource::SyntheticBall => PendingFrame::Cpu(synthetic_frame(target.0, target.1, n)),
             VideoSource::External(ext) => match ext.rx.recv_timeout(EXT_TICK) {
-                Ok(frame) => {
+                Ok(ExternalFrame::Cpu(frame)) => {
                     ext_last = Some(frame.clone());
-                    scale_frame(&frame, w, h)
+                    PendingFrame::Cpu(scale_frame(&frame, target.0, target.1))
                 }
+                // Retained GPU buffer: ownership moves into the encode
+                // step (submit or convert); a drop there releases it.
+                Ok(ExternalFrame::Gpu(gpu)) => PendingFrame::Gpu(gpu),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => match &ext_last {
-                    Some(last) => scale_frame(last, w, h),
+                    Some(last) => PendingFrame::Cpu(scale_frame(last, target.0, target.1)),
                     // No frame yet: black until the first arrives (never a
                     // stale picture from another source — there is none).
-                    None => I420Frame::black(w, h),
+                    None => PendingFrame::Cpu(I420Frame::black(target.0, target.1)),
                 },
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     let _ = event_tx.send(MediaEvent::Error(format!(
@@ -762,15 +1251,25 @@ fn encode_loop(
                 }
             },
         };
-        let frame = base;
-        match encoder.encode(&frame) {
-            Ok(unit) => {
+        // 3. Encode; transient skips are capped, anything else is fatal+loud.
+        let encoded = match frame {
+            PendingFrame::Cpu(frame) => encoder.encode_frame(&frame),
+            PendingFrame::Gpu(gpu) => encode_gpu_frame(&mut encoder, gpu, target),
+        };
+        match encoded {
+            Ok(Some(unit)) => {
+                consecutive_skips = 0;
                 // The host observes its own keyframes here (the sender side
                 // never decodes): NAL type 5 in the produced access unit.
                 if contains_idr(&unit) {
                     let _ = event_tx.send(MediaEvent::Keyframe);
                 }
-                if sample_tx.blocking_send(unit).is_err() {
+                slot.publish(unit, profile.frame_duration());
+            }
+            Ok(None) => {
+                consecutive_skips += 1;
+                if consecutive_skips > 30 {
+                    let _ = event_tx.send(MediaEvent::Error("encoder dropping every frame".into()));
                     break;
                 }
             }
@@ -780,7 +1279,8 @@ fn encode_loop(
             }
         }
         n += 1;
-        let next = start + FRAME_DURATION * (n as u32);
+        // 4. Pace on the CURRENT profile (reconfig may have changed fps).
+        let next = start + profile.frame_duration() * (n as u32);
         let now = Instant::now();
         if next > now {
             std::thread::sleep(next - now);
@@ -788,10 +1288,197 @@ fn encode_loop(
     }
 }
 
-/// Reads a movie file, decodes up to 300 frames into access units
-/// (new unit at each VCL NAL following a unit that already has video),
-/// normalizes to contract size.
-fn preload_movie(path: &PathBuf, w: usize, h: usize) -> Result<Vec<I420Frame>, MediaError> {
+/// Publishes the live encoder backend for counters/diagnostics.
+// Best-effort (a poisoned cell keeps its last value; readers use `None`).
+fn note_backend(
+    backend: &Arc<std::sync::Mutex<Option<&'static str>>>,
+    name: &'static str,
+) {
+    if let Ok(mut guard) = backend.lock() {
+        *guard = Some(name);
+    }
+}
+
+/// Routes a retained GPU buffer: zero-copy submit when the encoder is
+/// hardware at matching dims, else exactly one conversion at capture size
+/// plus scale (same correct output — the documented fallback, still a
+/// fraction of the old always-copy path).
+#[cfg(target_os = "macos")]
+fn encode_gpu_frame(
+    encoder: &mut VideoEncoder,
+    mut gpu: GpuPixelBuffer,
+    target: (usize, usize),
+) -> Result<Option<Vec<u8>>, MediaError> {
+    if (gpu.w as usize, gpu.h as usize) != target {
+        // Dims drift (reconfig in flight, or a source behind the profile):
+        // convert + scale keeps the output correct instead of failing.
+        let frame = gpu_to_i420(&gpu)?;
+        drop(gpu); // release the surface as soon as pixels are out
+        let frame = scale_frame(&frame, target.0, target.1);
+        return encoder.encode_frame(&frame);
+    }
+    match encoder {
+        VideoEncoder::Software(_) => {
+            let frame = gpu_to_i420(&gpu)?;
+            drop(gpu);
+            let frame = scale_frame(&frame, target.0, target.1);
+            encoder.encode_frame(&frame)
+        }
+        VideoEncoder::Hardware(enc) => {
+            let raw = gpu.take(); // adopt the +1; Drop goes inert
+            // SAFETY: adopted from a live +1 (handler retain); from_raw
+            // reconstitutes exactly one owner, dropped at fn end.
+            let pixel = std::ptr::NonNull::new(raw as *mut objc2_core_video::CVPixelBuffer)
+                .map(|nn| unsafe {
+                    objc2_core_foundation::CFRetained::from_raw(nn)
+                });
+            match pixel {
+                Some(pixel) => enc.encode_cv_pixel_buffer(pixel),
+                // Null adopt (cannot happen from the handler): transient
+                // skip, capped upstream like any encoder drop.
+                None => Ok(None),
+            }
+        }
+    }
+}
+
+/// Off-macOS the GPU arm is unreachable (never constructed there); a loud
+/// typed error surfaces a platform bug instead of wedging the share.
+#[cfg(not(target_os = "macos"))]
+fn encode_gpu_frame(
+    _encoder: &mut VideoEncoder,
+    gpu: GpuPixelBuffer,
+    _target: (usize, usize),
+) -> Result<Option<Vec<u8>>, MediaError> {
+    drop(gpu);
+    Err(MediaError::Codec("GPU frame off macOS".into()))
+}
+
+/// One conversion of a retained GPU buffer to I420 (fallback path only:
+/// software backend or dims drift). Borrows the buffer (the handle keeps
+/// the +1); stride-aware copy + platform conversion, all redacted errors.
+#[cfg(target_os = "macos")]
+fn gpu_to_i420(gpu: &GpuPixelBuffer) -> Result<I420Frame, MediaError> {
+    use objc2_core_video::{
+        kCVPixelFormatType_32BGRA, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
+        CVPixelBufferUnlockBaseAddress,
+    };
+    let w = gpu.w as usize;
+    let h = gpu.h as usize;
+    if w < 2 || h < 2 || w > 8192 || h > 8192 || gpu.stride < w * 4 {
+        return Err(MediaError::Codec("GPU frame dims out of range".into()));
+    }
+    // SAFETY: borrow only — the handle outlives this call, and the format
+    // check below runs before any byte is touched.
+    let pixel = unsafe { &*(gpu.as_ptr() as *const objc2_core_video::CVPixelBuffer) };
+    if objc2_core_video::CVPixelBufferGetPixelFormatType(pixel) != kCVPixelFormatType_32BGRA {
+        return Err(MediaError::Codec("GPU frame not BGRA".into()));
+    }
+    if unsafe { CVPixelBufferLockBaseAddress(pixel, CVPixelBufferLockFlags::ReadOnly) } != 0 {
+        return Err(MediaError::Codec("GPU frame lock failed".into()));
+    }
+    let frame = (|| {
+        let base = objc2_core_video::CVPixelBufferGetBaseAddress(pixel) as *const u8;
+        if base.is_null() {
+            return None;
+        }
+        let bytes = gpu
+            .stride
+            .checked_mul(h.saturating_sub(1))?
+            .checked_add(w.checked_mul(4)?)?;
+        // SAFETY: locked above, bounds checked, unlocked below.
+        let src = unsafe { std::slice::from_raw_parts(base, bytes) };
+        let mut data = vec![0u8; bytes];
+        for (dst_row, src_row) in data
+            .chunks_exact_mut(gpu.stride)
+            .zip(src.chunks(gpu.stride))
+            .take(h)
+        {
+            dst_row[..w * 4].copy_from_slice(&src_row[..w * 4]);
+        }
+        let bgra = golive_platform::BgraFrame {
+            w: gpu.w,
+            h: gpu.h,
+            stride: gpu.stride,
+            format: golive_platform::PixelFormat::Bgra8888,
+            data,
+        };
+        let planar = golive_platform::bgra_to_i420(&bgra).ok()?;
+        let mut out = Vec::with_capacity(w * h * 3 / 2);
+        out.extend_from_slice(&planar.y);
+        out.extend_from_slice(&planar.u);
+        out.extend_from_slice(&planar.v);
+        Some(I420Frame { w, h, data: out })
+    })();
+    unsafe { CVPixelBufferUnlockBaseAddress(pixel, CVPixelBufferLockFlags::ReadOnly) };
+    frame.ok_or_else(|| MediaError::Codec("GPU frame convert failed".into()))
+}
+
+/// Native source dims for target resolution (synthetic generates at will;
+/// movie reports its file; external is unknown until frames arrive).
+fn native_dims(source: &VideoSource, profile: &QualityProfile, movie: Option<&Vec<I420Frame>>) -> (u32, u32) {
+    match source {
+        VideoSource::SyntheticBall => (profile.w, profile.h),
+        VideoSource::MovieFile(_) => movie
+            .and_then(|frames| frames.first())
+            .map(|frame| (frame.w as u32, frame.h as u32))
+            .unwrap_or((profile.w, profile.h)),
+        VideoSource::External(_) => (profile.w, profile.h),
+    }
+}
+
+fn initial_target(
+    source: &VideoSource,
+    profile: &QualityProfile,
+    movie: Option<&Vec<I420Frame>>,
+) -> (usize, usize) {
+    let (sw, sh) = native_dims(source, profile, movie);
+    let (w, h) = profile.normalized_dims(sw, sh);
+    (w as usize, h as usize)
+}
+
+/// Build the encoder backend for a target. Software always works;
+/// hardware is probed (Auto) or demanded (Hardware → hard fail).
+fn build_encoder(
+    profile: &QualityProfile,
+    source: &VideoSource,
+    engine: EngineKind,
+    movie: Option<&Vec<I420Frame>>,
+) -> Result<(VideoEncoder, (usize, usize)), MediaError> {
+    let target = initial_target(source, profile, movie);
+    let encoder = VideoEncoder::new(profile, target.0, target.1, engine)?;
+    Ok((encoder, target))
+}
+
+/// Drain pending reconfigs, keeping only the latest (a burst of UI drags
+/// applies once, not N times).
+fn drain_reconfigs(
+    reconfig_rx: &std::sync::mpsc::Receiver<QualityProfile>,
+) -> Option<QualityProfile> {
+    let mut last = None;
+    while let Ok(profile) = reconfig_rx.try_recv() {
+        last = Some(profile);
+    }
+    last
+}
+
+/// Rebuild for a new profile: fresh encoder at the new target + forced IDR
+/// (applied by the caller right after) + SPS in-band on it. No SDP change.
+fn apply_reconfig(
+    next: &QualityProfile,
+    source: &VideoSource,
+    movie: Option<&Vec<I420Frame>>,
+    engine: EngineKind,
+) -> Result<(VideoEncoder, (usize, usize)), MediaError> {
+    next.validate().map_err(|e| MediaError::Codec(format!("profile: {e}")))?;
+    build_encoder(next, source, engine, movie)
+}
+
+/// Reads a movie file, decodes up to 300 frames at NATIVE size capped to
+/// 1080p (memory-bounded; the loop scales per frame to the live target).
+/// Native (not target) size is kept so reconfigs never upscale beyond the
+/// file (see `normalize_dims`).
+fn preload_movie(path: &PathBuf) -> Result<Vec<I420Frame>, MediaError> {
     let bytes =
         std::fs::read(path).map_err(|e| MediaError::Source(format!("read movie: {e}")))?;
     if bytes.len() > 256 * 1024 * 1024 {
@@ -832,7 +1519,15 @@ fn preload_movie(path: &PathBuf, w: usize, h: usize) -> Result<Vec<I420Frame>, M
     if frames.is_empty() {
         return Err(MediaError::Source("movie produced no frames".into()));
     }
-    Ok(frames.into_iter().map(|f| scale_frame(&f, w, h)).collect())
+    // Cap native size at 1080p (memory-bounded preload); the loop scales
+    // per frame to the live target, never upscaling beyond this.
+    Ok(frames
+        .into_iter()
+        .map(|f| {
+            let (w, h) = normalize_dims(f.w as u32, f.h as u32, 1920, 1080);
+            scale_frame(&f, w as usize, h as usize)
+        })
+        .collect())
 }
 
 /// Copies a (possibly strided) decoded slice into a contiguous I420 frame.
@@ -878,14 +1573,18 @@ impl NativeViewer {
                 .await
                 .map_err(|e| MediaError::Transport(format!("pc: {e}")))?,
         );
-        wire_ice_events(&pc, &event_tx);
+        // Shared redacted ICE census (see publisher side).
+        let census = Arc::new(std::sync::Mutex::new(CandidateCensus::default()));
+        wire_ice_events(&pc, &event_tx, &census);
         {
             let event_tx = event_tx.clone();
+            let census = Arc::clone(&census);
             pc.on_track(Box::new(move |track, _, _| {
                 let event_tx = event_tx.clone();
                 let on_frame = Arc::clone(&on_frame);
+                let census = Arc::clone(&census);
                 Box::pin(async move {
-                    read_loop(track, &event_tx, &on_frame).await;
+                    read_loop(track, &event_tx, &on_frame, &census).await;
                 })
             }));
         }
@@ -943,6 +1642,7 @@ async fn read_loop(
     track: Arc<TrackRemote>,
     event_tx: &mpsc::UnboundedSender<MediaEvent>,
     on_frame: &Arc<dyn Fn(PresentedFrame) + Send + Sync>,
+    census: &Arc<std::sync::Mutex<CandidateCensus>>,
 ) {
     let mut depacketizer = H264Packet::default();
     let mut decoder = match H264Decoder::new() {
@@ -978,6 +1678,7 @@ async fn read_loop(
                 if stats.frames_decoded % 30 == 0 {
                     let mut snapshot = stats.clone();
                     snapshot.ice_connected = true;
+                    snapshot.census = census_snapshot(census);
                     let _ = event_tx.send(MediaEvent::Stats(snapshot));
                 }
             }
@@ -1007,21 +1708,32 @@ fn decode_unit(
 }
 
 /// Shared ICE wiring: trickle + redacted census + connected milestone.
-fn wire_ice_events(pc: &Arc<RTCPeerConnection>, event_tx: &mpsc::UnboundedSender<MediaEvent>) {
+/// Snapshot of the shared ICE census (lock briefly, clone small counts).
+fn census_snapshot(cell: &Arc<std::sync::Mutex<CandidateCensus>>) -> CandidateCensus {
+    cell.lock().map(|guard| guard.clone()).unwrap_or_default()
+}
+
+fn wire_ice_events(
+    pc: &Arc<RTCPeerConnection>,
+    event_tx: &mpsc::UnboundedSender<MediaEvent>,
+    census: &Arc<std::sync::Mutex<CandidateCensus>>,
+) {
     {
         let event_tx = event_tx.clone();
-        let mut census = CandidateCensus::default();
+        let census = Arc::clone(census);
         let mut done = false;
         pc.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
-            // Census and completion update here (outer FnMut context); only
-            // owned event data moves into the async block below.
+            // Census updates under a short lock here (sync callback
+            // context); only owned event data moves into async below.
             let outgoing = match candidate {
                 Some(candidate) => {
                     // W3C toJSON form: full "candidate:..." line. (Display is
                     // a short human form and does NOT unmarshal remotely.)
                     match candidate.to_json() {
                         Ok(init) => {
-                            census.add(&init.candidate);
+                            if let Ok(mut guard) = census.lock() {
+                                guard.add(&init.candidate);
+                            }
                             Some(MediaEvent::IceCandidate {
                                 candidate: init.candidate,
                             })
@@ -1087,32 +1799,52 @@ mod tests {
             data[w * h..].fill(128);
             I420Frame { w, h, data }
         }
-        let (ext_tx, ext_rx) = std::sync::mpsc::sync_channel::<I420Frame>(4);
+        let (ext_tx, ext_rx) = std::sync::mpsc::sync_channel::<ExternalFrame>(4);
         let source = VideoSource::External(ExternalSource {
             rx: ext_rx,
             label: "test-inject".into(),
         });
-        let (sample_tx, mut sample_rx) = mpsc::channel::<Vec<u8>>(16);
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<MediaEvent>();
+        let slot = Arc::new(FrameSlot::default());
+        let (_reconfig_tx, reconfig_rx) = std::sync::mpsc::channel::<QualityProfile>();
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let stop_ = std::sync::Arc::clone(&stop);
+        let slot_ = Arc::clone(&slot);
+        let backend_ = Arc::new(std::sync::Mutex::new(None));
+        let census_ = Arc::new(std::sync::Mutex::new(CandidateCensus::default()));
         let handle = std::thread::spawn(move || {
-            encode_loop(source, Quality::P720, 1280, 720, &stop_, &sample_tx, &event_tx);
+            encode_loop(
+                source,
+                QualityProfile::medium(),
+                EngineKind::Software,
+                &stop_,
+                &slot_,
+                &backend_,
+                &census_,
+                &event_tx,
+                &reconfig_rx,
+            );
         });
         for n in 0..5 {
-            ext_tx.send(gray(128, 96, 16 + n * 20)).unwrap();
+            ext_tx.send(ExternalFrame::Cpu(gray(128, 96, 16 + n * 20))).unwrap();
         }
         drop(ext_tx); // source gone: loop must end by itself, bounded
+        // Drain latest-only units on a throwaway runtime (take is async).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
         let mut units = 0;
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        while units < 3 && std::time::Instant::now() < deadline {
-            if sample_rx.try_recv().is_ok() {
-                units += 1;
-            } else {
-                std::thread::sleep(Duration::from_millis(10));
-            }
+        for _ in 0..3 {
+            let got = rt.block_on(async {
+                tokio::time::timeout(Duration::from_secs(10), slot.take()).await
+            });
+            let (unit, duration) = got.expect("unit arrives within 10s");
+            assert!(!unit.is_empty(), "poison pill never counted");
+            assert_eq!(duration, QualityProfile::medium().frame_duration());
+            units += 1;
         }
-        assert!(units >= 3, "encoded {units} injected units");
+        assert_eq!(units, 3);
         // Loop exits on disconnect (bounded by the pacing tick + timeout).
         handle.join().expect("encode loop thread");
         let mut saw_gone = false;
@@ -1201,5 +1933,490 @@ mod tests {
         assert!(!FrameValidator::non_black(0.0));
         assert!(!FrameValidator::non_black(4.0));
         assert!(FrameValidator::non_black(50.0));
+    }
+
+    // -- quality engine ----------------------------------------------------
+
+    #[test]
+    fn presets_match_spec_ladder() {
+        let low = QualityProfile::low();
+        assert_eq!((low.w, low.h, low.bitrate_kbps, low.fps), (854, 480, 800, 15));
+        let medium = QualityProfile::medium();
+        assert_eq!((medium.w, medium.h, medium.bitrate_kbps, medium.fps), (1280, 720, 2000, 30));
+        let high = QualityProfile::high();
+        assert_eq!((high.w, high.h, high.bitrate_kbps, high.fps), (1920, 1080, 10_000, 30));
+        for preset in [low, medium, high] {
+            preset.validate().expect("presets are valid");
+        }
+        // Legacy mapping: P720 is the historical default, P1080 follows HIGH.
+        assert_eq!(Quality::P720.profile(), QualityProfile::medium());
+        assert_eq!(Quality::P1080.profile(), QualityProfile::high());
+    }
+
+    #[test]
+    fn custom_validates_ranges_with_typed_errors() {
+        let ok = QualityProfile::custom(640, 360, 1000, 24).expect("valid custom");
+        assert_eq!((ok.w, ok.h), (640, 360));
+        // Boundaries hold.
+        assert!(QualityProfile::custom(2, 2, 100, 1).is_ok());
+        assert!(QualityProfile::custom(4096, 4096, 20_000, 60).is_ok());
+        // Each axis fails typed (numbers only, no secrets possible).
+        assert_eq!(
+            QualityProfile::custom(1, 360, 1000, 30).unwrap_err(),
+            QualityError::InvalidDimensions { w: 1, h: 360 }
+        );
+        assert_eq!(
+            QualityProfile::custom(640, 5000, 1000, 30).unwrap_err(),
+            QualityError::InvalidDimensions { w: 640, h: 5000 }
+        );
+        assert_eq!(
+            QualityProfile::custom(640, 360, 99, 30).unwrap_err(),
+            QualityError::BitrateOutOfRange(99)
+        );
+        assert_eq!(
+            QualityProfile::custom(640, 360, 20_001, 30).unwrap_err(),
+            QualityError::BitrateOutOfRange(20_001)
+        );
+        assert_eq!(
+            QualityProfile::custom(640, 360, 1000, 0).unwrap_err(),
+            QualityError::FpsOutOfRange(0)
+        );
+        assert_eq!(
+            QualityProfile::custom(640, 360, 1000, 61).unwrap_err(),
+            QualityError::FpsOutOfRange(61)
+        );
+    }
+
+    #[test]
+    fn normalize_evens_aspect_and_never_upscales() {
+        // Odd request floors to even (at most 1px per axis).
+        assert_eq!(normalize_dims(1280, 720, 855, 481), (854, 480));
+        // Aspect preserved: wide source in a square request fits by width.
+        assert_eq!(normalize_dims(1280, 720, 480, 480), (480, 270));
+        // Never upscale beyond the source.
+        assert_eq!(normalize_dims(640, 360, 1920, 1080), (640, 360));
+        // Exact fit passes through.
+        assert_eq!(normalize_dims(1280, 720, 1280, 720), (1280, 720));
+        // Degenerate input never panics, never sub-minimum.
+        assert_eq!(normalize_dims(0, 720, 1280, 720), (2, 2));
+        assert_eq!(normalize_dims(1280, 720, 0, 0), (2, 2));
+        // Idempotent: normalizing twice is a fixed point.
+        let once = normalize_dims(721, 405, 1280, 720);
+        assert_eq!(once, (720, 404));
+        assert_eq!(normalize_dims(once.0, once.1, 1280, 720), once);
+    }
+
+    #[test]
+    fn pacing_and_keyframe_cadence_follow_fps() {
+        assert_eq!(QualityProfile::low().frame_duration(), Duration::from_micros(1_000_000 / 15));
+        assert_eq!(QualityProfile::medium().frame_duration(), Duration::from_micros(1_000_000 / 30));
+        assert_eq!(QualityProfile::high().frame_duration(), Duration::from_micros(1_000_000 / 30));
+        assert_eq!(QualityProfile::low().keyframe_interval_frames(), 30);
+        assert_eq!(QualityProfile::medium().keyframe_interval_frames(), 60);
+        // floor of 2 frames keeps tiny fps sane.
+        let one = QualityProfile::custom(320, 240, 500, 1).unwrap();
+        assert_eq!(one.keyframe_interval_frames(), 2);
+    }
+
+    #[test]
+    fn upload_estimate_is_bitrate_times_watchers_saturating() {
+        assert_eq!(upload_estimate_bps(2_000_000, 0), 0);
+        assert_eq!(upload_estimate_bps(2_000_000, 3), 6_000_000);
+        assert_eq!(upload_estimate_bps(10_000_000, 5), 50_000_000);
+        assert_eq!(upload_estimate_bps(u32::MAX, usize::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn decoder_survives_sps_dims_change_mid_stream() {
+        // Reconfig without re-signaling: the viewer keeps ONE decoder and
+        // picks the new SPS up mid-stream (new dims out, no reset).
+        let mut dec = H264Decoder::new().expect("decoder");
+        let mut enc_a =
+            H264Encoder::new_with_profile(&QualityProfile::custom(640, 360, 2000, 30).unwrap(), 640, 360)
+                .expect("encoder A");
+        for n in 0..5 {
+            let unit = enc_a.encode(&synthetic_frame(640, 360, n)).expect("encode A");
+            let picture = dec.decode(&unit).expect("decode A").expect("picture A");
+            assert_eq!((picture.frame.w, picture.frame.h), (640, 360));
+        }
+        // New generation, new dims: first unit carries fresh SPS/PPS + IDR.
+        let mut enc_b =
+            H264Encoder::new_with_profile(&QualityProfile::custom(480, 270, 1000, 15).unwrap(), 480, 270)
+                .expect("encoder B");
+        let first_b = enc_b.encode(&synthetic_frame(480, 270, 0)).expect("encode B");
+        assert!(contains_idr(&first_b), "reconfig lands on an IDR");
+        let picture = dec.decode(&first_b).expect("decode B").expect("picture B");
+        assert_eq!((picture.frame.w, picture.frame.h), (480, 270));
+        assert_eq!(picture.frame.rgba.len(), 480 * 270 * 4);
+        // Stream continues at the new size.
+        for n in 1..5 {
+            let unit = enc_b.encode(&synthetic_frame(480, 270, n)).expect("encode B");
+            let picture = dec.decode(&unit).expect("decode B").expect("picture B");
+            assert_eq!((picture.frame.w, picture.frame.h), (480, 270));
+        }
+    }
+
+    static HW_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn hw_probe_falls_back_explicitly_and_demanded_hw_fails_high() {
+        // Env mutation is process-global: serialize all HW-touching tests.
+        let _guard = HW_ENV_LOCK.lock().expect("hw lock");
+        std::env::set_var("GOLIVE_DISABLE_HW", "1");
+        assert!(
+            matches!(probe_hardware(), Err(MediaError::HwUnavailable(_))),
+            "hook forces probe failure"
+        );
+        let auto = VideoEncoder::new(&QualityProfile::low(), 320, 240, EngineKind::Auto)
+            .expect("auto falls back to software");
+        assert_eq!(auto.backend_name(), "openh264");
+        assert!(
+            matches!(
+                VideoEncoder::new(&QualityProfile::low(), 320, 240, EngineKind::Hardware),
+                Err(MediaError::HwUnavailable(_))
+            ),
+            "demanded hardware fails high, never silent software"
+        );
+        std::env::remove_var("GOLIVE_DISABLE_HW");
+        // Unhooked, Auto always yields a working encoder (either backend).
+        let auto = VideoEncoder::new(&QualityProfile::low(), 320, 240, EngineKind::Auto)
+            .expect("auto resolves");
+        assert!(matches!(auto.backend_name(), "openh264" | "videotoolbox"));
+        // Hook bypasses the process cache: a primed cache never leaks
+        // hardware into a forced-fallback decision (called twice on purpose).
+        std::env::set_var("GOLIVE_DISABLE_HW", "1");
+        for _ in 0..2 {
+            let auto = VideoEncoder::new(&QualityProfile::low(), 320, 240, EngineKind::Auto)
+                .expect("hooked auto still falls back");
+            assert_eq!(auto.backend_name(), "openh264");
+        }
+        std::env::remove_var("GOLIVE_DISABLE_HW");
+    }
+
+    #[test]
+    fn decide_engine_selects_hw_only_on_probe_ok() {
+        assert_eq!(decide_engine(true), EngineKind::Hardware);
+        assert_eq!(decide_engine(false), EngineKind::Software);
+    }
+
+    #[tokio::test]
+    async fn publisher_reports_live_backend() {
+        // Backend cell starts None and flips to the built backend without
+        // any product-code polling: the encode thread publishes on build.
+        let (event_tx, _event_rx) = mpsc::unbounded_channel::<MediaEvent>();
+        let mut publisher = Publisher::start_with_profile(
+            VideoSource::SyntheticBall,
+            QualityProfile::low(),
+            EngineKind::Software,
+            None,
+            event_tx,
+        )
+        .await
+        .expect("publisher starts");
+        let mut backend = None;
+        for _ in 0..100 {
+            backend = publisher.backend();
+            if backend.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        publisher.stop().await;
+        assert_eq!(backend, Some("openh264"));
+    }
+
+    #[tokio::test]
+    async fn reconfigure_bumps_generation_with_immediate_idr() {
+        // Full transactional path, no network: synthetic → encode thread →
+        // events. Reconfig applies atomically (rebuild + IDR + generation).
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<MediaEvent>();
+        let mut publisher = Publisher::start_with_profile(
+            VideoSource::SyntheticBall,
+            QualityProfile::low(),
+            EngineKind::Software,
+            None,
+            event_tx,
+        )
+        .await
+        .expect("publisher starts");
+        // Liveness first: the initial encoder opens with an IDR.
+        let mut saw_live_idr = false;
+        let live_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while !saw_live_idr {
+            let remaining = live_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, event_rx.recv()).await {
+                Ok(Some(MediaEvent::Keyframe)) => saw_live_idr = true,
+                Ok(Some(MediaEvent::Error(detail))) => panic!("encode failed: {detail}"),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(saw_live_idr, "stream alive before reconfig");
+        // Invalid profiles fail typed BEFORE touching the live encoder.
+        let bad = QualityProfile { w: 640, h: 360, bitrate_kbps: 50, fps: 15 };
+        assert!(
+            matches!(publisher.reconfigure(bad), Err(MediaError::Codec(_))),
+            "validate-first rejects bad profiles"
+        );
+        let next = QualityProfile::custom(640, 360, 1000, 15).expect("valid next");
+        publisher.reconfigure(next).expect("reconfig accepted");
+        // Await the generation fence (bounded), then the forced IDR after it.
+        let mut saw_post_idr = false;
+        let mut gen_seen = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !gen_seen || !saw_post_idr {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, event_rx.recv()).await {
+                Ok(Some(MediaEvent::Keyframe)) => {
+                    if gen_seen {
+                        saw_post_idr = true;
+                    }
+                }
+                Ok(Some(MediaEvent::Stats(stats))) => {
+                    if stats.generation == 1 {
+                        gen_seen = true;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        publisher.stop().await;
+        assert!(gen_seen, "generation fence bumps to 1");
+        assert!(saw_post_idr, "forced IDR lands right after reconfig");
+    }
+
+    #[tokio::test]
+    async fn reconfig_mid_stream_viewer_follows_dims_change() {
+        // End-to-end through the real path minus RTP: encode thread →
+        // latest-only slot → ONE decoder standing in for the viewer. A
+        // 720p→360p reconfig must land via in-band SPS: new dims out of the
+        // same decoder, no reset, stream alive throughout.
+        let profile_b = QualityProfile::custom(640, 360, 1000, 15).expect("profile B");
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<MediaEvent>();
+        let slot = Arc::new(FrameSlot::default());
+        let (reconfig_tx, reconfig_rx) = std::sync::mpsc::channel::<QualityProfile>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (stop_, slot_) = (Arc::clone(&stop), Arc::clone(&slot));
+        let backend_ = Arc::new(std::sync::Mutex::new(None));
+        let census_ = Arc::new(std::sync::Mutex::new(CandidateCensus::default()));
+        let handle = std::thread::spawn(move || {
+            encode_loop(
+                VideoSource::SyntheticBall,
+                QualityProfile::medium(),
+                EngineKind::Software,
+                &stop_,
+                &slot_,
+                &backend_,
+                &census_,
+                &event_tx,
+                &reconfig_rx,
+            );
+        });
+        let mut dec = H264Decoder::new().expect("decoder");
+        async fn take_unit(slot: &FrameSlot, secs: u64) -> Vec<u8> {
+            let (unit, _) = tokio::time::timeout(Duration::from_secs(secs), slot.take())
+                .await
+                .expect("unit arrives");
+            assert!(!unit.is_empty(), "poison pill never counted");
+            unit
+        }
+        // Phase 1: 720p pictures out of the shared decoder.
+        let mut saw_a = false;
+        let phase1 = tokio::time::Instant::now() + Duration::from_secs(15);
+        while !saw_a {
+            assert!(
+                tokio::time::Instant::now() < phase1,
+                "720p pictures never arrived"
+            );
+            let unit = take_unit(&slot, 10).await;
+            if let Some(picture) = dec.decode(&unit).expect("decode") {
+                if (picture.frame.w, picture.frame.h) == (1280, 720) {
+                    saw_a = true;
+                }
+            }
+        }
+        // Reconfig mid-stream; fence + forced IDR observed on events.
+        reconfig_tx.send(profile_b).expect("reconfig sent");
+        let mut gen_seen = false;
+        let mut saw_post_idr = false;
+        let fence_line = tokio::time::Instant::now() + Duration::from_secs(15);
+        while !gen_seen || !saw_post_idr {
+            let remaining = fence_line.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!remaining.is_zero(), "fence/IDR never observed");
+            match tokio::time::timeout(remaining, event_rx.recv()).await {
+                Ok(Some(MediaEvent::Keyframe)) => {
+                    if gen_seen {
+                        saw_post_idr = true;
+                    }
+                }
+                Ok(Some(MediaEvent::Stats(stats))) => {
+                    if stats.generation == 1 {
+                        gen_seen = true;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => panic!("event channel closed early"),
+            }
+        }
+        // Phase 2: the SAME decoder now yields 360p (SPS-driven, no reset).
+        let mut saw_b = false;
+        let phase2 = tokio::time::Instant::now() + Duration::from_secs(15);
+        while !saw_b {
+            assert!(
+                tokio::time::Instant::now() < phase2,
+                "360p pictures never arrived after reconfig"
+            );
+            let unit = take_unit(&slot, 10).await;
+            if let Some(picture) = dec.decode(&unit).expect("decode") {
+                assert!(
+                    (picture.frame.w, picture.frame.h) == (1280, 720)
+                        || (picture.frame.w, picture.frame.h) == (640, 360),
+                    "no other dims mid-flight: {:?}",
+                    (picture.frame.w, picture.frame.h)
+                );
+                if (picture.frame.w, picture.frame.h) == (640, 360) {
+                    assert_eq!(picture.frame.rgba.len(), 640 * 360 * 4);
+                    saw_b = true;
+                }
+            }
+        }
+        stop.store(true, Ordering::Release);
+        handle.join().expect("encode loop thread");
+        assert!(saw_a && gen_seen && saw_post_idr && saw_b);
+    }
+
+    /// Real IOSurface-backed pixel buffer with no capture involved:
+    /// allocating buffers needs no TCC (only SCK capture does).
+    #[cfg(target_os = "macos")]
+    fn mock_hw_buffer(w: usize, h: usize) -> objc2_core_foundation::CFRetained<objc2_core_video::CVPixelBuffer> {
+        use objc2_core_video::{kCVPixelFormatType_32BGRA, CVPixelBuffer, CVPixelBufferCreate};
+        let mut raw: *mut CVPixelBuffer = std::ptr::null_mut();
+        // SAFETY: out-pointer valid; None allocator/attributes are allowed.
+        let status = unsafe {
+            CVPixelBufferCreate(
+                None,
+                w,
+                h,
+                kCVPixelFormatType_32BGRA,
+                None,
+                std::ptr::NonNull::new(&mut raw).expect("out-pointer"),
+            )
+        };
+        assert_eq!(status, 0, "pool buffer created");
+        unsafe {
+            objc2_core_foundation::CFRetained::from_raw(
+                std::ptr::NonNull::new(raw).expect("non-null buffer"),
+            )
+        }
+    }
+
+    /// Test-only release balancing a `GpuPixelBuffer` wrap below.
+    /// Reconstitutes the +1 and drops it (safe: only ever handed real
+    /// buffers from `mock_hw_buffer`).
+    #[cfg(target_os = "macos")]
+    unsafe extern "C-unwind" fn test_gpu_release(ptr: *mut std::ffi::c_void) {
+        if ptr.is_null() {
+            return;
+        }
+        unsafe {
+            drop(
+                objc2_core_foundation::CFRetained::<objc2_core_video::CVPixelBuffer>::from_raw(
+                    std::ptr::NonNull::new(ptr as *mut objc2_core_video::CVPixelBuffer)
+                        .expect("non-null"),
+                ),
+            );
+        }
+    }
+
+    /// Counting no-op release for dangling/error-injection handles: never
+    /// dereferences, only proves Drop runs exactly once.
+    #[cfg(target_os = "macos")]
+    unsafe extern "C-unwind" fn counting_noop_release(ptr: *mut std::ffi::c_void) {
+        assert!(!ptr.is_null());
+        TEST_RELEASES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(target_os = "macos")]
+    static TEST_RELEASES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hw_zero_copy_submit_mock_iosurface_buffer() {
+        // True zero-copy integration without TCC: a real (IOSurface-backed)
+        // pool buffer goes straight into VTCompressionSessionEncodeFrame —
+        // no pool copy, no NV12 staging. VT works on this machine (see the
+        // probe test); the hook stays off here under the shared lock.
+        let _guard = HW_ENV_LOCK.lock().expect("hw lock");
+        std::env::remove_var("GOLIVE_DISABLE_HW");
+        let pixel = mock_hw_buffer(640, 360);
+        let mut enc = crate::vt::VtEncoder::new(640, 360, 2_000_000, 30, true)
+            .expect("hw session");
+        let unit = enc
+            .encode_cv_pixel_buffer(pixel)
+            .expect("submit")
+            .expect("unit out");
+        assert!(!unit.is_empty());
+        assert!(contains_idr(&unit), "first zero-copy submit is an IDR");
+        assert!(!annexb_nals(&unit).is_empty(), "units split");
+        enc.close();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hw_routing_falls_back_on_injected_dims_mismatch() {
+        // Injected error: retained 640x360 buffer against a 320x240 target.
+        // No HW needed (software route): convert + scale still yields
+        // correct-dims output instead of failing the session.
+        let pixel = mock_hw_buffer(640, 360);
+        let raw = objc2_core_foundation::CFRetained::into_raw(pixel);
+        // SAFETY: +1 moves into the handle with the balancing release.
+        let gpu = unsafe {
+            GpuPixelBuffer::from_raw(
+                raw.as_ptr() as *mut std::ffi::c_void,
+                640,
+                360,
+                640 * 4,
+                test_gpu_release,
+            )
+        };
+        let profile = QualityProfile::custom(320, 240, 500, 15).expect("profile");
+        let mut encoder =
+            VideoEncoder::new(&profile, 320, 240, EngineKind::Software).expect("sw encoder");
+        let unit = encode_gpu_frame(&mut encoder, gpu, (320, 240))
+            .expect("fallback converts")
+            .expect("unit out");
+        let mut dec = H264Decoder::new().expect("decoder");
+        let picture = dec.decode(&unit).expect("decode").expect("picture");
+        assert_eq!((picture.frame.w, picture.frame.h), (320, 240));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gpu_convert_rejects_degenerate_dims_without_touching_pixels() {
+        // Injected error with a dangling handle: w=0 must fail on the
+        // bounds check before any pointer is borrowed.
+        // SAFETY: never dereferenced — the dims check fires first, and the
+        // counting release never touches the pointer either.
+        TEST_RELEASES.store(0, std::sync::atomic::Ordering::SeqCst);
+        let gpu = unsafe {
+            GpuPixelBuffer::from_raw(
+                0x1000 as *mut std::ffi::c_void,
+                0,
+                48,
+                256,
+                counting_noop_release,
+            )
+        };
+        assert!(gpu_to_i420(&gpu).is_err());
+        // Drop releases exactly once even on the error path above.
+        drop(gpu);
+        assert_eq!(TEST_RELEASES.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

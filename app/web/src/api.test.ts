@@ -12,12 +12,14 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: mockListen }));
 
 import {
   createRoom,
+  getMediaCounters,
   getSnapshot,
   joinRoom,
   leaveRoom,
   listSources,
   onMediaEvent,
   onSignalEvent,
+  setQuality,
   setServer,
   sourceCapabilities,
   startShare,
@@ -54,6 +56,43 @@ describe("intents (comando certo, args certos)", () => {
   it("leave não leva args", async () => {
     await leaveRoom();
     expect(mockInvoke).toHaveBeenCalledWith("leave");
+  });
+
+  it("set_quality leva o payload top-level exato (sem wrapper)", async () => {
+    const result = {
+      profile: { w: 1280, h: 720, bitrate_kbps: 2000, fps: 30 },
+      generation: 0,
+    };
+    mockInvoke.mockResolvedValueOnce(result);
+    await expect(
+      setQuality({ w: 1280, h: 720, bitrate_kbps: 2000, fps: 30 }, "medium"),
+    ).resolves.toEqual(result);
+    // Tauri converte snake_case Rust para camelCase no IPC (argument_case
+    // default = Camel): a fronteira do invoke envia bitrateKbps.
+    expect(mockInvoke).toHaveBeenCalledWith("set_quality", {
+      w: 1280,
+      h: 720,
+      bitrateKbps: 2000,
+      fps: 30,
+      preset: "medium",
+    });
+  });
+
+  it("set_quality custom omite o preset", async () => {
+    const result = {
+      profile: { w: 640, h: 360, bitrate_kbps: 1000, fps: 24 },
+      generation: 0,
+    };
+    mockInvoke.mockResolvedValueOnce(result);
+    await expect(
+      setQuality({ w: 640, h: 360, bitrate_kbps: 1000, fps: 24 }),
+    ).resolves.toEqual(result);
+    expect(mockInvoke).toHaveBeenCalledWith("set_quality", {
+      w: 640,
+      h: 360,
+      bitrateKbps: 1000,
+      fps: 24,
+    });
   });
 
   it("start_share leva a fonte opaca; stop_share não leva args", async () => {
@@ -139,5 +178,38 @@ describe("fontes de captura (nomes exatos do backend)", () => {
     mockInvoke.mockResolvedValueOnce(caps);
     await expect(sourceCapabilities()).resolves.toEqual(caps);
     expect(mockInvoke).toHaveBeenCalledWith("source_capabilities");
+  });
+});
+
+describe("contadores de mídia (fallback observacional com links)", () => {
+  it("get_media_counters sem args devolve links por membro intactos", async () => {
+    const counters = {
+      connected: true,
+      frames: 120,
+      keyframes: 4,
+      keyframes_seen: true,
+      presented: 118,
+      links: [
+        {
+          member: "m-2",
+          title: "Bia",
+          codec: "H.264 Constrained Baseline",
+          width: 1280,
+          height: 720,
+          decoded: 120,
+          presented: 118,
+          dropped: 2,
+          render_fps: 29.7,
+          bitrate_bps: 1800000,
+          bitrate_note: "medido em bytes RGBA apresentados (pos-decode)",
+          delay_estimate_ms: null,
+          delay_note: "estimativa indisponivel: RTT do par ICE nao exposto pelo core",
+          dropped_note: "aproximacao: decodificados menos apresentados",
+        },
+      ],
+    };
+    mockInvoke.mockResolvedValueOnce(counters);
+    await expect(getMediaCounters()).resolves.toEqual(counters);
+    expect(mockInvoke).toHaveBeenCalledWith("get_media_counters");
   });
 });

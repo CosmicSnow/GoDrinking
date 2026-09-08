@@ -20,7 +20,12 @@ objc2-foundation = { version = "0.3", features = [
     "NSString",
 ] }
 objc2-core-media = "0.3"
-objc2-core-video = "0.3"
+# CVPixelBufferIOSurface for the zero-copy backing check (offline-safe:
+# objc2-io-surface is already in the lockfile via the default set).
+# The direct dep enables its `objc2` cargo feature, which the generated
+# getter needs (weak-dep `?` does not turn it on by itself).
+objc2-core-video = { version = "0.3", features = ["objc2-io-surface"] }
+objc2-io-surface = { version = "0.3", features = ["objc2"] }
 objc2-screen-capture-kit = "0.3"
 block2 = "0.6"
 dispatch2 = { version = "0.3", features = ["objc2"] }

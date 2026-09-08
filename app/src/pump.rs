@@ -80,6 +80,7 @@ pub fn spawn_forward(
                         }
                     }
                     bump_connected(&state);
+                    state.session_log("ice connected".to_string());
                     emit(&app, "media-event", &serde_json::json!({"kind": "ice-connected"}));
                 }
                 MediaEvent::VideoFrame { non_black, motion } => {
@@ -96,6 +97,43 @@ pub fn spawn_forward(
                 }
                 MediaEvent::Stats(stats) => {
                     merge_stats(&state, stats.frames_decoded, stats.keyframes_decoded, stats.ice_connected);
+                    // Generation fence (host side): the encode thread bumps
+                    // it on every applied reconfig. First observer wins the
+                    // authoritative `quality` event; the snapshot
+                    // (`get_media_counters.effective`) reflects it too.
+                    if matches!(target, ForwardTarget::Share) && stats.generation > 0 {
+                        let bumped = {
+                            let mut bumped = None;
+                            if let Ok(mut inner) = state.inner.lock() {
+                                let current = inner.share_profile.map(|s| s.generation).unwrap_or(0);
+                                if stats.generation > current {
+                                    if let Some(share) = inner.share_profile.as_mut() {
+                                        share.generation = stats.generation;
+                                        bumped = Some(*share);
+                                    }
+                                }
+                            }
+                            bumped
+                        };
+                        if let Some(effective) = bumped {
+                            state.session_log(format!(
+                                "quality applied generation={} profile={}x{}@{}",
+                                effective.generation,
+                                effective.profile.w,
+                                effective.profile.h,
+                                effective.profile.fps,
+                            ));
+                            emit(
+                                &app,
+                                "media-event",
+                                &serde_json::json!({
+                                    "kind": "quality",
+                                    "profile": effective.profile,
+                                    "generation": effective.generation,
+                                }),
+                            );
+                        }
+                    }
                     // Presented is summed live from the native windows.
                     let presented = {
                         state
@@ -106,6 +144,80 @@ pub fn spawn_forward(
                             })
                             .unwrap_or(0)
                     };
+                    // Per-link transmission stats for the watched member
+                    // (viewer side only; the host has no windows).
+                    let links = match target {
+                        ForwardTarget::Watch => {
+                            let member = state
+                                .inner
+                                .lock()
+                                .ok()
+                                .and_then(|inner| inner.owner.watchers().first().cloned())
+                                .unwrap_or_default();
+                            if member.is_empty() {
+                                Vec::new()
+                            } else {
+                                state
+                                    .link_stats_for(&member)
+                                    .map(|link| vec![link])
+                                    .unwrap_or_default()
+                            }
+                        }
+                        ForwardTarget::Share => Vec::new(),
+                    };
+                    // Live encode backend (host only; the viewer has no
+                    // encoder). Best-effort read on the event, never polled.
+                    // First sighting (and every change) also lands in the
+                    // session file for packaged verification.
+                    let backend = match target {
+                        ForwardTarget::Share => state
+                            .inner
+                            .lock()
+                            .ok()
+                            .and_then(|inner| {
+                                inner
+                                    .publishers
+                                    .values()
+                                    .filter_map(|session| session.publisher.try_lock().ok())
+                                    .filter_map(|publisher| publisher.backend())
+                                    .map(|name| name.to_owned())
+                                    .next()
+                            }),
+                        ForwardTarget::Watch => None,
+                    };
+                    if matches!(target, ForwardTarget::Share) {
+                        if let Ok(mut inner) = state.inner.lock() {
+                            let seen = backend.clone();
+                            if seen.is_some() && seen != inner.last_logged_backend {
+                                inner.last_logged_backend = seen.clone();
+                                if let Some(name) = seen {
+                                    state.session_log(format!("backend {name}"));
+                                }
+                            }
+                            // Redacted ICE census, once per process: kinds
+                            // and counts only (never addresses — the struct
+                            // cannot even hold them).
+                            if !inner.census_logged {
+                                let total = stats.census.host
+                                    + stats.census.srflx
+                                    + stats.census.other_typ;
+                                if total > 0 {
+                                    inner.census_logged = true;
+                                    state.session_log(format!(
+                                        "ice census host={} srflx={} other={} udp={} tcp={} ip4={} ip6={}",
+                                        stats.census.host,
+                                        stats.census.srflx,
+                                        stats.census.other_typ,
+                                        stats.census.udp,
+                                        stats.census.tcp,
+                                        stats.census.ip4,
+                                        stats.census.ip6,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    let backend_note = super::backend_note_for(backend.as_deref());
                     emit(
                         &app,
                         "media-event",
@@ -117,6 +229,9 @@ pub fn spawn_forward(
                             "host": stats.census.host,
                             "srflx": stats.census.srflx,
                             "presented": presented,
+                            "links": links,
+                            "backend": backend,
+                            "backend_note": backend_note,
                         }),
                     );
                 }
@@ -639,11 +754,14 @@ async fn on_viewer_envelope(state: &Arc<AppState>, payload: &Envelope) {
         // window); title carries the publisher nickname.
         let watcher = to.clone();
         let title = watcher_nickname(state, &watcher);
-        let on_frame = {
-            let state = Arc::clone(state);
-            let presented = Arc::new(std::sync::atomic::AtomicU64::new(0));
-            Arc::new(move |frame: golive_core::media::PresentedFrame| {
-                let push = {
+            let on_frame = {
+                let state = Arc::clone(state);
+                let presented = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                Arc::new(move |frame: golive_core::media::PresentedFrame| {
+                    // Event-driven decode observation (feeds per-link stats;
+                    // no polling anywhere on this path).
+                    state.note_link_frame(&watcher, &title, frame.w as u32, frame.h as u32);
+                    let push = {
                     let mut inner = match state.inner.lock() {
                         Ok(inner) => inner,
                         Err(_) => return,

@@ -1,3 +1,0 @@
-module CoreFoundationBridge {
-    header "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/apple-cf-f3212034ed417ea5/out/swift-build/arm64-apple-macosx/release/CoreFoundationBridge.build/include/CoreFoundationBridge-Swift.h"
-}

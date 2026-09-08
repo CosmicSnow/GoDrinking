@@ -1,3 +1,0 @@
-module AppleMetalBridge {
-    header "/Users/jouydurao/projetos/personal/GoLive/platform-macos/target/debug/build/apple-metal-3784fbafc1c871e9/out/swift-build/arm64-apple-macosx/release/AppleMetalBridge.build/include/AppleMetalBridge-Swift.h"
-}

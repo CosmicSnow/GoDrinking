@@ -1,9 +1,9 @@
 //! The capture contract. Backends implement this; the core never sees it
-//! (frames cross into the core as plain channel data), and tests inject a
+//! (packets cross into the core as plain channel data), and tests inject a
 //! [`crate::mock::MockSource`] with no OS involved.
 
 use crate::error::PlatformError;
-use crate::types::{BgraFrame, CaptureConfig, SourceInfo};
+use crate::types::{CaptureConfig, CapturePacket, SourceInfo};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
@@ -23,7 +23,7 @@ pub enum NextError {
 /// A live capture: poll frames, stop with a deadline. Dropping stops
 /// best-effort (bounded); explicit [`FrameStream::stop`] reports.
 pub struct FrameStream {
-    rx: mpsc::Receiver<BgraFrame>,
+    rx: mpsc::Receiver<CapturePacket>,
     error: Arc<std::sync::Mutex<Option<PlatformError>>>,
     stop_flag: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -33,7 +33,7 @@ impl FrameStream {
     /// Backend-only constructor: backends build the channel + worker and
     /// hand the assembled stream over. Not for app code (use a backend).
     pub fn new(
-        rx: mpsc::Receiver<BgraFrame>,
+        rx: mpsc::Receiver<CapturePacket>,
         error: Arc<std::sync::Mutex<Option<PlatformError>>>,
         stop_flag: Arc<AtomicBool>,
         worker: JoinHandle<()>,
@@ -41,9 +41,9 @@ impl FrameStream {
         Self { rx, error, stop_flag, worker: Some(worker) }
     }
 
-    /// Next frame within `timeout`. Stale frames never queue upstream: the
+    /// Next packet within `timeout`. Stale packets never queue upstream: the
     /// backend keeps latest-only (cap 2, drop oldest), so this is fresh.
-    pub fn next_frame(&self, timeout: Duration) -> Result<BgraFrame, NextError> {
+    pub fn next_frame(&self, timeout: Duration) -> Result<CapturePacket, NextError> {
         match self.rx.recv_timeout(timeout) {
             Ok(frame) => Ok(frame),
             Err(mpsc::RecvTimeoutError::Timeout) => Err(NextError::Timeout),

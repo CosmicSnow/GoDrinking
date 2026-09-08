@@ -11,6 +11,8 @@ node_modules
 src-tauri/target
 core/target
 app/target
+platform/target
+platform-macos/target
 gst-spike/target
 e2e-artifacts/
 dist

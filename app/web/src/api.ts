@@ -7,12 +7,23 @@
  * - create_room {nickname, password} -> string (código da sala)
  * - join_room {code, nickname, password} -> string (nosso member id)
  * - leave {} -> ()
- * - start_share {source} -> ()  ("synthetic" ou "movie:/caminho")
+ * - start_share {source} -> ()  ("synthetic", "movie:/caminho",
+ *   "display:<id>", "window:<id>")
  * - stop_share {} -> ()
+ * - set_quality {w, h, bitrate_kbps, fps, preset?} -> {profile, generation}
+ *   (top-level, sem wrapper; preset "low"|"medium"|"high" é hint de display,
+ *   os números mandam; erros redatados: "qualidade: …", "not sharing")
  * - watch {member} -> ()
  * - unwatch {member} -> ()
  * - get_snapshot {} -> OwnerSnapshot
+ * - get_media_counters {} -> MediaCounters (links + effective autoritativo)
  * - set_server {base} -> string (base normalizada)
+ * - list_sources {} -> SourceInfo[] | source_capabilities {} -> CapabilitySet
+ *   (fontes de captura; e2e_* são test-only, fora do caminho da UI)
+ *
+ * Perfil efetivo autoritativo: `get_media_counters().effective` (None fora
+ * do share) + evento `media-event {kind:"quality", profile, generation}`
+ * (a geração só chega async). A UI nunca trata o staged como efetivo.
  *
  * Eventos de `app/src/pump.rs` (cargas já redigidas no backend: kinds e
  * contagens — nunca SDP, candidates ou tokens):
@@ -79,8 +90,15 @@ export type MediaEvent =
       srflx: number;
       /** Frames presented in native windows (acks). Omitted by old shells. */
       presented?: number;
+      /** Per-link (lado viewer; host recebe []). Omitted by old shells. */
+      links?: LinkStats[];
+      /** Codificador vivo no host; null até o build. Omitted by old shells. */
+      backend?: string | null;
+      /** Motivo do fallback; null no hardware. Omitted by old shells. */
+      backend_note?: string | null;
     }
   | { kind: "gathering-complete" }
+  | { kind: "quality"; profile: QualityProfile; generation: number }
   | { kind: "error" };
 
 export interface ViewerStats {
@@ -125,6 +143,26 @@ export function stopShare(): Promise<void> {
   return invoke<void>("stop_share");
 }
 
+/**
+ * Aplica o perfil ao share vivo. O macro Tauri converte parâmetros Rust
+ * snake_case para chaves IPC camelCase por padrão (`argument_case = Camel`),
+ * então `bitrate_kbps` viaja como `bitrateKbps` — conversão feita AQUI, na
+ * fronteira do invoke, e em nenhum outro lugar.
+ */
+export function setQuality(
+  profile: QualityProfile,
+  preset?: QualityPresetHint,
+): Promise<EffectiveQuality> {
+  const { w, h, bitrate_kbps, fps } = profile;
+  return invoke<EffectiveQuality>("set_quality", {
+    w,
+    h,
+    bitrateKbps: bitrate_kbps,
+    fps,
+    ...(preset ? { preset } : {}),
+  });
+}
+
 /** Pede para assistir ao membro (intenção de watch, lado viewer). */
 export function watchMember(member: string): Promise<void> {
   return invoke<void>("watch", { member });
@@ -140,6 +178,53 @@ export function getSnapshot(): Promise<OwnerSnapshot> {
   return invoke<OwnerSnapshot>("get_snapshot");
 }
 
+/**
+ * Estatística por link (app/src/video.rs `LinkStats`, serializada como está).
+ * `delay_estimate_ms` é sempre None até o core expor RTT (BLOQUEADO) — a UI
+ * mostra "—" honesto + `delay_note`. `dropped` é aproximação (decodificados
+ * menos apresentados); `bitrate_bps` é medido pós-decode (ver `bitrate_note`).
+ */
+export interface LinkStats {
+  member: string;
+  title: string;
+  codec: string;
+  width: number;
+  height: number;
+  decoded: number;
+  presented: number;
+  dropped: number;
+  render_fps: number;
+  bitrate_bps: number;
+  bitrate_note: string;
+  delay_estimate_ms: number | null;
+  delay_note: string;
+  dropped_note: string;
+}
+
+/**
+ * Perfil de qualidade validado (core/src/media.rs `QualityProfile`,
+ * serializado como está). `preset` só existe no comando, como hint.
+ */
+export interface QualityProfile {
+  w: number;
+  h: number;
+  bitrate_kbps: number;
+  fps: number;
+}
+
+/** Hint de display do comando; os números do perfil mandam. */
+export type QualityPresetHint = "low" | "medium" | "high";
+
+/**
+ * Perfil efetivo autoritativo (app/src/lib.rs `EffectiveQuality`): último
+ * perfil aceito (ou o default do start_share) + geração do fence. A geração
+ * conta reconfigurações aplicadas e chega async via evento `quality`.
+ */
+export interface EffectiveQuality {
+  profile: QualityProfile;
+  generation: number;
+}
+
 /** Contadores de mídia observados no backend (pollable fallback). */
 export interface MediaCounters {
   connected: boolean;
@@ -147,6 +232,14 @@ export interface MediaCounters {
   keyframes: number;
   keyframes_seen: boolean;
   presented: number;
+  /** Um item por membro assistido com janela nativa; vazio ocioso/host. */
+  links: LinkStats[];
+  /** Efetivo autoritativo; None fora do share. */
+  effective: EffectiveQuality | null;
+  /** Codificador vivo (`videotoolbox`/`openh264`); null até o primeiro build. */
+  backend: string | null;
+  /** Motivo do fallback software; null no hardware ou sem backend. */
+  backend_note: string | null;
 }
 
 export function getMediaCounters(): Promise<MediaCounters> {

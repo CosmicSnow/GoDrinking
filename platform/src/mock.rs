@@ -3,7 +3,7 @@
 
 use crate::error::PlatformError;
 use crate::traits::{FrameStream, NextError, VideoSource};
-use crate::types::{BgraFrame, CaptureConfig, PixelFormat, SourceInfo, SourceKind};
+use crate::types::{BgraFrame, CaptureConfig, CapturePacket, PixelFormat, SourceInfo, SourceKind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
@@ -73,7 +73,7 @@ impl VideoSource for MockSource {
         let frames = self.frames.clone();
         let fail_after = self.fail_after.clone();
         let fps = config.fps.max(1);
-        let (tx, rx) = mpsc::sync_channel::<BgraFrame>(2);
+        let (tx, rx) = mpsc::sync_channel::<CapturePacket>(2);
         let error: Arc<std::sync::Mutex<Option<PlatformError>>> = Arc::new(std::sync::Mutex::new(None));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let error_ = Arc::clone(&error);
@@ -98,7 +98,7 @@ impl VideoSource for MockSource {
                     }
                     let frame = frames[n % frames.len()].clone();
                     n += 1;
-                    if tx.send(frame).is_err() {
+                    if tx.send(CapturePacket::Cpu(frame)).is_err() {
                         break;
                     }
                     std::thread::sleep(tick);
@@ -119,7 +119,10 @@ pub fn drive_lifecycle<S: VideoSource>(
     let mut out = Vec::new();
     for _ in 0..frames_wanted {
         match stream.next_frame(Duration::from_secs(5)) {
-            Ok(frame) => out.push(frame),
+            // The mock only ever emits CPU packets; a GPU packet here
+            // would be a mock bug, surfaced loudly instead of silently.
+            Ok(CapturePacket::Cpu(frame)) => out.push(frame),
+            Ok(CapturePacket::Gpu(_)) => panic!("mock emitted a GPU packet"),
             Err(NextError::Timeout) => continue,
             Err(NextError::Ended) => break,
             Err(NextError::Failed(error)) => {
@@ -177,11 +180,11 @@ mod tests {
     fn empty_script_ends_immediately() {
         let info = info();
         let mut source = MockSource::open(&info).unwrap();
-        let mut stream = source.start(&CaptureConfig::default()).unwrap();
-        assert_eq!(
+        let stream = source.start(&CaptureConfig::default()).unwrap();
+        assert!(matches!(
             stream.next_frame(Duration::from_secs(5)),
             Err(NextError::Ended)
-        );
+        ));
     }
 
     #[test]
@@ -190,11 +193,12 @@ mod tests {
         let mut source = MockSource::open(&info).unwrap();
         source.frames = vec![MockSource::display("x", 2, 2).with_solid_frame(1, 2, 3).frames.remove(0)];
         source.fail_after = Some((1, PlatformError::SourceGone { id: "9".into() }));
-        let mut stream = source.start(&CaptureConfig::default()).unwrap();
+        let stream = source.start(&CaptureConfig::default()).unwrap();
         assert!(stream.next_frame(Duration::from_secs(5)).is_ok());
-        assert_eq!(
+        assert!(matches!(
             stream.next_frame(Duration::from_secs(5)),
-            Err(NextError::Failed(PlatformError::SourceGone { id: "9".into() }))
-        );
+            Err(NextError::Failed(PlatformError::SourceGone { id }))
+            if id == "9"
+        ));
     }
 }

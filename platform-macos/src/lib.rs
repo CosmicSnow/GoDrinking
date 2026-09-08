@@ -40,8 +40,8 @@
 //! (non-BGRA aborts the frame, never misinterprets it).
 
 use golive_platform::{
-    BgraFrame, CaptureConfig, FrameStream, PixelFormat, PlatformError, SourceInfo, SourceKind,
-    VideoSource,
+    BgraFrame, CaptureConfig, CapturePacket, FrameStream, GpuPixelBuffer, PixelFormat,
+    PlatformError, SourceInfo, SourceKind, VideoSource,
 };
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -49,18 +49,19 @@ use objc2::{define_class, msg_send, AnyThread, DefinedClass};
 use objc2_core_media::{CMTime, CMTimeFlags};
 use objc2_core_video::{
     kCVPixelFormatType_32BGRA, CVImageBuffer, CVPixelBuffer, CVPixelBufferGetBaseAddress,
-    CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType,
-    CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
-    CVPixelBufferUnlockBaseAddress,
+    CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight, CVPixelBufferGetIOSurface,
+    CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress,
+    CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
 };
 use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamOutput,
     SCStreamOutputType, SCWindow,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Startup rendezvous bound: SCK setup (incl. first prompt wait) is quick;
 /// beyond this the start is declared failed, never hung.
@@ -227,7 +228,7 @@ impl VideoSource for ScSource {
         let info = self.info.clone();
         let config = *config;
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), PlatformError>>();
-        let (frame_tx, frame_rx) = mpsc::sync_channel::<BgraFrame>(CHANNEL_DEPTH);
+        let (frame_tx, frame_rx) = mpsc::sync_channel::<CapturePacket>(CHANNEL_DEPTH);
         let error: Arc<Mutex<Option<PlatformError>>> = Arc::new(Mutex::new(None));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let error_ = Arc::clone(&error);
@@ -261,11 +262,38 @@ impl VideoSource for ScSource {
 // ---------------------------------------------------------------------------
 
 struct OutputIvars {
-    tx: Mutex<mpsc::SyncSender<BgraFrame>>,
+    tx: Mutex<mpsc::SyncSender<CapturePacket>>,
     // Written here, read by golive-platform's FrameStream::next_frame
     // (cross-crate use the dead-code lint cannot see).
     #[allow(dead_code)]
     error_slot: Arc<Mutex<Option<PlatformError>>>,
+    /// Nanos of the last ACCEPTED frame (monotonic process clock below).
+    /// Atomic: the SCK queue thread gates on it with zero locks.
+    last_ns: AtomicU64,
+    /// Minimum spacing between accepted frames (1/profile-fps). Fixed per
+    /// stream; a quality change starts a new stream (see reconfigure).
+    interval_ns: u64,
+}
+
+/// Monotonic nanos without lock or alloc (callback-safe).
+fn now_ns() -> u64 {
+    use std::sync::OnceLock;
+    static T0: OnceLock<Instant> = OnceLock::new();
+    T0.get_or_init(Instant::now).elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+/// Cadence gate: accept only when `interval_ns` elapsed since the last
+/// accepted frame. Pure + wrapping-sub so a (practically impossible)
+/// clock step never wedges the stream open or shut.
+pub fn gate_open(last_ns: u64, now_ns: u64, interval_ns: u64) -> bool {
+    now_ns.wrapping_sub(last_ns) >= interval_ns
+}
+
+/// Initial gate state: pretend the last frame landed exactly one interval
+/// ago, so the first real frame is always accepted no matter how fast SCK
+/// delivers after setup. Pure (the stream builder stamps `now_ns()` here).
+pub fn initial_last_ns(now: u64, interval_ns: u64) -> u64 {
+    now.wrapping_sub(interval_ns)
 }
 
 define_class!(
@@ -291,18 +319,143 @@ define_class!(
             if r#type != SCStreamOutputType::Screen {
                 return;
             }
-            if let Some(frame) = extract_bgra(sample_buffer) {
-                if let Ok(ivars) = self.ivars().tx.lock() {
-                    // Latest-only: drop newest (not oldest) when full.
-                    let _ = ivars.try_send(frame);
-                }
+            // GATE FIRST: surplus frames die here touching nothing — no
+            // lock, no copy, no alloc.
+            let ivars = self.ivars();
+            let now = now_ns();
+            if !gate_open(ivars.last_ns.load(Ordering::Relaxed), now, ivars.interval_ns) {
+                return;
             }
+            let packet = match retain_gpu_packet(sample_buffer) {
+                // Zero-copy fast path: retained IOSurface buffer straight
+                // to the channel (VideoToolbox submits it without a CPU
+                // copy downstream).
+                Some(packet) => packet,
+                // Fallback: CPU copy when zero-copy is unavailable
+                // (non-BGRA, non-IOSurface, retain failure). Logged once
+                // per stream — persistent fallback is a surprise worth one
+                // line, per-frame spam is not.
+                None => match extract_bgra(sample_buffer) {
+                    Some(frame) => {
+                        log_fallback_once();
+                        CapturePacket::Cpu(frame)
+                    }
+                    None => return,
+                },
+            };
+            if let Ok(tx) = ivars.tx.lock() {
+                // Latest-only: drop newest (not oldest) when full.
+                let _ = tx.try_send(packet);
+            }
+            // Cadence accounts accepted frames even when the channel was
+            // full: copies/retains stay capped at profile fps while the
+            // core lags (never spins on a slow consumer).
+            ivars.last_ns.store(now, Ordering::Relaxed);
         }
     }
 );
 
+/// Per-frame routing decision (pure, unit-tested with a mock copy
+/// counter): gate first, then GPU-retain when the sample is directly
+/// submittable (BGRA + IOSurface-backed), else one CPU copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameRoute {
+    /// Off cadence: die touching nothing.
+    Drop,
+    /// Directly submittable: retain, zero CPU copy.
+    RetainGpu,
+    /// Anything else BGRA: exactly one stride-aware copy.
+    CopyCpu,
+}
+
+pub fn route_frame(gate_open: bool, is_bgra: bool, iosurface_backed: bool) -> FrameRoute {
+    if !gate_open {
+        FrameRoute::Drop
+    } else if is_bgra && iosurface_backed {
+        FrameRoute::RetainGpu
+    } else if is_bgra {
+        FrameRoute::CopyCpu
+    } else {
+        FrameRoute::Drop
+    }
+}
+
+/// First-occurrence fallback log (one line per process, not per frame).
+fn log_fallback_once() {
+    use std::sync::OnceLock;
+    static DONE: OnceLock<()> = OnceLock::new();
+    if DONE.set(()).is_ok() {
+        eprintln!("golive: capture zero-copy unavailable, CPU-copy fallback");
+    }
+}
+
+/// Retain the sample's pixel buffer for zero-copy submit downstream.
+/// `None` when the sample is not directly submittable (non-BGRA,
+/// non-IOSurface, or a failed retain) — the caller falls back to the CPU
+/// copy path. Never touches a pixel.
+fn retain_gpu_packet(
+    sample: &objc2_core_media::CMSampleBuffer,
+) -> Option<CapturePacket> {
+    // SAFETY: SCK screen output with a BGRA configuration always carries a
+    // CVPixelBuffer; format + backing validated before retaining.
+    unsafe {
+        let image = sample.image_buffer()?;
+        // Toll-free: CVPixelBuffer IS-A CVImageBuffer.
+        let pixel = &*(image.as_ref() as *const CVImageBuffer as *const CVPixelBuffer);
+        if CVPixelBufferGetPixelFormatType(pixel) != kCVPixelFormatType_32BGRA {
+            return None;
+        }
+        // VT submits any CVPixelBuffer, but the zero-copy fast path is
+        // only worthy of the name on IOSurface backing (no CPU residency
+        // surprises); anything else takes the copy path.
+        if CVPixelBufferGetIOSurface(Some(pixel)).is_none() {
+            return None;
+        }
+        let w = CVPixelBufferGetWidth(pixel);
+        let h = CVPixelBufferGetHeight(pixel);
+        let stride = CVPixelBufferGetBytesPerRow(pixel);
+        if w == 0 || h == 0 || w > 8192 || h > 8192 || stride < w * 4 {
+            return None;
+        }
+        let retained = Retained::retain(pixel as *const CVPixelBuffer as *mut CVPixelBuffer)?;
+        let raw = Retained::into_raw(retained);
+        // SAFETY: +1 from the retain above, balanced by the release fn.
+        let gpu = GpuPixelBuffer::from_raw(
+            raw as *mut c_void,
+            w as u32,
+            h as u32,
+            stride,
+            release_cv_pixel_buffer,
+        );
+        Some(CapturePacket::Gpu(gpu))
+    }
+}
+
+/// Balances one handler-side retain (see `retain_gpu_packet`).
+///
+/// # Safety
+/// `ptr` must be a live +1 CVPixelBuffer (or null, which is a no-op).
+unsafe extern "C-unwind" fn release_cv_pixel_buffer(ptr: *mut c_void) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let Some(retained) =
+            Retained::<CVPixelBuffer>::from_raw(ptr as *mut CVPixelBuffer)
+        else {
+            return;
+        };
+        drop(retained);
+    }
+}
+
 /// Copies one BGRA sample into an owned frame. Returns None (drop frame)
 /// on any anomaly — a dropped frame beats a misinterpreted one.
+///
+/// This is the FALLBACK path (see `retain_gpu_packet`): it runs only when
+/// zero-copy is unavailable (non-BGRA, non-IOSurface, failed retain). The
+/// copy stays profile-sized and cadence-capped, so even the fallback is a
+/// fraction of the old always-copy-everything behavior.
 fn extract_bgra(sample: &objc2_core_media::CMSampleBuffer) -> Option<BgraFrame> {
     // SAFETY: SCK screen output with a BGRA configuration always carries a
     // CVPixelBuffer; the pixel-format check below validates before touching.
@@ -355,7 +508,7 @@ fn extract_bgra(sample: &objc2_core_media::CMSampleBuffer) -> Option<BgraFrame> 
 fn run_capture(
     info: SourceInfo,
     config: CaptureConfig,
-    frame_tx: mpsc::SyncSender<BgraFrame>,
+    frame_tx: mpsc::SyncSender<CapturePacket>,
     error_slot: Arc<Mutex<Option<PlatformError>>>,
     stop_flag: Arc<AtomicBool>,
     ready_tx: mpsc::Sender<Result<(), PlatformError>>,
@@ -433,19 +586,36 @@ fn run_capture(
             return;
         };
         let stream_config = SCStreamConfiguration::new();
-        stream_config.setWidth(config.width as usize);
-        stream_config.setHeight(config.height as usize);
+        // Backend-bounded config (pure builder, tested): profile-sized
+        // output (GPU/capture-side downscale — full-res NEVER reaches the
+        // callback) + minimum interval so surplus frames are never born.
+        let applied = golive_platform::capture_config_for(config.width, config.height, config.fps);
+        stream_config.setWidth(applied.width as usize);
+        stream_config.setHeight(applied.height as usize);
         stream_config.setPixelFormat(kCVPixelFormatType_32BGRA);
         stream_config.setMinimumFrameInterval(CMTime {
             value: 1,
-            timescale: config.fps.clamp(1, 60) as i32,
+            timescale: applied.fps as i32,
             flags: CMTimeFlags::Valid,
             epoch: 0,
         });
         stream_config.setShowsCursor(true);
+        // Redacted proof the config reached the stream: dims + fps + kind
+        // only (never ids, names, pixels).
+        let kind = match info.kind {
+            SourceKind::Display => "display",
+            SourceKind::Window => "window",
+        };
+        eprintln!(
+            "golive: capture {}x{}@{}fps ({kind})",
+            applied.width, applied.height, applied.fps
+        );
+        let interval_ns = 1_000_000_000u64 / applied.fps.max(1) as u64;
         let output = CaptureOutput::alloc().set_ivars(OutputIvars {
             tx: Mutex::new(frame_tx),
             error_slot: Arc::clone(&error_slot),
+            last_ns: AtomicU64::new(initial_last_ns(now_ns(), interval_ns)),
+            interval_ns,
         });
         // SAFETY: standard init after alloc with ivars set.
         let output: Retained<CaptureOutput> = msg_send![super(output), init];
@@ -574,5 +744,132 @@ mod tests {
             h: 0,
         };
         assert!(ScSource::open(&good).is_ok());
+    }
+
+    #[test]
+    fn gate_opens_exactly_on_cadence() {
+        let interval = 1_000_000_000u64 / 15; // 15 fps profile
+        // Fresh streams accept the first frame immediately (init stamps
+        // one interval in the past).
+        assert!(gate_open(initial_last_ns(0, interval), 0, interval));
+        assert!(gate_open(initial_last_ns(5_000_000, interval), 5_000_000, interval));
+        assert!(!gate_open(0, interval - 1, interval));
+        assert!(gate_open(0, interval, interval));
+        assert!(gate_open(1_000, 1_000 + interval, interval));
+    }
+
+    #[test]
+    fn gate_drops_120hz_bursts_to_profile_rate_without_copies() {
+        // Aligned arrivals all pass (the gate enforces spacing, never
+        // drops on-cadence frames)…
+        let interval = 1_000_000_000u64 / 15;
+        let mut last = initial_last_ns(0, interval);
+        let mut at = Vec::new();
+        let mut t = 0u64;
+        while t < 1_000_000_000 {
+            if gate_open(last, t, interval) {
+                at.push(t);
+                last = t;
+            }
+            t += interval;
+        }
+        assert_eq!(at.len(), 16, "every on-cadence arrival passes");
+        for pair in at.windows(2) {
+            assert!(pair[1] - pair[0] >= interval, "spacing holds");
+        }
+        // …while a 120 Hz flood never exceeds it (grid quantization lands
+        // slightly under: the gate caps, never pads). Drops touch nothing —
+        // no copy happens before the gate in the handler.
+        let mut last = initial_last_ns(0, interval);
+        let mut copies = 0u32;
+        let mut dropped = 0u32;
+        let mut t = 0u64;
+        while t < 1_000_000_000 {
+            if gate_open(last, t, interval) {
+                copies += 1; // WOULD copy
+                last = t;
+            } else {
+                dropped += 1; // dies pre-copy
+            }
+            t += 1_000_000_000 / 120;
+        }
+        assert!(copies <= 15, "{copies} accepted at most");
+        assert!(copies >= 12, "{copies} accepted keeps liveness");
+        assert_eq!(copies + dropped, 121, "every tick accounted");
+    }
+
+    #[test]
+    fn stream_interval_math_matches_profile_fps() {
+        // Same formula the stream builder uses: 1s/fps, floor 1 fps.
+        let interval = |fps: u32| 1_000_000_000u64 / fps.max(1) as u64;
+        assert_eq!(interval(30), 33_333_333);
+        assert_eq!(interval(15), 66_666_666);
+        assert_eq!(interval(0), 1_000_000_000);
+    }
+
+    #[test]
+    fn route_frame_covers_all_six_combos() {
+        use FrameRoute::*;
+        // Off cadence always dies pre-copy, whatever the sample.
+        assert_eq!(route_frame(false, true, true), Drop);
+        assert_eq!(route_frame(false, true, false), Drop);
+        assert_eq!(route_frame(false, false, true), Drop);
+        assert_eq!(route_frame(false, false, false), Drop);
+        // On cadence: submittable BGRA+IOSurface retains (zero copy)…
+        assert_eq!(route_frame(true, true, true), RetainGpu);
+        // …BGRA without backing copies once…
+        assert_eq!(route_frame(true, true, false), CopyCpu);
+        // …anything else drops (never misinterpreted, same as before).
+        assert_eq!(route_frame(true, false, true), Drop);
+        assert_eq!(route_frame(true, false, false), Drop);
+    }
+
+    #[test]
+    fn mock_callback_sequence_counts_copies_not_drops() {
+        // Drives the pure routing core the way the SCK callback does:
+        // (gate, format, backing) per arrival; counts what WOULD copy.
+        // A 120 Hz all-submittable burst at 15 fps: 0 copies, all retained
+        // or dropped pre-copy.
+        let interval = 1_000_000_000u64 / 15;
+        let mut last = initial_last_ns(0, interval);
+        let (mut retained, mut copied, mut dropped) = (0u32, 0u32, 0u32);
+        let mut t = 0u64;
+        while t < 1_000_000_000 {
+            let gate = gate_open(last, t, interval);
+            match route_frame(gate, true, true) {
+                FrameRoute::RetainGpu => {
+                    retained += 1;
+                    last = t;
+                }
+                FrameRoute::CopyCpu => {
+                    copied += 1;
+                    last = t;
+                }
+                FrameRoute::Drop => dropped += 1,
+            }
+            t += 1_000_000_000 / 120;
+        }
+        assert_eq!(copied, 0, "submittable burst never copies");
+        assert!(retained <= 15 && retained >= 12, "{retained} retained");
+        assert!(dropped > 100, "{dropped} died pre-copy");
+        // Same burst, nothing IOSurface-backed: every accepted frame
+        // copies exactly once (the fallback), drops still cost nothing.
+        let mut last = initial_last_ns(0, interval);
+        let (mut copied, mut dropped) = (0u32, 0u32);
+        let mut t = 0u64;
+        while t < 1_000_000_000 {
+            let gate = gate_open(last, t, interval);
+            match route_frame(gate, true, false) {
+                FrameRoute::CopyCpu => {
+                    copied += 1;
+                    last = t;
+                }
+                FrameRoute::Drop => dropped += 1,
+                FrameRoute::RetainGpu => panic!("nothing submittable here"),
+            }
+            t += 1_000_000_000 / 120;
+        }
+        assert!(copied <= 15 && copied >= 12, "{copied} fallback copies");
+        assert!(dropped > 100, "{dropped} died pre-copy");
     }
 }

@@ -13,11 +13,13 @@ import { useEffect, useState } from "react";
 import {
   createRoom,
   getE2ePlan,
+  getMediaCounters,
   getSnapshot,
   joinRoom,
   leaveRoom,
   onMediaEvent,
   onSignalEvent,
+  setQuality as setQualityCommand,
   setServer,
   startShare,
   stopShare,
@@ -27,6 +29,8 @@ import {
   sourceCapabilities,
   type CapabilitySet,
   type E2ePlan,
+  type EffectiveQuality,
+  type LinkStats,
   type MediaEvent,
   type OwnerSnapshot,
   type RoomMember,
@@ -38,10 +42,13 @@ import { runE2ePlan, type E2eReport } from "./e2e";
 import {
   HomeScreen,
   RoomScreen,
+  resolveDesired,
   validateCode,
   validateNickname,
   validatePassword,
   validateSource,
+  type QualitySel,
+  type ResolutionSel,
 } from "./views";
 
 export const DEFAULT_SERVER = "http://127.0.0.1:18790";
@@ -67,6 +74,8 @@ const mediaSummary = (event: MediaEvent): string => {
       return `frame (não-preto: ${event.non_black ? "sim" : "não"})`;
     case "stats":
       return `stats (${event.frames} frames)`;
+    case "quality":
+      return `qualidade (geração ${event.generation})`;
     default:
       return event.kind;
   }
@@ -96,6 +105,25 @@ export default function App() {
   const [lastSignal, setLastSignal] = useState<string | null>(null);
   const [lastMedia, setLastMedia] = useState<string | null>(null);
   const [stats, setStats] = useState<ViewerStats | null>(null);
+  // Contadores por link: mesma fonte do refresh + evento stats (que já pode
+  // trazer `links` no lado viewer). Nenhum polling novo.
+  const [linkStats, setLinkStats] = useState<LinkStats[] | null>(null);
+  // Perfil de qualidade desejado (staged na UI; Aplicar chama `set_quality`
+  // e o efetivo autoritativo volta no snapshot/evento).
+  const [resolution, setResolution] = useState<ResolutionSel>("720p");
+  const [customW, setCustomW] = useState("");
+  const [customH, setCustomH] = useState("");
+  const [quality, setQuality] = useState<QualitySel>("medium");
+  const [customBitrate, setCustomBitrate] = useState("");
+  const [customFps, setCustomFps] = useState("");
+  // Efetivo autoritativo (snapshot + evento quality); aplicação em voo e o
+  // último erro do comando (verbatim, já redatado no backend).
+  const [effective, setEffective] = useState<EffectiveQuality | null>(null);
+  // Selo do codificador (snapshot + evento stats; sem polling novo).
+  const [backend, setBackend] = useState<string | null>(null);
+  const [backendNote, setBackendNote] = useState<string | null>(null);
+  const [applying, setApplying] = useState(false);
+  const [applyError, setApplyError] = useState<string | null>(null);
 
   // Modo autodirigido test-only: só ativa com `--e2e-plan` (get_e2e_plan
   // devolve null no app normal e nada aqui executa). Guarda contra
@@ -125,6 +153,7 @@ export default function App() {
               keyframes: 0,
               keyframesSeen: false,
               presented: 0,
+              qualityApplied: false,
               detail: typeof failure === "string" ? failure : failure instanceof Error ? failure.message : "e2e failed",
             });
           }
@@ -142,12 +171,24 @@ export default function App() {
     return fallback;
   };
 
-  /** Lê o snapshot agora (botão, pós-intent, pós-evento). */
+  /** Lê snapshot + contadores agora (botão, pós-intent, pós-evento). */
   const refresh = async (): Promise<void> => {
     try {
       setSnapshot(await getSnapshot());
     } catch (failure) {
       setError(messageOf(failure, "Não foi ler o estado da sala."));
+      return;
+    }
+    try {
+      const counters = await getMediaCounters();
+      setLinkStats(counters.links);
+      setEffective(counters.effective ?? null);
+      setBackend(counters.backend ?? null);
+      setBackendNote(counters.backend_note ?? null);
+    } catch {
+      // Contadores são fallback observacional: sem eles, o painel de links
+      // mostra o diagnóstico honesto em vez de número inventado.
+      setLinkStats((current) => current);
     }
   };
 
@@ -175,6 +216,11 @@ export default function App() {
       if (cancelled) return;
       if (event.kind === "stats") {
         setStats({ frames: event.frames, keyframes: event.keyframes, ice: event.ice, presented: event.presented ?? 0 });
+        if (event.links) setLinkStats(event.links);
+        if (event.backend !== undefined) setBackend(event.backend);
+        if (event.backend_note !== undefined) setBackendNote(event.backend_note);
+      } else if (event.kind === "quality") {
+        setEffective({ profile: event.profile, generation: event.generation });
       }
       setLastMedia(mediaSummary(event));
       void refresh();
@@ -263,6 +309,10 @@ export default function App() {
       setRoster([]);
       setWatching([]);
       setStats(null);
+      setLinkStats(null);
+      setEffective(null);
+      setApplying(false);
+      setApplyError(null);
       setSources([]);
       setSourcesError(null);
       setCaps(null);
@@ -305,6 +355,42 @@ export default function App() {
     void runIntent(async () => {
       await stopShare();
     });
+  };
+
+  /**
+   * Aplica o perfil desejado ao share vivo. Progresso e erro próprios do
+   * painel (não usa o busy global): o comando responde o efetivo pré-bump
+   * e a geração autoritativa chega pelo evento `quality`.
+   */
+  const handleApplyQuality = (): void => {
+    if (applying || busy) return;
+    const resolved = resolveDesired({
+      resolution,
+      customW,
+      customH,
+      quality,
+      customBitrate,
+      customFps,
+      srcDims: selectedSourceDims(),
+    });
+    if (!("profile" in resolved)) {
+      setApplyError(resolved.errors.join(" "));
+      return;
+    }
+    setApplying(true);
+    setApplyError(null);
+    const preset = quality === "custom" ? undefined : quality;
+    setQualityCommand(resolved.profile, preset).then(
+      (result) => {
+        setEffective(result);
+        setApplying(false);
+        void refresh();
+      },
+      (failure: unknown) => {
+        setApplyError(messageOf(failure, "Não foi aplicar a qualidade."));
+        setApplying(false);
+      },
+    );
   };
 
   const handleWatch = (id: string): void => {
@@ -360,6 +446,15 @@ export default function App() {
     );
   }
 
+  // Dimensões da fonte quando conhecida (display:/window: listado com w×h);
+  // synthetic/movie não têm teto conhecido — o backend normaliza na borda.
+  const selectedSourceDims = (): { w: number; h: number } | null => {
+    const selected = sources.find((item) => `${item.kind}:${item.id}` === source.trim());
+    return selected ? { w: selected.w, h: selected.h } : null;
+  };
+  const srcDims = selectedSourceDims();
+  const shareLive = snapshot?.share.state === "live";
+
   return (
     <RoomScreen
       roomCode={roomCode}
@@ -369,6 +464,30 @@ export default function App() {
       selfId={selfId}
       selfNickname={nickname.trim()}
       watching={watching}
+      quality={{
+        shareLive,
+        busy,
+        effective,
+        backend,
+        backendNote,
+        applying,
+        applyError,
+        resolution,
+        onResolution: setResolution,
+        customW,
+        onCustomW: setCustomW,
+        customH,
+        onCustomH: setCustomH,
+        quality,
+        onQuality: setQuality,
+        customBitrate,
+        onCustomBitrate: setCustomBitrate,
+        customFps,
+        onCustomFps: setCustomFps,
+        srcDims,
+        onApply: handleApplyQuality,
+      }}
+      linkStats={linkStats}
       source={source}
       onSource={setSource}
       sources={sources}

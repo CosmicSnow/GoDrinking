@@ -27,4 +27,4 @@ pub use capability::{capabilities, CapabilitySet, Support};
 pub use convert::{bgra_to_i420, convert_error, ConvertError};
 pub use error::{PlatformError, PERMISSION_HINT};
 pub use traits::{FrameStream, NextError, VideoSource};
-pub use types::{BgraFrame, CaptureConfig, PixelFormat, PlanarYuv, SourceInfo, SourceKind};
+pub use types::{capture_config_for, BgraFrame, CaptureConfig, CapturePacket, GpuPixelBuffer, PixelFormat, PlanarYuv, SourceInfo, SourceKind};

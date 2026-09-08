@@ -22,6 +22,7 @@ import {
   joinRoom,
   onMediaEvent,
   onSignalEvent,
+  setQuality,
   setServer,
   startShare,
   watchMember,
@@ -38,6 +39,7 @@ export type E2ePhase =
   | "joined"
   | "watching"
   | "connected"
+  | "quality-applied"
   | "error";
 
 export interface E2eReport {
@@ -52,6 +54,8 @@ export interface E2eReport {
   keyframesSeen: boolean;
   /** Frames apresentados em janelas nativas (acks; evidência de apresentação). */
   presented: number;
+  /** set_quality aplicado mid-share pelo caminho real do invoke + geração bumpada. */
+  qualityApplied: boolean;
   detail?: string;
 }
 
@@ -81,8 +85,8 @@ function messageOf(failure: unknown): string {
 }
 
 async function publish(report: E2eReport): Promise<void> {
-  const { role, phase, code, connected, frames, keyframes, keyframesSeen, presented, detail } = report;
-  await e2eStatus({ role, state: phase, code, connected, frames, keyframes, keyframesSeen, presented, detail });
+  const { role, phase, code, connected, frames, keyframes, keyframesSeen, presented, qualityApplied, detail } = report;
+  await e2eStatus({ role, state: phase, code, connected, frames, keyframes, keyframesSeen, presented, qualityApplied, detail });
 }
 
 async function readCodeWithRetry(onReport: (r: E2eReport) => void): Promise<string> {
@@ -94,7 +98,7 @@ async function readCodeWithRetry(onReport: (r: E2eReport) => void): Promise<stri
       if (Date.now() > deadline) {
         throw new Error("room code never published");
       }
-      onReport({ role: "viewer", phase: "boot", connected: false, frames: 0, keyframes: 0, keyframesSeen: false, presented: 0, detail: "waiting-room-code" });
+      onReport({ role: "viewer", phase: "boot", connected: false, frames: 0, keyframes: 0, keyframesSeen: false, presented: 0, qualityApplied: false, detail: "waiting-room-code" });
       await sleep(500);
     }
   }
@@ -109,6 +113,7 @@ async function runHost(plan: E2ePlan, onReport: (r: E2eReport) => void): Promise
     keyframes: 0,
     keyframesSeen: false,
     presented: 0,
+    qualityApplied: false,
   };
   const emit = async (): Promise<void> => {
     onReport({ ...report });
@@ -164,6 +169,33 @@ async function runHost(plan: E2ePlan, onReport: (r: E2eReport) => void): Promise
     );
     report.phase = "connected";
     await emit();
+    // Prova do caminho real do aplicar-qualidade sobre fonte sintética:
+    // o MESMO intent da UI (api.setQuality) → geração efetiva bumpa e o
+    // stream segue (o viewer prova continuidade do outro lado).
+    // Diagnóstico temporário: registra as chaves exatas enviadas.
+    const qp = { w: 640, h: 360, bitrate_kbps: 1000, fps: 15 };
+    report.detail = `sending set_quality keys: ${Object.keys(qp).join(",")}`;
+    await emit();
+    await setQuality(qp);
+    await waitFor(
+      async () => {
+        try {
+          const counters = await getMediaCounters();
+          if ((counters.effective?.generation ?? 0) >= 1) {
+            report.qualityApplied = true;
+            await emit();
+            return true;
+          }
+        } catch {
+          /* tenta de novo até o deadline */
+        }
+        return false;
+      },
+      30_000,
+      "quality generation bump timeout",
+    );
+    report.phase = "quality-applied";
+    await emit();
   } finally {
     offMedia();
   }
@@ -196,6 +228,7 @@ async function runViewer(plan: E2ePlan, onReport: (r: E2eReport) => void): Promi
     keyframes: 0,
     keyframesSeen: false,
     presented: 0,
+    qualityApplied: false,
   };
   const emit = async (): Promise<void> => {
     onReport({ ...report });
@@ -311,6 +344,7 @@ export async function runE2ePlan(
       keyframes: 0,
       keyframesSeen: false,
       presented: 0,
+      qualityApplied: false,
       detail,
     };
     onReport(report);
