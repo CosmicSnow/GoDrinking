@@ -742,6 +742,8 @@ export interface RoomProps {
   sources: SourceInfo[];
   /** Erro tipado da última listagem (permissão, plataforma, …). */
   sourcesError: string | null;
+  /** Permissão de captura negada: bloco honesto com o caminho manual. */
+  sourcesDenied?: boolean;
   /** Capacidades desta build (desabilita com motivo). */
   caps: CapabilitySet | null;
   onListSources: () => void;
@@ -893,7 +895,7 @@ function Tile(props: TileProps) {
 export function RoomScreen(props: RoomProps) {
   const {
     roomCode, snapshot, roster, selfId, selfNickname, watching,
-    source, onSource, sources, sourcesError, caps, onListSources,
+    source, onSource, sources, sourcesError, sourcesDenied = false, caps, onListSources,
     previews, onPreviewsVisible,
     busy, error, lastSignal, lastMedia, quality, linkStats,
     onRefresh, onLeave, onShare, onStopShare, onWatch, onUnwatch,
@@ -1470,7 +1472,16 @@ export function RoomScreen(props: RoomProps) {
                 <span className="hint" style={{ display: "block", marginTop: 8 }}>
                   A primeira listagem pode pedir permissão ao sistema.
                 </span>
-                {sourcesError ? (
+                {sourcesDenied ? (
+                  <span className="error" role="alert" style={{ display: "block", marginTop: 8 }}>
+                    {sourcesError ?? "Sem permissão de Gravação de Tela."}
+                    <span className="hint" style={{ display: "block", marginTop: 4 }}>
+                      Caminho manual: Ajustes → Privacidade e Segurança →
+                      Gravação de Tela (ative o GoLive) e toque Listar telas
+                      de novo.
+                    </span>
+                  </span>
+                ) : sourcesError ? (
                   <span className="error" role="alert" style={{ display: "block", marginTop: 8 }}>
                     {sourcesError}
                   </span>
@@ -1520,7 +1531,9 @@ export function RoomScreen(props: RoomProps) {
             )}
           </div>
           <p className="modal-note">
-            A enumeração vem do backend (<code>list_sources</code>); sem permissão, a lista vem vazia.
+            A enumeração vem do backend (<code>list_sources</code>); sem
+            permissão, a listagem erra honesto acima — nunca volta vazia
+            silenciosa.
           </p>
           <div className="modal-foot">
             <button type="button" className="btn ghost" onClick={closeShare}>

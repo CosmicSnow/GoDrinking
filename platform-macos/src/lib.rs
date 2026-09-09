@@ -69,10 +69,14 @@ const START_DEADLINE: Duration = Duration::from_secs(8);
 /// Channel depth: one in flight, one waiting. Newest drops when full, so
 /// memory stays flat and staleness is bounded (~2 frames), never queued.
 const CHANNEL_DEPTH: usize = 2;
-/// Apple's SCStreamErrorUserDeclined. Observed constant, flagged as such:
-/// denial primarily surfaces as empty enumerate (see below), this is the
-/// defensive second net for start-time errors.
+/// SCK denial codes: -3810 (SCStreamErrorUserDeclined, observed) and -3801
+/// (userDeclined — what TCC delivers on macOS 26). Both mean the user said
+/// no (or the app isn't listed): honest permission hint, never Internal.
+/// Denial also surfaces as hidden content instead of erroring (null
+/// shareable content / empty enumerate map separately — see below); this
+/// covers the error-carrying paths (shareable fetch, stream start).
 const SC_USER_DECLINED: i32 = -3810;
+const SC_TCC_DECLINED: i32 = -3801;
 
 /// A macOS display or window selected from [`enumerate`].
 #[derive(Clone, Debug)]
@@ -124,7 +128,14 @@ fn parse_product_version(text: &str) -> Option<(u32, u32)> {
 /// NSError → typed error. Only domain + code travel (never message text —
 /// system strings stay out of logs by policy).
 fn map_ns_error(domain: &str, code: i32) -> PlatformError {
-    if domain.contains("ScreenCaptureKit") && code == SC_USER_DECLINED {
+    if domain.contains("ScreenCaptureKit")
+        && (code == SC_USER_DECLINED || code == SC_TCC_DECLINED)
+    {
+        return PlatformError::permission_denied();
+    }
+    // -3801 is delivered by TCC itself (outside the SCK domain) on macOS 26:
+    // the code is denial-specific, so it maps regardless of domain.
+    if code == SC_TCC_DECLINED {
         return PlatformError::permission_denied();
     }
     // Denial also hides content instead of erroring; empty enumerate maps
@@ -797,6 +808,22 @@ mod tests {
             map_ns_error("com.apple.ScreenCaptureKit.scstream.error", -3810),
             PlatformError::permission_denied()
         );
+        // macOS 26 TCC code, inside and outside the SCK domain.
+        assert_eq!(
+            map_ns_error("com.apple.ScreenCaptureKit.scstream.error", -3801),
+            PlatformError::permission_denied()
+        );
+        assert_eq!(
+            map_ns_error("com.apple.TCC", -3801),
+            PlatformError::permission_denied()
+        );
+        // Neighboring codes stay Internal (redacted domain + code).
+        match map_ns_error("com.apple.ScreenCaptureKit.scstream.error", -3800) {
+            PlatformError::Internal(detail) => {
+                assert!(detail.contains("-3800"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
         match map_ns_error("com.apple.Foo", 42) {
             PlatformError::Internal(detail) => {
                 assert!(detail.contains("com.apple.Foo"));

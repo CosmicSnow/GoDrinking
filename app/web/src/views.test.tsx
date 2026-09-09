@@ -385,6 +385,33 @@ describe("fontes de captura (select + capacidades)", () => {
     expect(html).toContain("perm");
   });
 
+  it("permissão negada mostra o bloco honesto com o caminho manual", () => {
+    const html = renderToStaticMarkup(
+      createElement(
+        RoomScreen,
+        roomProps({
+          source: "display:",
+          sourcesError: "Sem permissão de Gravação de Tela — autorize em Ajustes.",
+          sourcesDenied: true,
+        }),
+      ),
+    );
+    expect(html).toContain("Sem permissão de Gravação de Tela");
+    expect(html).toContain("Privacidade e Segurança");
+    expect(html).toContain("Listar telas");
+  });
+
+  it("erro comum (sem denied) não mostra o caminho manual", () => {
+    const html = renderToStaticMarkup(
+      createElement(
+        RoomScreen,
+        roomProps({ source: "display:", sourcesError: "Não foi listar as fontes." }),
+      ),
+    );
+    expect(html).toContain("Não foi listar as fontes.");
+    expect(html).not.toContain("Privacidade e Segurança");
+  });
+
   it("capacidade negada desabilita a opção com o motivo", () => {
     const no = { supported: false, reason: "planejado (WGC/DXGI)" };
     const html = renderToStaticMarkup(

@@ -115,6 +115,9 @@ export default function App() {
   // a lista real só em gesto explícito (pode pedir permissão ao SO).
   const [sources, setSources] = useState<SourceInfo[]>([]);
   const [sourcesError, setSourcesError] = useState<string | null>(null);
+  // Permissão de captura negada (marcador "Gravação de Tela" do backend):
+  // a UI renderiza o bloco honesto com o caminho manual. Sem retry.
+  const [sourcesDenied, setSourcesDenied] = useState(false);
   // Thumbs PNG (data URL) por "kind:id": cache lazy do modal Compartilhar
   // (busca sob demanda via handlePreviewsVisible; mock nunca busca).
   const [previews, setPreviews] = useState<Record<string, string>>({});
@@ -453,6 +456,7 @@ export default function App() {
       setMockSharing(true);
       setPreviews({});
       previewsSeen.current.clear();
+      setSourcesDenied(false);
       return;
     }
     void runIntent(async () => {
@@ -476,6 +480,7 @@ export default function App() {
       setPassword("");
       setPreviews({});
       previewsSeen.current.clear();
+      setSourcesDenied(false);
     });
   };
 
@@ -495,11 +500,18 @@ export default function App() {
         previewsSeen.current.clear();
         if (listed.length === 0) {
           setSourcesError("Nenhuma fonte visível — provavelmente falta permissão de Gravação de Tela.");
+          setSourcesDenied(true);
+        } else {
+          setSourcesDenied(false);
         }
       },
       (failure: unknown) => {
         setSources([]);
-        setSourcesError(messageOf(failure, "Não foi listar as fontes."));
+        const message = messageOf(failure, "Não foi listar as fontes.");
+        setSourcesError(message);
+        // Marcador do HINT do backend ("Gravação de Tela"): bloco honesto na
+        // UI. Sem opener nativo no shell → caminho manual, sem botão.
+        setSourcesDenied(message.includes("Gravação de Tela"));
       },
     );
   };
@@ -730,6 +742,7 @@ export default function App() {
       onSource={setSource}
       sources={sources}
       sourcesError={sourcesError}
+      sourcesDenied={sourcesDenied}
       caps={caps}
       onListSources={handleListSources}
       previews={previews}
