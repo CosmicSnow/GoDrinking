@@ -22,6 +22,8 @@
  * - set_server {base} -> string (base normalizada)
  * - list_sources {} -> SourceInfo[] | source_capabilities {} -> CapabilitySet
  *   (fontes de captura; e2e_* são test-only, fora do caminho da UI)
+ * - preview_source {kind, id} -> {data_url, w, h} (thumb PNG lazy ~256px;
+ *   data_url null quando indisponível — nunca quebra a listagem)
  *
  * Perfil efetivo autoritativo: `get_media_counters().effective` (None fora
  * do share) + evento `media-event {kind:"quality", profile, generation}`
@@ -273,6 +275,15 @@ export interface SourceInfo {
   name: string;
   w: number;
   h: number;
+  /** Thumb PNG (data URL) quando o App já buscou; ausente = gradiente. */
+  thumbnail?: string | null;
+}
+
+/** Thumb one-shot do backend (sempre resolve; null = indisponível). */
+export interface SourcePreview {
+  data_url: string | null;
+  w: number;
+  h: number;
 }
 
 export interface Support {
@@ -291,6 +302,15 @@ export interface CapabilitySet {
 /** Lista displays/janelas. Pode pedir permissão ao SO no primeiro uso. */
 export function listSources(): Promise<SourceInfo[]> {
   return invoke<SourceInfo[]>("list_sources");
+}
+
+/**
+ * Thumb one-shot de uma fonte (lazy, sob demanda do modal). Resolve sempre:
+ * `data_url` null quando indisponível (sem permissão, fonte sumiu) — uma
+ * fonte sem thumb nunca quebra as outras.
+ */
+export function previewSource(kind: string, id: string): Promise<SourcePreview> {
+  return invoke<SourcePreview>("preview_source", { kind, id });
 }
 
 /** Capacidades sem tocar no SO (nunca pede permissão). */

@@ -306,6 +306,91 @@ pub fn enumerate_sources() -> Result<Vec<SourceInfo>, PlatformError> {
     }
 }
 
+/// Long side of share-modal thumbnails (PNG data URL, ~256px).
+pub const PREVIEW_LONG_SIDE: u32 = 256;
+/// Aspect fallback for windows (enumerate lists them 0x0 pre-stream).
+/// Pixels are always real — this only sets the uniform downscale factor.
+const PREVIEW_FALLBACK_DIMS: (u32, u32) = (1920, 1080);
+
+/// One-shot thumbnail for the share modal: PNG data URL + its dims.
+#[derive(Clone, Debug)]
+pub struct PreviewImage {
+    pub data_url: String,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// Lazy one-shot preview for one listed source: matches kind:id in the
+/// current enumeration (gone → `SourceGone`), grabs a single frame, and
+/// encodes it via [`encode_preview`]. Caller-driven (modal pulls), never
+/// polled. Never logs titles/pixels.
+pub fn preview_source(kind: SourceKind, id: &str) -> Result<PreviewImage, PlatformError> {
+    let info = enumerate_sources()?
+        .into_iter()
+        .find(|item| item.kind == kind && item.id == id)
+        .ok_or_else(|| PlatformError::SourceGone { id: id.to_owned() })?;
+    let frame = thumbnail_for(&info)?;
+    if frame.w == 0 || frame.h == 0 || frame.data.is_empty() {
+        return Err(PlatformError::Internal("thumbnail vazio".into()));
+    }
+    encode_preview(&frame, info.w, info.h)
+}
+
+/// Platform grab for one listed source (single synchronous still).
+fn thumbnail_for(info: &SourceInfo) -> Result<BgraFrame, PlatformError> {
+    #[cfg(target_os = "macos")]
+    {
+        golive_platform_macos::thumbnail(info.kind, &info.id)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = info;
+        Err(PlatformError::UnsupportedPlatform {
+            reason: "miniaturas: apenas macOS (Windows planejado)",
+        })
+    }
+}
+
+/// Scales `frame` by the uniform factor fitting source dims `(sw, sh)` —
+/// fallback for 0x0 windows — into [`PREVIEW_LONG_SIDE`]: never upscales,
+/// never stretches. Then BGRA→RGBA + PNG encode as a data URL. Pure.
+fn encode_preview(frame: &BgraFrame, sw: u32, sh: u32) -> Result<PreviewImage, PlatformError> {
+    let (sw, sh) = match (sw, sh) {
+        (0, _) | (_, 0) => PREVIEW_FALLBACK_DIMS,
+        dims => dims,
+    };
+    let long = sw.max(sh).max(1) as u64;
+    // Uniform factor, capped at 1 (shrink-only); final clamp keeps every
+    // thumb within PREVIEW_LONG_SIDE even if pixels outran the listing.
+    let num = (PREVIEW_LONG_SIDE as u64).min(long);
+    let tw = ((frame.w as u64 * num / long).max(1).min(PREVIEW_LONG_SIDE as u64)) as u32;
+    let th = ((frame.h as u64 * num / long).max(1).min(PREVIEW_LONG_SIDE as u64)) as u32;
+    let small = scale_bgra_nearest(frame, tw, th);
+    if small.data.is_empty() {
+        return Err(PlatformError::Internal("thumbnail vazio".into()));
+    }
+    let mut rgba = Vec::with_capacity(small.data.len());
+    for px in small.data.chunks_exact(4) {
+        rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+    }
+    let mut png_bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_bytes, small.w, small.h);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .and_then(|mut writer| writer.write_image_data(&rgba))
+            .map_err(|_| PlatformError::Internal("thumbnail encode falhou".into()))?;
+    }
+    use base64::Engine as _;
+    let data_url = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&png_bytes)
+    );
+    Ok(PreviewImage { data_url, w: small.w, h: small.h })
+}
+
 /// Re-exported types + helpers for Tauri commands (single import site).
 pub use golive_platform::capabilities;
 pub use golive_platform::CapabilitySet as Capabilities;
@@ -416,8 +501,41 @@ mod tests {
     }
 
     #[test]
-    fn should_forward_gates_on_interval() {
-        let now = Instant::now();
+    fn preview_encode_downscales_and_emits_png_data_url() {
+        use base64::Engine as _;
+        // Pure (no OS): 512x256 solid → long side 256, PNG magic after base64.
+        let frame = solid_bgra(512, 256, 10, 200, 30);
+        let preview = encode_preview(&frame, 512, 256).expect("encodes");
+        assert_eq!((preview.w, preview.h), (256, 128));
+        let b64 = preview
+            .data_url
+            .strip_prefix("data:image/png;base64,")
+            .expect("data url prefix");
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("valid base64");
+        assert_eq!(&raw[..8], &[137, 80, 78, 71, 13, 10, 26, 10], "PNG signature");
+        // 0x0 source dims (windows pre-stream) use the 16:9 fallback factor:
+        // 512x256 px * 256/1920 → 68x34, aspect preserved, no stretch.
+        let fallback = encode_preview(&frame, 0, 0).expect("fallback encodes");
+        assert_eq!((fallback.w, fallback.h), (68, 34));
+        // Never upscales: 64x64 stays native.
+        let tiny =
+            encode_preview(&solid_bgra(64, 64, 0, 0, 0), 64, 64).expect("tiny encodes");
+        assert_eq!((tiny.w, tiny.h), (64, 64));
+        // Degenerate pixels error typed, never panic.
+        let empty = BgraFrame {
+            w: 0,
+            h: 0,
+            stride: 0,
+            format: PixelFormat::Bgra8888,
+            data: Vec::new(),
+        };
+        assert!(encode_preview(&empty, 64, 64).is_err());
+    }
+
+    #[test]
+    fn should_forward_gates_on_interval() {        let now = Instant::now();
         let interval = Duration::from_millis(100);
         assert!(should_forward(None, now, interval));
         assert!(!should_forward(Some(now), now, interval));

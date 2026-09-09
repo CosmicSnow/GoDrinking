@@ -28,6 +28,10 @@ golive-platform = { path = "../platform" }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Share-modal thumbnails: PNG encode + data-URL base64 (offline-safe: both
+# already in the workspace lockfile via tauri).
+base64 = "0.22"
+png = "0.17"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 # Native video windows (helper process owns the main-thread event loop;
 # Tauri owns main in the app process). softbuffer = CPU blit, no GPU APIs,

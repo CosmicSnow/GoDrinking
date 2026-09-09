@@ -9,7 +9,7 @@
  *   exibe de volta o conteúdo dos campos de senha.
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   createRoom,
   getE2ePlan,
@@ -20,6 +20,7 @@ import {
   leaveRoom,
   onMediaEvent,
   onSignalEvent,
+  previewSource,
   setQuality as setQualityCommand,
   setServer,
   startShare,
@@ -114,6 +115,12 @@ export default function App() {
   // a lista real só em gesto explícito (pode pedir permissão ao SO).
   const [sources, setSources] = useState<SourceInfo[]>([]);
   const [sourcesError, setSourcesError] = useState<string | null>(null);
+  // Thumbs PNG (data URL) por "kind:id": cache lazy do modal Compartilhar
+  // (busca sob demanda via handlePreviewsVisible; mock nunca busca).
+  const [previews, setPreviews] = useState<Record<string, string>>({});
+  // Chaves já pedidas (ok ou null): evita refetch e rajadas; limpo a cada
+  // listagem/saída para acompanhar a lista fresca.
+  const previewsSeen = useRef<Set<string>>(new Set());
   const [caps, setCaps] = useState<CapabilitySet | null>(null);
   const [lastSignal, setLastSignal] = useState<string | null>(null);
   const [lastMedia, setLastMedia] = useState<string | null>(null);
@@ -444,6 +451,8 @@ export default function App() {
       setSelfId(null);
       setPassword("");
       setMockSharing(true);
+      setPreviews({});
+      previewsSeen.current.clear();
       return;
     }
     void runIntent(async () => {
@@ -465,6 +474,8 @@ export default function App() {
       setRoomCode(null);
       setSelfId(null);
       setPassword("");
+      setPreviews({});
+      previewsSeen.current.clear();
     });
   };
 
@@ -479,6 +490,9 @@ export default function App() {
     listSources().then(
       (listed) => {
         setSources(listed);
+        // Lista fresca → thumbs frescos (limpa o cache lazy).
+        setPreviews({});
+        previewsSeen.current.clear();
         if (listed.length === 0) {
           setSourcesError("Nenhuma fonte visível — provavelmente falta permissão de Gravação de Tela.");
         }
@@ -488,6 +502,30 @@ export default function App() {
         setSourcesError(messageOf(failure, "Não foi listar as fontes."));
       },
     );
+  };
+
+  /**
+   * Busca lazy dos thumbs da aba visível do modal (views avisa ao abrir /
+   * trocar de aba, com debounce). Cache por kind:id + dedupe de voo:
+   * null/falha marcam como visto (sem retry em rajada) e nunca quebram as
+   * outras fontes. Mock nunca busca (gradiente local).
+   */
+  const handlePreviewsVisible = (items: SourceInfo[]): void => {
+    if (isMock || items.length === 0) return;
+    for (const item of items) {
+      const key = `${item.kind}:${item.id}`;
+      if (previews[key] !== undefined || previewsSeen.current.has(key)) continue;
+      previewsSeen.current.add(key);
+      previewSource(item.kind, item.id).then(
+        (preview) => {
+          if (preview.data_url) {
+            const dataUrl: string = preview.data_url;
+            setPreviews((current) => ({ ...current, [key]: dataUrl }));
+          }
+        },
+        () => undefined,
+      );
+    }
   };
 
   const handleShare = (): void => {
@@ -694,6 +732,8 @@ export default function App() {
       sourcesError={sourcesError}
       caps={caps}
       onListSources={handleListSources}
+      previews={previews}
+      onPreviewsVisible={handlePreviewsVisible}
       busy={busy}
       error={error}
       lastSignal={lastSignal}

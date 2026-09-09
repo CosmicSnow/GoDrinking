@@ -158,6 +158,18 @@ pub struct RosterMember {
     pub share: bool,
 }
 
+/// Share-modal thumbnail (lazy one-shot pull, never polled). Always
+/// succeeds at the command boundary: capture failures (denial, gone
+/// source, encode) come back as a null `data_url` — the modal lists
+/// sources regardless. Never carries titles or pixels except inside the
+/// data URL itself.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SourcePreview {
+    pub data_url: Option<String>,
+    pub w: u32,
+    pub h: u32,
+}
+
 /// Wire ids as decimal strings (adopted from envelopes, never logged).
 #[derive(Clone, Default, Debug)]
 pub struct WireIds {
@@ -975,6 +987,29 @@ impl AppState {
         }
     }
 
+    /// One-shot source thumbnail for the share modal (explicit UI pull,
+    /// never polled). Infallible at the boundary: unknown kind and every
+    /// backend failure (denial, gone source, empty grab, encode) come back
+    /// as a null `data_url` with 0x0 dims — the modal lists sources
+    /// regardless. Never logs titles or pixels.
+    pub fn preview_source(&self, kind: &str, id: &str) -> SourcePreview {
+        let kind = match kind {
+            "display" => golive_platform::SourceKind::Display,
+            "window" => golive_platform::SourceKind::Window,
+            _ => {
+                return SourcePreview { data_url: None, w: 0, h: 0 };
+            }
+        };
+        match screen::preview_source(kind, id) {
+            Ok(preview) => SourcePreview {
+                data_url: Some(preview.data_url),
+                w: preview.w,
+                h: preview.h,
+            },
+            Err(_) => SourcePreview { data_url: None, w: 0, h: 0 },
+        }
+    }
+
     /// Backend-observed media counters (observational, redacted). Pollable
     /// fallback next to push events. `presented` is summed live from the
     /// native windows (acks), the rest is bumped by forward tasks.
@@ -1253,6 +1288,11 @@ fn get_roster(state: State<'_, Arc<AppState>>) -> Vec<RosterMember> {
 }
 
 #[tauri::command]
+fn preview_source(state: State<'_, Arc<AppState>>, kind: String, id: String) -> SourcePreview {
+    state.preview_source(&kind, &id)
+}
+
+#[tauri::command]
 fn get_media_counters(state: State<'_, Arc<AppState>>) -> Result<MediaCounters, String> {
     state.get_media_counters()
 }
@@ -1303,6 +1343,7 @@ pub fn run_with(state: Arc<AppState>) {
             unwatch,
             get_snapshot,
             get_roster,
+            preview_source,
             get_media_counters,
             set_server,
             get_e2e_plan,
@@ -1459,6 +1500,16 @@ mod roster_tests {
         // erroring — the event listener fills the roster in once WS connects.
         let state = AppState::new();
         assert!(state.get_roster().is_empty());
+    }
+
+    #[test]
+    fn preview_unknown_kind_is_null_never_errors() {
+        // No OS contact on this path: unknown kind short-circuits to a null
+        // thumbnail (the modal lists sources regardless).
+        let state = AppState::new();
+        let preview = state.preview_source("bogus", "1");
+        assert!(preview.data_url.is_none());
+        assert_eq!((preview.w, preview.h), (0, 0));
     }
 }
 

@@ -6,7 +6,7 @@
  * estado honesto, nunca mock. Idioma: só pt-BR.
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type {
   CapabilitySet,
   EffectiveQuality,
@@ -727,6 +727,10 @@ export interface RoomProps {
   /** Capacidades desta build (desabilita com motivo). */
   caps: CapabilitySet | null;
   onListSources: () => void;
+  /** Thumbs PNG (data URL) por "kind:id", cache lazy do App. Ausente = gradiente. */
+  previews?: Record<string, string>;
+  /** Pede thumbs da aba visível (App busca lazy com cache; mock ignora). */
+  onPreviewsVisible?: (items: SourceInfo[]) => void;
   busy: boolean;
   error: string | null;
   lastSignal: string | null;
@@ -872,6 +876,7 @@ export function RoomScreen(props: RoomProps) {
   const {
     roomCode, snapshot, roster, selfId, selfNickname, watching,
     source, onSource, sources, sourcesError, caps, onListSources,
+    previews, onPreviewsVisible,
     busy, error, lastSignal, lastMedia, quality, linkStats,
     onRefresh, onLeave, onShare, onStopShare, onWatch, onUnwatch,
     mock = false,
@@ -951,6 +956,19 @@ export function RoomScreen(props: RoomProps) {
   const visibleSources = sources.filter((item) =>
     shareTab === "screens" ? item.kind === "display" : item.kind === "window",
   );
+  // Previews lazy do modal: ao abrir ou trocar de aba/lista, pede os thumbs
+  // da aba visível com debounce (o App cacheia por kind:id; sem thumb, o
+  // gradiente continua). Callback via ref para não refogar o debounce.
+  const previewsCb = useRef(onPreviewsVisible);
+  previewsCb.current = onPreviewsVisible;
+  useEffect(() => {
+    if (!shareOpen) return;
+    const timer = setTimeout(() => {
+      previewsCb.current?.(visibleSources);
+    }, 180);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shareOpen, shareTab, sources]);
   const audioVisible: Array<{ id: string; name: string }> = [];
   const audioFiltered = audioVisible.filter((item) => {
     void audioSoundOnly;
@@ -1448,14 +1466,35 @@ export function RoomScreen(props: RoomProps) {
                   className={`source${source === `${item.kind}:${item.id}` ? " sel" : ""}`}
                   onClick={() => pickSource(item.kind, item.id, item.name)}
                 >
-                  <span
-                    className="thumb"
-                    style={{
-                      background: `linear-gradient(135deg, hsl(${hueOfNickname(item.id)} 45% 35%), hsl(${hueOfNickname(item.id)} 45% 12%))`,
-                    }}
-                  >
-                    FONTE
-                  </span>
+                  {(() => {
+                    const thumb =
+                      previews?.[`${item.kind}:${item.id}`] ?? item.thumbnail ?? null;
+                    return thumb ? (
+                      <span className="thumb" aria-hidden="true">
+                        <img
+                          src={thumb}
+                          alt=""
+                          aria-hidden="true"
+                          draggable={false}
+                          style={{
+                            width: "100%",
+                            height: "100%",
+                            objectFit: "cover",
+                            display: "block",
+                          }}
+                        />
+                      </span>
+                    ) : (
+                      <span
+                        className="thumb"
+                        style={{
+                          background: `linear-gradient(135deg, hsl(${hueOfNickname(item.id)} 45% 35%), hsl(${hueOfNickname(item.id)} 45% 12%))`,
+                        }}
+                      >
+                        FONTE
+                      </span>
+                    );
+                  })()}
                   <b>{item.name}</b>
                   <small>{item.w} × {item.h}</small>
                 </button>

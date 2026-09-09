@@ -20,6 +20,7 @@ import {
   listSources,
   onMediaEvent,
   onSignalEvent,
+  previewSource,
   setQuality,
   setServer,
   sourceCapabilities,
@@ -132,6 +133,19 @@ describe("intents (comando certo, args certos)", () => {
     mockInvoke.mockResolvedValueOnce(roster);
     await expect(getRoster()).resolves.toEqual(roster);
     expect(mockInvoke).toHaveBeenCalledWith("get_roster");
+  });
+
+  it("preview_source leva kind+id e devolve o thumb (null quando indisponível)", async () => {
+    const preview = { data_url: "data:image/png;base64,iVBOR", w: 256, h: 144 };
+    mockInvoke.mockResolvedValueOnce(preview);
+    await expect(previewSource("display", "1")).resolves.toEqual(preview);
+    expect(mockInvoke).toHaveBeenCalledWith("preview_source", { kind: "display", id: "1" });
+    mockInvoke.mockResolvedValueOnce({ data_url: null, w: 0, h: 0 });
+    await expect(previewSource("window", "42")).resolves.toEqual({
+      data_url: null,
+      w: 0,
+      h: 0,
+    });
   });
 });
 

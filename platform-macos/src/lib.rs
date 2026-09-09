@@ -215,6 +215,95 @@ fn shareable_content() -> Result<Retained<SCShareableContent>, PlatformError> {
     }
 }
 
+/// One-shot still for the share-modal preview: a single
+/// `CGWindowListCreateImage` grab (synchronous, no stream, no extra OS
+/// prompt beyond what enumerate already needed). Displays capture their
+/// own bounds; windows capture by id (`CGRectNull` + IncludingWindow).
+/// Returns tight BGRA pixels (window-list images are premultiplied-first
+/// little-endian; the preview path treats the bytes as BGRA8888 —
+/// premultiplication is visually negligible at thumbnail size).
+///
+/// One call per source, caller-driven (lazy modal pulls) — never polled.
+/// Failures are typed (bad id, gone source, empty grab); titles and pixels
+/// never reach logs.
+#[allow(deprecated)] // deprecated for capture; still the one-shot still API.
+pub fn thumbnail(kind: SourceKind, id: &str) -> Result<BgraFrame, PlatformError> {
+    use objc2_core_graphics::{
+        CGDataProvider, CGDisplayBounds, CGImageGetBitsPerComponent, CGImageGetBitsPerPixel,
+        CGImageGetBytesPerRow, CGImageGetDataProvider, CGImageGetHeight, CGImageGetWidth,
+        CGWindowImageOption, CGWindowListCreateImage, CGWindowListOption, CGRectIsNull,
+        CGRectNull, kCGNullWindowID,
+    };
+    let window_id: u32 =
+        id.trim()
+            .parse()
+            .map_err(|_| PlatformError::InvalidSource { reason: "id de fonte inválido" })?;
+    // SAFETY: plain CoreGraphics C calls. Every pointer is null-checked
+    // (Option returns), every read is exact-size (dims/stride come from the
+    // getters below), and the pixel copy outlives nothing: bytes are copied
+    // while the retained CFData is alive.
+    unsafe {
+        let image = match kind {
+            SourceKind::Display => {
+                let bounds = CGDisplayBounds(window_id);
+                if CGRectIsNull(bounds) {
+                    return Err(PlatformError::SourceGone { id: id.to_owned() });
+                }
+                CGWindowListCreateImage(
+                    bounds,
+                    CGWindowListOption::OptionOnScreenOnly,
+                    kCGNullWindowID,
+                    CGWindowImageOption::Default,
+                )
+            }
+            SourceKind::Window => CGWindowListCreateImage(
+                CGRectNull,
+                CGWindowListOption::OptionIncludingWindow,
+                window_id,
+                CGWindowImageOption::Default,
+            ),
+        };
+        let image =
+            image.ok_or_else(|| PlatformError::Internal("thumbnail indisponível".into()))?;
+        let w = CGImageGetWidth(Some(&image));
+        let h = CGImageGetHeight(Some(&image));
+        let stride = CGImageGetBytesPerRow(Some(&image));
+        if w == 0
+            || h == 0
+            || w > 8192
+            || h > 8192
+            || CGImageGetBitsPerComponent(Some(&image)) != 8
+            || CGImageGetBitsPerPixel(Some(&image)) != 32
+            || stride < w.saturating_mul(4)
+        {
+            return Err(PlatformError::Internal("thumbnail vazio".into()));
+        }
+        let provider = CGImageGetDataProvider(Some(&image))
+            .ok_or_else(|| PlatformError::Internal("thumbnail vazio".into()))?;
+        let data = CGDataProvider::data(Some(&provider))
+            .ok_or_else(|| PlatformError::Internal("thumbnail vazio".into()))?;
+        let len = data.length().max(0) as usize;
+        if len < h.saturating_mul(stride) {
+            return Err(PlatformError::Internal("thumbnail vazio".into()));
+        }
+        let bytes = std::slice::from_raw_parts(data.byte_ptr(), len);
+        // Tight copy honoring provider stride (row padding dropped).
+        let mut pixels = vec![0u8; w * h * 4];
+        for (dst_row, src_row) in
+            pixels.chunks_exact_mut(w * 4).zip(bytes.chunks(stride)).take(h)
+        {
+            dst_row.copy_from_slice(&src_row[..w * 4]);
+        }
+        Ok(BgraFrame {
+            w: w as u32,
+            h: h as u32,
+            stride: w * 4,
+            format: PixelFormat::Bgra8888,
+            data: pixels,
+        })
+    }
+}
+
 impl VideoSource for ScSource {
     fn enumerate() -> Result<Vec<SourceInfo>, PlatformError> {
         enumerate()

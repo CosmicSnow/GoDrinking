@@ -27,5 +27,14 @@ objc2-core-media = "0.3"
 objc2-core-video = { version = "0.3", features = ["objc2-io-surface"] }
 objc2-io-surface = { version = "0.3", features = ["objc2"] }
 objc2-screen-capture-kit = "0.3"
+# One-shot stills for the share-modal preview (CGWindowListCreateImage +
+# pixel readout; offline-safe: already in the workspace lockfile).
+objc2-core-graphics = { version = "0.3", features = [
+    "CGWindow",
+    "CGImage",
+    "CGGeometry",
+    "CGDataProvider",
+    "CGDirectDisplay",
+] }
 block2 = "0.6"
 dispatch2 = { version = "0.3", features = ["objc2"] }

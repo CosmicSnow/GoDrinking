@@ -395,6 +395,37 @@ describe("fontes de captura (select + capacidades)", () => {
     );
     expect(html).toContain("Display 1 · 2560x1440");
   });
+
+  it("thumb vira <img> quando há preview; sem preview, gradiente FONTE", () => {
+    const withThumb = renderToStaticMarkup(
+      createElement(
+        RoomScreen,
+        roomProps({
+          source: "display:",
+          sources: [
+            { kind: "display", id: "1", name: "Display 1 · 2560x1440", w: 2560, h: 1440 },
+          ],
+          previews: { "display:1": "data:image/png;base64,iVBOR" },
+        }),
+      ),
+    );
+    expect(withThumb).toContain("<img");
+    expect(withThumb).toContain("data:image/png;base64,iVBOR");
+
+    const plain = renderToStaticMarkup(
+      createElement(
+        RoomScreen,
+        roomProps({
+          source: "display:",
+          sources: [
+            { kind: "display", id: "1", name: "Display 1 · 2560x1440", w: 2560, h: 1440 },
+          ],
+        }),
+      ),
+    );
+    expect(plain).toContain("FONTE");
+    expect(plain).not.toContain("data:image");
+  });
 });
 
 describe("qualidade (espelha QualityProfile; fio bloqueado)", () => {
