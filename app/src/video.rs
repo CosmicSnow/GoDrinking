@@ -27,8 +27,15 @@
 use golive_core::media::PresentedFrame;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
+
+#[cfg(unix)]
+type IpcStream = UnixStream;
+#[cfg(windows)]
+type IpcStream = std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -436,10 +443,15 @@ pub struct LinkStats {
 /// `Contents/MacOS/golive-video` next to the packaged binary (the e2e
 /// script copies it there after `tauri build`).
 pub fn helper_path() -> PathBuf {
+    let name = if cfg!(windows) {
+        "golive-video.exe"
+    } else {
+        HELPER_NAME
+    };
     std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(HELPER_NAME)))
-        .unwrap_or_else(|| PathBuf::from(HELPER_NAME))
+        .and_then(|exe| exe.parent().map(|dir| dir.join(name)))
+        .unwrap_or_else(|| PathBuf::from(name))
 }
 
 // ---------------------------------------------------------------------------
@@ -660,21 +672,16 @@ fn feed_loop(
     };
 
     // Spawn the helper now.
-    let _ = std::fs::remove_file(&sock_path);
-    let listener = match std::os::unix::net::UnixListener::bind(&sock_path) {
-        Ok(listener) => listener,
+    let (listener, helper_arg) = match bind_ipc(&sock_path) {
+        Ok(bound) => bound,
         Err(e) => {
             eprintln!("video socket bind failed: {e}");
             healthy.store(false, Ordering::Release);
             return;
         }
     };
-    if listener.set_nonblocking(true).is_err() {
-        healthy.store(false, Ordering::Release);
-        return;
-    }
     let child = match std::process::Command::new(&helper)
-        .arg(&sock_path)
+        .arg(&helper_arg)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -712,7 +719,7 @@ fn feed_loop(
             }
         }
     }
-    let mut sock: UnixStream = match sock {
+    let mut sock: IpcStream = match sock {
         Some(sock) => sock,
         None => {
             eprintln!("video helper never connected back");
@@ -725,6 +732,7 @@ fn feed_loop(
     let _ = sock.set_nonblocking(false);
     let _ = sock.set_read_timeout(Some(SOCKET_TIMEOUT));
     let _ = sock.set_write_timeout(Some(SOCKET_TIMEOUT));
+    prepare_ipc_stream(&sock);
 
     if write_handshake(&mut sock, &title, w, h).is_err() {
         healthy.store(false, Ordering::Release);
@@ -793,7 +801,28 @@ impl FrameSlot {
     }
 }
 
-fn write_handshake(sock: &mut UnixStream, title: &str, w: usize, h: usize) -> std::io::Result<()> {
+#[cfg(unix)]
+fn bind_ipc(sock_path: &Path) -> std::io::Result<(UnixListener, PathBuf)> {
+    let _ = std::fs::remove_file(sock_path);
+    let listener = UnixListener::bind(sock_path)?;
+    listener.set_nonblocking(true)?;
+    Ok((listener, sock_path.to_path_buf()))
+}
+
+#[cfg(windows)]
+fn bind_ipc(_sock_path: &Path) -> std::io::Result<(std::net::TcpListener, PathBuf)> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let addr = listener.local_addr()?;
+    Ok((listener, PathBuf::from(addr.to_string())))
+}
+
+fn prepare_ipc_stream(_sock: &IpcStream) {
+    #[cfg(windows)]
+    let _ = _sock.set_nodelay(true);
+}
+
+fn write_handshake(sock: &mut impl Write, title: &str, w: usize, h: usize) -> std::io::Result<()> {
     let title = title.as_bytes();
     let title_len = title.len().min(256) as u32;
     let mut header = Vec::with_capacity(16);
@@ -806,7 +835,7 @@ fn write_handshake(sock: &mut UnixStream, title: &str, w: usize, h: usize) -> st
     sock.flush()
 }
 
-fn write_frame(sock: &mut UnixStream, frame: &PresentedFrame) -> std::io::Result<()> {
+fn write_frame(sock: &mut impl Write, frame: &PresentedFrame) -> std::io::Result<()> {
     let expected = frame.w.checked_mul(frame.h).and_then(|n| n.checked_mul(4));
     if expected != Some(frame.rgba.len()) {
         return Err(std::io::Error::new(
@@ -819,7 +848,7 @@ fn write_frame(sock: &mut UnixStream, frame: &PresentedFrame) -> std::io::Result
     sock.flush()
 }
 
-fn read_ack(sock: &mut UnixStream) -> std::io::Result<()> {
+fn read_ack(sock: &mut impl Read) -> std::io::Result<()> {
     let mut ack = [0u8; 1];
     sock.read_exact(&mut ack)?;
     if ack[0] != 0x01 {
@@ -834,6 +863,14 @@ fn read_ack(sock: &mut UnixStream) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn connected_pair() -> (std::net::TcpStream, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (client, server)
+    }
 
     #[test]
     fn letterbox_preserves_aspect() {
@@ -1132,7 +1169,7 @@ mod tests {
 
     #[test]
     fn handshake_bytes_carry_magic_dims_and_title() {
-        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (mut a, mut b) = connected_pair();
         write_handshake(&mut a, "nick", 1280, 720).unwrap();
         let mut header = [0u8; 16];
         b.read_exact(&mut header).unwrap();
@@ -1148,7 +1185,7 @@ mod tests {
 
     #[test]
     fn handshake_truncates_long_titles_at_256() {
-        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (mut a, mut b) = connected_pair();
         write_handshake(&mut a, &"n".repeat(300), 640, 480).unwrap();
         let mut header = [0u8; 16];
         b.read_exact(&mut header).unwrap();
@@ -1158,7 +1195,7 @@ mod tests {
 
     #[test]
     fn frame_roundtrip_and_ack_shape() {
-        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (mut a, mut b) = connected_pair();
         let frame = PresentedFrame { w: 2, h: 1, rgba: vec![9u8; 8] };
         write_frame(&mut a, &frame).unwrap();
         let mut len = [0u8; 4];

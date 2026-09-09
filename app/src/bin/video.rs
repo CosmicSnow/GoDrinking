@@ -24,8 +24,12 @@ use golive_app::video::{
 };
 use std::io::{Read, Write};
 use std::num::NonZeroU32;
-use std::os::unix::net::UnixStream;
 use std::sync::{mpsc, Arc};
+
+#[cfg(unix)]
+type IpcStream = std::os::unix::net::UnixStream;
+#[cfg(windows)]
+type IpcStream = std::net::TcpStream;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -72,7 +76,7 @@ struct App {
     base_title: String,
     frozen: bool,
     last_present: Instant,
-    ack: Option<UnixStream>,
+    ack: Option<IpcStream>,
     inbox: mpsc::Receiver<Inbox>,
     gone: bool,
     src_w: u32,
@@ -464,7 +468,7 @@ fn run() -> Result<(), String> {
     let sock_path = std::env::args()
         .nth(1)
         .ok_or_else(|| "usage: golive-video <socket-path>".to_string())?;
-    let mut sock = UnixStream::connect(&sock_path).map_err(|e| format!("connect: {e}"))?;
+    let mut sock = connect_ipc(&sock_path).map_err(|e| format!("connect: {e}"))?;
     sock.set_read_timeout(Some(READ_TICK))
         .map_err(|e| format!("socket timeout: {e}"))?;
     let (title, src_w, src_h) = read_handshake(&mut sock)?;
@@ -536,7 +540,20 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn read_handshake(sock: &mut UnixStream) -> Result<(String, u32, u32), String> {
+fn connect_ipc(addr: &str) -> std::io::Result<IpcStream> {
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(addr)
+    }
+    #[cfg(windows)]
+    {
+        let sock = std::net::TcpStream::connect(addr)?;
+        sock.set_nodelay(true)?;
+        Ok(sock)
+    }
+}
+
+fn read_handshake(sock: &mut IpcStream) -> Result<(String, u32, u32), String> {
     // Blocking reads with an overall bound: the shell connects promptly.
     sock.set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|e| format!("socket timeout: {e}"))?;
@@ -564,7 +581,7 @@ fn read_handshake(sock: &mut UnixStream) -> Result<(String, u32, u32), String> {
 /// Reads one frame for the contracted size. Ok(Some) = full frame,
 /// Ok(None) = quiet tick, Err = session over (EOF, timeout-mid-frame,
 /// size mismatch — the shell tears down; never render partial data).
-fn read_frame(sock: &mut UnixStream, w: u32, h: u32) -> Result<Option<Vec<u8>>, String> {
+fn read_frame(sock: &mut IpcStream, w: u32, h: u32) -> Result<Option<Vec<u8>>, String> {
     let expected = (w as usize)
         .checked_mul(h as usize)
         .and_then(|n| n.checked_mul(4))
