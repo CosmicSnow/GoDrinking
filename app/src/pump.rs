@@ -239,10 +239,17 @@ pub fn spawn_forward(
                     // Offer/answer SDP travels via explicit envelopes.
                 }
                 MediaEvent::IceCandidate { candidate } => {
-                    // Host trickle-out is handled by the pump's send path;
-                    // viewer trickle-out is forwarded here (adopted fence).
-                    if matches!(target, ForwardTarget::Watch) {
-                        forward_viewer_candidate(&state, candidate).await;
+                    // Trickle-out per session: host candidates go to the
+                    // adopted watcher; viewer candidates go to our watch
+                    // target (adopted fence). Dropping either side stalls
+                    // ICE in "negotiating" forever.
+                    match target {
+                        ForwardTarget::Watch => {
+                            forward_viewer_candidate(&state, candidate).await;
+                        }
+                        ForwardTarget::Share => {
+                            forward_host_candidate(&state, candidate).await;
+                        }
                     }
                 }
                 MediaEvent::IceGatheringComplete => {
@@ -251,6 +258,7 @@ pub fn spawn_forward(
                             forward_viewer_gathering_complete(&state).await;
                         }
                         ForwardTarget::Share => {
+                            forward_host_gathering_complete(&state).await;
                             emit(
                                 &app,
                                 "media-event",
@@ -351,6 +359,77 @@ async fn forward_viewer_gathering_complete(state: &Arc<AppState>) {
     if to.is_empty() {
         return;
     }
+    let envelope = envelope(&ids, EnvelopeKind::IceComplete, None, None);
+    if check_envelope(&envelope).is_ok() {
+        let inner = match state.inner.lock() {
+            Ok(inner) => inner,
+            Err(_) => return,
+        };
+        if let Some(signal) = inner.signal.as_ref() {
+            let _ = signal.send_signal(&to, &envelope);
+        }
+    }
+}
+
+/// Pure host-trickle addressing (unit-tested below, no media/signal).
+///
+/// Returns the watcher + wire ids for host trickle-out: the adopted
+/// per-watcher link. The idle template (key `""`, empty wire until adopted
+/// on watch) is skipped. MVP holds a single live link — the pump's Share
+/// forward task serves the one adopted publisher — so the first live entry
+/// is the specific watcher; entries are `(member id, wire ids)`.
+fn select_host_trickle_target<'a>(
+    entries: impl Iterator<Item = (&'a str, &'a WireIds)>,
+) -> Option<(String, WireIds)> {
+    entries
+        .filter(|(key, ids)| !key.is_empty() && !ids.session.is_empty())
+        .map(|(key, ids)| (key.to_owned(), ids.clone()))
+        .next()
+}
+
+/// Host trickle-out: adopted per-watcher link's wire ids + watcher as `to`.
+/// Mirrors `forward_viewer_candidate` (same envelope shape/validation; the
+/// viewer already understands Candidate + ice-complete per PROTOCOL.md).
+async fn forward_host_candidate(state: &Arc<AppState>, candidate: String) {
+    let (to, ids) = {
+        let inner = match state.inner.lock() {
+            Ok(inner) => inner,
+            Err(_) => return,
+        };
+        match select_host_trickle_target(
+            inner.publishers.iter().map(|(k, s)| (k.as_str(), &s.wire)),
+        ) {
+            Some(target) => target,
+            None => return,
+        }
+    };
+    let envelope = envelope(&ids, EnvelopeKind::Candidate, None, Some(candidate));
+    if check_envelope(&envelope).is_ok() {
+        let inner = match state.inner.lock() {
+            Ok(inner) => inner,
+            Err(_) => return,
+        };
+        if let Some(signal) = inner.signal.as_ref() {
+            let _ = signal.send_signal(&to, &envelope);
+        }
+    }
+}
+
+/// Host gathering-complete: same `ice-complete` envelope the viewer path
+/// already emits (the viewer validates the fence and needs no PC action).
+async fn forward_host_gathering_complete(state: &Arc<AppState>) {
+    let (to, ids) = {
+        let inner = match state.inner.lock() {
+            Ok(inner) => inner,
+            Err(_) => return,
+        };
+        match select_host_trickle_target(
+            inner.publishers.iter().map(|(k, s)| (k.as_str(), &s.wire)),
+        ) {
+            Some(target) => target,
+            None => return,
+        }
+    };
     let envelope = envelope(&ids, EnvelopeKind::IceComplete, None, None);
     if check_envelope(&envelope).is_ok() {
         let inner = match state.inner.lock() {
@@ -688,10 +767,45 @@ fn watcher_nickname(state: &Arc<AppState>, watcher: &str) -> String {
 
 async fn on_viewer_envelope(state: &Arc<AppState>, payload: &Envelope) {
     if payload.kind == EnvelopeKind::Candidate {
-        // Queue pre-offer (bounded + non-relay already checked).
+        // Pre-offer (no adopted fence yet): queue for the offer flush.
+        // Post-offer: fence-check, then apply when the remote is ready
+        // (mirror of the host path in `on_host_envelope`) — otherwise
+        // queue. Without the ready branch, host candidates trickled after
+        // the answer would sit queued forever and ICE would never close.
+        // (Size + non-relay already rejected by `check_envelope` upstream.)
         if let Some(candidate) = payload.candidate.clone() {
-            if let Ok(mut inner) = state.inner.lock() {
-                inner.viewer_pending_remote.push(candidate);
+            let (adopted, ready, viewer) = {
+                let inner = match state.inner.lock() {
+                    Ok(inner) => inner,
+                    Err(_) => return,
+                };
+                (
+                    inner.adopted.clone(),
+                    inner.viewer_remote_ready,
+                    inner.viewer.clone(),
+                )
+            };
+            match adopted {
+                None => {
+                    if let Ok(mut inner) = state.inner.lock() {
+                        inner.viewer_pending_remote.push(candidate);
+                    }
+                }
+                Some(ids) => {
+                    if !current(&ids, payload) {
+                        return;
+                    }
+                    match (ready, viewer) {
+                        (true, Some(viewer)) => {
+                            let _ = viewer.lock().await.add_remote_candidate(&candidate).await;
+                        }
+                        _ => {
+                            if let Ok(mut inner) = state.inner.lock() {
+                                inner.viewer_pending_remote.push(candidate);
+                            }
+                        }
+                    }
+                }
             }
         }
         return;
@@ -842,5 +956,92 @@ async fn on_viewer_envelope(state: &Arc<AppState>, payload: &Envelope) {
             }
         }
         Err(_) => {}
+    }
+}
+
+#[cfg(test)]
+mod host_trickle_tests {
+    use super::*;
+
+    fn wire(session: &str) -> WireIds {
+        WireIds {
+            session: session.to_owned(),
+            share: "1".to_owned(),
+            link: "2".to_owned(),
+            attempt: "3".to_owned(),
+        }
+    }
+
+    #[test]
+    fn template_without_watcher_is_dropped() {
+        // Idle template (key "", empty wire): no watcher adopted yet.
+        let template = WireIds::default();
+        let entries = [("", &template)];
+        assert!(
+            select_host_trickle_target(entries.iter().map(|(k, v)| (*k, *v))).is_none()
+        );
+    }
+
+    #[test]
+    fn adopted_link_is_addressed_to_its_watcher() {
+        let template = WireIds::default();
+        let live = wire("7");
+        let entries = [("", &template), ("watcher-abc", &live)];
+        let (to, ids) = select_host_trickle_target(entries.iter().map(|(k, v)| (*k, *v)))
+            .expect("adopted link selected");
+        assert_eq!(to, "watcher-abc");
+        assert_eq!(ids.session, "7");
+    }
+
+    #[test]
+    fn no_links_selects_nothing() {
+        let entries: [(&str, &WireIds); 0] = [];
+        assert!(
+            select_host_trickle_target(entries.iter().map(|(k, v)| (*k, *v))).is_none()
+        );
+    }
+
+    #[test]
+    fn host_candidate_and_ice_complete_envelopes_validate() {
+        // Same envelope shapes the viewer path already understands
+        // (PROTOCOL.md): candidate + ice-complete, no SDP anywhere.
+        let ids = wire("7");
+        let candidate = envelope(
+            &ids,
+            EnvelopeKind::Candidate,
+            None,
+            Some("candidate:1 1 udp 1 203.0.113.5 9 typ host".to_owned()),
+        );
+        assert!(check_envelope(&candidate).is_ok());
+        assert!(current(&ids, &candidate));
+        let complete = envelope(&ids, EnvelopeKind::IceComplete, None, None);
+        assert!(check_envelope(&complete).is_ok());
+        assert!(current(&ids, &complete));
+    }
+
+    #[test]
+    fn relay_candidates_stay_rejected_on_host_path() {
+        // No TURN in this product: relay candidates never reach the wire.
+        let ids = wire("7");
+        let relay = envelope(
+            &ids,
+            EnvelopeKind::Candidate,
+            None,
+            Some("candidate:9 1 udp 1 203.0.113.7 9 typ relay".to_owned()),
+        );
+        assert!(check_envelope(&relay).is_err());
+    }
+
+    #[test]
+    fn stale_host_candidates_miss_the_current_fence() {
+        let ids = wire("7");
+        let mut stale = envelope(
+            &ids,
+            EnvelopeKind::Candidate,
+            None,
+            Some("candidate:1 1 udp 1 203.0.113.5 9 typ host".to_owned()),
+        );
+        stale.attempt = "2".to_owned();
+        assert!(!current(&ids, &stale));
     }
 }
