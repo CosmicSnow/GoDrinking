@@ -9,11 +9,27 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ART="$ROOT/e2e-artifacts"
-APP="$ROOT/app/target/debug/bundle/macos/GoLive.app"
+# Build profile do bundle sob teste (default debug = comportamento existente;
+# release via E2E_PROFILE=release, que é o que o lane Display-3 valida).
+E2E_PROFILE="${E2E_PROFILE:-debug}"
+APP="$ROOT/app/target/$E2E_PROFILE/bundle/macos/GoLive.app"
+# Fonte do share do host (default synthetic = comportamento existente;
+# display:<id> para o lane Display-3, movie:<path> idem). Validada no parse
+# do plano (app/src/lib.rs); aqui só repasse.
+E2E_SHARE="${E2E_SHARE:-synthetic}"
+# Traces opt-in por instância (GOLIVE_TRACE_DIR por processo): host-trace/ +
+# viewer-trace/ sob o run dir. Isolados por instância para o overlay
+# host-vs-viewer do analyze-trace.py.
+TRACE_ROOT="${E2E_TRACE_ROOT:-$ART/traces}"
+HOST_TRACE="$TRACE_ROOT/host-trace"
+VIEWER_TRACE="$TRACE_ROOT/viewer-trace"
 # The Mach-O inside is named after the cargo binary (golive-app), not the
 # product name — resolve it by name (never first-executable: the staged
 # video helper lives in the same dir).
-BIN="$APP/Contents/MacOS/golive-app"
+# Override to drive a consented identity directly (e.g. the unbundled
+# target/release/golive-app that already holds the Screen Recording grant —
+# a bundle copy at another path is a different TCC identity).
+BIN="${E2E_BIN:-$APP/Contents/MacOS/golive-app}"
 SERVER="$ROOT/server/server.mjs"
 TIMEOUT_S="${E2E_TIMEOUT_S:-120}"
 PASSWORD="e2e-packaged-local"
@@ -21,17 +37,21 @@ PASSWORD="e2e-packaged-local"
 mkdir -p "$ART"
 rm -f "$ART/code" "$ART/host.json" "$ART/viewer.json" \
   "$ART/verdict.json" "$ART/screen-final.png" \
-  "$ART/host.log" "$ART/viewer.log" "$ART/server.log"
+  "$ART/host.log" "$ART/viewer.log" "$ART/server.log" \
+  "$ART/analyze.log" "$ART/analyze.err"
+mkdir -p "$HOST_TRACE" "$VIEWER_TRACE"
+rm -f "$HOST_TRACE"/golive-trace-*.jsonl "$VIEWER_TRACE"/golive-trace-*.jsonl
 
 fail() { echo "E2E-FAIL: $1" >&2; return 1; }
 [ -n "$BIN" ] && [ -x "$BIN" ] || { fail "no executable inside $APP/Contents/MacOS"; exit 1; }
 # Video helper: Tauri bundles only the main binary, so the harness stages
 # golive-video next to it (same dir the shell searches at runtime).
 # Production packaging would use bundle.externalBin — documented follow-up.
-HELPER_SRC="$ROOT/app/target/debug/golive-video"
-HELPER_DST="$APP/Contents/MacOS/golive-video"
+HELPER_SRC="$ROOT/app/target/$E2E_PROFILE/golive-video"
+HELPER_DST="$(dirname "$BIN")/golive-video"
 [ -f "$HELPER_SRC" ] || { fail "helper missing: run cargo build --bin golive-video in app/"; exit 1; }
-cp -f "$HELPER_SRC" "$HELPER_DST" && chmod +x "$HELPER_DST" || { fail "helper stage failed"; exit 1; }
+if [ "$HELPER_SRC" -ef "$HELPER_DST" ]; then :; else cp -f "$HELPER_SRC" "$HELPER_DST" || { fail "helper stage failed"; exit 1; }; fi
+chmod +x "$HELPER_DST" || { fail "helper stage failed"; exit 1; }
 [ -f "$SERVER" ] || { fail "server missing: $SERVER"; exit 1; }
 command -v node >/dev/null || { fail "node not found"; exit 1; }
 
@@ -56,12 +76,15 @@ for _ in $(seq 1 150); do
 done
 curl -sf -m 2 "$BASE/health" >/dev/null 2>&1 || { fail "server-up (no health on $BASE)"; exit 1; }
 
-HOST_PLAN="{\"role\":\"host\",\"server\":\"$BASE\",\"password\":\"$PASSWORD\",\"nickname\":\"host-e2e\",\"code_file\":\"$ART/code\",\"status_file\":\"$ART/host.json\"}"
+HOST_PLAN="{\"role\":\"host\",\"server\":\"$BASE\",\"password\":\"$PASSWORD\",\"nickname\":\"host-e2e\",\"code_file\":\"$ART/code\",\"status_file\":\"$ART/host.json\",\"share\":\"$E2E_SHARE\"}"
 VIEWER_PLAN="{\"role\":\"viewer\",\"server\":\"$BASE\",\"password\":\"$PASSWORD\",\"nickname\":\"viewer-e2e\",\"code_file\":\"$ART/code\",\"status_file\":\"$ART/viewer.json\"}"
 
-"$BIN" --e2e-plan "$HOST_PLAN" >"$ART/host.log" 2>&1 &
+# GOLIVE_TRACE_DIR por instância: cada processo escreve no seu dir (o trace
+# abre golive-trace-<pid>.jsonl lá dentro). Sem isso os dois traces
+# colidiriam no mesmo dir sem separação host/viewer para o overlay.
+GOLIVE_TRACE_DIR="$HOST_TRACE" "$BIN" --e2e-plan "$HOST_PLAN" >"$ART/host.log" 2>&1 &
 HOST_PID=$!
-"$BIN" --e2e-plan "$VIEWER_PLAN" >"$ART/viewer.log" 2>&1 &
+GOLIVE_TRACE_DIR="$VIEWER_TRACE" "$BIN" --e2e-plan "$VIEWER_PLAN" >"$ART/viewer.log" 2>&1 &
 VIEWER_PID=$!
 
 # Espera dirigida por status com first-missing ordenado.
@@ -180,6 +203,16 @@ with open(f"{art}/verdict.json", "w") as f:
     json.dump(doc, f, indent=2)
 print(json.dumps(doc))
 EOF
+
+# Análise dos traces como passo final não-fatal: nunca muda o veredito
+# (que segue só dos status files acima). Em runs sem tracing ou com dirs
+# vazios o analyzer erra — o erro fica registrado e o harness segue.
+if python3 "$ROOT/scripts/analyze-trace.py" "$HOST_TRACE" "$VIEWER_TRACE" >"$ART/analyze.log" 2>"$ART/analyze.err"; then
+  echo "E2E-ANALYZE ok (host-trace + viewer-trace)"
+else
+  echo "E2E-ANALYZE skipped (code $?; see $ART/analyze.err)" >&2 || true
+  cat "$ART/analyze.err" >>"$ART/analyze.log" 2>/dev/null || true
+fi
 
 if [ "$VERDICT" = "PASS" ]; then
   echo "E2E-PASS in ${ELAPSED}s"

@@ -992,14 +992,15 @@ fn pli_due(last: &mut HashMap<u32, Instant>, media_ssrc: u32, now: Instant) -> b
 
 /// Sends one PLI for `media_ssrc` unless one went out within the debounce
 /// window. Fire-and-forget: RTCP send failures just mean the next gap asks
-/// again (still debounced).
+/// again (still debounced). Returns whether a PLI went out, so the caller
+/// can trace sent vs suppressed gap storms (numeric counters only).
 async fn maybe_send_pli(
     pc: &Arc<RTCPeerConnection>,
     last_pli: &mut HashMap<u32, Instant>,
     media_ssrc: u32,
-) {
+) -> bool {
     if !pli_due(last_pli, media_ssrc, Instant::now()) {
-        return;
+        return false;
     }
     let pli = PictureLossIndication {
         sender_ssrc: 0,
@@ -1008,6 +1009,7 @@ async fn maybe_send_pli(
     let _ = pc
         .write_rtcp(&[Box::new(pli) as Box<dyn RtcpPacket + Send + Sync>])
         .await;
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1342,7 +1344,10 @@ fn encode_loop(
         // 1b. PLI/FIR recovery: the viewer's loss signal (set by the RTCP
         // task) forces the next unit to start with an IDR. Consumed once;
         // the normal path never sets it, so behavior there is unchanged.
-        if intra_requested.swap(false, Ordering::Acquire) {
+        // Inbound FIR/PLI batches coalesce here, so one applied IDR may
+        // answer several inbound requests — the trace counts applications.
+        let intra_applied = intra_requested.swap(false, Ordering::Acquire) as u64;
+        if intra_applied == 1 {
             encoder.force_intra();
         }
         // 2. Fetch one frame at the current target dims. CPU frames scale
@@ -1403,6 +1408,7 @@ fn encode_loop(
             bytes: encoded.as_ref().ok().and_then(|u| u.as_ref()).map(|u| u.len() as u64).unwrap_or(0),
             keyframes: encoded.as_ref().ok().and_then(|u| u.as_ref()).map(|u| contains_idr(u) as u64).unwrap_or(0),
             dropped: matches!(&encoded, Ok(None)) as u64, errors: encoded.is_err() as u64,
+            intra_applied,
             width: target.0 as u32, height: target.1 as u32, target_fps: profile.fps,
             ..Default::default()
         }, started); }
@@ -1859,8 +1865,14 @@ async fn read_loop(
             Ok(_) => {}
             Err(_) => {
                 // Irrecoverable AU gap: the unit being assembled can never
-                // decode cleanly — ask for an IDR (debounced inside).
-                maybe_send_pli(pc, &mut last_pli, packet.header.ssrc).await;
+                // decode cleanly — ask for an IDR (debounced inside). Trace
+                // sent vs suppressed so gap storms stay visible as numbers.
+                let sent = maybe_send_pli(pc, &mut last_pli, packet.header.ssrc).await;
+                decode_trace.record(TraceSample {
+                    pli_sent: sent as u64,
+                    pli_suppressed: (!sent) as u64,
+                    ..Default::default()
+                }, None);
                 continue;
             }
         }
@@ -2094,6 +2106,34 @@ mod tests {
         );
         assert!(pli_due(&mut last, 11, t0 + PLI_DEBOUNCE), "window re-arms");
         assert!(pli_due(&mut last, 22, t0), "other SSRC independent");
+    }
+
+    #[test]
+    fn pli_gap_storm_sends_once_per_second() {
+        // Simulated gap storm: dozens of irrecoverable AU gaps inside one
+        // debounce window must emit exactly 1 PLI; the rest is suppressed
+        // (numeric counters only — the trace records both sides).
+        let mut last: HashMap<u32, Instant> = HashMap::new();
+        let t0 = Instant::now();
+        let mut sent = 0u64;
+        let mut suppressed = 0u64;
+        for _ in 0..50 {
+            if pli_due(&mut last, 7, t0) {
+                sent += 1;
+            } else {
+                suppressed += 1;
+            }
+        }
+        assert_eq!(sent, 1, "one PLI per storm");
+        assert_eq!(suppressed, 49, "rest suppressed by debounce");
+        let sample = TraceSample {
+            pli_sent: sent,
+            pli_suppressed: suppressed,
+            ..Default::default()
+        };
+        assert_eq!((sample.pli_sent, sample.pli_suppressed), (1, 49));
+        // Next window re-arms: recovery is delayed, never lost.
+        assert!(pli_due(&mut last, 7, t0 + PLI_DEBOUNCE), "window re-arms");
     }
 
     #[test]

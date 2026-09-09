@@ -133,6 +133,50 @@ describe("runE2ePlan host", () => {
     expect(last.keyframesSeen).toBe(true);
     expect(last.qualityApplied).toBe(true);
   });
+
+  it("repasse plan.share display:<id> ao start_share (default segue synthetic)", async () => {
+    mockListen.mockResolvedValue(() => undefined);
+    mockInvoke.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "set_server":
+          return Promise.resolve("http://127.0.0.1:9");
+        case "create_room":
+          return Promise.resolve("ABC123");
+        case "start_share":
+          return Promise.resolve(undefined);
+        case "set_quality":
+          return Promise.resolve({
+            profile: { w: 640, h: 360, bitrate_kbps: 1000, fps: 15 },
+            generation: 0,
+          });
+        case "get_media_counters":
+          return Promise.resolve({
+            connected: true,
+            frames: 0,
+            keyframes: 1,
+            keyframes_seen: true,
+            presented: 0,
+            effective: {
+              profile: { w: 640, h: 360, bitrate_kbps: 1000, fps: 15 },
+              generation: 1,
+            },
+          });
+        case "e2e_status":
+          return Promise.resolve(undefined);
+        case "get_snapshot":
+          return Promise.resolve(SNAPSHOT(["connected"]));
+        default:
+          return Promise.reject(new Error(`unexpected ${cmd}`));
+      }
+    });
+    // Sem share no plano: default synthetic (comportamento existente).
+    await runE2ePlan(PLAN, () => undefined);
+    expect(mockInvoke).toHaveBeenCalledWith("start_share", { source: "synthetic" });
+    mockInvoke.mockClear();
+    // Com share display:3: repasse verbatim (o backend valida via ShareSource).
+    await runE2ePlan({ ...PLAN, share: "display:3" }, () => undefined);
+    expect(mockInvoke).toHaveBeenCalledWith("start_share", { source: "display:3" });
+  });
 });
 
 describe("runE2ePlan viewer", () => {

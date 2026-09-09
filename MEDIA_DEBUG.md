@@ -61,13 +61,27 @@ not a zero-rate sample: it can mean that stage is blocked or inactive.
   frames from fresh capture arrivals.
 - `encode`: encoded frames, actual H.264 bytes, keyframes, encode work time,
   dimensions and requested FPS. Includes GPU conversion fallback time.
+  `intra_applied` counts viewer FIR/PLI requests applied as forced IDRs
+  (inbound bursts coalesce: one applied IDR may answer several requests).
 - `send`: access units submitted to the WebRTC track, H.264 bytes, and
   submission work time. Success does not establish delivery to the watcher.
 - `rtp`: here `frames` counts RTP packets, not video frames; `bytes` is RTP
   payload bytes, excluding headers and transport overhead.
 - `decode`: decoded frames and decode-plus-RGBA-conversion work time.
   `dropped` means an access unit produced no picture (including decode
-  errors). Assembly/wait time is excluded.
+  errors). Assembly/wait time is excluded. `pli_sent` counts PLI requests
+  actually sent for irrecoverable access-unit gaps (debounced ~1/s per
+  SSRC); `pli_suppressed` counts gaps that asked for nothing because the
+  debounce window was still held — a storm reads as `pli_sent: 1` beside a
+  large `pli_suppressed`.
+- `present`: helper acknowledgements and RGBA bytes. Work time includes
+  IPC, helper rendering, and the acknowledgement wait. `repeats` counts
+  re-sends in older traces; these are not fresh video frames. The feeder now
+  waits for a fresh frame after a timeout, so new traces should report zero
+  repeats. `max_gap_us` is the worst ack-to-ack gap inside the record
+  (microseconds, 0 with fewer than 2 acks): presenter judder the 1s-average
+  rate hides. The analyzer reports it per present summary and raises
+  `JITTER` when it reaches 2x the mean present interval.
 - `present`: helper acknowledgements and RGBA bytes. Work time includes
   IPC, helper rendering, and the acknowledgement wait. `repeats` counts
   re-sends in older traces; these are not fresh video frames. The feeder now

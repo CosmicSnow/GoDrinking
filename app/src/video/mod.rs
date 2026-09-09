@@ -747,6 +747,10 @@ fn feed_loop(
     }
     // Phase 2: stream latest-only; each ack is one presented frame.
     let mut trace = Trace::new(Stage::Present);
+    // Presenter pacing: worst ack-to-ack gap inside the current ~1s record.
+    // The trace max-merges it per record, so the feeder only reports each
+    // ack's own gap (0 for the first); the flush resets the window.
+    let mut last_ack: Option<Instant> = None;
     loop {
         if stop.load(Ordering::Acquire) {
             return;
@@ -758,8 +762,11 @@ fn feed_loop(
             healthy.store(false, Ordering::Release);
             return;
         }
+        let now = Instant::now();
+        let gap_us = last_ack.map(|t| now.duration_since(t).as_micros() as u64).unwrap_or(0);
+        last_ack = Some(now);
         trace.record(TraceSample {
-            frames: 1, bytes, width: w as u32, height: h as u32,
+            frames: 1, bytes, width: w as u32, height: h as u32, max_gap_us: gap_us,
             ..Default::default()
         }, started);
         presented.fetch_add(1, Ordering::Relaxed);

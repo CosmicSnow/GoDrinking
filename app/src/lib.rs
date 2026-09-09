@@ -214,6 +214,11 @@ pub struct E2ePlan {
     pub code_file: String,
     /// File where this instance reports JSON status.
     pub status_file: String,
+    /// Share source selector ("synthetic" default | "movie:<path>" |
+    /// "display:<id>" | "window:<id>"). Optional so existing plans keep
+    /// working unchanged (absent == synthetic). The viewer ignores it.
+    #[serde(default)]
+    pub share: Option<String>,
 }
 
 impl E2ePlan {
@@ -242,6 +247,15 @@ impl E2ePlan {
             if value.trim().is_empty() {
                 return Err(format!("e2e plan field '{name}' must not be empty"));
             }
+        }
+        if let Some(share) = plan.share.as_deref() {
+            if share.trim().is_empty() {
+                return Err("e2e plan field 'share' must not be empty".to_string());
+            }
+            // Early rejection: the host passes this straight to start_share,
+            // so a typo here must fail at plan parse, not mid-run.
+            ShareSource::parse(share)
+                .map_err(|e| format!("e2e plan field 'share': {e}"))?;
         }
         Ok(Some(plan))
     }
@@ -746,10 +760,11 @@ impl AppState {
     /// reconfig) and leaves `share_profile` untouched — the encoder is
     /// never left in an intermediate state.
     ///
-    /// Returns the new effective profile (pre-bump generation); the
-    /// authoritative generation arrives async via `media-event` `quality`
-    /// (emitted here optimistically and again by the forward task when it
-    /// observes the fence bump) and via `get_media_counters.effective`.
+    /// Returns the stored effective profile (never older than the observed
+    /// generation); the authoritative generation arrives async via
+    /// `media-event` `quality` (emitted here optimistically and again by
+    /// the forward task when it observes the fence bump) and via
+    /// `get_media_counters.effective`.
     pub async fn set_quality(
         self: &Arc<Self>,
         app: Option<AppHandle>,
@@ -834,7 +849,7 @@ impl AppState {
                 return Err(format!("qualidade: captura: {e}"));
             }
         }
-        let effective = EffectiveQuality { profile, generation: previous.generation };
+        let mut effective = EffectiveQuality { profile, generation: previous.generation };
         {
             if let Ok(mut inner) = self.inner.lock() {
                 if inner.publishers.is_empty() {
@@ -846,6 +861,12 @@ impl AppState {
                     inner.screen_bridge = None;
                     return Err("not sharing".into());
                 }
+                // Never write the generation backwards: the encode loop may
+                // have applied the reconfig (and the forward task the fence
+                // bump) while the bridge reconfigure awaited above. Re-read
+                // under this same lock and take the max.
+                let observed = inner.share_profile.map(|s| s.generation).unwrap_or(0);
+                effective.generation = effective.generation.max(observed);
                 inner.share_profile = Some(effective);
                 // Re-clamp capture in place (bridge reads it per tick).
                 if let Some(live) = inner.share_capture.as_ref() {
@@ -1405,6 +1426,25 @@ mod e2e_plan_tests {
     }
 
     #[test]
+    fn share_defaults_to_none_and_accepts_display() {
+        // Absent == synthetic (existing plans keep working unchanged).
+        let plan = E2ePlan::from_args(args(&["--e2e-plan", PLAN]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.share, None);
+        // display:<id> passes through; empty/unknown share rejects at parse.
+        let display = PLAN.replace('}', r#","share":"display:3"}"#);
+        let plan = E2ePlan::from_args(args(&["--e2e-plan", &display]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.share.as_deref(), Some("display:3"));
+        let empty = PLAN.replace('}', r#","share":""}"#);
+        assert!(E2ePlan::from_args(args(&["--e2e-plan", &empty])).is_err());
+        let bogus = PLAN.replace('}', r#","share":"screen"}"#);
+        assert!(E2ePlan::from_args(args(&["--e2e-plan", &bogus])).is_err());
+    }
+
+    #[test]
     fn rejects_bad_role_json_and_empty_fields() {
         assert!(E2ePlan::from_args(args(&["--e2e-plan"])).is_err());
         assert!(E2ePlan::from_args(args(&["--e2e-plan", "{}"])).is_err());
@@ -1634,6 +1674,72 @@ mod quality_tests {
         let stored = counters.effective.expect("effective present");
         assert_eq!((stored.profile.w, stored.profile.h), (640, 360));
         assert_eq!(counters.backend.as_deref(), Some("openh264"));
+        // Teardown: stop the publisher explicitly (encode thread joins).
+        let publisher = {
+            state
+                .inner
+                .lock()
+                .expect("state lock")
+                .publishers
+                .remove("watcher")
+                .map(|session| session.publisher)
+        };
+        if let Some(publisher) = publisher {
+            publisher.lock().await.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn set_quality_never_writes_generation_backwards() {
+        // Race: set_quality snapshots previous (gen 0), then parks on the
+        // publisher/bridge awaits while the encode loop applies the reconfig
+        // and the forward task bumps share_profile.generation to 1. The
+        // final store must take the max, never erase the observed bump.
+        // No real bridge in unit tests (needs OS capture), so the publisher
+        // mutex is held to open the same await window deterministically.
+        let (state, _event_rx) = live_state().await;
+        let publisher = {
+            state
+                .inner
+                .lock()
+                .expect("state lock")
+                .publishers
+                .get("watcher")
+                .expect("watcher")
+                .publisher
+                .clone()
+        };
+        let guard = publisher.lock().await;
+        let parked = Arc::clone(&state);
+        let task =
+            tokio::spawn(async move { parked.set_quality(None, args(640, 360, 1000, 15)).await });
+        // The parked call can only have snapshotted previous (gen 0) by now:
+        // it cannot proceed past the held publisher lock.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        {
+            let mut inner = state.inner.lock().expect("state lock");
+            if let Some(share) = inner.share_profile.as_mut() {
+                share.generation = 1;
+            }
+        }
+        drop(guard);
+        let effective = task.await.expect("join").expect("set_quality applies");
+        assert!(
+            effective.generation >= 1,
+            "stale snapshot must not clobber the observed bump (got {})",
+            effective.generation
+        );
+        let stored = state
+            .get_media_counters()
+            .expect("counters")
+            .effective
+            .expect("effective present");
+        assert_eq!((stored.profile.w, stored.profile.h), (640, 360));
+        assert!(
+            stored.generation >= 1,
+            "stored generation keeps the bump (got {})",
+            stored.generation
+        );
         // Teardown: stop the publisher explicitly (encode thread joins).
         let publisher = {
             state

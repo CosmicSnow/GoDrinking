@@ -6,6 +6,10 @@
 /// least half an interval, rather than replaying the missed ticks in a burst.
 /// Caller checks that `now.wrapping_sub(last) >= interval` before accepting.
 pub fn advance_capture_clock(last: u64, now: u64, interval: u64) -> u64 {
+    debug_assert!(interval != 0, "capture cadence needs a nonzero interval");
+    if interval == 0 {
+        return now;
+    }
     let late = now.wrapping_sub(last).saturating_sub(interval);
     now.wrapping_sub(late.min(interval / 2))
 }
@@ -28,6 +32,25 @@ mod tests {
                 }
             }
             assert_eq!(accepted, 300, "{fps}fps with 1ms jitter");
+        }
+    }
+
+    #[test]
+    fn zero_interval_falls_back_to_now() {
+        // The guard has two halves split by profile: debug flags the
+        // zero-interval misuse at the call site, release falls back to `now`
+        // (no panic, no catch-up arithmetic — arrival time wins).
+        #[cfg(debug_assertions)]
+        {
+            assert!(
+                std::panic::catch_unwind(|| advance_capture_clock(0, 10_000, 0)).is_err(),
+                "debug flags zero interval"
+            );
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            assert_eq!(advance_capture_clock(0, 10_000, 0), 10_000);
+            assert_eq!(advance_capture_clock(9_999, 10_000, 0), 10_000);
         }
     }
 

@@ -32,6 +32,15 @@ pub struct Sample {
     pub keyframes: u64,
     pub repeats: u64,
     pub gpu_frames: u64,
+    /// Viewer loss recovery: PLIs actually sent (debounced ~1/s per SSRC).
+    pub pli_sent: u64,
+    /// Viewer loss recovery: AU gaps that asked for no PLI (debounce held).
+    pub pli_suppressed: u64,
+    /// Publisher loss recovery: inbound FIR/PLI requests applied as force-intra.
+    pub intra_applied: u64,
+    /// Presenter pacing: max gap between consecutive successful acks within
+    /// the record (microseconds, 0 when fewer than 2 acks). Max-merged, not summed.
+    pub max_gap_us: u64,
     pub width: u32,
     pub height: u32,
     pub target_fps: u32,
@@ -129,7 +138,10 @@ impl Trace {
         r.work_us += us;
         r.max_work_us = r.max_work_us.max(us);
         macro_rules! sum { ($($f:ident),*) => { $(r.sample.$f += sample.$f;)* }; }
-        sum!(frames, bytes, dropped, timeouts, errors, keyframes, repeats, gpu_frames);
+        sum!(frames, bytes, dropped, timeouts, errors, keyframes, repeats, gpu_frames,
+             pli_sent, pli_suppressed, intra_applied);
+        // Pacing extremes never average away: keep the worst ack gap seen.
+        r.sample.max_gap_us = r.sample.max_gap_us.max(sample.max_gap_us);
         if sample.width != 0 {
             r.sample.width = sample.width;
         }
@@ -289,6 +301,10 @@ mod tests {
                     frames: 1,
                     bytes: 16,
                     repeats: 1,
+                    pli_sent: 1,
+                    pli_suppressed: 4,
+                    intra_applied: 1,
+                    max_gap_us: 40_000,
                     ..Default::default()
                 },
                 None,
@@ -301,6 +317,10 @@ mod tests {
         assert_eq!(r["frames"], 2);
         assert_eq!(r["bytes"], 32);
         assert_eq!(r["repeats"], 2);
+        assert_eq!(r["pli_sent"], 2, "loss counters sum like the rest");
+        assert_eq!(r["pli_suppressed"], 8);
+        assert_eq!(r["intra_applied"], 2);
+        assert_eq!(r["max_gap_us"], 40_000, "pacing keeps the worst gap, never a sum");
         for (key, value) in r.as_object().unwrap() {
             if key == "stage" {
                 assert_eq!(value, "present");

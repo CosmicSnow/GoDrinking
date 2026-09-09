@@ -5,8 +5,11 @@
  * `--e2e-plan '<json>'`). Sem plano, nada aqui é importado em caminho quente
  * — a UI normal nunca toca este módulo além do boot check.
  *
- * Host: set_server → create_room → publica code → start_share synthetic →
- * aguarda ice-connected + keyframe (eventos) → status connected.
+ * Host: set_server → create_room → publica code → start_share (plan.share
+ * ou "synthetic") → aguarda ice-connected + keyframe (eventos) → status
+ * connected. Um share display: que o SO nega (sem consentimento de Gravação
+ * de Tela) rejeita aqui e o boot registra phase error com o detalhe — o
+ * veredito do harness segue FAIL gracioso, nunca fallback silencioso.
  * Viewer: aguarda code → set_server → join → roster acha quem compartilha →
  * watch → aguarda ice-connected + stats com frames>0 → status connected.
  *
@@ -124,7 +127,7 @@ async function runHost(plan: E2ePlan, onReport: (r: E2eReport) => void): Promise
   report.code = code;
   report.phase = "room";
   await emit();
-  await startShare("synthetic");
+  await startShare(plan.share ?? "synthetic");
   report.phase = "sharing";
   await emit();
 

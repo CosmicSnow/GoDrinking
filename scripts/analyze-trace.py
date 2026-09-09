@@ -14,8 +14,10 @@ given -- a host+viewer overlay keyed on ``timestamp_ms``.
 Schema mirror of ``core/src/trace.rs``: every value must be a number
 except ``stage``, which must be one of
 capture/source/encode/send/rtp/decode/present. Unknown *numeric* fields
-(e.g. future ``pli``/``nack`` counters) are accepted so the pli-storm
-heuristic keeps working; anything non-numeric is rejected.
+are accepted so older traces keep parsing; the pli-storm heuristic sums
+the ``pli_sent``/``pli_suppressed``/``intra_applied`` counters (plus legacy
+``pli``/``nack``/``fir`` names) and the judder heuristic reads
+``max_gap_us`` on present records. Anything non-numeric is rejected.
 
 Semantics mirror ``MEDIA_DEBUG.md``: rate = count*1e6/elapsed_us, fresh
 presentation = frames-repeats, rtp.frames counts packets not pictures.
@@ -40,7 +42,8 @@ TOTALS = ("frames", "bytes", "dropped", "timeouts", "errors", "keyframes",
 # Optional future counters for the pli-storm heuristic. Absent from current
 # traces; only consulted when present as numeric fields.
 PLI_KEYS = ("pli", "plis", "pli_count", "fir", "firs", "fir_count",
-            "nack", "nacks", "nack_count")
+            "nack", "nacks", "nack_count",
+            "pli_sent", "pli_suppressed", "intra_applied")
 
 TIMEOUT_BURST_DEFAULT = 8      # single-record capture.timeouts at/above this = burst
 STALL_US_DEFAULT = 100_000     # single-observation max_work_us at/above this = stall
@@ -120,10 +123,14 @@ def summarize(records):
             "observations": 0, "max_work_us": 0, "max_timeouts": 0,
             "t_min": rec.get("timestamp_ms", 0),
             "t_max": rec.get("timestamp_ms", 0),
-            "pli": 0,
+            "pli": 0, "pli_sent": 0, "pli_suppressed": 0,
+            "intra_applied": 0, "max_gap_us": 0,
         })
         for key in TOTALS:
             s[key] = s.get(key, 0) + num(rec, key)
+        for key in ("pli_sent", "pli_suppressed", "intra_applied"):
+            s[key] += num(rec, key)
+        s["max_gap_us"] = max(s["max_gap_us"], num(rec, "max_gap_us"))
         s["records"] += 1
         s["elapsed_us"] += num(rec, "elapsed_us")
         s["work_us"] += num(rec, "work_us")
@@ -151,6 +158,11 @@ def flag_stage(stage, s, timeout_burst, stall_us):
     if stage == "present" and s.get("repeats", 0) > 0:
         flags.append("REPLAY present.repeats=%d (re-sends, not fresh frames)"
                      % s["repeats"])
+    if stage == "present" and s.get("frames", 0) > 0 and s.get("elapsed_us", 0) > 0:
+        interval = s["elapsed_us"] / s["frames"]
+        if s.get("max_gap_us", 0) >= 2 * interval:
+            flags.append("JITTER present.max_gap_us=%dus (>= 2x %.0fus interval)"
+                         % (s["max_gap_us"], interval))
     if stage == "capture" and s.get("max_timeouts", 0) >= timeout_burst:
         flags.append("TIMEOUT-BURST capture.timeouts peak=%d in one record "
                      "(total=%d, bridge 100ms wait starved)"
@@ -180,7 +192,13 @@ def report_file(path, records, summary, timeout_burst, stall_us):
         extra = ""
         if stage == "present":
             fresh = s["frames"] - s.get("repeats", 0)
-            extra = " fresh=%d fresh_fps=%.1f" % (fresh, rate(fresh, s["elapsed_us"]))
+            extra = " fresh=%d fresh_fps=%.1f max_gap=%dus" % (
+                fresh, rate(fresh, s["elapsed_us"]), s.get("max_gap_us", 0))
+        if stage == "decode" and (s.get("pli_sent", 0) or s.get("pli_suppressed", 0)):
+            extra = " pli_sent=%d pli_suppressed=%d" % (
+                s["pli_sent"], s["pli_suppressed"])
+        if stage == "encode" and s.get("intra_applied", 0):
+            extra = " intra_applied=%d" % s["intra_applied"]
         if stage == "rtp":
             extra = " (frames=packets)"
         lines.append(
@@ -252,7 +270,7 @@ def run_self_test():
     except TraceError as exc:
         print("FAIL: fixture parses: %s" % exc)
         return 1
-    check(len(records) == 10, "fixture has 10 records (got %d)" % len(records))
+    check(len(records) == 13, "fixture has 13 records (got %d)" % len(records))
     check({r["stage"] for r in records}
           >= {"capture", "encode", "decode", "present"},
           "fixture covers capture/encode/decode/present")
@@ -260,6 +278,13 @@ def run_self_test():
     summary = summarize(records)
     check(summary["decode"].get("dropped") == 2, "decode.dropped totals 2")
     check(summary["present"].get("repeats") == 3, "present.repeats totals 3")
+    check(summary["decode"].get("pli_sent") == 1, "decode.pli_sent totals 1")
+    check(summary["decode"].get("pli_suppressed") == 49,
+          "decode.pli_suppressed totals 49 (storm suppressed)")
+    check(summary["encode"].get("intra_applied") == 1,
+          "encode.intra_applied totals 1")
+    check(summary["present"].get("max_gap_us") == 250000,
+          "present.max_gap_us keeps the worst ack gap")
 
     flags = [f for st, s in summary.items()
              for f in flag_stage(st, s, TIMEOUT_BURST_DEFAULT, STALL_US_DEFAULT)]
@@ -267,6 +292,10 @@ def run_self_test():
     check(any(f.startswith("REPLAY") for f in flags), "replay flagged")
     check(any(f.startswith("TIMEOUT-BURST") for f in flags),
           "capture timeout burst flagged")
+    check(any(f.startswith("PLI-STORM") for f in flags),
+          "pli storm flagged (gap storm counters)")
+    check(any(f.startswith("JITTER") for f in flags),
+          "present judder flagged (max_gap_us >= 2x interval)")
 
     bad = {"stage": "decode", "frames": "many"}
     ok = True
@@ -277,7 +306,7 @@ def run_self_test():
     check(not ok, "non-numeric value rejected by schema rule")
     check("nope" not in STAGES, "unknown stage rejected by schema rule")
 
-    checks = 9  # number of check() calls above
+    checks = 14  # number of check() calls above
     if failures:
         print("self-test: %d failure(s)" % len(failures))
         return 1
