@@ -198,6 +198,29 @@ describe("HomeScreen", () => {
     expect(html).toContain("Como te chamam na sala");
   });
 
+  it("card de servidor acima do nick, ligado às props legadas", () => {
+    const html = renderToStaticMarkup(
+      createElement(HomeScreen, {
+        server: "http://127.0.0.1:18790",
+        onServer: noop,
+        nickname: "",
+        onNickname: noop,
+        password: "",
+        onPassword: noop,
+        code: "",
+        onCode: noop,
+        busy: false,
+        error: null,
+        onCreate: noop,
+        onJoin: noop,
+      }),
+    );
+    expect(html).toContain('id="server"');
+    expect(html).toContain('value="http://127.0.0.1:18790"');
+    // Servidor renderiza antes do nick.
+    expect(html.indexOf('id="server"')).toBeLessThan(html.indexOf('id="nickname"'));
+  });
+
   it("mostra o erro sem área muda", () => {    const html = renderToStaticMarkup(
       createElement(HomeScreen, {
         server: "",

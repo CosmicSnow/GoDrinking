@@ -547,6 +547,7 @@ export interface HomeProps {
 
 export function HomeScreen(props: HomeProps) {
   const {
+    server = "", onServer,
     nickname = "", onNickname,
     password, onPassword, code, onCode, busy, error, onCreate, onJoin,
     mock = false,
@@ -589,6 +590,23 @@ export function HomeScreen(props: HomeProps) {
             <div className="lobby-card lobby-card--wide">
               <h2>Crie ou entre em uma Sala</h2>
               <p>Salas com código + senha. O compartilhamento só aparece dentro da sala.</p>
+
+              <section className="lobby-pane lobby-name" aria-label="Servidor">
+                <label className="field" htmlFor="server">
+                  <span>Servidor</span>
+                  <input
+                    className="input"
+                    id="server"
+                    type="text"
+                    value={server}
+                    onChange={(event) => onServer?.(event.target.value)}
+                    placeholder="http://127.0.0.1:18790"
+                    autoComplete="off"
+                    spellCheck={false}
+                    disabled={busy}
+                  />
+                </label>
+              </section>
 
               <section className="lobby-pane lobby-name" aria-label="Seu Nick (só pessoas na sala conseguem ver)">
                 <label className="field" htmlFor="nickname">
