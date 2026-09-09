@@ -102,6 +102,13 @@ packaged exe points at `devUrl` instead of the bundled `frontendDist`.
   limits, kick, succession, heartbeat, ratelimit, nomedia).
 - Packaged end-to-end: `scripts/e2e-packaged.sh` (server + host + viewer, asserts
   presented frames where windows exist).
+- Media trace analyzer: `python3 scripts/analyze-trace.py <trace-dir-or-*.jsonl...>`
+  (numeric-only JSONL, never prints raw lines). Per-stage rates (`rate=count*1e6/elapsed_us`)
+  + flags (STARVATION `decode.dropped`, REPLAY `present.repeats`, TIMEOUT-BURST
+  `capture.timeouts`, STALL `max_work_us`) + host+viewer overlay by `timestamp_ms`.
+  Self-test: `python3 scripts/analyze-trace.py --self-test`; fixture:
+  `scripts/fixtures/trace-sample.jsonl`. Capture via `bash scripts/debug-media.sh`
+  (see `MEDIA_DEBUG.md`); existing repro: `e2e-artifacts/slow-screen-share-repro/`.
 
 ## 6. Server
 
