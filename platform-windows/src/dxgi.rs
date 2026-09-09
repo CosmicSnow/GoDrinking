@@ -194,7 +194,12 @@ pub fn run_display(
                         if let Ok(tex) = resource.cast::<ID3D11Texture2D>() {
                             if let Ok(frame) = texture_to_bgra(&device, &context, &tex) {
                                 let _ = frame_tx.try_send(CapturePacket::Cpu(frame));
-                                last_ns.store(now, Ordering::Relaxed);
+                                last_ns.store(
+                                    golive_platform::cadence::advance_capture_clock(
+                                        last_ns.load(Ordering::Relaxed), now, interval,
+                                    ),
+                                    Ordering::Relaxed,
+                                );
                             }
                         }
                     }

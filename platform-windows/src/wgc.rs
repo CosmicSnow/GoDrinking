@@ -298,7 +298,12 @@ pub fn run_window(
                 let now = now_ns();
                 if gate_open(last_ns.load(Ordering::Relaxed), now, interval) {
                     let _ = frame_tx.try_send(CapturePacket::Cpu(frame));
-                    last_ns.store(now, Ordering::Relaxed);
+                    last_ns.store(
+                        golive_platform::cadence::advance_capture_clock(
+                            last_ns.load(Ordering::Relaxed), now, interval,
+                        ),
+                        Ordering::Relaxed,
+                    );
                 }
             }
             None => std::thread::sleep(Duration::from_millis(10)),

@@ -383,7 +383,7 @@ fn now_ns() -> u64 {
 }
 
 /// Cadence gate: accept only when `interval_ns` elapsed since the last
-/// accepted frame. Pure + wrapping-sub so a (practically impossible)
+/// scheduled tick. Pure + wrapping-sub so a (practically impossible)
 /// clock step never wedges the stream open or shut.
 pub fn gate_open(last_ns: u64, now_ns: u64, interval_ns: u64) -> bool {
     now_ns.wrapping_sub(last_ns) >= interval_ns
@@ -450,7 +450,12 @@ define_class!(
             // Cadence accounts accepted frames even when the channel was
             // full: copies/retains stay capped at profile fps while the
             // core lags (never spins on a slow consumer).
-            ivars.last_ns.store(now, Ordering::Relaxed);
+            ivars.last_ns.store(
+                golive_platform::cadence::advance_capture_clock(
+                    ivars.last_ns.load(Ordering::Relaxed), now, ivars.interval_ns,
+                ),
+                Ordering::Relaxed,
+            );
         }
     }
 );
@@ -885,7 +890,7 @@ mod tests {
         while t < 1_000_000_000 {
             if gate_open(last, t, interval) {
                 at.push(t);
-                last = t;
+                last = golive_platform::cadence::advance_capture_clock(last, t, interval);
             }
             t += interval;
         }
@@ -903,7 +908,7 @@ mod tests {
         while t < 1_000_000_000 {
             if gate_open(last, t, interval) {
                 copies += 1; // WOULD copy
-                last = t;
+                last = golive_platform::cadence::advance_capture_clock(last, t, interval);
             } else {
                 dropped += 1; // dies pre-copy
             }
@@ -955,11 +960,11 @@ mod tests {
             match route_frame(gate, true, true) {
                 FrameRoute::RetainGpu => {
                     retained += 1;
-                    last = t;
+                    last = golive_platform::cadence::advance_capture_clock(last, t, interval);
                 }
                 FrameRoute::CopyCpu => {
                     copied += 1;
-                    last = t;
+                    last = golive_platform::cadence::advance_capture_clock(last, t, interval);
                 }
                 FrameRoute::Drop => dropped += 1,
             }
@@ -978,7 +983,7 @@ mod tests {
             match route_frame(gate, true, false) {
                 FrameRoute::CopyCpu => {
                     copied += 1;
-                    last = t;
+                    last = golive_platform::cadence::advance_capture_clock(last, t, interval);
                 }
                 FrameRoute::Drop => dropped += 1,
                 FrameRoute::RetainGpu => panic!("nothing submittable here"),

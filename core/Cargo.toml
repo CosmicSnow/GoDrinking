@@ -46,3 +46,8 @@ objc2-core-foundation = "0.3"
 objc2-core-media = "0.3"
 objc2-core-video = "0.3"
 objc2-video-toolbox = "0.3"
+
+# RGBA conversion is on the live receive path; unoptimized OpenH264 misses
+# the 720p30 frame budget even when native decoding is fast.
+[profile.dev.package.openh264]
+opt-level = 3

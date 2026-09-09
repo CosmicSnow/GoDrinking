@@ -904,6 +904,19 @@ async fn run_two_peer(
         return Err(missing);
     }
 
+    if matches!(source, VideoSource::MovieFile(_)) {
+        let before = world.viewer.non_black_frames;
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            world.pump_once().await;
+            world.drive_media().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let frames = world.viewer.non_black_frames - before;
+        eprintln!("motion throughput: {frames} fresh frames in 5 seconds");
+        assert!(frames >= 125, "moving video must sustain at least 25 decoded fps");
+    }
+
     // Contract assertions on the negotiated SDP (redacted: presence only).
     {
         let offer = world.host.offer_sdp.clone().unwrap_or_default();

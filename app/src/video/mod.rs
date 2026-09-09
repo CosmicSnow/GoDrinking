@@ -43,6 +43,7 @@ pub use transport::{connect as connect_helper, helper_file_name, FeedStream, Hel
 use transport::{bind, prepare_feed_stream};
 
 use golive_core::media::PresentedFrame;
+use golive_core::trace::{Trace, Stage, Sample as TraceSample};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -745,25 +746,37 @@ fn feed_loop(
         return;
     }
     // Phase 2: stream latest-only; each ack is one presented frame.
+    let mut trace = Trace::new(Stage::Present);
     loop {
         if stop.load(Ordering::Acquire) {
             return;
         }
         let bytes = frame.rgba.len() as u64;
+        let started = trace.start();
         if write_frame(&mut sock, &frame).is_err() || read_ack(&mut sock).is_err() {
+            trace.record(TraceSample { errors: 1, ..Default::default() }, started);
             healthy.store(false, Ordering::Release);
             return;
         }
+        trace.record(TraceSample {
+            frames: 1, bytes, width: w as u32, height: h as u32,
+            ..Default::default()
+        }, started);
         presented.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut stats) = present_stats.lock() {
             stats.push(Instant::now(), bytes);
         }
-        match slot.wait(IDLE_TICK) {
-            SlotWait::Frame(next) => frame = next,
-            // No fresh frame: idle (the helper freezes on its own clock).
-            // Never re-send the old frame as if it were new.
-            SlotWait::Timeout => continue,
-            SlotWait::Gone => return,
+        loop {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            match slot.wait(IDLE_TICK) {
+                SlotWait::Frame(next) => { frame = next; break; },
+                // Keep waiting; only a fresh frame may reach the write above.
+                // The helper freezes on its own clock.
+                SlotWait::Timeout => continue,
+                SlotWait::Gone => return,
+            }
         }
     }
 }
@@ -1003,6 +1016,41 @@ mod tests {
         }
         assert!(shown > 0, "helper presented frames");
         assert!(healthy, "feeder stayed healthy");
+    }
+
+    #[test]
+    fn feeder_does_not_replay_frame_when_source_is_idle() {
+        let helper = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/golive-video");
+        if !helper.exists() {
+            eprintln!("SKIP: helper binary not built");
+            return;
+        }
+        let presented = Arc::new(AtomicU64::new(0));
+        let (mut window, push) = VideoWindow::spawn_with(
+            "idle-test".into(), 32, 32, Arc::clone(&presented), helper,
+        );
+        let frame = || PresentedFrame { w: 32, h: 32, rgba: vec![128; 32 * 32 * 4] };
+        push.push(frame());
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while presented.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if presented.load(Ordering::Relaxed) == 0 {
+            window.stop();
+            eprintln!("SKIP: no present ack (no window server?)");
+            return;
+        }
+        std::thread::sleep(IDLE_TICK * 3);
+        let idle_count = presented.load(Ordering::Relaxed);
+        push.push(frame());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while presented.load(Ordering::Relaxed) == idle_count && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let resumed_count = presented.load(Ordering::Relaxed);
+        window.stop();
+        assert_eq!(idle_count, 1, "idle source must not replay its last frame");
+        assert_eq!(resumed_count, 2, "a fresh frame resumes presentation");
     }
 
     // -- view controls: pure zoom/pan/fullscreen math ---------------------

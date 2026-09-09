@@ -22,6 +22,7 @@
 //! never logs titles, pixels, or tokens.
 
 use golive_core::media::{normalize_dims, ExternalFrame, I420Frame, QualityProfile};
+use golive_core::trace::{Trace, Stage, Sample as TraceSample};
 use golive_platform::{
     BgraFrame, CaptureConfig, CapturePacket, FrameStream, NextError, PixelFormat, PlatformError,
     SourceInfo, SourceKind, VideoSource,
@@ -110,7 +111,7 @@ fn spawn_stream(
     let thread = std::thread::Builder::new()
         .name("golive-screen-bridge".into())
         .spawn(move || {
-            pump_bridge(&mut stream, &core_tx, &stop_, &live);
+            pump_bridge(&mut stream, &core_tx, &stop_, &live, Instant::now);
         })
         .map_err(|e| PlatformError::Internal(format!("thread da ponte: {e}")))?;
     Ok((thread, stop))
@@ -188,7 +189,7 @@ fn open_stream(
 }
 
 /// Time gate: forwards a frame only when at least `interval` elapsed since
-/// the last forwarded one. Pure (the bridge owns the clock).
+/// the last scheduled tick. Pure (the bridge owns the clock).
 pub fn should_forward(
     last: Option<Instant>,
     now: Instant,
@@ -197,6 +198,17 @@ pub fn should_forward(
     match last {
         None => true,
         Some(t) => now.duration_since(t) >= interval,
+    }
+}
+
+fn advance_forwarded(last: Option<Instant>, now: Instant, interval: Duration) -> Instant {
+    match last {
+        None => now,
+        Some(last) => last + Duration::from_nanos(
+            golive_platform::cadence::advance_capture_clock(
+                0, now.duration_since(last).as_nanos() as u64, interval.as_nanos() as u64,
+            ),
+        ),
     }
 }
 
@@ -238,8 +250,10 @@ fn pump_bridge(
     core_tx: &mpsc::SyncSender<ExternalFrame>,
     stop: &AtomicBool,
     live: &Arc<Mutex<QualityProfile>>,
+    mut clock: impl FnMut() -> Instant,
 ) {
     let mut last_forwarded: Option<Instant> = None;
+    let mut trace = Trace::new(Stage::Capture);
     loop {
         if stop.load(Ordering::Acquire) {
             break;
@@ -251,18 +265,27 @@ fn pump_bridge(
         };
         match stream.next_frame(BRIDGE_TICK) {
             Ok(CapturePacket::Gpu(gpu)) => {
-                let now = Instant::now();
+                let started = trace.start();
+                let now = clock();
                 if !should_forward(last_forwarded, now, interval) {
+                    trace.record(TraceSample { dropped: 1, ..Default::default() }, started);
                     continue; // over profile fps: drop retained, no pixels
                 }
-                last_forwarded = Some(now);
+                last_forwarded = Some(advance_forwarded(last_forwarded, now, interval));
                 // Latest-only: a full channel means the core is behind;
                 // drop (releasing) rather than queue stale.
-                let _ = core_tx.try_send(ExternalFrame::Gpu(gpu));
+                let sent = core_tx.try_send(ExternalFrame::Gpu(gpu)).is_ok();
+                trace.record(TraceSample {
+                    frames: sent as u64, dropped: (!sent) as u64, gpu_frames: sent as u64,
+                    target_fps: (1.0 / interval.as_secs_f64()).round() as u32,
+                    ..Default::default()
+                }, started);
             }
             Ok(CapturePacket::Cpu(bgra)) => {
-                let now = Instant::now();
+                let started = trace.start();
+                let now = clock();
                 if !should_forward(last_forwarded, now, interval) {
+                    trace.record(TraceSample { dropped: 1, ..Default::default() }, started);
                     continue; // over profile fps: drop before touching pixels
                 }
                 // Fit the capture into the profile (never upscale), so the
@@ -277,19 +300,28 @@ fn pump_bridge(
                         data.extend_from_slice(&planar.u);
                         data.extend_from_slice(&planar.v);
                         let frame = I420Frame { w: planar.w as usize, h: planar.h as usize, data };
-                        last_forwarded = Some(now);
+                        last_forwarded = Some(advance_forwarded(last_forwarded, now, interval));
                         // Latest-only: a full channel means the core is
                         // behind; drop this one rather than queue stale.
-                        let _ = core_tx.try_send(ExternalFrame::Cpu(frame));
+                        let sent = core_tx.try_send(ExternalFrame::Cpu(frame)).is_ok();
+                        trace.record(TraceSample {
+                            frames: sent as u64, dropped: (!sent) as u64, width: tw as u32, height: th as u32,
+                            target_fps: (1.0 / interval.as_secs_f64()).round() as u32,
+                            ..Default::default()
+                        }, started);
                     }
                     Err(e) => {
+                        trace.record(TraceSample { errors: 1, ..Default::default() }, started);
                         // Malformed frame: skip one, keep the stream (log the
                         // kind only — never pixels).
                         eprintln!("screen convert skipped: {e}");
                     }
                 }
             }
-            Err(NextError::Timeout) => continue,
+            Err(NextError::Timeout) => {
+                trace.record(TraceSample { timeouts: 1, ..Default::default() }, None);
+                continue;
+            }
             Err(NextError::Ended) | Err(NextError::Failed(_)) => break,
         }
     }
@@ -453,6 +485,31 @@ mod tests {
     }
 
     #[test]
+    fn bridge_preserves_capture_fps_with_callback_jitter() {
+        let interval = QualityProfile::medium().frame_duration();
+        let start = Instant::now();
+        let (tx, rx) = mpsc::channel();
+        for _ in 0..300 {
+            tx.send(CapturePacket::Cpu(solid_bgra(2, 2, 40, 80, 120))).unwrap();
+        }
+        drop(tx);
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut stream = FrameStream::new(
+            rx, Arc::new(Mutex::new(None)), Arc::clone(&stop), std::thread::spawn(|| {}),
+        );
+        let (core_tx, core_rx) = mpsc::sync_channel(300);
+        let live = Arc::new(Mutex::new(QualityProfile::medium()));
+        let mut n = 0;
+        pump_bridge(&mut stream, &core_tx, &stop, &live, || {
+            let at = start + interval * n + Duration::from_millis((n % 2) as u64);
+            n += 1;
+            at
+        });
+        let forwarded = core_rx.try_iter().count();
+        assert_eq!(forwarded, 300, "30fps capture lost frames to 1ms jitter");
+    }
+
+    #[test]
     fn bridge_drops_stale_not_new() {
         // try_send semantics the pump relies on: a full cap-2 channel keeps
         // flowing (drops), never blocks the capture thread.
@@ -578,7 +635,7 @@ mod tests {
         let (core_tx, core_rx) = mpsc::sync_channel::<ExternalFrame>(2);
         let stop = AtomicBool::new(false);
         let live = Arc::new(Mutex::new(profile));
-        pump_bridge(&mut stream, &core_tx, &stop, &live);
+        pump_bridge(&mut stream, &core_tx, &stop, &live, Instant::now);
         let mut out = Vec::new();
         while let Ok(packet) = core_rx.recv_timeout(Duration::from_millis(200)) {
             match packet {
@@ -640,7 +697,7 @@ mod tests {
         let (core_tx, core_rx) = mpsc::sync_channel::<ExternalFrame>(2);
         let stop = AtomicBool::new(false);
         let live = Arc::new(Mutex::new(QualityProfile::medium()));
-        pump_bridge(&mut stream, &core_tx, &stop, &live);
+        pump_bridge(&mut stream, &core_tx, &stop, &live, Instant::now);
         match core_rx.recv_timeout(Duration::from_secs(2)).expect("gpu forwarded") {
             ExternalFrame::Gpu(forwarded) => {
                 // Untouched: same dims/stride, still owned (no convert ran —

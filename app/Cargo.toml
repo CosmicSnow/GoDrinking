@@ -52,3 +52,8 @@ golive-platform-macos = { path = "../platform-macos" }
 # the macOS backend above: other platforms build without it.
 [target.'cfg(target_os = "windows")'.dependencies]
 golive-platform-windows = { path = "../platform-windows" }
+
+# RGBA conversion is on the live receive path; unoptimized OpenH264 misses
+# the 720p30 frame budget even when native decoding is fast.
+[profile.dev.package.openh264]
+opt-level = 3

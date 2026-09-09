@@ -22,6 +22,7 @@
 //!   dependency — still zero OS bindings in this crate's own code).
 
 use golive_platform::GpuPixelBuffer;
+use crate::trace::{Trace, Stage, Sample as TraceSample};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1121,6 +1122,7 @@ impl Publisher {
         {
             let slot = Arc::clone(&slot);
             tokio::spawn(async move {
+                let mut trace = Trace::new(Stage::Send);
                 loop {
                     let (unit, duration) = slot.take().await;
                     if unit.is_empty() {
@@ -1134,7 +1136,15 @@ impl Publisher {
                         prev_dropped_packets: 0,
                         prev_padding_packets: 0,
                     };
-                    if track.write_sample(&sample).await.is_err() {
+                    let started = trace.start();
+                    let result = track.write_sample(&sample).await;
+                    trace.record(TraceSample {
+                        frames: result.is_ok() as u64,
+                        bytes: sample.data.len() as u64,
+                        errors: result.is_err() as u64,
+                        ..Default::default()
+                    }, started);
+                    if result.is_err() {
                         break;
                     }
                 }
@@ -1301,6 +1311,8 @@ fn encode_loop(
     let mut generation: u64 = 0;
     let mut ext_last: Option<I420Frame> = None;
     let mut consecutive_skips: u32 = 0;
+    let mut encode_trace = Trace::new(Stage::Encode);
+    let mut source_trace = Trace::new(Stage::Source);
     let start = Instant::now();
     let mut n: u64 = 0;
     while !stop.load(Ordering::Acquire) {
@@ -1346,7 +1358,18 @@ fn encode_loop(
                 PendingFrame::Cpu(scale_frame(&frames[(n as usize) % frames.len()], target.0, target.1))
             }
             VideoSource::SyntheticBall => PendingFrame::Cpu(synthetic_frame(target.0, target.1, n)),
-            VideoSource::External(ext) => match ext.rx.recv_timeout(EXT_TICK) {
+            VideoSource::External(ext) => match {
+                let started = source_trace.start();
+                let received = ext.rx.recv_timeout(EXT_TICK);
+                source_trace.record(TraceSample {
+                    frames: received.is_ok() as u64,
+                    gpu_frames: matches!(&received, Ok(ExternalFrame::Gpu(_))) as u64,
+                    timeouts: matches!(&received, Err(std::sync::mpsc::RecvTimeoutError::Timeout)) as u64,
+                    errors: matches!(&received, Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) as u64,
+                    target_fps: profile.fps, ..Default::default()
+                }, started);
+                received
+            } {
                 Ok(ExternalFrame::Cpu(frame)) => {
                     ext_last = Some(frame.clone());
                     PendingFrame::Cpu(scale_frame(&frame, target.0, target.1))
@@ -1370,10 +1393,19 @@ fn encode_loop(
             },
         };
         // 3. Encode; transient skips are capped, anything else is fatal+loud.
+        let started = encode_trace.start();
         let encoded = match frame {
             PendingFrame::Cpu(frame) => encoder.encode_frame(&frame),
             PendingFrame::Gpu(gpu) => encode_gpu_frame(&mut encoder, gpu, target),
         };
+        if started.is_some() { encode_trace.record(TraceSample {
+            frames: matches!(&encoded, Ok(Some(_))) as u64,
+            bytes: encoded.as_ref().ok().and_then(|u| u.as_ref()).map(|u| u.len() as u64).unwrap_or(0),
+            keyframes: encoded.as_ref().ok().and_then(|u| u.as_ref()).map(|u| contains_idr(u) as u64).unwrap_or(0),
+            dropped: matches!(&encoded, Ok(None)) as u64, errors: encoded.is_err() as u64,
+            width: target.0 as u32, height: target.1 as u32, target_fps: profile.fps,
+            ..Default::default()
+        }, started); }
         match encoded {
             Ok(Some(unit)) => {
                 consecutive_skips = 0;
@@ -1780,15 +1812,28 @@ async fn read_loop(
     let mut unit = Vec::<u8>::new();
     let mut unit_ts: Option<u32> = None;
     let mut last_pli: HashMap<u32, Instant> = HashMap::new();
+    let mut rtp_trace = Trace::new(Stage::Rtp);
+    let mut decode_trace = Trace::new(Stage::Decode);
     loop {
         let (packet, _) = match track.read_rtp().await {
             Ok(pair) => pair,
             Err(_) => break,
         };
         let ts = packet.header.timestamp;
+        rtp_trace.record(TraceSample { frames: 1, bytes: packet.payload.len() as u64, ..Default::default() }, None);
         // Access-unit boundary: timestamp rollover flushes the previous unit.
         if unit_ts.map(|t| t != ts).unwrap_or(false) && !unit.is_empty() {
-            if let Some(picture) = decode_unit(&mut decoder, &unit, event_tx) {
+            let started = decode_trace.start();
+            let decoded = decode_unit(&mut decoder, &unit, event_tx);
+            decode_trace.record(TraceSample {
+                frames: decoded.is_some() as u64, dropped: decoded.is_none() as u64,
+                bytes: unit.len() as u64,
+                width: decoded.as_ref().map(|p| p.frame.w as u32).unwrap_or(0),
+                height: decoded.as_ref().map(|p| p.frame.h as u32).unwrap_or(0),
+                keyframes: decoded.as_ref().map(|p| p.stats.is_keyframe as u64).unwrap_or(0),
+                ..Default::default()
+            }, started);
+            if let Some(picture) = decoded {
                 let frame = picture.stats;
                 stats.frames_decoded += 1;
                 if frame.is_keyframe {

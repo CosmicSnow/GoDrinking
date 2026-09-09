@@ -15,6 +15,7 @@
 //! with user copy, never silence.
 
 pub mod capability;
+pub mod cadence;
 pub mod convert;
 pub mod error;
 pub mod mock;
