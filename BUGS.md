@@ -36,3 +36,20 @@ Checks após ajuste: app `cargo check`/`cargo test` (57 + smoke), core
 `npm run typecheck`/`npm test` (67)/`npm run build`, server `npm test`,
 Windows cross-check passaram (6 avisos preexistentes no stub VT).
 Executável debug e helper recompilados com `tauri/custom-protocol`.
+
+Validação Display-3 + geração (2026-09-09): harness `E2E_SHARE=display:3`
+(hook `--e2e-plan`, traces por instância + analyzer) verdict PASS em 23 s:
+host `quality-applied` + `qualityApplied: true`, viewer conectado com frames
+e presented. Root cause do "quality generation bump timeout": `set_quality`
+gravava `generation` antiga por cima do bump do forward task durante o
+restart SCK (~146 ms) — corrigido com max sob lock + teste de regressão
+(`set_quality_never_writes_generation_backwards`, falha sem o fix, passa
+com). Mídia do run: encode ~14,4/s → viewer fresh ~14,8/s (perfil
+640x360@15 pós-switch), 0 repeats, 5 drops só no join-burst pré-keyframe
+(PLI 0/0 — keyframe-wait, não perda), um gap de ~1 s na janela do switch
+com recuperação total. Arquivos (não commitados): `app/src/lib.rs` (fix),
+`core/src/trace.rs` + `media.rs` + `video/mod.rs` (pli/max_gap),
+`scripts/e2e-packaged.sh` + `e2e.ts` (lane display + traces). Veredicto e
+traces do run em `e2e-artifacts/` (verdict.json + traces/host-trace +
+viewer-trace). Pendente: apurar possível reconnect loop do viewer (`ice
+connected` ~a cada 2 s ×60 no session log) como bug próprio.

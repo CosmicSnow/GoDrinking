@@ -652,6 +652,75 @@ async fn on_unwatch(state: &Arc<AppState>, watcher: &str) {
     }
 }
 
+/// Present routing for one decoded frame: reuse the live window while its
+/// spawn-contracted dims still fit the frame. `None` (no window yet) and
+/// dim changes take the spawn path; identical dims reuse the feed, so
+/// bitrate/fps-only applies never disturb presentation.
+fn window_fits(contracted: Option<(u32, u32)>, w: u32, h: u32) -> bool {
+    matches!(contracted, Some((cw, ch)) if cw == w && ch == h)
+}
+
+/// Pushes one decoded frame to a watched member's present window. When the
+/// frame dims no longer fit the live window's spawn contract (the encoder
+/// rebuilt at new dims on quality-apply, which the helper rejects with
+/// "frame size != contracted" and then exits), the dead window is closed
+/// and a fresh one spawns through the same first-frame path — automatic
+/// recovery with no user action and no re-signaling. Dims only in
+/// diagnostics; never pixels, titles, or tokens.
+fn push_present_frame(
+    state: &Arc<AppState>,
+    watcher: &str,
+    title: &str,
+    presented: &Arc<std::sync::atomic::AtomicU64>,
+    frame: golive_core::media::PresentedFrame,
+) {
+    // Event-driven decode observation (feeds per-link stats; no polling
+    // anywhere on this path).
+    state.note_link_frame(watcher, title, frame.w as u32, frame.h as u32);
+    let (fw, fh) = (frame.w as u32, frame.h as u32);
+    let mut dead: Option<crate::video::VideoWindow> = None;
+    let mut push: Option<crate::video::FramePush> = None;
+    {
+        let mut inner = match state.inner.lock() {
+            Ok(inner) => inner,
+            Err(_) => return,
+        };
+        let contracted = inner.video_windows.get(watcher).map(|w| w.resolution());
+        if window_fits(contracted, fw, fh) {
+            push = inner.video_feeds.get(watcher).cloned();
+        }
+        if push.is_none() {
+            // First frame, or the contract no longer fits: drop the stale
+            // entries here; the dead window stops outside the lock below
+            // (never join a feeder thread while holding state).
+            dead = inner.video_windows.remove(watcher);
+            inner.video_feeds.remove(watcher);
+        }
+    }
+    if let Some(mut dead) = dead {
+        let (dw, dh) = dead.resolution();
+        dead.stop();
+        state.session_log(format!("present window respawn {dw}x{dh} -> {fw}x{fh}"));
+    }
+    let push = match push {
+        Some(push) => push,
+        None => {
+            let (window, push) = crate::video::VideoWindow::spawn(
+                title.to_owned(),
+                frame.w,
+                frame.h,
+                Arc::clone(presented),
+            );
+            if let Ok(mut inner) = state.inner.lock() {
+                inner.video_windows.insert(watcher.to_owned(), window);
+                inner.video_feeds.insert(watcher.to_owned(), push.clone());
+            }
+            push
+        }
+    };
+    push.push(frame);
+}
+
 /// Route one validated envelope: host link or viewer adoption.
 async fn on_envelope(
     state: &Arc<AppState>,
@@ -898,29 +967,7 @@ async fn on_viewer_envelope(
                 let state = Arc::clone(state);
                 let presented = Arc::new(std::sync::atomic::AtomicU64::new(0));
                 Arc::new(move |frame: golive_core::media::PresentedFrame| {
-                    // Event-driven decode observation (feeds per-link stats;
-                    // no polling anywhere on this path).
-                    state.note_link_frame(&watcher, &title, frame.w as u32, frame.h as u32);
-                    let push = {
-                    let mut inner = match state.inner.lock() {
-                        Ok(inner) => inner,
-                        Err(_) => return,
-                    };
-                    if let Some(push) = inner.video_feeds.get(&watcher) {
-                        push.clone()
-                    } else {
-                        let (window, push) = crate::video::VideoWindow::spawn(
-                            title.clone(),
-                            frame.w,
-                            frame.h,
-                            Arc::clone(&presented),
-                        );
-                        inner.video_windows.insert(watcher.clone(), window);
-                        inner.video_feeds.insert(watcher.clone(), push.clone());
-                        push
-                    }
-                };
-                push.push(frame);
+                    push_present_frame(&state, &watcher, &title, &presented, frame);
             })
         };
         let viewer = match NativeViewer::start(None, event_tx, on_frame).await {
@@ -982,6 +1029,79 @@ async fn on_viewer_envelope(
             }
         }
         Err(_) => {}
+    }
+}
+
+#[cfg(test)]
+mod present_respawn_tests {
+    use super::*;
+
+    fn frame(w: usize, h: usize) -> golive_core::media::PresentedFrame {
+        golive_core::media::PresentedFrame {
+            w,
+            h,
+            rgba: vec![128u8; w * h * 4],
+        }
+    }
+
+    #[test]
+    fn fit_decision_reuses_match_respawns_mismatch() {
+        // Same dims (bitrate/fps-only applies): reuse, old path untouched.
+        assert!(window_fits(Some((1280, 720)), 1280, 720));
+        // Encoder rebuilt at new dims: respawn.
+        assert!(!window_fits(Some((1280, 720)), 640, 360));
+        // No window yet (first frame): spawn path.
+        assert!(!window_fits(None, 1280, 720));
+        assert!(!window_fits(None, 0, 0));
+    }
+
+    #[test]
+    fn dim_change_respawns_window_and_accepts_new_frame() {
+        // Regression: on quality-apply with different dims the helper would
+        // reject the first new-dims frame ("frame size != contracted") and
+        // die, freezing presentation forever. Routing two frames at
+        // different dims through the on_frame decision must respawn the
+        // window and accept the new frame — no user action, no re-signaling.
+        // Spawning parks the feeder before any helper launch (no frame has
+        // flowed), so no window server is needed for the routing asserts.
+        let state = Arc::new(AppState::new());
+        let presented = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        {
+            let mut inner = state.inner.lock().expect("state lock");
+            let (window, push) = crate::video::VideoWindow::spawn(
+                "watcher".to_owned(),
+                64,
+                36,
+                Arc::clone(&presented),
+            );
+            inner.video_windows.insert("watcher".to_owned(), window);
+            inner.video_feeds.insert("watcher".to_owned(), push);
+        }
+        // Same-dims frame: exact old path, same window, feed untouched.
+        push_present_frame(&state, "watcher", "watcher", &presented, frame(64, 36));
+        {
+            let inner = state.inner.lock().expect("state lock");
+            assert_eq!(inner.video_windows.get("watcher").expect("window").resolution(), (64, 36));
+            assert_eq!(inner.video_windows.get("watcher").expect("window").pushed(), 1);
+        }
+        // New-dims frame (post quality-apply): the stale 64x36 window is
+        // replaced, and the frame lands in the fresh feed.
+        push_present_frame(&state, "watcher", "watcher", &presented, frame(32, 18));
+        {
+            let inner = state.inner.lock().expect("state lock");
+            let window = inner.video_windows.get("watcher").expect("respawned window");
+            assert_eq!(window.resolution(), (32, 18), "contract follows the new dims");
+            assert_eq!(window.pushed(), 1, "new frame accepted by the fresh feed");
+        }
+        // Steady state again: same-dims frames reuse without respawn.
+        push_present_frame(&state, "watcher", "watcher", &presented, frame(32, 18));
+        {
+            let inner = state.inner.lock().expect("state lock");
+            let window = inner.video_windows.get("watcher").expect("window");
+            assert_eq!(window.resolution(), (32, 18));
+            assert_eq!(window.pushed(), 2, "reuse feeds the live window");
+        }
+        state.close_video_window("watcher");
     }
 }
 
