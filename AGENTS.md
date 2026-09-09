@@ -35,10 +35,10 @@ platform/             golive-platform: VideoSource trait, shared types
 platform-macos/       golive-platform-macos: ScreenCaptureKit backend via pure
                       objc2 (no Swift toolchain — undeployable here, see
                       platform/README.md). enumerate/open/start + thumbnail.
-platform-windows/     golive-platform-windows: Windows backend. STUB today
-                      (honest UnsupportedPlatform, same shape as macOS API) —
-                      DXGI/WGC plugs into enumerate/open/start (TODOs in
-                      src/lib.rs). Wired target-gated in app/Cargo.toml.
+platform-windows/     golive-platform-windows: DXGI Desktop Duplication
+                      (displays) + Windows.Graphics.Capture (windows).
+                      Same VideoSource shape as macOS. Wired target-gated
+                      in app/Cargo.toml.
 server/               server.mjs: rendezvous signaling ONLY (routes envelopes,
                       never carries media, never parses SDP/candidates).
                       Contract: server/PROTOCOL.md (normative).
@@ -64,24 +64,12 @@ app/web/              React+TS+Vite frontend. Intents via Tauri commands;
 - Denial is typed (`PlatformError::PermissionDenied` + Settings copy), never
   silence. Titles/pixels/tokens/SDP never reach logs.
 
-## 3. Continuing screen sharing on Windows
+## 3. Windows screen capture
 
-1. Implement in `platform-windows/src/lib.rs` (TODOs mark each plug point):
-   - `enumerate()`: adapters via `IDXGIAdapter1` + outputs via
-     `IDXGIOutput1::DuplicateOutput` (displays); windows via GraphicsCapturePicker.
-   - `WindowsSource::open()`: validate id/kind vs fresh enumeration.
-   - `WindowsSource::start()`: D3D11 device + duplication + pump thread into a
-     bounded latest-only `BgraFrame` channel (reuse `bgra_to_i420` unchanged).
-   - Add the `windows` crate dep (`Windows::Graphics::Capture`,
-     `Windows::Win32::Graphics::{Dxgi, Direct3D11}`).
-2. Wiring already exists: target-gated dep in `app/Cargo.toml` + per-OS arms in
-   `app/src/screen.rs` (`open_stream`, `enumerate_sources`, `thumbnail_for`).
-3. Test: crate unit tests (pure, run on any host) → reuse
-   `platform::mock::drive_lifecycle` to lock stream semantics →
-   `cargo xwin check --target x86_64-pc-windows-msvc` from `app/` (validates the
-   Windows arms in situ) → on a real Windows machine, manual share + packaged e2e.
-4. Keep the adapter small: frames out, errors typed. No RTP/WebRTC/lifecycle
-   in the backend; pacing/encode belong to the core, lifecycle to the app.
+Implemented in `platform-windows/`: DXGI outputs for displays, WGC
+(`CreateForWindow`) for windows, one-shot `thumbnail()`, typed denial.
+Keep the adapter small: frames out, errors typed. No RTP/WebRTC/lifecycle
+in the backend; pacing/encode belong to the core, lifecycle to the app.
 
 ## 4. Commands per OS
 

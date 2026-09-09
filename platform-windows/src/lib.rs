@@ -1,44 +1,45 @@
-//! Windows capture backend: honest stub today, DXGI/WGC tomorrow.
+//! Windows capture backend: DXGI Desktop Duplication (displays) +
+//! Windows.Graphics.Capture (windows).
 //!
-//! API mirrors the macOS backend crate (`golive-platform-macos`) on purpose
-//! (`WindowsSource` + free [`enumerate`] + free [`thumbnail`]) so the app
-//! glue (`golive-app/src/screen.rs`) delegates per OS with no UI changes:
-//! same [`golive_platform::SourceInfo`] shapes in, same typed
-//! [`golive_platform::PlatformError`] out.
+//! Mapping to the pure contract (`golive-platform`):
+//! - `enumerate()` lists DXGI outputs (displays) and top-level windows.
+//!   Empty on a real desktop maps to [`PlatformError::PermissionDenied`].
+//! - `open()` validates id/kind against a fresh enumeration (gone →
+//!   `SourceGone`).
+//! - `start()` creates a D3D11 device, acquires duplication or a WGC
+//!   session, and spawns a pump thread feeding a bounded latest-only
+//!   channel of [`BgraFrame`]. Startup is rendezvous-bounded.
+//! - `thumbnail()` is a one-shot still (same BGRA shape as macOS).
 //!
-//! Current behavior (PRESERVED from the pre-crate stub): capture is
-//! unavailable — capabilities report unsupported, `enumerate` is denied
-//! with an honest reason, `open` validates without touching the OS,
-//! `start`/`thumbnail` refuse typed. No silence, no empty lists, no panics.
-//!
-//! Where the real DXGI/WGC capture plugs in (all three are TODOs below):
-//! - `enumerate()`: list adapters via `IDXGIAdapter1` + outputs via
-//!   `IDXGIOutput1::DuplicateOutput` (displays), windows via the
-//!   GraphicsCapturePicker (WGC). Map each to `SourceInfo`.
-//! - `WindowsSource::open()`: validate the id/kind against a fresh
-//!   enumeration (gone → `SourceGone`), hold the adapter/output handles.
-//! - `WindowsSource::start()`: create the D3D11 device, acquire
-//!   `IDXGIOutputDuplication`, spawn the pump thread feeding a bounded
-//!   latest-only channel of `BgraFrame` (reuse
-//!   [`golive_platform::bgra_to_i420`] downstream unchanged), rendezvous-
-//!   bounded startup, deadline-bounded `stop` (indicators released).
-//! Expected dependency then: the `windows` crate
-//! (`Windows::Graphics::Capture`, `Windows::Win32::Graphics::{Dxgi,
-//! Direct3D11}`). Permission model differs from macOS TCC (capture picker,
-//! no equivalent): surface denial as `PermissionDenied` with its own hint.
-//! Keep the adapter small: frames out, errors typed — no RTP/WebRTC/
-//! lifecycle in here (same rule as every other backend).
+//! Frames out, errors typed. No RTP/WebRTC/lifecycle here. Titles, pixels,
+//! tokens, and SDP never reach logs (aggregate counts + kind only).
 
 use golive_platform::{
-    BgraFrame, CaptureConfig, FrameStream, PlatformError, SourceInfo, SourceKind, VideoSource,
+    BgraFrame, CaptureConfig, CapturePacket, FrameStream, PlatformError, SourceInfo, SourceKind,
+    VideoSource,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
+
+mod copy;
+mod d3d;
+mod dxgi;
+mod map;
+mod wgc;
+
+pub use copy::{copy_tight_bgra, gate_open, initial_last_ns, interval_ns};
+
+/// Copy shown when Windows denies capture. Points at Settings, never at a title.
+pub const PERMISSION_HINT: &str =
+    "Sem permissão de captura de tela — autorize em Configurações → Privacidade e segurança e tente de novo.";
+
+const START_DEADLINE: Duration = Duration::from_secs(8);
+const CHANNEL_DEPTH: usize = 2;
 
 /// A Windows display or window selected from [`enumerate`].
 #[derive(Clone, Debug)]
 pub struct WindowsSource {
-    // Held for shape parity with real backends (populated at plug time:
-    // adapter LUID + output index, or WGC item token).
-    #[allow(dead_code)]
     info: SourceInfo,
 }
 
@@ -53,28 +54,34 @@ impl WindowsSource {
     }
 }
 
-/// List capture targets on this PC.
-///
-/// TODO(DXGI): enumerate adapters/outputs (displays) + picker items
-/// (windows) and return one `SourceInfo` per target. Until then this is
-/// denied with an honest reason — never an empty list on a real desktop
-/// (same rule as every backend: empty-on-desktop means denial, not "none").
+/// List capture targets on this PC. Empty on a real desktop means denial
+/// hid the content, so empty maps to `PermissionDenied`, never a silent UI.
 pub fn enumerate() -> Result<Vec<SourceInfo>, PlatformError> {
-    Err(PlatformError::UnsupportedPlatform {
-        reason: "captura de tela: apenas macOS (Windows planejado)",
-    })
+    init_com();
+    let mut out = dxgi::enumerate_displays()?;
+    match wgc::enumerate_windows() {
+        Ok(mut windows) => out.append(&mut windows),
+        Err(error) => {
+            if out.is_empty() {
+                return Err(error);
+            }
+        }
+    }
+    dxgi::empty_is_denied(&out)
 }
 
-/// One-shot still for the share-modal preview (single synchronous grab).
-///
-/// TODO(DXGI): implement via `IDXGIOutputDuplication::AcquireNextFrame`
-/// (display) / WGC one-shot (window), returning tight BGRA pixels like the
-/// macOS `thumbnail`. Until then: typed refusal, same as capture.
+/// One-shot still for the share-modal preview. Failures are typed; titles
+/// and pixels never reach logs.
 pub fn thumbnail(kind: SourceKind, id: &str) -> Result<BgraFrame, PlatformError> {
-    let _ = (kind, id);
-    Err(PlatformError::UnsupportedPlatform {
-        reason: "miniaturas: apenas macOS (Windows planejado)",
-    })
+    init_com();
+    let id = id.trim();
+    if id.is_empty() {
+        return Err(PlatformError::InvalidSource { reason: "id vazio" });
+    }
+    match kind {
+        SourceKind::Display => dxgi::thumbnail_display(id),
+        SourceKind::Window => wgc::thumbnail_window(id),
+    }
 }
 
 impl VideoSource for WindowsSource {
@@ -83,27 +90,72 @@ impl VideoSource for WindowsSource {
     }
 
     fn open(info: &SourceInfo) -> Result<Self, PlatformError> {
-        // TODO(DXGI): validate id/kind against a fresh `enumerate()` here
-        // (gone → `SourceGone`) and retain the adapter/output handles.
-        // Validation-only today: fast, no OS contact.
-        Self::validated(info)
+        let source = Self::validated(info)?;
+        let list = enumerate()?;
+        if copy::find_source(&list, info.kind, info.id.trim()).is_none() {
+            return Err(PlatformError::SourceGone { id: info.id.clone() });
+        }
+        Ok(source)
     }
 
     fn start(&mut self, config: &CaptureConfig) -> Result<FrameStream, PlatformError> {
-        // TODO(DXGI): D3D11 device + DuplicateOutput + pump thread (bounded
-        // latest-only channel, rendezvous-bounded startup, deadline-bounded
-        // stop). First OS contact happens here — this is where the capture
-        // picker/consent surfaces.
-        let _ = config;
-        Err(PlatformError::UnsupportedPlatform {
-            reason: "captura de tela: apenas macOS (Windows planejado)",
-        })
+        let list = enumerate()?;
+        if copy::find_source(&list, self.info.kind, self.info.id.trim()).is_none() {
+            return Err(PlatformError::SourceGone {
+                id: self.info.id.clone(),
+            });
+        }
+        let info = self.info.clone();
+        let config = *config;
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), PlatformError>>();
+        let (frame_tx, frame_rx) = mpsc::sync_channel::<CapturePacket>(CHANNEL_DEPTH);
+        let error: Arc<Mutex<Option<PlatformError>>> = Arc::new(Mutex::new(None));
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let error_ = Arc::clone(&error);
+        let stop_ = Arc::clone(&stop_flag);
+        let worker = std::thread::Builder::new()
+            .name("golive-wgc".into())
+            .spawn(move || {
+                init_com();
+                match info.kind {
+                    SourceKind::Display => dxgi::run_display(
+                        info.id, config, frame_tx, stop_, error_, ready_tx,
+                    ),
+                    SourceKind::Window => wgc::run_window(
+                        info.id, config, frame_tx, stop_, error_, ready_tx,
+                    ),
+                }
+            })
+            .map_err(|e| PlatformError::Internal(format!("thread de captura: {e}")))?;
+        match ready_rx.recv_timeout(START_DEADLINE) {
+            Ok(Ok(())) => Ok(FrameStream::new(frame_rx, error, stop_flag, worker)),
+            Ok(Err(error)) => {
+                stop_flag.store(true, Ordering::Release);
+                let _ = worker.join();
+                Err(error)
+            }
+            Err(_) => {
+                stop_flag.store(true, Ordering::Release);
+                let _ = worker.join();
+                Err(PlatformError::Internal("timeout ao iniciar captura".into()))
+            }
+        }
+    }
+}
+
+fn init_com() {
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+    use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let _ = RoInitialize(RO_INIT_MULTITHREADED);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use golive_platform::SourceKind;
 
     fn display(id: &str) -> SourceInfo {
         SourceInfo {
@@ -116,15 +168,6 @@ mod tests {
     }
 
     #[test]
-    fn enumerate_is_denied_never_silent() {
-        // A real desktop with zero sources would be denial hiding content;
-        // the stub denies honestly instead of returning an empty list.
-        let error = enumerate().unwrap_err();
-        assert!(matches!(error, PlatformError::UnsupportedPlatform { .. }));
-        assert!(WindowsSource::enumerate().is_err());
-    }
-
-    #[test]
     fn open_validates_without_os() {
         let bad = SourceInfo {
             kind: SourceKind::Display,
@@ -134,19 +177,82 @@ mod tests {
             h: 0,
         };
         assert!(matches!(
-            WindowsSource::open(&bad).unwrap_err(),
+            WindowsSource::validated(&bad).unwrap_err(),
             PlatformError::InvalidSource { .. }
         ));
-        assert!(WindowsSource::open(&display("1")).is_ok());
+        assert!(WindowsSource::validated(&display("\\\\.\\DISPLAY1")).is_ok());
     }
 
     #[test]
-    fn start_and_thumbnail_refuse_typed() {
-        let mut source = WindowsSource::open(&display("1")).unwrap();
+    fn empty_list_is_denied_never_silent() {
+        let error = dxgi::empty_is_denied(&[]).unwrap_err();
+        assert!(matches!(error, PlatformError::PermissionDenied { .. }));
+        assert!(error.to_string().contains("Privacidade"));
+        assert!(dxgi::empty_is_denied(&[display("1")]).is_ok());
+    }
+
+    #[test]
+    fn gone_match_is_by_kind_and_id() {
+        let list = vec![display("\\\\.\\DISPLAY1")];
+        assert!(copy::find_source(&list, SourceKind::Display, "\\\\.\\DISPLAY1").is_some());
+        assert!(copy::find_source(&list, SourceKind::Window, "\\\\.\\DISPLAY1").is_none());
+        assert!(copy::find_source(&list, SourceKind::Display, "gone").is_none());
+    }
+
+    #[test]
+    fn denial_hresult_maps_typed() {
         assert!(matches!(
-            source.start(&CaptureConfig::default()),
-            Err(PlatformError::UnsupportedPlatform { .. })
+            map::map_hresult(map::hresult_i32(windows::Win32::Foundation::E_ACCESSDENIED)),
+            PlatformError::PermissionDenied { .. }
         ));
-        assert!(thumbnail(SourceKind::Display, "1").is_err());
+        assert!(matches!(
+            map::map_hresult(map::hresult_i32(
+                windows::Win32::Graphics::Dxgi::DXGI_ERROR_ACCESS_DENIED
+            )),
+            PlatformError::PermissionDenied { .. }
+        ));
+        assert!(matches!(
+            map::map_hresult(map::hresult_i32(
+                windows::Win32::Graphics::Dxgi::DXGI_ERROR_NOT_CURRENTLY_AVAILABLE
+            )),
+            PlatformError::PermissionDenied { .. }
+        ));
+        match map::map_hresult(42) {
+            PlatformError::Internal(detail) => assert!(detail.contains("42")),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(map::is_wait_timeout(map::hresult_i32(
+            windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAIT_TIMEOUT
+        )));
+        assert!(map::is_access_lost(map::hresult_i32(
+            windows::Win32::Graphics::Dxgi::DXGI_ERROR_ACCESS_LOST
+        )));
+    }
+
+    #[test]
+    fn gate_opens_exactly_on_cadence() {
+        let interval = interval_ns(15);
+        assert!(gate_open(initial_last_ns(0, interval), 0, interval));
+        assert!(!gate_open(0, interval - 1, interval));
+        assert!(gate_open(0, interval, interval));
+    }
+
+    #[test]
+    fn copy_tight_bgra_drops_stride_padding() {
+        let mut src = vec![0u8; 8 * 2];
+        src[0..4].copy_from_slice(&[1, 2, 3, 4]);
+        src[8..12].copy_from_slice(&[5, 6, 7, 8]);
+        let frame = copy_tight_bgra(&src, 1, 2, 8).unwrap();
+        assert_eq!(frame.stride, 4);
+        assert_eq!(frame.data, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(copy_tight_bgra(&src, 0, 2, 8).is_none());
+        assert!(copy_tight_bgra(&src, 3, 2, 8).is_none());
+    }
+
+    #[test]
+    fn stream_interval_math_matches_profile_fps() {
+        assert_eq!(interval_ns(30), 33_333_333);
+        assert_eq!(interval_ns(15), 66_666_666);
+        assert_eq!(interval_ns(0), 1_000_000_000);
     }
 }

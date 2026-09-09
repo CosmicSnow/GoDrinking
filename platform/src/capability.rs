@@ -13,8 +13,6 @@ pub struct Support {
     pub reason: &'static str,
 }
 
-// `yes` is unused on targets where every capability is negative today
-// (Windows stub); kept so each cfg arm reads identically.
 #[allow(dead_code)]
 const fn yes(reason: &'static str) -> Support {
     Support { supported: true, reason }
@@ -48,10 +46,10 @@ pub const fn capabilities() -> CapabilitySet {
     #[cfg(target_os = "windows")]
     {
         CapabilitySet {
-            display: no("planejado (WGC/DXGI)"),
-            window: no("planejado (WGC/DXGI)"),
+            display: yes("DXGI Desktop Duplication"),
+            window: yes("Windows.Graphics.Capture (pode pedir permissão no primeiro uso)"),
             app_audio: no("planejado (lane de áudio)"),
-            exclusion: no("planejado (WGC/DXGI)"),
+            exclusion: no("planejado (WGC)"),
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]

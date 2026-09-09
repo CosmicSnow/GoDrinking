@@ -465,10 +465,9 @@ mod tests {
 
     #[test]
     fn enumerate_fails_typed_off_macos() {
-        // On macOS enumerate() touches the OS (prompt/denial) — unit tests
-        // must NEVER call it there. Elsewhere it must be the typed
-        // UnsupportedPlatform, never a panic or empty silence.
-        #[cfg(not(target_os = "macos"))]
+        // On macOS/Windows enumerate() touches the OS (prompt/denial) —
+        // unit tests must NEVER treat that as UnsupportedPlatform.
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             let error = enumerate_sources().unwrap_err();
             assert!(matches!(
@@ -476,9 +475,8 @@ mod tests {
                 PlatformError::UnsupportedPlatform { .. }
             ));
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            // Capabilities are pure cfg facts: safe to assert, no OS contact.
             let caps = crate::screen::capabilities();
             assert!(caps.display.supported);
         }
