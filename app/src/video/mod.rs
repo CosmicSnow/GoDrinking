@@ -10,6 +10,12 @@
 //! watched member, so N links mean N independent windows; a dead helper
 //! fails only its own link.
 //!
+//! Transport is per-OS (`transport_unix` / `transport_windows`, selected
+//! below — the ONLY `cfg` point in this module): Unix filesystem sockets,
+//! Windows TCP loopback. Both expose the same types/functions; everything
+//! else here (protocol GLV1, handshake, frame/ack, timeouts, feed loop) is
+//! shared and behavior-identical on every OS.
+//!
 //! Freshness (a window never shows an old frame as new):
 //! - the feeder keeps latest-only (bounded channel, stale dropped);
 //! - the helper freezes + suffixes "(congelado)" after 1s without frames;
@@ -24,18 +30,22 @@
 //! ```
 //! EOF on the socket is a clean shutdown request for the helper.
 
+#[cfg(unix)]
+mod transport_unix;
+#[cfg(windows)]
+mod transport_windows;
+#[cfg(unix)]
+use transport_unix as transport;
+#[cfg(windows)]
+use transport_windows as transport;
+
+pub use transport::{connect as connect_helper, helper_file_name, FeedStream, HelperStream};
+use transport::{bind, prepare_feed_stream};
+
 use golive_core::media::PresentedFrame;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-
-#[cfg(unix)]
-use std::os::unix::net::{UnixListener, UnixStream};
-
-#[cfg(unix)]
-type IpcStream = UnixStream;
-#[cfg(windows)]
-type IpcStream = std::net::TcpStream;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -443,11 +453,7 @@ pub struct LinkStats {
 /// `Contents/MacOS/golive-video` next to the packaged binary (the e2e
 /// script copies it there after `tauri build`).
 pub fn helper_path() -> PathBuf {
-    let name = if cfg!(windows) {
-        "golive-video.exe"
-    } else {
-        HELPER_NAME
-    };
+    let name = helper_file_name();
     std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(name)))
@@ -672,7 +678,7 @@ fn feed_loop(
     };
 
     // Spawn the helper now.
-    let (listener, helper_arg) = match bind_ipc(&sock_path) {
+    let (listener, helper_arg) = match bind(&sock_path) {
         Ok(bound) => bound,
         Err(e) => {
             eprintln!("video socket bind failed: {e}");
@@ -719,7 +725,7 @@ fn feed_loop(
             }
         }
     }
-    let mut sock: IpcStream = match sock {
+    let mut sock: FeedStream = match sock {
         Some(sock) => sock,
         None => {
             eprintln!("video helper never connected back");
@@ -732,7 +738,7 @@ fn feed_loop(
     let _ = sock.set_nonblocking(false);
     let _ = sock.set_read_timeout(Some(SOCKET_TIMEOUT));
     let _ = sock.set_write_timeout(Some(SOCKET_TIMEOUT));
-    prepare_ipc_stream(&sock);
+    prepare_feed_stream(&sock);
 
     if write_handshake(&mut sock, &title, w, h).is_err() {
         healthy.store(false, Ordering::Release);
@@ -799,27 +805,6 @@ impl FrameSlot {
             }
         }
     }
-}
-
-#[cfg(unix)]
-fn bind_ipc(sock_path: &Path) -> std::io::Result<(UnixListener, PathBuf)> {
-    let _ = std::fs::remove_file(sock_path);
-    let listener = UnixListener::bind(sock_path)?;
-    listener.set_nonblocking(true)?;
-    Ok((listener, sock_path.to_path_buf()))
-}
-
-#[cfg(windows)]
-fn bind_ipc(_sock_path: &Path) -> std::io::Result<(std::net::TcpListener, PathBuf)> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    listener.set_nonblocking(true)?;
-    let addr = listener.local_addr()?;
-    Ok((listener, PathBuf::from(addr.to_string())))
-}
-
-fn prepare_ipc_stream(_sock: &IpcStream) {
-    #[cfg(windows)]
-    let _ = _sock.set_nodelay(true);
 }
 
 fn write_handshake(sock: &mut impl Write, title: &str, w: usize, h: usize) -> std::io::Result<()> {

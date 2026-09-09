@@ -13,6 +13,7 @@ core/target
 app/target
 platform/target
 platform-macos/target
+platform-windows/target
 gst-spike/target
 e2e-artifacts/
 dist

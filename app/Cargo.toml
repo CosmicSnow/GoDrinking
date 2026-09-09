@@ -47,3 +47,8 @@ ureq = { version = "3", features = ["json"] }
 # build the shell without it (capabilities report accordingly).
 [target.'cfg(target_os = "macos")'.dependencies]
 golive-platform-macos = { path = "../platform-macos" }
+
+# Windows capture backend (DXGI/WGC stub today). Target-gated, mirroring
+# the macOS backend above: other platforms build without it.
+[target.'cfg(target_os = "windows")'.dependencies]
+golive-platform-windows = { path = "../platform-windows" }

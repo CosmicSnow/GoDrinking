@@ -1862,6 +1862,7 @@ dependencies = [
  "golive-core",
  "golive-platform",
  "golive-platform-macos",
+ "golive-platform-windows",
  "png 0.17.16",
  "serde",
  "serde_json",
@@ -1917,6 +1918,13 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-io-surface",
  "objc2-screen-capture-kit",
+]
+
+[[package]]
+name = "golive-platform-windows"
+version = "0.1.0"
+dependencies = [
+ "golive-platform",
 ]
 
 [[package]]

@@ -173,7 +173,12 @@ fn open_stream(
             })?;
         source.start(config)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        let mut source = golive_platform_windows::WindowsSource::open(info)?;
+        source.start(config)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (info, config);
         Err(PlatformError::UnsupportedPlatform {
@@ -298,7 +303,11 @@ pub fn enumerate_sources() -> Result<Vec<SourceInfo>, PlatformError> {
     {
         golive_platform_macos::enumerate()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        golive_platform_windows::enumerate()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         Err(PlatformError::UnsupportedPlatform {
             reason: "captura de tela: apenas macOS (Windows planejado)",
@@ -342,7 +351,11 @@ fn thumbnail_for(info: &SourceInfo) -> Result<BgraFrame, PlatformError> {
     {
         golive_platform_macos::thumbnail(info.kind, &info.id)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        golive_platform_windows::thumbnail(info.kind, &info.id)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = info;
         Err(PlatformError::UnsupportedPlatform {

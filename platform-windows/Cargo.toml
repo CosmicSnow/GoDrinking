@@ -1,0 +1,15 @@
+[package]
+name = "golive-platform-windows"
+version = "0.1.0"
+edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0"
+description = "GoLive Windows capture backend (DXGI/WGC). Stub today: honest UnsupportedPlatform behind the golive-platform contract; capture plugs in per TODOs."
+
+[lib]
+name = "golive_platform_windows"
+crate-type = ["rlib"]
+
+[dependencies]
+# Pure contract only (trait + types + typed errors). Zero OS bindings until
+# the DXGI implementation lands (see TODOs in src/lib.rs).
+golive-platform = { path = "../platform" }
