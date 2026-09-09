@@ -62,25 +62,7 @@ pub fn spawn_forward(
         while let Some(event) = events.recv().await {
             match event {
                 MediaEvent::IceConnected => {
-                    // Attribute to the live fence of this session.
-                    let fence = {                        let inner = match state.inner.lock() {
-                            Ok(inner) => inner,
-                            Err(_) => break,
-                        };
-                        match target {
-                            ForwardTarget::Share => {
-                                inner.publishers.values().next().map(|s| s.owner_fence)
-                            }
-                            ForwardTarget::Watch => inner.viewer_fence,
-                        }
-                    };
-                    if let Some(fence) = fence {
-                        if let Ok(inner) = state.inner.lock() {
-                            let _ = inner.owner.link_connected(&fence);
-                        }
-                    }
-                    bump_connected(&state);
-                    state.session_log("ice connected".to_string());
+                    apply_ice_connected(&state, target);
                     emit(&app, "media-event", &serde_json::json!({"kind": "ice-connected"}));
                 }
                 MediaEvent::VideoFrame { non_black, motion } => {
@@ -97,6 +79,9 @@ pub fn spawn_forward(
                 }
                 MediaEvent::Stats(stats) => {
                     merge_stats(&state, stats.frames_decoded, stats.keyframes_decoded, stats.ice_connected);
+                    if stats.ice_connected {
+                        apply_ice_connected(&state, target);
+                    }
                     // Generation fence (host side): the encode thread bumps
                     // it on every applied reconfig. First observer wins the
                     // authoritative `quality` event; the snapshot
@@ -282,6 +267,38 @@ fn emit(app: &Option<AppHandle>, event: &str, payload: &serde_json::Value) {
             eprintln!("[e2e-probe] emit {event} failed: {e}");
         }
     }
+}
+
+/// Marks the live link Connected. Share uses the adopted watcher (never the
+/// idle template / HashMap::next — that left ICE "negotiating" forever).
+fn ice_fence(inner: &super::Inner, target: ForwardTarget) -> Option<Fence> {
+    match target {
+        ForwardTarget::Watch => inner.viewer_fence,
+        ForwardTarget::Share => {
+            let watcher = select_host_trickle_target(
+                inner.publishers.iter().map(|(k, s)| (k.as_str(), &s.wire)),
+            )?
+            .0;
+            inner.publishers.get(&watcher).map(|session| session.owner_fence)
+        }
+    }
+}
+
+fn apply_ice_connected(state: &Arc<AppState>, target: ForwardTarget) {
+    let fence = {
+        let inner = match state.inner.lock() {
+            Ok(inner) => inner,
+            Err(_) => return,
+        };
+        ice_fence(&inner, target)
+    };
+    if let Some(fence) = fence {
+        if let Ok(inner) = state.inner.lock() {
+            let _ = inner.owner.link_connected(&fence);
+        }
+    }
+    bump_connected(state);
+    state.session_log("ice connected".to_string());
 }
 
 /// Backend-observed counters (polled by `get_media_counters`; kinds only).
@@ -516,7 +533,7 @@ async fn handle_signal(state: &Arc<AppState>, app: &Option<AppHandle>, message: 
                 "signal-event",
                 &serde_json::json!({"kind": "signal", "from": from, "type": format!("{:?}", payload.kind)}),
             );
-            on_envelope(state, &from, &payload).await;
+            on_envelope(state, app, &from, &payload).await;
         }
         Incoming::Kicked => {
             emit(app, "signal-event", &serde_json::json!({"kind": "kicked"}));
@@ -636,7 +653,12 @@ async fn on_unwatch(state: &Arc<AppState>, watcher: &str) {
 }
 
 /// Route one validated envelope: host link or viewer adoption.
-async fn on_envelope(state: &Arc<AppState>, from: &str, payload: &Envelope) {
+async fn on_envelope(
+    state: &Arc<AppState>,
+    app: &Option<AppHandle>,
+    from: &str,
+    payload: &Envelope,
+) {
     // Host link?
     let is_host_link = {
         let inner = match state.inner.lock() {
@@ -648,7 +670,7 @@ async fn on_envelope(state: &Arc<AppState>, from: &str, payload: &Envelope) {
     if is_host_link {
         on_host_envelope(state, from, payload).await;
     } else {
-        on_viewer_envelope(state, payload).await;
+        on_viewer_envelope(state, app, payload).await;
     }
 }
 
@@ -765,7 +787,11 @@ fn watcher_nickname(state: &Arc<AppState>, watcher: &str) -> String {
     }
 }
 
-async fn on_viewer_envelope(state: &Arc<AppState>, payload: &Envelope) {
+async fn on_viewer_envelope(
+    state: &Arc<AppState>,
+    app: &Option<AppHandle>,
+    payload: &Envelope,
+) {
     if payload.kind == EnvelopeKind::Candidate {
         // Pre-offer (no adopted fence yet): queue for the offer flush.
         // Post-offer: fence-check, then apply when the remote is ready
@@ -909,7 +935,7 @@ async fn on_viewer_envelope(state: &Arc<AppState>, payload: &Envelope) {
             inner.viewer = Some(Arc::clone(&viewer));
             inner.tasks.push(spawn_forward(
                 Arc::clone(state),
-                None,
+                app.clone(),
                 event_rx,
                 ForwardTarget::Watch,
             ));
