@@ -944,9 +944,10 @@ export function RoomScreen(props: RoomProps) {
     }
   };
 
+  // Selecionar-confirmar: o clique só seleciona (highlight .sel via `source`);
+  // só o botão Compartilhar inicia o share e fecha o modal.
   const pickSource = (kind: "display" | "window", id: string, name: string): void => {
     onSource(`${kind}:${id}`);
-    setShareOpen(false);
     say(`Fonte escolhida: ${name}. Toque Compartilhar para ir ao ar.`);
   };
 

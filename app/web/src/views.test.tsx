@@ -446,6 +446,25 @@ describe("fontes de captura (select + capacidades)", () => {
     expect(html).toContain("Display 1 · 2560x1440");
   });
 
+  it("modal Compartilhar: fonte selecionada destaca (.sel); confirmar é no botão", () => {
+    const html = renderToStaticMarkup(
+      createElement(
+        RoomScreen,
+        roomProps({
+          source: "display:1",
+          sources: [
+            { kind: "display", id: "1", name: "Display 1 · 2560x1440", w: 2560, h: 1440 },
+          ],
+        }),
+      ),
+    );
+    // Seleção = highlight, sem compartilhar sozinho.
+    expect(html).toContain('class="source sel"');
+    // Confirmar/cancelar explícitos no rodapé do modal.
+    expect(html).toContain("Cancelar");
+    expect(html).toContain("Compartilhar");
+  });
+
   it("thumb vira <img> quando há preview; sem preview, gradiente FONTE", () => {
     const withThumb = renderToStaticMarkup(
       createElement(
