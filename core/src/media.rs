@@ -22,18 +22,24 @@
 //!   dependency — still zero OS bindings in this crate's own code).
 
 use golive_platform::GpuPixelBuffer;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
+use interceptor::registry::Registry;
 use openh264::decoder::Decoder;
 use openh264::encoder::{
     BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, Level, Profile,
 };
 use openh264::formats::{YUVBuffer, YUVSource};
+use rtcp::packet::Packet as RtcpPacket;
+use rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
+use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use tokio::sync::mpsc;
+use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
@@ -42,6 +48,7 @@ use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit}
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+use webrtc::rtp_transceiver::RTCPFeedback;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
@@ -899,17 +906,24 @@ impl FrameValidator {
 // PeerConnection factory (symmetric both ends)
 // ---------------------------------------------------------------------------
 
-/// Builds the shared API: default codecs (H264 CB mode-1 included), mDNS
-/// DISABLED on both ends (lesson 2: symmetric, plus redacted census).
+/// Builds the shared API: default codecs (H264 CB mode-1 included, already
+/// carrying goog-remb + ccm fir + nack + nack pli), mDNS DISABLED on both
+/// ends (lesson 2: symmetric, plus redacted census), and the default
+/// interceptors (NACK generator+responder, sender/receiver reports, TWCC
+/// receiver-only) — the loss-recovery half of PLI. The IDR-request half is
+/// the viewer `read_loop` PLI below plus the publisher RTCP task.
 fn build_api() -> Result<webrtc::api::API, MediaError> {
     let mut media_engine = MediaEngine::default();
     media_engine
         .register_default_codecs()
         .map_err(|e| MediaError::Transport(format!("codecs: {e}")))?;
+    let registry = register_default_interceptors(Registry::new(), &mut media_engine)
+        .map_err(|e| MediaError::Transport(format!("interceptors: {e}")))?;
     let mut setting_engine = SettingEngine::default();
     setting_engine.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
     Ok(APIBuilder::default()
         .with_media_engine(media_engine)
+        .with_interceptor_registry(registry)
         .with_setting_engine(setting_engine)
         .build())
 }
@@ -933,8 +947,66 @@ fn video_codec() -> RTCRtpCodecCapability {
         channels: 0,
         sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
             .to_owned(),
-        rtcp_feedback: vec![],
+        // Loss recovery, mirrored from the media-engine defaults: generic
+        // NACK (retransmit via the responder interceptor) + PLI (viewer asks
+        // for an IDR on irrecoverable AU gaps) + FIR (same, alternate form).
+        // The offer carries `a=rtcp-fb:<pt> nack pli`; behavior under no
+        // loss is byte-identical to before.
+        rtcp_feedback: vec![
+            RTCPFeedback {
+                typ: "nack".to_owned(),
+                parameter: "".to_owned(),
+            },
+            RTCPFeedback {
+                typ: "nack".to_owned(),
+                parameter: "pli".to_owned(),
+            },
+            RTCPFeedback {
+                typ: "ccm".to_owned(),
+                parameter: "fir".to_owned(),
+            },
+        ],
     }
+}
+
+// ---------------------------------------------------------------------------
+// PLI loss recovery (viewer asks, publisher obeys; signaling untouched)
+// ---------------------------------------------------------------------------
+
+/// Minimum gap between PLIs for one SSRC (~1/s): loss recovery without RTCP
+/// floods. Never per packet — only the irrecoverable-AU-gap path arms it.
+const PLI_DEBOUNCE: Duration = Duration::from_secs(1);
+
+/// Pure debounce decision (the clock is the caller's, so tests own time):
+/// first sighting per SSRC is due, repeats within [`PLI_DEBOUNCE`] are not.
+fn pli_due(last: &mut HashMap<u32, Instant>, media_ssrc: u32, now: Instant) -> bool {
+    match last.get(&media_ssrc) {
+        Some(&t) if now.duration_since(t) < PLI_DEBOUNCE => false,
+        _ => {
+            last.insert(media_ssrc, now);
+            true
+        }
+    }
+}
+
+/// Sends one PLI for `media_ssrc` unless one went out within the debounce
+/// window. Fire-and-forget: RTCP send failures just mean the next gap asks
+/// again (still debounced).
+async fn maybe_send_pli(
+    pc: &Arc<RTCPeerConnection>,
+    last_pli: &mut HashMap<u32, Instant>,
+    media_ssrc: u32,
+) {
+    if !pli_due(last_pli, media_ssrc, Instant::now()) {
+        return;
+    }
+    let pli = PictureLossIndication {
+        sender_ssrc: 0,
+        media_ssrc,
+    };
+    let _ = pc
+        .write_rtcp(&[Box::new(pli) as Box<dyn RtcpPacket + Send + Sync>])
+        .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -953,6 +1025,10 @@ pub struct Publisher {
     /// Live encoder backend (`None` until the encode thread builds it).
     /// Written on every build/rebuild; read for counters/diagnostics.
     backend: Arc<std::sync::Mutex<Option<&'static str>>>,
+    /// PLI/FIR recovery task handle (aborted in `stop()`). The flag it sets
+    /// is owned by the encode thread + the task itself — this handle is the
+    /// only publisher-side state the recovery needs.
+    rtcp_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Publisher {
@@ -1002,7 +1078,8 @@ impl Publisher {
             "video".to_owned(),
             "golive".to_owned(),
         ));
-        pc.add_track(track.clone())
+        let sender = pc
+            .add_track(track.clone())
             .await
             .map_err(|e| MediaError::Transport(format!("add_track: {e}")))?;
         // Explicit sendonly: this side never receives. (Default would be
@@ -1018,8 +1095,11 @@ impl Publisher {
 
         // Encode on a blocking thread; latest-only slot into tokio (see
         // FrameSlot: at most one unit queued, stale replaced, never block).
+        // `intra_requested` bridges the async RTCP task (PLI/FIR in) to the
+        // encode thread (`force_intra()` out).
         let slot = Arc::new(FrameSlot::default());
         let backend = Arc::new(std::sync::Mutex::new(None));
+        let intra_requested = Arc::new(AtomicBool::new(false));
         let (reconfig_tx, reconfig_rx) = std::sync::mpsc::channel::<QualityProfile>();
         let encode_stop = Arc::new(AtomicBool::new(false));
         let encode_thread = {
@@ -1028,10 +1108,11 @@ impl Publisher {
             let slot = Arc::clone(&slot);
             let backend = Arc::clone(&backend);
             let census = Arc::clone(&census);
+            let intra = Arc::clone(&intra_requested);
             std::thread::Builder::new()
                 .name("golive-encode".into())
                 .spawn(move || {
-                    encode_loop(source, profile, engine, &stop, &slot, &backend, &census, &event_tx, &reconfig_rx);
+                    encode_loop(source, profile, engine, &stop, &slot, &backend, &census, &event_tx, &reconfig_rx, &intra);
                 })
                 .map_err(|e| MediaError::Codec(format!("encode thread: {e}")))?
         };
@@ -1059,6 +1140,31 @@ impl Publisher {
                 }
             });
         }
+        // RTCP recovery task: the viewer sends PLI (irrecoverable AU gap) or
+        // FIR; either arms `intra_requested` and the encode loop forces the
+        // next unit to start with an IDR. Generic NACKs never reach us (the
+        // responder interceptor retransmits below us). Ends on RTCP errors
+        // (close) and is aborted in `stop()`.
+        let rtcp_task = {
+            let intra = Arc::clone(&intra_requested);
+            tokio::spawn(async move {
+                loop {
+                    match sender.read_rtcp().await {
+                        Ok((pkts, _)) => {
+                            for pkt in &pkts {
+                                if pkt.as_any().downcast_ref::<PictureLossIndication>().is_some()
+                                    || pkt.as_any().downcast_ref::<FullIntraRequest>().is_some()
+                                {
+                                    intra.store(true, Ordering::Release);
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
 
         Ok(Self {
             pc,
@@ -1069,6 +1175,7 @@ impl Publisher {
             reconfig_tx: Some(reconfig_tx),
             slot,
             backend,
+            rtcp_task: Some(rtcp_task),
         })
     }
 
@@ -1132,13 +1239,17 @@ impl Publisher {
     }
 
     /// Bounded idempotent stop: flag, timed PC close, poison the pump so it
-    /// cannot park in `take()` forever, thread join. Never wedges.
+    /// cannot park in `take()` forever, abort the RTCP task, thread join.
+    /// Never wedges.
     pub async fn stop(&mut self) {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
         }
         self.encode_stop.store(true, Ordering::Release);
         let _ = tokio::time::timeout(Duration::from_secs(5), self.pc.close()).await;
+        if let Some(handle) = self.rtcp_task.take() {
+            handle.abort();
+        }
         self.slot.poison();
         if let Some(thread) = self.encode_thread.take() {
             let _ = thread.join();
@@ -1163,6 +1274,7 @@ fn encode_loop(
     census: &Arc<std::sync::Mutex<CandidateCensus>>,
     event_tx: &mpsc::UnboundedSender<MediaEvent>,
     reconfig_rx: &std::sync::mpsc::Receiver<QualityProfile>,
+    intra_requested: &AtomicBool,
 ) {
     // 0. Movie preload (native size, capped — see preload_movie). The
     // bridge/setup failures below are fatal + loud (typed errors).
@@ -1214,6 +1326,12 @@ fn encode_loop(
                     }
                 }
             }
+        }
+        // 1b. PLI/FIR recovery: the viewer's loss signal (set by the RTCP
+        // task) forces the next unit to start with an IDR. Consumed once;
+        // the normal path never sets it, so behavior there is unchanged.
+        if intra_requested.swap(false, Ordering::Acquire) {
+            encoder.force_intra();
         }
         // 2. Fetch one frame at the current target dims. CPU frames scale
         // here; GPU buffers stay retained until the encode step routes
@@ -1579,12 +1697,14 @@ impl NativeViewer {
         {
             let event_tx = event_tx.clone();
             let census = Arc::clone(&census);
+            let pc_pli = Arc::clone(&pc);
             pc.on_track(Box::new(move |track, _, _| {
                 let event_tx = event_tx.clone();
                 let on_frame = Arc::clone(&on_frame);
                 let census = Arc::clone(&census);
+                let pc_pli = Arc::clone(&pc_pli);
                 Box::pin(async move {
-                    read_loop(track, &event_tx, &on_frame, &census).await;
+                    read_loop(track, &pc_pli, &event_tx, &on_frame, &census).await;
                 })
             }));
         }
@@ -1637,9 +1757,12 @@ impl NativeViewer {
 }
 
 /// Track read loop: depacketize, assemble access units per RTP timestamp,
-/// decode once, then validate + emit + present the same picture.
+/// decode once, then validate + emit + present the same picture. On an
+/// irrecoverable AU gap (the depacketize error path) asks the publisher for
+/// an IDR via PLI — debounced ~1/s per SSRC, never per packet.
 async fn read_loop(
     track: Arc<TrackRemote>,
+    pc: &Arc<RTCPeerConnection>,
     event_tx: &mpsc::UnboundedSender<MediaEvent>,
     on_frame: &Arc<dyn Fn(PresentedFrame) + Send + Sync>,
     census: &Arc<std::sync::Mutex<CandidateCensus>>,
@@ -1656,6 +1779,7 @@ async fn read_loop(
     let mut stats = MediaStats::default();
     let mut unit = Vec::<u8>::new();
     let mut unit_ts: Option<u32> = None;
+    let mut last_pli: HashMap<u32, Instant> = HashMap::new();
     loop {
         let (packet, _) = match track.read_rtp().await {
             Ok(pair) => pair,
@@ -1688,7 +1812,12 @@ async fn read_loop(
         match depacketizer.depacketize(&packet.payload) {
             Ok(bytes) if !bytes.is_empty() => unit.extend_from_slice(&bytes),
             Ok(_) => {}
-            Err(_) => continue,
+            Err(_) => {
+                // Irrecoverable AU gap: the unit being assembled can never
+                // decode cleanly — ask for an IDR (debounced inside).
+                maybe_send_pli(pc, &mut last_pli, packet.header.ssrc).await;
+                continue;
+            }
         }
     }
 }
@@ -1812,6 +1941,7 @@ mod tests {
         let slot_ = Arc::clone(&slot);
         let backend_ = Arc::new(std::sync::Mutex::new(None));
         let census_ = Arc::new(std::sync::Mutex::new(CandidateCensus::default()));
+        let intra_ = Arc::new(AtomicBool::new(false));
         let handle = std::thread::spawn(move || {
             encode_loop(
                 source,
@@ -1823,6 +1953,7 @@ mod tests {
                 &census_,
                 &event_tx,
                 &reconfig_rx,
+                &intra_,
             );
         });
         for n in 0..5 {
@@ -1884,6 +2015,86 @@ mod tests {
         let first = enc.encode(&synthetic_frame(1280, 720, 0)).expect("encode");
         assert!(contains_idr(&first), "first unit is an IDR");
         assert!(!contains_idr(&[]), "empty unit has no IDR");
+    }
+
+    // -- PLI loss recovery ---------------------------------------------------
+
+    #[test]
+    fn video_codec_advertises_pli_recovery() {
+        // Negotiation half of recovery: the track codec mirrors the
+        // media-engine defaults (nack + nack pli + ccm fir) so the offer
+        // carries `a=rtcp-fb:<pt> nack pli`.
+        let codec = video_codec();
+        let feedback: Vec<(&str, &str)> = codec
+            .rtcp_feedback
+            .iter()
+            .map(|fb| (fb.typ.as_str(), fb.parameter.as_str()))
+            .collect();
+        assert!(feedback.contains(&("nack", "")), "generic NACK present");
+        assert!(feedback.contains(&("nack", "pli")), "PLI present");
+        assert!(feedback.contains(&("ccm", "fir")), "FIR present");
+    }
+
+    #[test]
+    fn pli_debounce_allows_one_per_second_per_ssrc() {
+        // Pure decision with caller-owned time: first sighting per SSRC is
+        // due, repeats within the window are not, other SSRCs are unaffected.
+        let mut last: HashMap<u32, Instant> = HashMap::new();
+        let t0 = Instant::now();
+        assert!(pli_due(&mut last, 11, t0), "first gap asks");
+        assert!(!pli_due(&mut last, 11, t0), "never per packet");
+        assert!(
+            !pli_due(&mut last, 11, t0 + PLI_DEBOUNCE - Duration::from_millis(1)),
+            "still debounced just before the window"
+        );
+        assert!(pli_due(&mut last, 11, t0 + PLI_DEBOUNCE), "window re-arms");
+        assert!(pli_due(&mut last, 22, t0), "other SSRC independent");
+    }
+
+    #[test]
+    fn loss_gap_arms_pli_then_idr() {
+        // perda → PLI → IDR, minus the wire: a corrupt payload fails the
+        // same depacketize the read loop runs (arming exactly one PLI), and
+        // the publisher-side `force_intra()` the RTCP task would trigger
+        // lands an IDR on the very next unit.
+        let mut depacketizer = H264Packet::default();
+        assert!(
+            depacketizer
+                .depacketize(&Bytes::from_static(&[]))
+                .is_err(),
+            "empty payload is an irrecoverable AU gap"
+        );
+        let mut last: HashMap<u32, Instant> = HashMap::new();
+        let now = Instant::now();
+        assert!(pli_due(&mut last, 7, now), "gap arms one PLI");
+        assert!(!pli_due(&mut last, 7, now), "burst of gaps still one PLI");
+        // Publisher side: stream running, then the PLI-equivalent signal.
+        let mut enc = H264Encoder::new(Quality::P720).expect("encoder");
+        let _ = enc.encode(&synthetic_frame(1280, 720, 0)).expect("priming IDR");
+        enc.force_intra();
+        let unit = enc.encode(&synthetic_frame(1280, 720, 1)).expect("encode");
+        assert!(contains_idr(&unit), "PLI-equivalent forces an observed IDR");
+    }
+
+    #[tokio::test]
+    async fn offer_sdp_advertises_nack_pli() {
+        // Negotiation over the real path: the publisher offer must carry
+        // `nack pli` (and `ccm fir`) — no signaling-protocol change, just
+        // the codec feedback lines.
+        let (event_tx, _event_rx) = mpsc::unbounded_channel::<MediaEvent>();
+        let mut publisher = Publisher::start_with_profile(
+            VideoSource::SyntheticBall,
+            QualityProfile::low(),
+            EngineKind::Software,
+            None,
+            event_tx,
+        )
+        .await
+        .expect("publisher starts");
+        let sdp = publisher.create_offer().await.expect("offer");
+        publisher.stop().await;
+        assert!(sdp.contains("nack pli"), "offer negotiates PLI recovery");
+        assert!(sdp.contains("ccm fir"), "offer negotiates FIR recovery");
     }
 
     #[test]
@@ -2206,6 +2417,7 @@ mod tests {
         let (stop_, slot_) = (Arc::clone(&stop), Arc::clone(&slot));
         let backend_ = Arc::new(std::sync::Mutex::new(None));
         let census_ = Arc::new(std::sync::Mutex::new(CandidateCensus::default()));
+        let intra_ = Arc::new(AtomicBool::new(false));
         let handle = std::thread::spawn(move || {
             encode_loop(
                 VideoSource::SyntheticBall,
@@ -2217,6 +2429,7 @@ mod tests {
                 &census_,
                 &event_tx,
                 &reconfig_rx,
+                &intra_,
             );
         });
         let mut dec = H264Decoder::new().expect("decoder");
