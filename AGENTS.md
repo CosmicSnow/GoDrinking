@@ -137,7 +137,14 @@ packaged exe points at `devUrl` instead of the bundled `frontendDist`.
   watcher AND viewer candidates forward to the watch target (`pump.rs`), plus
   `ice-complete` both ways per `PROTOCOL.md`. No TURN (`typ relay` rejected).
 
-## 8. Commit style
+## 8. Bugs (BUGS.md)
+
+- Known bugs live in `BUGS.md` (repo root), each with a status — review
+  them before touching related code.
+- A bug that is 100% fixed AND verified is REMOVED from `BUGS.md`.
+  Never mark done-in-place; the list holds open bugs only.
+
+## 9. Commit style
 
 Short `type: subject` headers, lowercase, no trailing period. Usual types:
 `feat:`, `fix:`, `refactor:`, `release:`. `sala:` prefix for Sala-lane work,
