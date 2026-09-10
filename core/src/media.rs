@@ -21,7 +21,7 @@
 //! - Capture GPU buffers cross as opaque platform handles (types-only
 //!   dependency — still zero OS bindings in this crate's own code).
 
-use golive_platform::GpuPixelBuffer;
+use golive_platform::{EncodedAudioPacket, GpuPixelBuffer};
 use crate::trace::{Trace, Stage, Sample as TraceSample};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -49,7 +49,8 @@ use webrtc::ice::mdns::MulticastDnsMode;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
-use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+use webrtc::api::media_engine::MIME_TYPE_OPUS;
+use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTPCodecType};
 use webrtc::rtp_transceiver::RTCPFeedback;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
@@ -966,6 +967,16 @@ fn rtc_config(ice_servers: Option<Vec<String>>) -> RTCConfiguration {
     }
 }
 
+fn opus_codec() -> RTCRtpCodecCapability {
+    RTCRtpCodecCapability {
+        mime_type: MIME_TYPE_OPUS.to_owned(),
+        clock_rate: 48000,
+        channels: 2,
+        sdp_fmtp_line: "minptime=10;useinbandfec=1".to_owned(),
+        rtcp_feedback: vec![],
+    }
+}
+
 fn video_codec() -> RTCRtpCodecCapability {
     use webrtc::api::media_engine::MIME_TYPE_H264;
     RTCRtpCodecCapability {
@@ -1090,6 +1101,25 @@ impl Publisher {
         ice_servers: Option<Vec<String>>,
         event_tx: mpsc::UnboundedSender<MediaEvent>,
     ) -> Result<Self, MediaError> {
+        Self::start_with_profile_and_audio(
+            source,
+            profile,
+            engine,
+            ice_servers,
+            event_tx,
+            None,
+        )
+        .await
+    }
+
+    pub async fn start_with_profile_and_audio(
+        source: VideoSource,
+        profile: QualityProfile,
+        engine: EngineKind,
+        ice_servers: Option<Vec<String>>,
+        event_tx: mpsc::UnboundedSender<MediaEvent>,
+        audio_rx: Option<std::sync::mpsc::Receiver<EncodedAudioPacket>>,
+    ) -> Result<Self, MediaError> {
         profile
             .validate()
             .map_err(|e| MediaError::Codec(format!("profile: {e}")))?;
@@ -1111,6 +1141,19 @@ impl Publisher {
             .add_track(track.clone())
             .await
             .map_err(|e| MediaError::Transport(format!("add_track: {e}")))?;
+        let audio_pair = if let Some(audio_rx) = audio_rx {
+            let audio_track = Arc::new(TrackLocalStaticSample::new(
+                opus_codec(),
+                "audio".to_owned(),
+                "golive".to_owned(),
+            ));
+            pc.add_track(audio_track.clone())
+                .await
+                .map_err(|e| MediaError::Transport(format!("add_audio_track: {e}")))?;
+            Some((audio_track, audio_rx))
+        } else {
+            None
+        };
         // Explicit sendonly: this side never receives. (Default would be
         // sendrecv; the contract pins directions, asserted in E2E.)
         for transceiver in pc.get_transceivers().await {
@@ -1145,6 +1188,27 @@ impl Publisher {
                 })
                 .map_err(|e| MediaError::Codec(format!("encode thread: {e}")))?
         };
+        if let Some((audio_track, audio_rx)) = audio_pair {
+            let stop = Arc::clone(&encode_stop);
+            let runtime = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let Ok(packet) = audio_rx.recv_timeout(Duration::from_millis(20)) else {
+                        continue;
+                    };
+                    let sample = Sample {
+                        data: Bytes::from(packet.data),
+                        timestamp: SystemTime::now(),
+                        duration: packet.duration,
+                        packet_timestamp: 0,
+                        prev_dropped_packets: 0,
+                        prev_padding_packets: 0,
+                    };
+                    let audio_track = Arc::clone(&audio_track);
+                    let _ = runtime.block_on(async move { audio_track.write_sample(&sample).await });
+                }
+            });
+        }
         // Pump freshest units into the track with per-sample durations from
         // the live profile (reconfig may change fps mid-share).
         {
@@ -1799,6 +1863,15 @@ impl NativeViewer {
         event_tx: mpsc::UnboundedSender<MediaEvent>,
         on_frame: Arc<dyn Fn(PresentedFrame) + Send + Sync>,
     ) -> Result<Self, MediaError> {
+        Self::start_with_audio(ice_servers, event_tx, on_frame, None).await
+    }
+
+    pub async fn start_with_audio(
+        ice_servers: Option<Vec<String>>,
+        event_tx: mpsc::UnboundedSender<MediaEvent>,
+        on_frame: Arc<dyn Fn(PresentedFrame) + Send + Sync>,
+        on_audio: Option<Arc<dyn Fn(&[f32]) + Send + Sync>>,
+    ) -> Result<Self, MediaError> {
         let api = build_api()?;
         let pc = Arc::new(
             api.new_peer_connection(rtc_config(ice_servers))
@@ -1815,9 +1888,16 @@ impl NativeViewer {
             pc.on_track(Box::new(move |track, _, _| {
                 let event_tx = event_tx.clone();
                 let on_frame = Arc::clone(&on_frame);
+                let on_audio = on_audio.clone();
                 let census = Arc::clone(&census);
                 let pc_pli = Arc::clone(&pc_pli);
                 Box::pin(async move {
+                    if track.kind() == RTPCodecType::Audio {
+                        if let Some(on_audio) = on_audio {
+                            audio_read_loop(track, on_audio).await;
+                        }
+                        return;
+                    }
                     read_loop(track, &pc_pli, &event_tx, &on_frame, &census).await;
                 })
             }));
@@ -1883,6 +1963,29 @@ fn au_is_stale(last_decoded_ts: Option<u32>, completed_ts: u32) -> bool {
     match last_decoded_ts {
         None => false,
         Some(prev) => completed_ts != prev && completed_ts.wrapping_sub(prev) > (u32::MAX >> 1),
+    }
+}
+
+async fn audio_read_loop(
+    track: Arc<TrackRemote>,
+    on_audio: Arc<dyn Fn(&[f32]) + Send + Sync>,
+) {
+    let Ok(mut decoder) = opus::Decoder::new(48_000, opus::Channels::Stereo) else {
+        return;
+    };
+    let mut pcm = vec![0f32; 960 * 2 * 6];
+    loop {
+        let (packet, _) = match track.read_rtp().await {
+            Ok(pair) => pair,
+            Err(_) => break,
+        };
+        match decoder.decode_float(&packet.payload, &mut pcm, false) {
+            Ok(samples) if samples > 0 => {
+                let end = (samples * 2).min(pcm.len());
+                on_audio(&pcm[..end]);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -2343,6 +2446,27 @@ mod tests {
         publisher.stop().await;
         assert!(sdp.contains("nack pli"), "offer negotiates PLI recovery");
         assert!(sdp.contains("ccm fir"), "offer negotiates FIR recovery");
+        assert!(!sdp.contains("m=audio"), "synthetic share stays video-only");
+    }
+
+    #[tokio::test]
+    async fn offer_sdp_includes_opus_when_audio_is_attached() {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel::<MediaEvent>();
+        let (_tx, rx) = std::sync::mpsc::sync_channel::<EncodedAudioPacket>(1);
+        let mut publisher = Publisher::start_with_profile_and_audio(
+            VideoSource::SyntheticBall,
+            QualityProfile::low(),
+            EngineKind::Software,
+            None,
+            event_tx,
+            Some(rx),
+        )
+        .await
+        .expect("publisher starts");
+        let sdp = publisher.create_offer().await.expect("offer");
+        publisher.stop().await;
+        assert!(sdp.contains("m=audio"), "audio track advertised");
+        assert!(sdp.contains("opus") || sdp.contains("OPUS") || sdp.contains("Opus"));
     }
 
     #[test]

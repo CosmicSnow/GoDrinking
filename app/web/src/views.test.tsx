@@ -265,6 +265,7 @@ describe("RoomScreen (snapshot → markup, sem inferência)", () => {
     expect(html).toContain("Copiar");
     expect(html).toContain("Atualizar");
     expect(html).toContain("Ignorar Áudio de Apps");
+    expect(html).toContain("Disponível durante o compartilhamento de tela.");
     expect(html).not.toContain("room-code-bar");
     expect(html).not.toContain("Copiar código");
   });
@@ -276,6 +277,27 @@ describe("RoomScreen (snapshot → markup, sem inferência)", () => {
     expect(html).toContain("tile-view-m-2");
     // Sidebar continua com todo mundo.
     expect(html).toContain("(você)");
+  });
+
+  it("share live lista apps para ignorar áudio", () => {
+    const html = renderToStaticMarkup(
+      createElement(
+        RoomScreen,
+        roomProps({
+          snapshot: snapshotFixture({ share: { id: "s1", state: "live" } }),
+          audioApps: [
+            { name: "Discord", id: "com.hnc.Discord", pid: 9, emitting_audio: true },
+            { name: "Safari", id: "com.apple.Safari", pid: 8, emitting_audio: false },
+          ],
+          audioExcluded: ["com.hnc.Discord"],
+        }),
+      ),
+    );
+    expect(html).toContain("Discord");
+    expect(html).toContain("Safari");
+    expect(html).toContain("audio-list");
+    expect(html).toContain("audio-card");
+    expect(html).not.toContain("Disponível durante o compartilhamento de tela.");
   });
 
   it("ninguém compartilhando: palco vazio honesto, sidebar intacta", () => {

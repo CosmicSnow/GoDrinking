@@ -18,7 +18,18 @@ objc2-foundation = { version = "0.3", features = [
     "NSArray",
     "NSError",
     "NSString",
+    "NSValue",
+    "NSUUID",
+    "NSProcessInfo",
 ] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "libc",
+    "NSWorkspace",
+    "NSRunningApplication",
+] }
+core-foundation = "0.10"
+opus = "0.3"
 objc2-core-media = "0.3"
 # CVPixelBufferIOSurface for the zero-copy backing check (offline-safe:
 # objc2-io-surface is already in the lockfile via the default set).

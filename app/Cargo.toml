@@ -38,6 +38,7 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", 
 # no extra dylibs — trivially packable.
 winit = "0.30"
 softbuffer = "0.4"
+cpal = "0.15"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net"] }

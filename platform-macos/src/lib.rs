@@ -39,6 +39,10 @@
 //! documented screen-capture contract plus a runtime pixel-format check
 //! (non-BGRA aborts the frame, never misinterprets it).
 
+mod audio;
+
+pub use audio::{list_audio_apps, start_audio_tap, AudioTap};
+
 use golive_platform::{
     BgraFrame, CaptureConfig, CapturePacket, FrameStream, GpuPixelBuffer, PixelFormat,
     PlatformError, SourceInfo, SourceKind, VideoSource,

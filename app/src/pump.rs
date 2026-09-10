@@ -1030,7 +1030,11 @@ async fn on_viewer_envelope(
                     push_present_frame(&state, &watcher, &title, &presented, frame, &alive);
             })
         };
-        let viewer = match NativeViewer::start(None, event_tx, on_frame).await {
+        let playback = crate::audio::ViewerPlayback::start();
+        let on_audio = playback
+            .as_ref()
+            .map(|_| crate::audio::playback_callback());
+        let viewer = match NativeViewer::start_with_audio(None, event_tx, on_frame, on_audio).await {
             Ok(viewer) => Arc::new(tokio::sync::Mutex::new(viewer)),
             Err(_) => return,
         };
@@ -1041,6 +1045,7 @@ async fn on_viewer_envelope(
             };
             inner.viewer = Some(Arc::clone(&viewer));
             inner.viewer_alive = Some(Arc::clone(&alive));
+            inner.viewer_playback = playback;
             inner.tasks.push(spawn_forward(
                 Arc::clone(state),
                 app.clone(),
@@ -1340,7 +1345,7 @@ mod rewatch_tests {
     async fn seed_synthetic_template(state: &Arc<AppState>) {
         let live = Arc::new(std::sync::Mutex::new(Quality::P720.profile()));
         let (publisher, bridge, event_rx) =
-            AppState::build_source_session(&ShareSource::Synthetic, Quality::P720.profile(), &live)
+            AppState::build_source_session(&ShareSource::Synthetic, Quality::P720.profile(), &live, None)
                 .await
                 .expect("template builds");
         assert!(bridge.is_none(), "synthetic owns no bridge");

@@ -27,8 +27,11 @@ import {
   stopShare,
   unwatchMember,
   watchMember,
+  listAudioApps,
   listSources,
+  setAudioExclusions,
   sourceCapabilities,
+  type AudioApp,
   type CapabilitySet,
   type E2ePlan,
   type EffectiveQuality,
@@ -125,6 +128,8 @@ export default function App() {
   // listagem/saída para acompanhar a lista fresca.
   const previewsSeen = useRef<Set<string>>(new Set());
   const [caps, setCaps] = useState<CapabilitySet | null>(null);
+  const [audioApps, setAudioApps] = useState<AudioApp[]>([]);
+  const [audioExcluded, setAudioExcluded] = useState<string[]>([]);
   const [lastSignal, setLastSignal] = useState<string | null>(null);
   const [lastMedia, setLastMedia] = useState<string | null>(null);
   const [stats, setStats] = useState<ViewerStats | null>(null);
@@ -224,8 +229,11 @@ export default function App() {
         },
       );
       return;
-    }    try {
-      setSnapshot(await getSnapshot());
+    }
+    let snap: OwnerSnapshot | null = null;
+    try {
+      snap = await getSnapshot();
+      setSnapshot(snap);
     } catch (failure) {
       setError(messageOf(failure, "Não foi ler o estado da sala."));
       return;
@@ -248,6 +256,16 @@ export default function App() {
       // Contadores são fallback observacional: sem eles, o painel de links
       // mostra o diagnóstico honesto em vez de número inventado.
       setLinkStats((current) => current);
+    }
+    try {
+      if (snap?.share.state === "live" || snap?.share.state === "starting") {
+        setAudioApps(await listAudioApps());
+      } else {
+        setAudioApps([]);
+        setAudioExcluded([]);
+      }
+    } catch {
+      setAudioApps([]);
     }
   };
 
@@ -294,6 +312,28 @@ export default function App() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [screen]);
+
+  useEffect(() => {
+    if (isMock || screen !== "room") return;
+    const live = snapshot?.share.state === "live" || snapshot?.share.state === "starting";
+    if (!live) {
+      setAudioApps([]);
+      setAudioExcluded([]);
+      return;
+    }
+    let cancelled = false;
+    listAudioApps().then(
+      (apps) => {
+        if (!cancelled) setAudioApps(apps);
+      },
+      () => {
+        if (!cancelled) setAudioApps([]);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [isMock, screen, snapshot?.share.state]);
 
   const runIntent = async (work: () => Promise<void>): Promise<void> => {
     if (busy) return;
@@ -568,11 +608,24 @@ export default function App() {
       setSnapshot(mockSnapshot(false, watching));
       setRoster(mockRoster(nickname.trim() || "Convidado", false));
       setLastMedia("frame (não-preto: não)");
+      setAudioApps([]);
+      setAudioExcluded([]);
       return;
     }
     void runIntent(async () => {
       await stopShare();
+      setAudioApps([]);
+      setAudioExcluded([]);
     });
+  };
+
+  const handleToggleAudioExclude = (id: string): void => {
+    const next = audioExcluded.includes(id)
+      ? audioExcluded.filter((item) => item !== id)
+      : [...audioExcluded, id];
+    setAudioExcluded(next);
+    if (isMock) return;
+    void setAudioExclusions(next).catch(() => undefined);
   };
 
   /**
@@ -759,6 +812,9 @@ export default function App() {
       onStopShare={handleStopShare}
       onWatch={handleWatch}
       onUnwatch={handleUnwatch}
+      audioApps={audioApps}
+      audioExcluded={audioExcluded}
+      onToggleAudioExclude={handleToggleAudioExclude}
       mock={isMock}
     />
   );

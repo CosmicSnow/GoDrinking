@@ -22,6 +22,8 @@
  * - set_server {base} -> string (base normalizada)
  * - list_sources {} -> SourceInfo[] | source_capabilities {} -> CapabilitySet
  *   (fontes de captura; e2e_* são test-only, fora do caminho da UI)
+ * - list_audio_apps {} -> AudioApp[]
+ * - set_audio_exclusions {apps} -> ()
  * - preview_source {kind, id} -> {data_url, w, h} (thumb PNG lazy ~256px;
  *   data_url null quando indisponível — nunca quebra a listagem)
  *
@@ -316,6 +318,21 @@ export function previewSource(kind: string, id: string): Promise<SourcePreview> 
 /** Capacidades sem tocar no SO (nunca pede permissão). */
 export function sourceCapabilities(): Promise<CapabilitySet> {
   return invoke<CapabilitySet>("source_capabilities");
+}
+
+export interface AudioApp {
+  name: string;
+  id: string;
+  pid: number;
+  emitting_audio: boolean;
+}
+
+export function listAudioApps(): Promise<AudioApp[]> {
+  return invoke<AudioApp[]>("list_audio_apps");
+}
+
+export function setAudioExclusions(apps: string[]): Promise<void> {
+  return invoke<void>("set_audio_exclusions", { apps });
 }
 
 // ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@
 //! lifecycle in backends); titles never enter logs; denial is a typed error
 //! with user copy, never silence.
 
+pub mod audio;
 pub mod capability;
 pub mod cadence;
 pub mod convert;
@@ -24,6 +25,7 @@ pub mod types;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+pub use audio::{app_excluded_by_token, AudioApp, EncodedAudioPacket};
 pub use capability::{capabilities, CapabilitySet, Support};
 pub use convert::{bgra_to_i420, convert_error, ConvertError};
 pub use error::{PlatformError, PERMISSION_HINT};

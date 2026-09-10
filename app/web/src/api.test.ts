@@ -17,10 +17,12 @@ import {
   getSnapshot,
   joinRoom,
   leaveRoom,
+  listAudioApps,
   listSources,
   onMediaEvent,
   onSignalEvent,
   previewSource,
+  setAudioExclusions,
   setQuality,
   setServer,
   sourceCapabilities,
@@ -203,6 +205,19 @@ describe("fontes de captura (nomes exatos do backend)", () => {
     mockInvoke.mockResolvedValueOnce(caps);
     await expect(sourceCapabilities()).resolves.toEqual(caps);
     expect(mockInvoke).toHaveBeenCalledWith("source_capabilities");
+  });
+
+  it("list_audio_apps sem args devolve apps opacos", async () => {
+    const apps = [{ name: "Discord", id: "com.hnc.Discord", pid: 42, emitting_audio: true }];
+    mockInvoke.mockResolvedValueOnce(apps);
+    await expect(listAudioApps()).resolves.toEqual(apps);
+    expect(mockInvoke).toHaveBeenCalledWith("list_audio_apps");
+  });
+
+  it("set_audio_exclusions leva os tokens", async () => {
+    mockInvoke.mockResolvedValueOnce(undefined);
+    await setAudioExclusions(["com.hnc.Discord"]);
+    expect(mockInvoke).toHaveBeenCalledWith("set_audio_exclusions", { apps: ["com.hnc.Discord"] });
   });
 });
 

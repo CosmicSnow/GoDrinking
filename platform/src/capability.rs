@@ -18,6 +18,7 @@ const fn yes(reason: &'static str) -> Support {
     Support { supported: true, reason }
 }
 
+#[allow(dead_code)]
 const fn no(reason: &'static str) -> Support {
     Support { supported: false, reason }
 }
@@ -31,16 +32,16 @@ pub struct CapabilitySet {
     pub exclusion: Support,
 }
 
-/// Compile-time capabilities for this build. Audio capture is a later lane
-/// everywhere, so it is honestly unsupported on all platforms for now.
+/// Compile-time capabilities for this build. Audio capture is a process tap
+/// (macOS 14.2+) or WASAPI loopback (Windows); exclusion is audio-only.
 pub const fn capabilities() -> CapabilitySet {
     #[cfg(target_os = "macos")]
     {
         CapabilitySet {
             display: yes("ScreenCaptureKit (pode pedir permissão no primeiro uso)"),
             window: yes("ScreenCaptureKit (pode pedir permissão no primeiro uso)"),
-            app_audio: no("planejado (lane de áudio)"),
-            exclusion: yes("SCContentFilter suporta excluir janelas"),
+            app_audio: yes("process tap (macOS 14.2+)"),
+            exclusion: yes("CATapDescription exclui apps do áudio, sem esconder a janela"),
         }
     }
     #[cfg(target_os = "windows")]
@@ -48,8 +49,8 @@ pub const fn capabilities() -> CapabilitySet {
         CapabilitySet {
             display: yes("DXGI Desktop Duplication"),
             window: yes("Windows.Graphics.Capture (pode pedir permissão no primeiro uso)"),
-            app_audio: no("planejado (lane de áudio)"),
-            exclusion: no("planejado (WGC)"),
+            app_audio: yes("WASAPI loopback"),
+            exclusion: yes("process loopback (um app por sessão)"),
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -57,7 +58,7 @@ pub const fn capabilities() -> CapabilitySet {
         CapabilitySet {
             display: no("apenas macOS/Windows"),
             window: no("apenas macOS/Windows"),
-            app_audio: no("planejado (lane de áudio)"),
+            app_audio: no("apenas macOS/Windows"),
             exclusion: no("apenas macOS/Windows"),
         }
     }
@@ -76,7 +77,17 @@ mod tests {
     }
 
     #[test]
-    fn audio_is_honestly_unsupported_everywhere() {
-        assert!(!capabilities().app_audio.supported);
+    fn app_audio_is_supported_on_desktop() {
+        let caps = capabilities();
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            assert!(caps.app_audio.supported);
+            assert!(caps.exclusion.supported);
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            assert!(!caps.app_audio.supported);
+            assert!(!caps.exclusion.supported);
+        }
     }
 }

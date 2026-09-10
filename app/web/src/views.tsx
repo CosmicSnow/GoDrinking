@@ -8,6 +8,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type {
+  AudioApp,
   CapabilitySet,
   EffectiveQuality,
   LinkState,
@@ -787,6 +788,9 @@ export interface RoomProps {
   onStopShare: () => void;
   onWatch: (id: string) => void;
   onUnwatch: (id: string) => void;
+  audioApps?: AudioApp[];
+  audioExcluded?: string[];
+  onToggleAudioExclude?: (id: string) => void;
   /** Selo visual discreto do modo navegador (mock, sem Tauri). Só visual. */
   mock?: boolean;
 }
@@ -920,6 +924,7 @@ export function RoomScreen(props: RoomProps) {
     previews, onPreviewsVisible,
     busy, error, lastSignal, lastMedia, quality, linkStats,
     onRefresh, onLeave, onShare, onStopShare, onWatch, onUnwatch,
+    audioApps = [], audioExcluded = [], onToggleAudioExclude,
     mock = false,
   } = props;
   const watchingSet = new Set(watching);
@@ -939,7 +944,7 @@ export function RoomScreen(props: RoomProps) {
   const [txOpen, setTxOpen] = useState(false);
   const [shareTab, setShareTab] = useState<"screens" | "apps">("screens");
   const [audioQuery, setAudioQuery] = useState("");
-  const [audioSoundOnly] = useState(false);
+  const [audioSoundOnly, setAudioSoundOnly] = useState(false);
   const { toast, show } = useToast();
 
   const sharingMembers = roster.filter((member) => member.share);
@@ -1011,9 +1016,8 @@ export function RoomScreen(props: RoomProps) {
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shareOpen, shareTab, sources]);
-  const audioVisible: Array<{ id: string; name: string }> = [];
-  const audioFiltered = audioVisible.filter((item) => {
-    void audioSoundOnly;
+  const audioFiltered = audioApps.filter((item) => {
+    if (audioSoundOnly && !item.emitting_audio) return false;
     if (audioQuery && !item.name.toLowerCase().includes(audioQuery.toLowerCase())) return false;
     return true;
   });
@@ -1347,7 +1351,7 @@ export function RoomScreen(props: RoomProps) {
             )}
           </section>
 
-          <section className="card" data-hook="audio-policy">
+          <section className="card audio-card" data-hook="audio-policy">
             <div className="card-head">
               <h2>Ignorar Áudio de Apps</h2>
             </div>
@@ -1360,17 +1364,60 @@ export function RoomScreen(props: RoomProps) {
                 placeholder="Buscar app…"
                 value={audioQuery}
                 onChange={(event) => setAudioQuery(event.target.value)}
+                disabled={!sharing}
               />
-              <button type="button" className="btn ghost small" aria-pressed="false" disabled>
+              <button
+                type="button"
+                className="btn ghost small"
+                aria-pressed={audioSoundOnly}
+                disabled={!sharing}
+                onClick={() => setAudioSoundOnly((value) => !value)}
+              >
                 App com Som
               </button>
             </div>
-            <p className="card-desc">
-              O áudio da sessão segue o share ativo. Sem apps mapeados pelo backend por aqui.
-            </p>
-            {audioFiltered.length === 0 ? (
-              <p className="empty-sources">Nenhum app encontrado.</p>
-            ) : null}
+            {!sharing ? (
+              <p className="card-desc">Disponível durante o compartilhamento de tela.</p>
+            ) : caps && !caps.app_audio.supported ? (
+              <p className="card-desc">{caps.app_audio.reason}</p>
+            ) : (
+              <p className="card-desc">
+                Quem assiste não ouve os apps marcados. Ex.: ignore o Discord para o grupo não se ouvir.
+              </p>
+            )}
+            <div className="audio-list">
+              {sharing && audioFiltered.length === 0 ? (
+                <p className="empty-sources">Nenhum app encontrado.</p>
+              ) : null}
+              {sharing ? (
+                <ul className="apps">
+                  {audioFiltered.map((app) => {
+                    const excluded = audioExcluded.includes(app.id);
+                    return (
+                      <li key={`${app.pid}-${app.id}`}>
+                        <button
+                          type="button"
+                          className={`app-row${excluded ? " sel" : ""}`}
+                          aria-pressed={excluded}
+                          onClick={() => onToggleAudioExclude?.(app.id)}
+                        >
+                          <span className="app-ico" aria-hidden="true">
+                            {app.name.slice(0, 1).toUpperCase()}
+                          </span>
+                          <span className="who">
+                            <b>{app.name}</b>
+                            {app.emitting_audio ? <small>com som</small> : null}
+                          </span>
+                          <span className={`snd${app.emitting_audio ? " on" : " off"}`} aria-hidden="true">
+                            <i /><i /><i />
+                          </span>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : null}
+            </div>
           </section>
 
           <p className="foot-note">

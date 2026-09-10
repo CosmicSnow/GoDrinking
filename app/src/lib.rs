@@ -11,6 +11,7 @@
 //! - Locks are held briefly; never across `.await` (media sessions sit
 //!   behind `tokio::sync::Mutex`, the sync core behind short std locks).
 
+pub mod audio;
 pub mod pump;
 pub mod screen;
 pub mod session_log;
@@ -20,6 +21,7 @@ use golive_core::media::{
     EngineKind, ExternalSource, MediaEvent, NativeViewer, Publisher, Quality, QualityProfile,
     VideoSource,
 };
+use golive_platform::AudioApp;
 use golive_core::owner::{Fence, Owner, OwnerSnapshot};
 use golive_core::signal::SignalClient;
 use std::collections::HashMap;
@@ -319,6 +321,10 @@ struct Inner {
     /// target dims, re-clamped by `set_quality` without restarting the OS
     /// stream). `None` for synthetic/movie (no bridge) and when idle.
     share_capture: Option<Arc<Mutex<QualityProfile>>>,
+    /// System-audio tap + Opus fanout for the live share (Display/Window).
+    audio: Option<audio::ShareAudio>,
+    /// Viewer speakers; dropped with the native viewer.
+    viewer_playback: Option<audio::ViewerPlayback>,
     /// Session-log dedupe: last backend name logged + whether the ICE
     /// census line went out (log once per process, not per Stats event).
     last_logged_backend: Option<String>,
@@ -359,6 +365,8 @@ impl AppState {
                 link_tracks: HashMap::new(),
                 share_profile: None,
                 share_capture: None,
+                audio: None,
+                viewer_playback: None,
                 last_logged_backend: None,
                 census_logged: false,
                 share_source: None,
@@ -507,7 +515,7 @@ impl AppState {
     /// best-effort. Idempotent.
     pub async fn leave(self: &Arc<Self>) -> Result<(), String> {
         let _operation = self.operations.lock().await;
-        let (signal, publishers, viewer) = {
+        let (signal, publishers, viewer, audio) = {
             let mut inner = self
                 .inner
                 .lock()
@@ -524,12 +532,16 @@ impl AppState {
             if let Some(alive) = inner.viewer_alive.take() {
                 alive.store(false, std::sync::atomic::Ordering::Release);
             }
+            let audio = inner.audio.take();
+            inner.viewer_playback = None;
             (
                 inner.signal.take(),
                 std::mem::take(&mut inner.publishers),
                 inner.viewer.take(),
+                audio,
             )
         };
+        drop(audio);
         // Outside the lock: network + media teardown.
         if let Some(mut signal) = signal {
             signal.leave();
@@ -576,11 +588,16 @@ impl AppState {
         // bridge thread shares it so `set_quality` re-clamps mid-share).
         let live_profile = Arc::new(Mutex::new(Quality::P720.profile()));
         let start_profile = Quality::P720.profile();
+        let mut share_audio = match &source {
+            ShareSource::Display(_) | ShareSource::Window(_) => audio::ShareAudio::start(Vec::new()).ok(),
+            ShareSource::Synthetic | ShareSource::Movie(_) => None,
+        };
+        let audio_rx = share_audio.as_ref().map(|session| session.subscribe());
         // Build the template session BEFORE touching lifecycle (pre-flight):
         // bridge setup may prompt/fail, and a failure must leave no
         // half-started share behind (Starting has no path back to Stopped).
         let (mut template, mut template_bridge, event_rx) =
-            match Self::build_source_session(&source, start_profile, &live_profile).await {
+            match Self::build_source_session(&source, start_profile, &live_profile, audio_rx).await {
                 Ok(built) => built,
                 Err(e) => return Err(e),
             };
@@ -657,6 +674,7 @@ impl AppState {
             // watches can rebuild (re-watch after unwatch, second peer).
             inner.share_source = Some(source.clone());
             inner.share_capture = has_bridge.then(|| Arc::clone(&live_profile));
+            inner.audio = share_audio.take();
         }
         // Milestone: source KIND only (never paths/ids) + start profile.
         let kind = match &source {
@@ -666,9 +684,13 @@ impl AppState {
             ShareSource::Window(_) => "window",
         };
         let start_profile = Quality::P720.profile();
+        let audio_live = {
+            let inner = self.inner.lock().map_err(|_| "state lock poisoned".to_string())?;
+            inner.audio.as_ref().map(|session| session.live()).unwrap_or(false)
+        };
         self.session_log(format!(
-            "share start kind={kind} profile={}x{}@{}",
-            start_profile.w, start_profile.h, start_profile.fps
+            "share start kind={kind} profile={}x{}@{} audio={}",
+            start_profile.w, start_profile.h, start_profile.fps, audio_live as u8
         ));
         Ok(())
     }
@@ -683,6 +705,7 @@ impl AppState {
         source: &ShareSource,
         profile: QualityProfile,
         live: &Arc<Mutex<QualityProfile>>,
+        audio_rx: Option<std::sync::mpsc::Receiver<golive_platform::EncodedAudioPacket>>,
     ) -> Result<
         (
             Publisher,
@@ -741,8 +764,15 @@ impl AppState {
         // `Publisher::start` pins Quality::P720; late watches rebuild at the
         // CURRENT effective profile, so both go through `start_with_profile`
         // (Auto engine == `start`'s engine — identical behavior at P720).
-        match Publisher::start_with_profile(video_source, profile, EngineKind::Auto, None, event_tx)
-            .await
+        match Publisher::start_with_profile_and_audio(
+            video_source,
+            profile,
+            EngineKind::Auto,
+            None,
+            event_tx,
+            audio_rx,
+        )
+        .await
         {
             Ok(publisher) => Ok((publisher, bridge, event_rx)),
             Err(e) => {
@@ -771,7 +801,7 @@ impl AppState {
     ) -> bool {
         // Caller on_watch holds operations across this build/adoption.
         // Gate + snapshot under one short lock; the build runs outside it.
-        let (source, live, profile) = {
+        let (source, live, profile, audio_rx) = {
             let inner = match self.inner.lock() {
                 Ok(inner) => inner,
                 Err(_) => return false,
@@ -801,10 +831,11 @@ impl AppState {
                     Arc::new(Mutex::new(profile))
                 }
             };
-            (source, live, profile)
+            let audio_rx = inner.audio.as_ref().map(|session| session.subscribe());
+            (source, live, profile, audio_rx)
         };
         let (publisher, mut bridge, event_rx) =
-            match Self::build_source_session(&source, profile, &live).await {
+            match Self::build_source_session(&source, profile, &live, audio_rx).await {
                 Ok(built) => built,
                 Err(_) => return false,
             };
@@ -889,7 +920,7 @@ impl AppState {
     /// deterministically.
     pub async fn stop_share(self: &Arc<Self>) -> Result<(), String> {
         let _operation = self.operations.lock().await;
-        let publishers = {
+        let (publishers, audio) = {
             let mut inner = self
                 .inner
                 .lock()
@@ -897,8 +928,11 @@ impl AppState {
             inner.share_profile = None;
             inner.share_capture = None;
             inner.share_source = None;
-            std::mem::take(&mut inner.publishers)
+            let publishers = std::mem::take(&mut inner.publishers);
+            let audio = inner.audio.take();
+            (publishers, audio)
         };
+        drop(audio);
         for (_, mut session) in publishers {
             session.publisher.lock().await.stop().await;
             if let Some(bridge) = session.bridge.as_mut() {
@@ -1189,6 +1223,35 @@ impl AppState {
     /// No OS contact: safe to call any time, never prompts.
     pub fn source_capabilities(&self) -> screen::Capabilities {
         screen::capabilities()
+    }
+
+    pub async fn list_audio_apps(&self) -> Vec<AudioApp> {
+        tokio::task::spawn_blocking(audio::list_apps)
+            .await
+            .unwrap_or_default()
+    }
+
+    pub async fn set_audio_exclusions(self: &Arc<Self>, apps: Vec<String>) -> Result<(), String> {
+        let _operation = self.operations.lock().await;
+        let mut audio = {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| "state lock poisoned".to_string())?;
+            inner.audio.take()
+        };
+        let Some(mut session) = audio.take() else {
+            return Err("not sharing".into());
+        };
+        let result = session.set_exclusions(apps);
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| "state lock poisoned".to_string())?;
+            inner.audio = Some(session);
+        }
+        result
     }
 
     /// Immutable snapshot for the UI. Locks only to clone.
@@ -1541,6 +1604,19 @@ fn source_capabilities(state: State<'_, Arc<AppState>>) -> screen::Capabilities 
 }
 
 #[tauri::command]
+async fn list_audio_apps(state: State<'_, Arc<AppState>>) -> Result<Vec<AudioApp>, String> {
+    Ok(state.list_audio_apps().await)
+}
+
+#[tauri::command]
+async fn set_audio_exclusions(
+    state: State<'_, Arc<AppState>>,
+    apps: Vec<String>,
+) -> Result<(), String> {
+    state.set_audio_exclusions(apps).await
+}
+
+#[tauri::command]
 async fn watch(state: State<'_, Arc<AppState>>, member: String) -> Result<(), String> {
     state.watch(&member).await
 }
@@ -1612,6 +1688,8 @@ pub fn run_with(state: Arc<AppState>) {
             set_quality,
             list_sources,
             source_capabilities,
+            list_audio_apps,
+            set_audio_exclusions,
             watch,
             unwatch,
             get_snapshot,

@@ -23,12 +23,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
+mod audio;
 mod copy;
 mod d3d;
 mod dxgi;
 mod map;
 mod resource;
 mod wgc;
+
+pub use audio::{is_process_loopback_supported, list_audio_apps, start_audio_tap, AudioTap};
 
 pub use copy::{copy_tight_bgra, gate_open, initial_last_ns, interval_ns};
 
