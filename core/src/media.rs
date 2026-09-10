@@ -1794,6 +1794,22 @@ impl NativeViewer {
     }
 }
 
+/// Stale-AU decision for the viewer read loop: a completed access unit
+/// older than the last DECODED RTP timestamp moves presentation backwards
+/// (late/duplicate pre-switch unit decoded after newer frames, tripping
+/// dims respawns) — drop it instead of decoding/presenting. Equal/newer
+/// pass untouched; keyframes need no bypass (recovery IDRs always carry
+/// newer timestamps) and the PLI path is separate (depacketize errors never
+/// reach here). Wrapping-aware: RTP timestamps wrap every ~13h at 90kHz, so
+/// "older" means more than half the u32 space behind, never a plain `<`
+/// (which would discard the whole stream after one wrap).
+fn au_is_stale(last_decoded_ts: Option<u32>, completed_ts: u32) -> bool {
+    match last_decoded_ts {
+        None => false,
+        Some(prev) => completed_ts != prev && completed_ts.wrapping_sub(prev) > (u32::MAX >> 1),
+    }
+}
+
 /// Track read loop: depacketize, assemble access units per RTP timestamp,
 /// decode once, then validate + emit + present the same picture. On an
 /// irrecoverable AU gap (the depacketize error path) asks the publisher for
@@ -1817,6 +1833,7 @@ async fn read_loop(
     let mut stats = MediaStats::default();
     let mut unit = Vec::<u8>::new();
     let mut unit_ts: Option<u32> = None;
+    let mut last_decoded_ts: Option<u32> = None;
     let mut last_pli: HashMap<u32, Instant> = HashMap::new();
     let mut rtp_trace = Trace::new(Stage::Rtp);
     let mut decode_trace = Trace::new(Stage::Decode);
@@ -1829,35 +1846,50 @@ async fn read_loop(
         rtp_trace.record(TraceSample { frames: 1, bytes: packet.payload.len() as u64, ..Default::default() }, None);
         // Access-unit boundary: timestamp rollover flushes the previous unit.
         if unit_ts.map(|t| t != ts).unwrap_or(false) && !unit.is_empty() {
-            let started = decode_trace.start();
-            let decoded = decode_unit(&mut decoder, &unit, event_tx);
-            decode_trace.record(TraceSample {
-                frames: decoded.is_some() as u64, dropped: decoded.is_none() as u64,
-                bytes: unit.len() as u64,
-                width: decoded.as_ref().map(|p| p.frame.w as u32).unwrap_or(0),
-                height: decoded.as_ref().map(|p| p.frame.h as u32).unwrap_or(0),
-                keyframes: decoded.as_ref().map(|p| p.stats.is_keyframe as u64).unwrap_or(0),
-                ..Default::default()
-            }, started);
-            if let Some(picture) = decoded {
-                let frame = picture.stats;
-                stats.frames_decoded += 1;
-                if frame.is_keyframe {
-                    stats.keyframes_decoded += 1;
-                    let _ = event_tx.send(MediaEvent::Keyframe);
+            let completed_ts = unit_ts.expect("guarded by the map above");
+            if au_is_stale(last_decoded_ts, completed_ts) {
+                // Late pre-switch duplicate: decoding it would move
+                // presentation backwards in time. Count it in the existing
+                // decode `dropped` sample; the PLI path already asked for
+                // (or will ask for) the IDR that replaces it.
+                decode_trace.record(TraceSample {
+                    dropped: 1,
+                    bytes: unit.len() as u64,
+                    ..Default::default()
+                }, None);
+                unit.clear();
+            } else {
+                let started = decode_trace.start();
+                let decoded = decode_unit(&mut decoder, &unit, event_tx);
+                decode_trace.record(TraceSample {
+                    frames: decoded.is_some() as u64, dropped: decoded.is_none() as u64,
+                    bytes: unit.len() as u64,
+                    width: decoded.as_ref().map(|p| p.frame.w as u32).unwrap_or(0),
+                    height: decoded.as_ref().map(|p| p.frame.h as u32).unwrap_or(0),
+                    keyframes: decoded.as_ref().map(|p| p.stats.is_keyframe as u64).unwrap_or(0),
+                    ..Default::default()
+                }, started);
+                if let Some(picture) = decoded {
+                    last_decoded_ts = Some(completed_ts);
+                    let frame = picture.stats;
+                    stats.frames_decoded += 1;
+                    if frame.is_keyframe {
+                        stats.keyframes_decoded += 1;
+                        let _ = event_tx.send(MediaEvent::Keyframe);
+                    }
+                    let non_black = FrameValidator::non_black(frame.luma_mean);
+                    let motion = validator.motion(frame.luma_mean);
+                    let _ = event_tx.send(MediaEvent::VideoFrame { non_black, motion });
+                    on_frame(picture.frame);
+                    if stats.frames_decoded % 30 == 0 {
+                        let mut snapshot = stats.clone();
+                        snapshot.ice_connected = true;
+                        snapshot.census = census_snapshot(census);
+                        let _ = event_tx.send(MediaEvent::Stats(snapshot));
+                    }
                 }
-                let non_black = FrameValidator::non_black(frame.luma_mean);
-                let motion = validator.motion(frame.luma_mean);
-                let _ = event_tx.send(MediaEvent::VideoFrame { non_black, motion });
-                on_frame(picture.frame);
-                if stats.frames_decoded % 30 == 0 {
-                    let mut snapshot = stats.clone();
-                    snapshot.ice_connected = true;
-                    snapshot.census = census_snapshot(census);
-                    let _ = event_tx.send(MediaEvent::Stats(snapshot));
-                }
-            }
-            unit.clear();
+                unit.clear();
+            } // end non-stale branch
         }
         unit_ts = Some(ts);
         match depacketizer.depacketize(&packet.payload) {
@@ -2134,6 +2166,25 @@ mod tests {
         assert_eq!((sample.pli_sent, sample.pli_suppressed), (1, 49));
         // Next window re-arms: recovery is delayed, never lost.
         assert!(pli_due(&mut last, 7, t0 + PLI_DEBOUNCE), "window re-arms");
+    }
+
+    #[test]
+    fn stale_au_drops_time_travel_passes_normal_flow() {
+        // Pure decision behind the read_loop stale guard: a completed AU
+        // older than the last decoded timestamp is dropped (late pre-switch
+        // duplicate); everything else decodes untouched. No decoder needed —
+        // the read_loop wiring just calls this and counts `dropped`.
+        assert!(!au_is_stale(None, 0), "first AU always passes");
+        assert!(!au_is_stale(None, u32::MAX), "first AU always passes");
+        assert!(!au_is_stale(Some(3000), 3000), "equal timestamps pass");
+        assert!(!au_is_stale(Some(3000), 3001), "newer timestamps pass");
+        assert!(!au_is_stale(Some(3000), 6000), "post-switch jump passes");
+        assert!(au_is_stale(Some(6000), 3000), "older AU drops");
+        assert!(au_is_stale(Some(6000), 5999), "one tick back still drops");
+        // RTP wrap (~13h at 90kHz) must not nuke the stream: just-wrapped
+        // timestamps are newer, just-about-to-wrap are older.
+        assert!(!au_is_stale(Some(u32::MAX), 5), "post-wrap passes");
+        assert!(au_is_stale(Some(5), u32::MAX - 5), "pre-wrap straggler drops");
     }
 
     #[test]

@@ -518,7 +518,7 @@ async fn handle_signal(state: &Arc<AppState>, app: &Option<AppHandle>, message: 
         }
         Incoming::Watch { from } => {
             emit(app, "signal-event", &serde_json::json!({"kind": "watch", "from": from}));
-            on_watch(state, &from).await;
+            on_watch(state, app, &from).await;
         }
         Incoming::Unwatch { from } => {
             emit(app, "signal-event", &serde_json::json!({"kind": "unwatch", "from": from}));
@@ -545,7 +545,7 @@ async fn handle_signal(state: &Arc<AppState>, app: &Option<AppHandle>, message: 
 }
 
 /// Host path: register the watcher, ensure its publisher, offer.
-async fn on_watch(state: &Arc<AppState>, watcher: &str) {
+async fn on_watch(state: &Arc<AppState>, app: &Option<AppHandle>, watcher: &str) {
     let fence = {
         let inner = match state.inner.lock() {
             Ok(inner) => inner,
@@ -566,11 +566,11 @@ async fn on_watch(state: &Arc<AppState>, watcher: &str) {
         inner.publishers.contains_key(watcher)
     };
     if !has_publisher {
-        // Reuse the idle template's source is overkill here: publishers are
-        // created per watcher from the share source. The share source is not
-        // stored, so fall back to synthetic for late watchers is WRONG —
-        // instead, refuse quietly. Store the source at start_share instead.
-        // (See start_share: template publisher under key "".)
+        // Single-shot template: the first watch adopts it. Later watches
+        // (re-watch after unwatch, a second concurrent peer) build a FRESH
+        // session from the stored share source — the template is gone and
+        // must never be re-fabricated from thin air (a synthetic fallback
+        // here would silently share the wrong source).
         let template = {
             let mut inner = match state.inner.lock() {
                 Ok(inner) => inner,
@@ -589,7 +589,12 @@ async fn on_watch(state: &Arc<AppState>, watcher: &str) {
                 };
                 inner.publishers.insert(watcher.to_owned(), template);
             }
-        } else {
+        } else if !state
+            .adopt_fresh_session(app.clone(), watcher, fence, ids.clone())
+            .await
+        {
+            // Share not live (or the rebuild failed): refuse quietly, as
+            // before — no offer, no fence advance.
             return;
         }
     } else {
@@ -642,8 +647,11 @@ async fn on_unwatch(state: &Arc<AppState>, watcher: &str) {
         };
         inner.publishers.remove(watcher)
     };
-    if let Some(session) = session {
+    if let Some(mut session) = session {
         session.publisher.lock().await.stop().await;
+        if let Some(bridge) = session.bridge.as_mut() {
+            bridge.stop();
+        }
     }
     if let Ok(inner) = state.inner.lock() {
         if let Ok(fence) = inner.owner.unwatch(watcher) {
@@ -658,6 +666,14 @@ async fn on_unwatch(state: &Arc<AppState>, watcher: &str) {
 /// bitrate/fps-only applies never disturb presentation.
 fn window_fits(contracted: Option<(u32, u32)>, w: u32, h: u32) -> bool {
     matches!(contracted, Some((cw, ch)) if cw == w && ch == h)
+}
+
+/// Respawn log line: per-link window sequence + dims direction only —
+/// never member ids, names, titles, pixels, or tokens. Consecutive lines
+/// with consecutive seqs and mirrored directions mean one flapping link;
+/// non-consecutive seqs mean interleaved links spawned in between.
+fn respawn_line(seq: u64, old: (u32, u32), new: (u32, u32)) -> String {
+    format!("present window respawn #{seq} {}x{} -> {}x{}", old.0, old.1, new.0, new.1)
 }
 
 /// Pushes one decoded frame to a watched member's present window. When the
@@ -680,6 +696,9 @@ fn push_present_frame(
     let (fw, fh) = (frame.w as u32, frame.h as u32);
     let mut dead: Option<crate::video::VideoWindow> = None;
     let mut push: Option<crate::video::FramePush> = None;
+    // Sequence reserved for the replacement window (also consumed by the
+    // first-frame spawn, which logs nothing). 0 means "reusing".
+    let mut spawn_seq: u64 = 0;
     {
         let mut inner = match state.inner.lock() {
             Ok(inner) => inner,
@@ -695,12 +714,15 @@ fn push_present_frame(
             // (never join a feeder thread while holding state).
             dead = inner.video_windows.remove(watcher);
             inner.video_feeds.remove(watcher);
+            inner.video_seq.remove(watcher);
+            spawn_seq = inner.next_video_seq;
+            inner.next_video_seq += 1;
         }
     }
     if let Some(mut dead) = dead {
         let (dw, dh) = dead.resolution();
         dead.stop();
-        state.session_log(format!("present window respawn {dw}x{dh} -> {fw}x{fh}"));
+        state.session_log(respawn_line(spawn_seq, (dw, dh), (fw, fh)));
     }
     let push = match push {
         Some(push) => push,
@@ -712,6 +734,7 @@ fn push_present_frame(
                 Arc::clone(presented),
             );
             if let Ok(mut inner) = state.inner.lock() {
+                inner.video_seq.insert(watcher.to_owned(), spawn_seq);
                 inner.video_windows.insert(watcher.to_owned(), window);
                 inner.video_feeds.insert(watcher.to_owned(), push.clone());
             }
@@ -1056,6 +1079,19 @@ mod present_respawn_tests {
     }
 
     #[test]
+    fn respawn_line_carries_seq_and_direction_only() {
+        // Attribution without identity: seq + dims direction, never member
+        // ids, names, titles, or tokens.
+        let line = respawn_line(7, (1280, 720), (1920, 1080));
+        assert_eq!(line, "present window respawn #7 1280x720 -> 1920x1080");
+        let back = respawn_line(8, (1920, 1080), (1280, 720));
+        assert_eq!(back, "present window respawn #8 1920x1080 -> 1280x720");
+        for token in ["watcher", "nick", "token", "sdp", "title"] {
+            assert!(!line.contains(token), "identity leak: {token}");
+        }
+    }
+
+    #[test]
     fn dim_change_respawns_window_and_accepts_new_frame() {
         // Regression: on quality-apply with different dims the helper would
         // reject the first new-dims frame ("frame size != contracted") and
@@ -1085,13 +1121,16 @@ mod present_respawn_tests {
             assert_eq!(inner.video_windows.get("watcher").expect("window").pushed(), 1);
         }
         // New-dims frame (post quality-apply): the stale 64x36 window is
-        // replaced, and the frame lands in the fresh feed.
+        // replaced, and the frame lands in the fresh feed. The replacement
+        // reserves the next per-link sequence for the respawn line.
         push_present_frame(&state, "watcher", "watcher", &presented, frame(32, 18));
         {
             let inner = state.inner.lock().expect("state lock");
             let window = inner.video_windows.get("watcher").expect("respawned window");
             assert_eq!(window.resolution(), (32, 18), "contract follows the new dims");
             assert_eq!(window.pushed(), 1, "new frame accepted by the fresh feed");
+            assert_eq!(inner.video_seq.get("watcher"), Some(&1), "respawn carries seq #1");
+            assert_eq!(inner.next_video_seq, 2, "counter advances past the reservation");
         }
         // Steady state again: same-dims frames reuse without respawn.
         push_present_frame(&state, "watcher", "watcher", &presented, frame(32, 18));
@@ -1100,8 +1139,22 @@ mod present_respawn_tests {
             let window = inner.video_windows.get("watcher").expect("window");
             assert_eq!(window.resolution(), (32, 18));
             assert_eq!(window.pushed(), 2, "reuse feeds the live window");
+            assert_eq!(inner.video_seq.get("watcher"), Some(&1), "reuse reserves nothing");
+        }
+        // A second link gets its own sequence: interleaved links stay
+        // distinguishable from one flapping link in the session log.
+        push_present_frame(&state, "other", "other", &presented, frame(64, 36));
+        {
+            let inner = state.inner.lock().expect("state lock");
+            assert_eq!(inner.video_seq.get("other"), Some(&2), "second link gets seq #2");
         }
         state.close_video_window("watcher");
+        state.close_video_window("other");
+        {
+            let inner = state.inner.lock().expect("state lock");
+            assert!(!inner.video_seq.contains_key("watcher"), "close forgets the seq");
+            assert!(!inner.video_seq.contains_key("other"), "close forgets the seq");
+        }
     }
 }
 
@@ -1189,5 +1242,250 @@ mod host_trickle_tests {
         );
         stale.attempt = "2".to_owned();
         assert!(!current(&ids, &stale));
+    }
+}
+
+#[cfg(test)]
+mod rewatch_tests {
+    use super::*;
+    use crate::{EffectiveQuality, ShareSource};
+    use golive_core::media::Quality;
+    use golive_core::state::{LinkState, ShareState};
+    use std::time::Duration;
+
+    /// Opens session + live share on the owner only (no room/signal), so
+    /// on_watch/on_unwatch run their real paths inside a `--lib` test.
+    fn open_live_share(state: &AppState) {
+        let inner = state.inner.lock().expect("state lock");
+        let join = inner.owner.begin_join().expect("begin_join");
+        inner.owner.complete_opened(&join).expect("opened");
+        let start = inner.owner.begin_share_start().expect("begin_share_start");
+        inner.owner.complete_share_live(&start).expect("live");
+    }
+
+    /// Seeds exactly what start_share leaves behind for a synthetic share:
+    /// stored source + default effective + idle template publisher with its
+    /// Share forward task. Real encode, no signal, no helper process — needs
+    /// no honest-skip (synthetic never touches a window server).
+    async fn seed_synthetic_template(state: &Arc<AppState>) {
+        let live = Arc::new(std::sync::Mutex::new(Quality::P720.profile()));
+        let (publisher, bridge, event_rx) =
+            AppState::build_source_session(&ShareSource::Synthetic, Quality::P720.profile(), &live)
+                .await
+                .expect("template builds");
+        assert!(bridge.is_none(), "synthetic owns no bridge");
+        {
+            let mut inner = state.inner.lock().expect("state lock");
+            inner.share_source = Some(ShareSource::Synthetic);
+            inner.share_profile = Some(EffectiveQuality {
+                profile: Quality::P720.profile(),
+                generation: 0,
+            });
+            inner.publishers.insert(
+                String::new(),
+                crate::PublishSession {
+                    publisher: Arc::new(tokio::sync::Mutex::new(publisher)),
+                    owner_fence: golive_core::owner::Fence::idle(),
+                    wire: WireIds::default(),
+                    remote_ready: false,
+                    pending_remote: Vec::new(),
+                    bridge: None,
+                },
+            );
+            inner.tasks.push(spawn_forward(
+                Arc::clone(state),
+                None,
+                event_rx,
+                ForwardTarget::Share,
+            ));
+        }
+    }
+
+    /// The adopted wire fence must carry real ids (the pre-fix silent-refuse
+    /// left no session at all; a half-adopted one would carry empties).
+    fn assert_wire_live(state: &AppState, watcher: &str) {
+        let inner = state.inner.lock().expect("state lock");
+        let session = inner.publishers.get(watcher).expect("session live");
+        assert!(!session.wire.session.is_empty(), "adopted wire carries session");
+        assert!(!session.wire.share.is_empty(), "adopted wire carries share");
+        assert!(!session.wire.link.is_empty(), "adopted wire carries link");
+        assert!(!session.wire.attempt.is_empty(), "adopted wire carries attempt");
+    }
+
+    /// Reports the stored owner fence as transport-connected (stands in for
+    /// the ICE Connected report the forward task delivers in production).
+    fn mark_connected(state: &AppState, watcher: &str) {
+        let fence = {
+            state
+                .inner
+                .lock()
+                .expect("state lock")
+                .publishers
+                .get(watcher)
+                .expect("watcher session")
+                .owner_fence
+        };
+        state
+            .inner
+            .lock()
+            .expect("state lock")
+            .owner
+            .link_connected(&fence)
+            .expect("link connected");
+        let link = state
+            .get_snapshot()
+            .expect("snapshot")
+            .links
+            .into_iter()
+            .find(|l| l.watcher == watcher)
+            .expect("link snapshot");
+        assert_eq!(link.state, LinkState::Connected, "fence lands on the link");
+    }
+
+    /// Waits until the Share forward task observes more host-side keyframes
+    /// than `past` (the encode loop reports its own IDRs; publishers never
+    /// decode, so `frames` stays 0 here — keyframes are the host liveness
+    /// signal). Event-driven counters, never polled media.
+    async fn wait_for_keyframes(state: &Arc<AppState>, past: u64, secs: u64) -> u64 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        loop {
+            let keyframes = state.get_media_counters().expect("counters").keyframes;
+            if keyframes > past {
+                return keyframes;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("no keyframes flowed within {secs}s (past={past} now={keyframes})");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    #[test]
+    fn stored_source_survives_watch_cycles() {
+        // No media: the stored descriptor (+ shared live profile) must
+        // outlive every watch/unwatch, and the share must stay Live.
+        let state = AppState::new();
+        open_live_share(&state);
+        {
+            let mut inner = state.inner.lock().expect("state lock");
+            inner.share_source = Some(ShareSource::Display("d1".into()));
+            inner.share_capture =
+                Some(Arc::new(std::sync::Mutex::new(Quality::P720.profile())));
+            inner.share_profile = Some(EffectiveQuality {
+                profile: Quality::P720.profile(),
+                generation: 0,
+            });
+        }
+        for watcher in ["a", "b", "a"] {
+            let fence = {
+                let inner = state.inner.lock().expect("state lock");
+                inner.owner.watch(watcher).expect("watch")
+            };
+            {
+                let inner = state.inner.lock().expect("state lock");
+                inner.owner.link_connected(&fence).expect("connected");
+            }
+            {
+                let inner = state.inner.lock().expect("state lock");
+                let fence = inner.owner.unwatch(watcher).expect("unwatch");
+                inner.owner.complete_link_removed(&fence).expect("removed");
+            }
+            let inner = state.inner.lock().expect("state lock");
+            assert!(
+                matches!(inner.share_source, Some(ShareSource::Display(_))),
+                "source kept after {watcher}"
+            );
+            assert!(inner.share_capture.is_some(), "live profile kept after {watcher}");
+            assert_eq!(
+                inner.owner.snapshot().share.state,
+                ShareState::Live,
+                "share live after {watcher}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rewatch_after_unwatch_gets_fresh_offer_and_frames() {
+        // Exact user path: share → watch → connected → unwatch → re-watch →
+        // new offer + connected + frames. Pre-fix the re-watch hit the
+        // silent-refuse (template consumed, never restored): no publisher, no
+        // offer, both sides stuck Negotiating forever.
+        let state = Arc::new(AppState::new());
+        open_live_share(&state);
+        seed_synthetic_template(&state).await;
+
+        // share → watch → connected → frames (template adoption path).
+        on_watch(&state, &None, "w1").await;
+        {
+            let inner = state.inner.lock().expect("state lock");
+            assert!(inner.publishers.contains_key("w1"), "first watch adopts");
+            assert!(!inner.publishers.contains_key(""), "template consumed");
+        }
+        assert_wire_live(&state, "w1");
+        mark_connected(&state, "w1");
+        let frames1 = wait_for_keyframes(&state, 0, 20).await;
+
+        // A second concurrent peer builds FRESH (previously silent-refuse).
+        on_watch(&state, &None, "w2").await;
+        {
+            let inner = state.inner.lock().expect("state lock");
+            assert!(inner.publishers.contains_key("w1"), "first link undisturbed");
+            assert!(inner.publishers.contains_key("w2"), "second peer builds fresh");
+        }
+
+        // unwatch → template gone for good, share still live, source kept.
+        on_unwatch(&state, "w1").await;
+        on_unwatch(&state, "w2").await;
+        {
+            let inner = state.inner.lock().expect("state lock");
+            assert!(inner.publishers.is_empty(), "both sessions dropped");
+            assert_eq!(
+                inner.owner.snapshot().share.state,
+                ShareState::Live,
+                "share survives unwatches"
+            );
+            assert!(
+                matches!(inner.share_source, Some(ShareSource::Synthetic)),
+                "stored source survives unwatches"
+            );
+        }
+
+        // re-watch → NEW offer-capable publisher → connected → frames again.
+        on_watch(&state, &None, "w1").await;
+        {
+            let inner = state.inner.lock().expect("state lock");
+            assert!(
+                inner.publishers.contains_key("w1"),
+                "re-watch rebuilds (was silent-refuse)"
+            );
+        }
+        assert_wire_live(&state, "w1");
+        let publisher = {
+            state
+                .inner
+                .lock()
+                .expect("state lock")
+                .publishers
+                .get("w1")
+                .expect("rebuilt session")
+                .publisher
+                .clone()
+        };
+        let sdp = publisher.lock().await.create_offer().await.expect("fresh offers");
+        assert!(!sdp.is_empty(), "new offer produced on the rebuilt link");
+        mark_connected(&state, "w1");
+        let frames2 = wait_for_keyframes(&state, frames1, 20).await;
+        assert!(frames2 > frames1, "keyframes flow on the rebuilt link");
+
+        // Teardown through the real stop (also proves stop_share handles
+        // rebuilt sessions + their forward tasks).
+        state.stop_share().await.expect("stop_share");
+        {
+            let inner = state.inner.lock().expect("state lock");
+            assert!(inner.publishers.is_empty());
+            assert_eq!(inner.owner.snapshot().share.state, ShareState::Stopped);
+            assert!(inner.share_source.is_none(), "stop clears the stored source");
+        }
+        state.leave().await.expect("leave");
     }
 }

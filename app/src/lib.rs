@@ -16,7 +16,10 @@ pub mod screen;
 pub mod session_log;
 pub mod video;
 
-use golive_core::media::{NativeViewer, Publisher, Quality, QualityProfile, VideoSource};
+use golive_core::media::{
+    EngineKind, ExternalSource, MediaEvent, NativeViewer, Publisher, Quality, QualityProfile,
+    VideoSource,
+};
 use golive_core::owner::{Fence, Owner, OwnerSnapshot};
 use golive_core::signal::SignalClient;
 use std::collections::HashMap;
@@ -186,6 +189,11 @@ pub struct PublishSession {
     pub wire: WireIds,
     pub remote_ready: bool,
     pub pending_remote: Vec<String>,
+    /// Capture bridge feeding THIS session (Display/Window only; None for
+    /// synthetic/movie). Per-session so a re-watch builds a fresh OS stream
+    /// instead of inheriting a dead one; stopped with the publisher on
+    /// unwatch/stop/leave.
+    pub bridge: Option<screen::BridgeHandle>,
 }
 
 /// Shared shell state. Managed as `Arc<AppState>` so background tasks and
@@ -276,15 +284,24 @@ struct Inner {
     /// Present only when launched with `--e2e-plan`. Gates every test-only
     /// command; the normal UI path never sees it.
     e2e_plan: Option<E2ePlan>,
-    /// Running screen-capture bridge (Display/Window shares). Owned here so
-    /// stop_share/leave always tear it down — never orphaned.
-    screen_bridge: Option<screen::BridgeHandle>,
+    /// Stored share source descriptor (set at start_share, cleared on
+    /// stop/leave). Lets late watches (re-watch after unwatch, a second
+    /// concurrent peer) build a FRESH publisher + bridge instead of reusing
+    /// the single-shot idle template. Kind + id/path only — never titles,
+    /// pixels, or tokens.
+    share_source: Option<ShareSource>,
     /// Backend-observed media counters (forward tasks bump these).
     media_counters: MediaCounters,
     /// One native video window (+ its latest-only feed) per watched member.
     /// N links mean N independent windows; a dead helper fails one link.
     video_windows: HashMap<String, video::VideoWindow>,
     video_feeds: HashMap<String, video::FramePush>,
+    /// Per-link present-window sequence, assigned at every spawn and logged
+    /// on respawn so interleaved links stay distinguishable from one
+    /// flapping link. Numeric only — never names, titles, or nicknames.
+    video_seq: HashMap<String, u64>,
+    /// Next present-window sequence number (starts at 1; 0 never appears).
+    next_video_seq: u64,
     /// Per-link decode observations (bumped in the `on_frame` callback:
     /// decoded count + latest dims). Joined with the windows above into
     /// [`video::LinkStats`] on snapshot/emit — no polling anywhere.
@@ -332,12 +349,14 @@ impl AppState {
                 media_counters: MediaCounters::default(),
                 video_windows: HashMap::new(),
                 video_feeds: HashMap::new(),
+                video_seq: HashMap::new(),
+                next_video_seq: 1,
                 link_tracks: HashMap::new(),
                 share_profile: None,
                 share_capture: None,
                 last_logged_backend: None,
                 census_logged: false,
-                screen_bridge: None,
+                share_source: None,
             }),
             session_log: Mutex::new(session_log::SessionLog::disabled()),
         }
@@ -479,7 +498,7 @@ impl AppState {
     /// Leaves the room: tasks aborted, media stopped, session closed
     /// best-effort. Idempotent.
     pub async fn leave(self: &Arc<Self>) -> Result<(), String> {
-        let (signal, publishers, viewer, screen_bridge) = {
+        let (signal, publishers, viewer) = {
             let mut inner = self
                 .inner
                 .lock()
@@ -492,11 +511,11 @@ impl AppState {
             }
             inner.share_profile = None;
             inner.share_capture = None;
+            inner.share_source = None;
             (
                 inner.signal.take(),
                 std::mem::take(&mut inner.publishers),
                 inner.viewer.take(),
-                inner.screen_bridge.take(),
             )
         };
         // Outside the lock: network + media teardown.
@@ -504,14 +523,14 @@ impl AppState {
             signal.leave();
             signal.shutdown();
         }
-        for (_, session) in publishers {
+        for (_, mut session) in publishers {
             session.publisher.lock().await.stop().await;
+            if let Some(bridge) = session.bridge.as_mut() {
+                bridge.stop();
+            }
         }
         if let Some(viewer) = viewer {
             viewer.lock().await.stop().await;
-        }
-        if let Some(mut bridge) = screen_bridge {
-            bridge.stop();
         }
         // Native video windows close with the session (no orphan windows).
         self.close_all_video_windows();
@@ -540,96 +559,46 @@ impl AppState {
         source: &str,
     ) -> Result<(), String> {
         let source = ShareSource::parse(source)?;
-        // Live capture profile for the bridge (starts at the default; the
+        // Live capture profile for bridges (starts at the default; every
         // bridge thread shares it so `set_quality` re-clamps mid-share).
         let live_profile = Arc::new(Mutex::new(Quality::P720.profile()));
-        // Resolve the core source BEFORE touching lifecycle (pre-flight):
+        let start_profile = Quality::P720.profile();
+        // Build the template session BEFORE touching lifecycle (pre-flight):
         // bridge setup may prompt/fail, and a failure must leave no
         // half-started share behind (Starting has no path back to Stopped).
-        enum Resolved {
-            Direct(VideoSource),
-            Bridged {
-                video: VideoSource,
-                bridge: screen::BridgeHandle,
-            },
-        }
-        let resolved = match &source {
-            ShareSource::Synthetic => Resolved::Direct(VideoSource::SyntheticBall),
-            ShareSource::Movie(path) => {
-                if !std::path::Path::new(path).exists() {
-                    return Err("movie file not found".into());
-                }
-                Resolved::Direct(VideoSource::MovieFile(path.into()))
-            }
-            ShareSource::Display(id) => {
-                let (rx, bridge, label) = screen::start_capture_for(
-                    golive_platform::SourceKind::Display,
-                    id,
-                    Quality::P720.profile(),
-                    Arc::clone(&live_profile),
-                )
-                .map_err(|e| e.to_string())?;
-                Resolved::Bridged {
-                    video: VideoSource::External(
-                        golive_core::media::ExternalSource { rx, label },
-                    ),
-                    bridge,
-                }
-            }
-            ShareSource::Window(id) => {
-                let (rx, bridge, label) = screen::start_capture_for(
-                    golive_platform::SourceKind::Window,
-                    id,
-                    Quality::P720.profile(),
-                    Arc::clone(&live_profile),
-                )
-                .map_err(|e| e.to_string())?;
-                Resolved::Bridged {
-                    video: VideoSource::External(
-                        golive_core::media::ExternalSource { rx, label },
-                    ),
-                    bridge,
-                }
-            }
-        };
-        let (video_source, mut bridge) = match resolved {
-            Resolved::Direct(video) => (video, None),
-            Resolved::Bridged { video, bridge } => (video, Some(bridge)),
-        };
-        // From here on, every failure path stops the bridge (if any).
+        let (mut template, mut template_bridge, event_rx) =
+            match Self::build_source_session(&source, start_profile, &live_profile).await {
+                Ok(built) => built,
+                Err(e) => return Err(e),
+            };
+        // From here on, every failure path stops the template pieces.
+        // Gate under one short lock (no await inside — a std guard must
+        // never cross one); refusals stop the built pieces outside it.
         let start = {
             let inner = self
                 .inner
                 .lock()
                 .map_err(|_| "state lock poisoned".to_string())?;
             if inner.signal.is_none() {
-                if let Some(bridge) = bridge.as_mut() {
-                    bridge.stop();
-                }
-                return Err("not in a room".into());
-            }
-            match inner.owner.begin_share_start() {
-                Ok(start) => start,
-                Err(e) => {
-                    drop(inner);
-                    if let Some(bridge) = bridge.as_mut() {
-                        bridge.stop();
-                    }
-                    return Err(redact_owner(e));
+                Err("not in a room".to_owned())
+            } else {
+                match inner.owner.begin_share_start() {
+                    Ok(start) => Ok(start),
+                    Err(e) => Err(redact_owner(e)),
                 }
             }
         };
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let publisher = match Publisher::start(video_source, Quality::P720, None, event_tx).await {
-            Ok(publisher) => publisher,
+        let start = match start {
+            Ok(start) => start,
             Err(e) => {
-                if let Some(bridge) = bridge.as_mut() {
+                template.stop().await;
+                if let Some(bridge) = template_bridge.as_mut() {
                     bridge.stop();
                 }
-                return Err(format!("publisher: {e}"));
+                return Err(e);
             }
         };
-        let publisher = Arc::new(tokio::sync::Mutex::new(publisher));
+        let template = Arc::new(tokio::sync::Mutex::new(template));
         {
             let mut inner = self
                 .inner
@@ -648,16 +617,19 @@ impl AppState {
                 event_rx,
                 pump::ForwardTarget::Share,
             ));
-            // Stash the idle publisher as the template for per-watcher links.
-            // (MVP: first watch reuses it; see pump.)
+            // Stash the idle publisher as the template for the first watch.
+            // Single-shot: adopting moves it to the watcher; later watches
+            // rebuild fresh from `share_source` (see pump `on_watch`).
+            let has_bridge = template_bridge.is_some();
             inner.publishers.insert(
                 String::new(),
                 PublishSession {
-                    publisher,
+                    publisher: template,
                     owner_fence: start,
                     wire: WireIds::default(),
                     remote_ready: false,
                     pending_remote: Vec::new(),
+                    bridge: template_bridge,
                 },
             );
             // Default effective quality: MEDIUM (== Quality::P720, the fixed
@@ -666,17 +638,10 @@ impl AppState {
                 profile: Quality::P720.profile(),
                 generation: 0,
             });
-            // The bridge (if any) shares the live profile from here on.
-            inner.share_capture = bridge.is_some().then(|| Arc::clone(&live_profile));
-            // Own the bridge from here: stop_share/leave always tear it down.
-            // (A previous bridge cannot exist: stop clears it, and start
-            // while live fails at begin_share_start above. Defensive stop
-            // anyway — never orphan an OS stream.)
-            let stale = std::mem::replace(&mut inner.screen_bridge, bridge);
-            drop(inner);
-            if let Some(mut stale) = stale {
-                stale.stop();
-            }
+            // Remember the source descriptor + shared live profile so late
+            // watches can rebuild (re-watch after unwatch, second peer).
+            inner.share_source = Some(source.clone());
+            inner.share_capture = has_bridge.then(|| Arc::clone(&live_profile));
         }
         // Milestone: source KIND only (never paths/ids) + start profile.
         let kind = match &source {
@@ -693,7 +658,208 @@ impl AppState {
         Ok(())
     }
 
-    /// Stops sharing: media stopped, bridge torn down, links cleared
+    /// Builds one publisher session from a share source at `profile`.
+    /// Display/Window open a fresh OS stream bridged into the publisher's
+    /// External feed (sharing `live` for capture clamping); Synthetic/Movie
+    /// resolve directly (Movie pre-flights the path, as before). Pre-flight
+    /// safe: on `Err` nothing was started and nothing leaks. Shared by
+    /// start_share's template and late watches (re-watch, second peer).
+    async fn build_source_session(
+        source: &ShareSource,
+        profile: QualityProfile,
+        live: &Arc<Mutex<QualityProfile>>,
+    ) -> Result<
+        (
+            Publisher,
+            Option<screen::BridgeHandle>,
+            mpsc::UnboundedReceiver<MediaEvent>,
+        ),
+        String,
+    > {
+        enum Resolved {
+            Direct(VideoSource),
+            Bridged {
+                video: VideoSource,
+                bridge: screen::BridgeHandle,
+            },
+        }
+        let resolved = match source {
+            ShareSource::Synthetic => Resolved::Direct(VideoSource::SyntheticBall),
+            ShareSource::Movie(path) => {
+                if !std::path::Path::new(path).exists() {
+                    return Err("movie file not found".into());
+                }
+                Resolved::Direct(VideoSource::MovieFile(path.into()))
+            }
+            ShareSource::Display(id) => {
+                let (rx, bridge, label) = screen::start_capture_for(
+                    golive_platform::SourceKind::Display,
+                    id,
+                    profile,
+                    Arc::clone(live),
+                )
+                .map_err(|e| e.to_string())?;
+                Resolved::Bridged {
+                    video: VideoSource::External(ExternalSource { rx, label }),
+                    bridge,
+                }
+            }
+            ShareSource::Window(id) => {
+                let (rx, bridge, label) = screen::start_capture_for(
+                    golive_platform::SourceKind::Window,
+                    id,
+                    profile,
+                    Arc::clone(live),
+                )
+                .map_err(|e| e.to_string())?;
+                Resolved::Bridged {
+                    video: VideoSource::External(ExternalSource { rx, label }),
+                    bridge,
+                }
+            }
+        };
+        let (video_source, mut bridge) = match resolved {
+            Resolved::Direct(video) => (video, None),
+            Resolved::Bridged { video, bridge } => (video, Some(bridge)),
+        };
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        // `Publisher::start` pins Quality::P720; late watches rebuild at the
+        // CURRENT effective profile, so both go through `start_with_profile`
+        // (Auto engine == `start`'s engine — identical behavior at P720).
+        match Publisher::start_with_profile(video_source, profile, EngineKind::Auto, None, event_tx)
+            .await
+        {
+            Ok(publisher) => Ok((publisher, bridge, event_rx)),
+            Err(e) => {
+                if let Some(bridge) = bridge.as_mut() {
+                    bridge.stop();
+                }
+                Err(format!("publisher: {e}"))
+            }
+        }
+    }
+
+    /// Builds + adopts a FRESH publisher session for a late watcher from the
+    /// stored share source (re-watch after unwatch, or a second concurrent
+    /// peer): the idle template is single-shot, so once adopted there is
+    /// nothing left to reuse. Runs at the CURRENT effective profile and, for
+    /// Display/Window, opens a fresh bridge on the shared live profile (so
+    /// `set_quality` keeps clamping every live bridge). Also spawns the
+    /// session's Share forward task. Returns false to keep the silent-refuse
+    /// (share not live, or the build failed) — no protocol change.
+    pub(crate) async fn adopt_fresh_session(
+        self: &Arc<Self>,
+        app: Option<AppHandle>,
+        watcher: &str,
+        fence: Fence,
+        wire: WireIds,
+    ) -> bool {
+        // Gate + snapshot under one short lock; the build runs outside it.
+        let (source, live, profile) = {
+            let inner = match self.inner.lock() {
+                Ok(inner) => inner,
+                Err(_) => return false,
+            };
+            if inner.owner.snapshot().share.state != golive_core::state::ShareState::Live {
+                return false;
+            }
+            let Some(source) = inner.share_source.clone() else {
+                return false;
+            };
+            let profile = inner
+                .share_profile
+                .map(|s| s.profile)
+                .unwrap_or_else(|| Quality::P720.profile());
+            // Display/Window share the stored live Arc; its absence alongside
+            // a capture source is inconsistent — refuse rather than fork it.
+            let live = match &source {
+                ShareSource::Display(_) | ShareSource::Window(_) => {
+                    match inner.share_capture.clone() {
+                        Some(live) => live,
+                        None => return false,
+                    }
+                }
+                ShareSource::Synthetic | ShareSource::Movie(_) => {
+                    Arc::new(Mutex::new(profile))
+                }
+            };
+            (source, live, profile)
+        };
+        let (publisher, mut bridge, event_rx) =
+            match Self::build_source_session(&source, profile, &live).await {
+                Ok(built) => built,
+                Err(_) => return false,
+            };
+        let publisher = Arc::new(tokio::sync::Mutex::new(publisher));
+        // Decide + insert under one short lock with NO await inside (a std
+        // guard must never cross an await — it would poison Send for every
+        // caller: pump spawn, Tauri commands). Teardown runs outside.
+        enum FreshDecision {
+            Inserted,
+            ShareGone,
+            Taken,
+        }
+        let decision = match self.inner.lock().ok() {
+            // `ok()` drops a PoisonError (which owns the guard) at once, so
+            // only a live guard enters the Some arm — and no await runs
+            // inside either arm.
+            Some(mut inner) => {
+                // The share may have died while the build ran: refuse instead
+                // of resurrecting anything.
+                if inner.owner.snapshot().share.state != golive_core::state::ShareState::Live {
+                    FreshDecision::ShareGone
+                // A concurrent watch may have adopted first: keep the winner
+                // and drop the spare (a session IS live, so the caller still
+                // proceeds to offer from it).
+                } else if inner.publishers.contains_key(watcher) {
+                    FreshDecision::Taken
+                } else {
+                    inner.publishers.insert(
+                        watcher.to_owned(),
+                        PublishSession {
+                            publisher: Arc::clone(&publisher),
+                            owner_fence: fence,
+                            wire,
+                            remote_ready: false,
+                            pending_remote: Vec::new(),
+                            // `take` keeps `bridge` initialized on every path
+                            // (None after a successful insert) so the teardown
+                            // below stays well-formed.
+                            bridge: bridge.take(),
+                        },
+                    );
+                    inner.tasks.push(pump::spawn_forward(
+                        Arc::clone(self),
+                        app,
+                        event_rx,
+                        pump::ForwardTarget::Share,
+                    ));
+                    FreshDecision::Inserted
+                }
+            }
+            // Poisoned lock: no guard was ever acquired; the spare dies
+            // outside the lock below.
+            None => FreshDecision::ShareGone,
+        };
+        match decision {
+            FreshDecision::Inserted => {}
+            // Spare / stillborn build: stop it outside the lock.
+            FreshDecision::ShareGone | FreshDecision::Taken => {
+                stop_fresh_parts(&publisher, &mut bridge).await;
+            }
+        }
+        // Milestone: source KIND only (never watcher ids, paths, or tokens).
+        let kind = match &source {
+            ShareSource::Synthetic => "synthetic",
+            ShareSource::Movie(_) => "movie",
+            ShareSource::Display(_) => "display",
+            ShareSource::Window(_) => "window",
+        };
+        self.session_log(format!("watch fresh kind={kind}"));
+        true
+    }
+
+    /// Stops sharing: media stopped, bridges torn down, links cleared
     /// deterministically.
     pub async fn stop_share(self: &Arc<Self>) -> Result<(), String> {
         let publishers = {
@@ -703,20 +869,12 @@ impl AppState {
                 .map_err(|_| "state lock poisoned".to_string())?;
             inner.share_profile = None;
             inner.share_capture = None;
+            inner.share_source = None;
             std::mem::take(&mut inner.publishers)
         };
-        for (_, session) in publishers {
+        for (_, mut session) in publishers {
             session.publisher.lock().await.stop().await;
-        }
-        {
-            let mut bridge = {
-                self.inner
-                    .lock()
-                    .map_err(|_| "state lock poisoned".to_string())?
-                    .screen_bridge
-                    .take()
-            };
-            if let Some(bridge) = bridge.as_mut() {
+            if let Some(bridge) = session.bridge.as_mut() {
                 bridge.stop();
             }
         }
@@ -826,39 +984,66 @@ impl AppState {
             }
             return Err(error);
         }
-        // Restart the capture stream at the new profile (if bridged).
-        // Transactional: the new SCK stream starts first, so a failure
-        // leaves the old stream running and only needs a publisher
-        // rollback. The handle is taken out for the blocking call (no
-        // long-held lock) and put back after, unless the share died
-        // under us (leave raced: stop instead of resurrecting).
-        let mut bridge = {
-            match self.inner.lock() {
-                Ok(mut inner) => inner.screen_bridge.take(),
-                Err(_) => None,
-            }
+        // Restart the capture streams at the new profile (if bridged).
+        // EVERY live session owns its bridge (re-watch/second-peer fanout),
+        // so reconfigure ALL of them — otherwise late watchers' bridges
+        // diverge after a quality apply. Transactional per stream (the new
+        // OS stream starts first; a failure leaves the old one running)
+        // with best-effort rollback of the streams that already moved plus
+        // the publishers that already applied. Handles leave Inner for the
+        // blocking calls (no long-held lock) and are restored after, unless
+        // the share died under us (stop instead of resurrecting) or a
+        // session turned over mid-switch (stop the orphan).
+        let mut bridges: Vec<(String, screen::BridgeHandle)> = match self.inner.lock() {
+            Ok(mut inner) => inner
+                .publishers
+                .iter_mut()
+                .filter_map(|(watcher, session)| {
+                    session.bridge.take().map(|bridge| (watcher.clone(), bridge))
+                })
+                .collect(),
+            Err(_) => Vec::new(),
         };
-        if let Some(handle) = bridge.as_mut() {
-            if let Err(e) = handle.reconfigure(profile) {
+        if !bridges.is_empty() {
+            let mut moved = 0usize;
+            let mut bridge_error: Option<String> = None;
+            for (_, handle) in bridges.iter_mut() {
+                match handle.reconfigure(profile) {
+                    Ok(()) => moved += 1,
+                    Err(e) => {
+                        bridge_error = Some(format!("qualidade: captura: {e}"));
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = bridge_error {
                 for publisher in publishers.iter().take(applied) {
                     let _ = publisher.lock().await.reconfigure(previous.profile);
                 }
-                if let Ok(mut inner) = self.inner.lock() {
-                    inner.screen_bridge = bridge;
+                for (_, handle) in bridges.iter_mut().take(moved) {
+                    let _ = handle.reconfigure(previous.profile);
                 }
-                return Err(format!("qualidade: captura: {e}"));
+                if let Ok(mut inner) = self.inner.lock() {
+                    restore_bridges(&mut inner, bridges);
+                } else {
+                    // Wedged lock: stop everything taken rather than leak OS
+                    // streams with no owner.
+                    for (_, mut handle) in bridges {
+                        handle.stop();
+                    }
+                }
+                return Err(error);
             }
         }
         let mut effective = EffectiveQuality { profile, generation: previous.generation };
         {
             if let Ok(mut inner) = self.inner.lock() {
                 if inner.publishers.is_empty() {
-                    // Share died mid-switch: stop the (reconfigured) bridge
-                    // instead of resurrecting it, report cleanly.
-                    if let Some(mut handle) = bridge.take() {
+                    // Share died mid-switch: stop the (reconfigured) bridges
+                    // instead of resurrecting them, report cleanly.
+                    for (_, mut handle) in bridges {
                         handle.stop();
                     }
-                    inner.screen_bridge = None;
                     return Err("not sharing".into());
                 }
                 // Never write the generation backwards: the encode loop may
@@ -868,13 +1053,13 @@ impl AppState {
                 let observed = inner.share_profile.map(|s| s.generation).unwrap_or(0);
                 effective.generation = effective.generation.max(observed);
                 inner.share_profile = Some(effective);
-                // Re-clamp capture in place (bridge reads it per tick).
+                // Re-clamp capture in place (every live bridge reads it per tick).
                 if let Some(live) = inner.share_capture.as_ref() {
                     if let Ok(mut guard) = live.lock() {
                         *guard = profile;
                     }
                 }
-                inner.screen_bridge = bridge;
+                restore_bridges(&mut inner, bridges);
             }
         }
         if let Some(app) = app {
@@ -1129,6 +1314,7 @@ impl AppState {
                 Ok(mut inner) => {
                     inner.video_feeds.remove(member);
                     inner.link_tracks.remove(member);
+                    inner.video_seq.remove(member);
                     inner.video_windows.remove(member)
                 }
                 Err(_) => None,
@@ -1145,6 +1331,7 @@ impl AppState {
             Ok(mut inner) => {
                 inner.video_feeds.clear();
                 inner.link_tracks.clear();
+                inner.video_seq.clear();
                 std::mem::take(&mut inner.video_windows)
             }
             Err(_) => return,
@@ -1215,6 +1402,35 @@ impl Default for AppState {
 /// Owner errors rendered without internals (states are enums, safe to show).
 fn redact_owner(e: golive_core::owner::OwnerError) -> String {
     format!("{e:?}")
+}
+
+/// Stops spare fresh-build pieces (publisher behind its Arc + optional
+/// bridge) when they lose a race (lock poisoned, share died, concurrent
+/// adopt). Bounded; never resurrects anything.
+async fn stop_fresh_parts(
+    publisher: &Arc<tokio::sync::Mutex<Publisher>>,
+    bridge: &mut Option<screen::BridgeHandle>,
+) {
+    publisher.lock().await.stop().await;
+    if let Some(bridge) = bridge.as_mut() {
+        bridge.stop();
+    }
+}
+
+/// Puts taken bridge handles back on their sessions. A session that vanished
+/// or turned over mid-reconfigure (fresh bridge already in place) releases
+/// the orphan instead of resurrecting anything.
+fn restore_bridges(inner: &mut Inner, bridges: Vec<(String, screen::BridgeHandle)>) {
+    for (watcher, mut handle) in bridges {
+        match inner.publishers.get_mut(&watcher) {
+            Some(session) if session.bridge.is_none() => {
+                session.bridge = Some(handle);
+            }
+            _ => {
+                handle.stop();
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1597,6 +1813,7 @@ mod quality_tests {
                     wire: WireIds::default(),
                     remote_ready: false,
                     pending_remote: Vec::new(),
+                    bridge: None,
                 },
             );
             inner.share_profile = Some(EffectiveQuality {

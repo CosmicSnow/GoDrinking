@@ -119,6 +119,51 @@ pub fn scale_rgba_nearest(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec
     out
 }
 
+/// Bilinear RGBA scale (smoother downscales than nearest: ~4 taps/px).
+/// Same contract as [`scale_rgba_nearest`]: RGBA in/out, tight rows, empty
+/// output on zero sizes or short input (never panics), pure. Alpha is
+/// interpolated like any other channel (no premultiply, no drop). Same-dims
+/// input copies exactly (byte-equal wash, no float drift).
+pub fn scale_rgba_bilinear(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+        return Vec::new();
+    }
+    if src.len() < (sw as usize) * (sh as usize) * 4 {
+        return Vec::new();
+    }
+    if sw == dw && sh == dh {
+        return src[..(sw as usize) * (sh as usize) * 4].to_vec();
+    }
+    let (sw_us, sh_us, dw_us, dh_us) = (sw as usize, sh as usize, dw as usize, dh as usize);
+    let (sw_f, sh_f, dw_f, dh_f) = (sw as f32, sh as f32, dw as f32, dh as f32);
+    let mut out = vec![0u8; dw_us * dh_us * 4];
+    for y in 0..dh_us {
+        // Center-mapped source coordinate; clamp the fractional part so
+        // edge pixels reuse the edge tap instead of going out of bounds.
+        let sy = (y as f32 + 0.5) * sh_f / dh_f - 0.5;
+        let y0 = (sy.floor() as i64).clamp(0, sh as i64 - 1) as usize;
+        let y1 = (y0 + 1).min(sh_us - 1);
+        let fy = (sy - y0 as f32).clamp(0.0, 1.0);
+        for x in 0..dw_us {
+            let sx = (x as f32 + 0.5) * sw_f / dw_f - 0.5;
+            let x0 = (sx.floor() as i64).clamp(0, sw as i64 - 1) as usize;
+            let x1 = (x0 + 1).min(sw_us - 1);
+            let fx = (sx - x0 as f32).clamp(0.0, 1.0);
+            let d = (y * dw_us + x) * 4;
+            for c in 0..4 {
+                let a = src[(y0 * sw_us + x0) * 4 + c] as f32;
+                let b = src[(y0 * sw_us + x1) * 4 + c] as f32;
+                let cc = src[(y1 * sw_us + x0) * 4 + c] as f32;
+                let dd = src[(y1 * sw_us + x1) * 4 + c] as f32;
+                let top = a + (b - a) * fx;
+                let bot = cc + (dd - cc) * fx;
+                out[d + c] = (top + (bot - top) * fy).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    out
+}
+
 /// RGBA bytes to softbuffer pixels: `0x00RRGGBB` per the softbuffer docs
 /// (highest byte zero, then R, G, B). Alpha is dropped (X).
 pub fn rgba_to_xrgb8888(rgba: &[u8]) -> Vec<u32> {
@@ -924,6 +969,74 @@ mod tests {
         // Bad inputs yield empty, never panic.
         assert!(scale_rgba_nearest(&src, 2, 2, 0, 4).is_empty());
         assert!(scale_rgba_nearest(&src[..4], 2, 2, 4, 4).is_empty());
+    }
+
+    #[test]
+    fn scale_bilinear_identity_copies_bytes() {
+        // Same-dims blit is a wash: byte-equal, no float drift.
+        let src: Vec<u8> = (0..(6 * 5 * 4)).map(|i| (i * 37 % 251) as u8).collect();
+        assert_eq!(scale_rgba_bilinear(&src, 6, 5, 6, 5), src);
+    }
+
+    #[test]
+    fn scale_bilinear_downscale_diagonal_is_smoother_than_nearest() {
+        // Sharp diagonal edge, 8x8 white (x>y) on black, halved to 4x4.
+        // Nearest keeps the 0/255 cliff; bilinear must blend it (mid grays).
+        let (sw, sh, dw, dh) = (8u32, 8u32, 4u32, 4u32);
+        let mut src = vec![0u8; (sw as usize) * (sh as usize) * 4];
+        for y in 0..sh as usize {
+            for x in 0..sw as usize {
+                let v = if x > y { 255u8 } else { 0u8 };
+                let i = (y * sw as usize + x) * 4;
+                src[i] = v;
+                src[i + 1] = v;
+                src[i + 2] = v;
+                src[i + 3] = 255;
+            }
+        }
+        let max_adjacent_delta = |img: &[u8]| -> u32 {
+            let mut m = 0u32;
+            for y in 0..dh as usize {
+                for x in 0..dw as usize {
+                    let v = img[(y * dw as usize + x) * 4] as i32;
+                    if x + 1 < dw as usize {
+                        m = m.max((v - img[(y * dw as usize + x + 1) * 4] as i32).abs() as u32);
+                    }
+                    if y + 1 < dh as usize {
+                        m = m.max((v - img[((y + 1) * dw as usize + x) * 4] as i32).abs() as u32);
+                    }
+                }
+            }
+            m
+        };
+        let nearest = scale_rgba_nearest(&src, sw, sh, dw, dh);
+        let bilinear = scale_rgba_bilinear(&src, sw, sh, dw, dh);
+        assert_eq!(nearest.len(), (dw as usize) * (dh as usize) * 4);
+        assert_eq!(bilinear.len(), nearest.len());
+        assert_eq!(max_adjacent_delta(&nearest), 255);
+        assert!(max_adjacent_delta(&bilinear) < max_adjacent_delta(&nearest));
+        // Blended edge pixels actually exist (strictly between black/white).
+        assert!(bilinear.chunks_exact(4).any(|px| px[0] > 0 && px[0] < 255));
+    }
+
+    #[test]
+    fn scale_bilinear_rejects_bad_sizes_and_blends_alpha() {
+        let src: Vec<u8> = vec![
+            255, 0, 0, 0, 0, 255, 0, 128, //
+            0, 0, 255, 192, 255, 255, 255, 255,
+        ];
+        assert!(scale_rgba_bilinear(&src, 2, 2, 0, 2).is_empty());
+        assert!(scale_rgba_bilinear(&src, 2, 2, 2, 0).is_empty());
+        assert!(scale_rgba_bilinear(&src, 0, 2, 2, 2).is_empty());
+        assert!(scale_rgba_bilinear(&src[..4], 2, 2, 1, 1).is_empty());
+        // 2x2 -> 1x1 samples the exact center: straight mean of all 4 taps,
+        // alpha interpolated like any other channel (no premultiply, no drop).
+        let out = scale_rgba_bilinear(&src, 2, 2, 1, 1);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0], 128); // (255+0+0+255)/4 = 127.5 -> 128
+        assert_eq!(out[1], 128);
+        assert_eq!(out[2], 128);
+        assert_eq!(out[3], 144); // (0+128+192+255)/4 = 143.75 -> 144
     }
 
     #[test]

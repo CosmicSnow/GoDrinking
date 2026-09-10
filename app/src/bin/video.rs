@@ -20,7 +20,7 @@
 
 use golive_app::video::{
     connect_helper, draw_text, help_visible, is_double_click, letterbox, rgba_to_xrgb8888,
-    scale_rgba_nearest, text_height_px, text_width_px, HelperStream, ViewState, HELP_LINE,
+    scale_rgba_bilinear, text_height_px, text_width_px, HelperStream, ViewState, HELP_LINE,
     WINDOW_H, WINDOW_W,
 };
 use std::io::{Read, Write};
@@ -145,7 +145,7 @@ impl App {
         let scaled = if sw == self.src_w && sh == self.src_h {
             rgba
         } else {
-            scale_rgba_nearest(&rgba, self.src_w, self.src_h, sw, sh)
+            scale_rgba_bilinear(&rgba, self.src_w, self.src_h, sw, sh)
         };
         let pixels = rgba_to_xrgb8888(&scaled);
         if pixels.len() != sw as usize * sh as usize {
