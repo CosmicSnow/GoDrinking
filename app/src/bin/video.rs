@@ -25,7 +25,7 @@ use golive_app::video::{
 };
 use std::io::{Read, Write};
 use std::num::NonZeroU32;
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -45,8 +45,7 @@ const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 type Disp = Arc<Window>;
 type Surf = softbuffer::Surface<Disp, Disp>;
 
-/// Reader thread to main loop: at most 2 frames in flight (latest-only is
-/// enforced by the shell feeder; this bound keeps helper memory flat).
+/// Reader overwrites this; the event loop presents only the latest.
 #[derive(Debug)]
 enum Inbox {
     Frame(Vec<u8>),
@@ -73,7 +72,7 @@ struct App {
     frozen: bool,
     last_present: Instant,
     ack: Option<HelperStream>,
-    inbox: mpsc::Receiver<Inbox>,
+    inbox: Arc<Mutex<Option<Inbox>>>,
     gone: bool,
     src_w: u32,
     src_h: u32,
@@ -440,15 +439,11 @@ impl ApplicationHandler<UserWake> for App {
 
 impl App {
     fn drain_inbox(&mut self) {
-        // Drain inbox (reader wakes us per frame; normally one item).
-        while let Ok(msg) = self.inbox.try_recv() {
-            match msg {
-                Inbox::Frame(rgba) => self.render_frame(rgba),
-                Inbox::Gone => {
-                    self.gone = true;
-                    break;
-                }
-            }
+        let msg = self.inbox.lock().ok().and_then(|mut slot| slot.take());
+        match msg {
+            Some(Inbox::Frame(rgba)) => self.render_frame(rgba),
+            Some(Inbox::Gone) => self.gone = true,
+            None => {}
         }
     }
 
@@ -485,7 +480,8 @@ fn run() -> Result<(), String> {
 
     // Reader thread: frames in, wake-ups out. Bounded handoff (cap 2);
     // latest-only is enforced by the shell feeder upstream.
-    let (tx, rx) = mpsc::sync_channel::<Inbox>(2);
+        let inbox = Arc::new(Mutex::new(None));
+    let inbox_reader = Arc::clone(&inbox);
     std::thread::Builder::new()
         .name("golive-video-read".into())
         .spawn(move || {
@@ -495,19 +491,22 @@ fn run() -> Result<(), String> {
             loop {
                 match read_frame(&mut sock, src_w, src_h) {
                     Ok(Some(rgba)) => {
-                        if tx.send(Inbox::Frame(rgba)).is_err() {
+                        if let Ok(mut slot) = inbox_reader.lock() {
+                            *slot = Some(Inbox::Frame(rgba));
+                        } else {
                             break;
                         }
                         tick();
                     }
-                    // Quiet tick: main loop owns the frozen clock.
                     Ok(None) => {
                         tick();
                     }
                     Err(_) => break,
                 }
             }
-            let _ = tx.send(Inbox::Gone);
+            if let Ok(mut slot) = inbox_reader.lock() {
+                *slot = Some(Inbox::Gone);
+            }
             tick();
         })
         .map_err(|e| format!("reader thread: {e}"))?;
@@ -520,7 +519,7 @@ fn run() -> Result<(), String> {
         frozen: false,
         last_present: Instant::now(),
         ack: Some(ack),
-        inbox: rx,
+        inbox,
         gone: false,
         src_w,
         src_h,
@@ -614,19 +613,20 @@ mod tests {
 
     #[test]
     fn inbox_transfers_pixels_without_copy_or_false_present() {
-        let (tx, rx) = mpsc::channel();
+    let inbox = Arc::new(Mutex::new(None));
         let now = Instant::now();
         let mut app = App {
             window: None, surface: None, _context: None,
             base_title: String::new(), frozen: true, last_present: now,
-            ack: None, inbox: rx, gone: false, src_w: 2, src_h: 2,
+            ack: None, inbox: Arc::clone(&inbox), gone: false, src_w: 2, src_h: 2,
             view: ViewState::new(), cursor: (0.0, 0.0), dragging: false,
             drag_last: (0.0, 0.0), last_press: None, interacted_at: now,
             help_active: false, last: None,
         };
         let pixels = vec![42; 16];
         let allocation = pixels.as_ptr();
-        tx.send(Inbox::Frame(pixels)).unwrap();
+        *inbox.lock().unwrap() = Some(Inbox::Frame(vec![1; 16]));
+        *inbox.lock().unwrap() = Some(Inbox::Frame(pixels));
         app.drain_inbox();
         assert_eq!(app.last.as_ref().unwrap().as_ptr(), allocation);
         assert_eq!(app.last.as_ref().unwrap(), &[42; 16]);

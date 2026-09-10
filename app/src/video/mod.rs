@@ -809,21 +809,38 @@ fn feed_loop(
         }
         let bytes = frame.rgba.len() as u64;
         let started = trace.start();
-        if write_frame(&mut sock, &frame).is_err() || read_ack(&mut sock).is_err() {
+        if write_frame(&mut sock, &frame).is_err() {
             trace.record(TraceSample { errors: 1, ..Default::default() }, started);
             healthy.store(false, Ordering::Release);
             return;
         }
+        let acked = match drain_present_acks(&mut sock) {
+            Ok(n) => n,
+            Err(_) => {
+                trace.record(TraceSample { errors: 1, ..Default::default() }, started);
+                healthy.store(false, Ordering::Release);
+                return;
+            }
+        };
         let now = Instant::now();
-        let gap_us = last_ack.map(|t| now.duration_since(t).as_micros() as u64).unwrap_or(0);
-        last_ack = Some(now);
-        trace.record(TraceSample {
-            frames: 1, bytes, width: w as u32, height: h as u32, max_gap_us: gap_us,
-            ..Default::default()
-        }, started);
-        presented.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut stats) = present_stats.lock() {
-            stats.push(Instant::now(), bytes);
+        if acked > 0 {
+            let gap_us = last_ack.map(|t| now.duration_since(t).as_micros() as u64).unwrap_or(0);
+            last_ack = Some(now);
+            presented.fetch_add(acked, Ordering::Relaxed);
+            if let Ok(mut stats) = present_stats.lock() {
+                for _ in 0..acked {
+                    stats.push(now, bytes);
+                }
+            }
+            trace.record(TraceSample {
+                frames: acked, bytes: bytes.saturating_mul(acked), width: w as u32, height: h as u32, max_gap_us: gap_us,
+                ..Default::default()
+            }, started);
+        } else {
+            trace.record(TraceSample {
+                frames: 1, bytes, width: w as u32, height: h as u32,
+                ..Default::default()
+            }, started);
         }
         loop {
             if stop.load(Ordering::Acquire) {
@@ -915,6 +932,27 @@ fn read_ack(sock: &mut impl Read) -> std::io::Result<()> {
         ));
     }
     Ok(())
+}
+
+fn drain_present_acks(sock: &mut FeedStream) -> std::io::Result<u64> {
+    sock.set_nonblocking(true)?;
+    let mut n = 0u64;
+    let result = loop {
+        match read_ack(sock) {
+            Ok(()) => n += 1,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break Ok(n);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => break Err(e),
+        }
+    };
+    let _ = sock.set_nonblocking(false);
+    let _ = sock.set_read_timeout(Some(SOCKET_TIMEOUT));
+    result
 }
 
 #[cfg(test)]
@@ -1379,5 +1417,14 @@ mod tests {
         assert!(read_ack(&mut a).is_ok());
         b.write_all(&[0x02]).unwrap();
         assert!(read_ack(&mut a).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drain_acks_returns_immediately_when_empty() {
+        let (mut a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let started = Instant::now();
+        assert_eq!(drain_present_acks(&mut a).unwrap(), 0);
+        assert!(started.elapsed() < Duration::from_millis(200));
     }
 }
