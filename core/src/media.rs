@@ -110,7 +110,11 @@ impl Quality {
 /// - HIGH `1920x1080 @ 10000 kbps @ 60 fps`: screen-share ladder (OBS-like
 ///   1080p60). Software may not hold 60; Auto picks VideoToolbox on macOS.
 ///
-/// Validation ranges: dims `2..=4096` (any parity in, even out — see
+/// Inclusive max per axis for a quality/encode profile. Ultrawide
+/// 5120×1440 fits; backends clamp capture to the same ceiling.
+pub const MAX_DIM: u32 = 8192;
+
+/// Validation ranges: dims `2..=MAX_DIM` (any parity in, even out — see
 /// [`normalize_dims`]); bitrate `100..=20000` kbps (below 100 the control
 /// loop starves at HD sizes); fps `1..=60` (decoder/player sanity plus
 /// encoder throughput; above 60 is rejected, never silently clamped).
@@ -143,7 +147,7 @@ impl QualityProfile {
     }
 
     pub fn validate(&self) -> Result<(), QualityError> {
-        if self.w < 2 || self.w > 4096 || self.h < 2 || self.h > 4096 {
+        if self.w < 2 || self.w > MAX_DIM || self.h < 2 || self.h > MAX_DIM {
             return Err(QualityError::InvalidDimensions { w: self.w, h: self.h });
         }
         if !(100..=20_000).contains(&self.bitrate_kbps) {
@@ -197,7 +201,7 @@ impl std::fmt::Display for QualityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             QualityError::InvalidDimensions { w, h } => {
-                write!(f, "dimensions out of range 2..=4096: {w}x{h}")
+                write!(f, "dimensions out of range 2..={MAX_DIM}: {w}x{h}")
             }
             QualityError::BitrateOutOfRange(bps) => {
                 write!(f, "bitrate out of range 100..=20000 kbps: {bps}")
@@ -580,8 +584,8 @@ impl H264Encoder {
     /// (already normalized even); frames must match exactly.
     pub fn new_with_profile(profile: &QualityProfile, w: usize, h: usize) -> Result<Self, MediaError> {
         profile.validate().map_err(|e| MediaError::Codec(format!("profile: {e}")))?;
-        if w < 2 || h < 2 || w > 4096 || h > 4096 || w % 2 != 0 || h % 2 != 0 {
-            return Err(MediaError::Codec(format!("backend dims must be even 2..=4096: {w}x{h}")));
+        if w < 2 || h < 2 || w > MAX_DIM as usize || h > MAX_DIM as usize || w % 2 != 0 || h % 2 != 0 {
+            return Err(MediaError::Codec(format!("backend dims must be even 2..={MAX_DIM}: {w}x{h}")));
         }
         let config = EncoderConfig::new()
             .bitrate(BitRate::from_bps(profile.bitrate_kbps * 1000))
@@ -956,6 +960,42 @@ fn build_api() -> Result<webrtc::api::API, MediaError> {
         .build())
 }
 
+/// Apply one trickle candidate to every m-line (audio+video). Hardcoding
+/// index 0 attached ICE to only the first media section, so a two-m-line
+/// offer delivered one medium per attempt.
+async fn add_ice_candidate_all_mlines(
+    pc: &RTCPeerConnection,
+    candidate: &str,
+) -> Result<(), MediaError> {
+    let n = pc.get_transceivers().await.len().max(1);
+    let mut last = None;
+    let mut any = false;
+    for index in 0..=n {
+        let init = RTCIceCandidateInit {
+            candidate: candidate.to_owned(),
+            sdp_mid: None,
+            sdp_mline_index: if index == n {
+                None
+            } else {
+                Some(index as u16)
+            },
+            username_fragment: None,
+        };
+        match pc.add_ice_candidate(init).await {
+            Ok(()) => any = true,
+            Err(e) => last = Some(e),
+        }
+    }
+    if any {
+        Ok(())
+    } else {
+        Err(MediaError::Transport(format!(
+            "add candidate: {}",
+            last.map(|e| e.to_string()).unwrap_or_else(|| "failed".into())
+        )))
+    }
+}
+
 fn rtc_config(ice_servers: Option<Vec<String>>) -> RTCConfiguration {
     let urls = ice_servers.unwrap_or_else(|| vec!["stun:stun.l.google.com:19302".to_owned()]);
     RTCConfiguration {
@@ -1328,16 +1368,7 @@ impl Publisher {
     }
 
     pub async fn add_remote_candidate(&self, candidate: &str) -> Result<(), MediaError> {
-        self.pc
-            .add_ice_candidate(RTCIceCandidateInit {
-                candidate: candidate.to_owned(),
-                sdp_mid: None,
-                sdp_mline_index: Some(0),
-                username_fragment: None,
-            })
-            .await
-            .map_err(|e| MediaError::Transport(format!("add candidate: {e}")))?;
-        Ok(())
+        add_ice_candidate_all_mlines(&self.pc, candidate).await
     }
 
     /// Bounded idempotent stop: flag, timed PC close, poison the pump so it
@@ -1929,16 +1960,7 @@ impl NativeViewer {
     }
 
     pub async fn add_remote_candidate(&self, candidate: &str) -> Result<(), MediaError> {
-        self.pc
-            .add_ice_candidate(RTCIceCandidateInit {
-                candidate: candidate.to_owned(),
-                sdp_mid: None,
-                sdp_mline_index: Some(0),
-                username_fragment: None,
-            })
-            .await
-            .map_err(|e| MediaError::Transport(format!("add candidate: {e}")))?;
-        Ok(())
+        add_ice_candidate_all_mlines(&self.pc, candidate).await
     }
 
     /// Bounded idempotent stop. Never wedges.
@@ -2543,14 +2565,16 @@ mod tests {
         // Boundaries hold.
         assert!(QualityProfile::custom(2, 2, 100, 1).is_ok());
         assert!(QualityProfile::custom(4096, 4096, 20_000, 60).is_ok());
+        assert!(QualityProfile::custom(5120, 1440, 20_000, 60).is_ok());
+        assert!(QualityProfile::custom(MAX_DIM, MAX_DIM, 20_000, 60).is_ok());
         // Each axis fails typed (numbers only, no secrets possible).
         assert_eq!(
             QualityProfile::custom(1, 360, 1000, 30).unwrap_err(),
             QualityError::InvalidDimensions { w: 1, h: 360 }
         );
         assert_eq!(
-            QualityProfile::custom(640, 5000, 1000, 30).unwrap_err(),
-            QualityError::InvalidDimensions { w: 640, h: 5000 }
+            QualityProfile::custom(640, MAX_DIM + 1, 1000, 30).unwrap_err(),
+            QualityError::InvalidDimensions { w: 640, h: MAX_DIM + 1 }
         );
         assert_eq!(
             QualityProfile::custom(640, 360, 99, 30).unwrap_err(),
@@ -2596,8 +2620,9 @@ mod tests {
         let fitted = cap.normalized_dims(3440, 1440);
         assert_eq!(encode_target_for_frame(3440, 1440, &cap), (fitted.0 as usize, fitted.1 as usize));
         assert!(fitted.0 <= 1920 && fitted.1 <= 1080);
-        let native = QualityProfile::custom(4096, 4096, 10_000, 60).unwrap();
+        let native = QualityProfile::custom(MAX_DIM, MAX_DIM, 10_000, 60).unwrap();
         assert_eq!(encode_target_for_frame(3440, 1440, &native), (3440, 1440));
+        assert_eq!(encode_target_for_frame(5120, 1440, &native), (5120, 1440));
         assert_eq!(encode_target_for_frame(1200, 900, &native), (1200, 900));
     }
 

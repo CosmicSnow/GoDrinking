@@ -213,6 +213,17 @@ impl Owner {
         Ok(())
     }
 
+    /// Handshake failed after `begin_join`. Fenced: a late success cannot
+    /// clobber a retry. Clears session ids so the next `begin_join` is allowed.
+    pub fn abort_join(&self, fence: &Fence) -> Result<(), OwnerError> {
+        let mut inner = self.inner.lock().expect("owner lock poisoned");
+        check_session_fence(&inner, fence)?;
+        inner.session_state = inner.session_state.apply(SalaEvent::JoinFailed)?;
+        inner.session_id = None;
+        inner.session_attempt = None;
+        Ok(())
+    }
+
     /// Validates `Open`, moves to `Closing`.
     pub fn begin_close(&self) -> Result<Fence, OwnerError> {
         let mut inner = self.inner.lock().expect("owner lock poisoned");
@@ -638,6 +649,31 @@ mod tests {
         let snap = owner.snapshot();
         assert_eq!(snap.session.state, SalaState::Closed);
         assert_eq!(snap.session.id, None);
+    }
+
+    #[test]
+    fn abort_join_unlocks_retry() {
+        let owner = Owner::new();
+        let first = owner.begin_join().unwrap();
+        assert_eq!(owner.snapshot().session.state, SalaState::Joining);
+        assert!(matches!(
+            owner.begin_join(),
+            Err(OwnerError::SessionBusy {
+                state: SalaState::Joining
+            })
+        ));
+        owner.abort_join(&first).unwrap();
+        let snap = owner.snapshot();
+        assert_eq!(snap.session.state, SalaState::Closed);
+        assert_eq!(snap.session.id, None);
+        let second = owner.begin_join().unwrap();
+        owner.complete_opened(&second).unwrap();
+        assert_eq!(owner.snapshot().session.state, SalaState::Open);
+        assert!(matches!(
+            owner.abort_join(&first),
+            Err(OwnerError::Stale { .. })
+        ));
+        assert_eq!(owner.snapshot().session.state, SalaState::Open);
     }
 
     #[test]

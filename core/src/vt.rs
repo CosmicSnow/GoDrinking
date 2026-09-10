@@ -226,9 +226,10 @@ mod backend {
                     "disabled by GOLIVE_DISABLE_HW (test hook)".into(),
                 ));
             }
-            if w < 2 || h < 2 || w > 4096 || h > 4096 || w % 2 != 0 || h % 2 != 0 {
+            if w < 2 || h < 2 || w > crate::media::MAX_DIM as usize || h > crate::media::MAX_DIM as usize || w % 2 != 0 || h % 2 != 0 {
                 return Err(MediaError::Codec(format!(
-                    "hw dims must be even 2..=4096: {w}x{h}"
+                    "hw dims must be even 2..={}: {w}x{h}",
+                    crate::media::MAX_DIM
                 )));
             }
             let state = Arc::new(CbState {

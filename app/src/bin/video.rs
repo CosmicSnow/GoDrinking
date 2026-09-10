@@ -39,7 +39,7 @@ const FROZEN_AFTER: Duration = Duration::from_secs(1);
 /// Socket reads tick the frozen check even when silent.
 const READ_TICK: Duration = Duration::from_millis(250);
 /// Hard caps: protocol-level sanity, never large allocations from the wire.
-const MAX_DIM: usize = 4096;
+const MAX_DIM: usize = 8192;
 const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 
 type Disp = Arc<Window>;

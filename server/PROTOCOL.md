@@ -40,6 +40,11 @@ All POST bodies are JSON, max 64 KiB. Errors: `400 {"ok":false,"error":"invalid"
 - Max frame 64 KiB; oversize frames are dropped by the transport.
 - Every message refreshes the member heartbeat. `{t:"heartbeat"}` is
   answered with the current roster.
+- Socket close that is not a reconnect replacement starts a disconnect
+  grace (default 8 s, `DISCONNECT_GRACE_MS`). If the member does not
+  reopen a socket in that window, they are removed and the roster is
+  broadcast (`{t:"gone"}`). Reconnect within the grace keeps the same
+  member and token.
 
 Client → server (all require an accepted member unless noted):
 
@@ -79,6 +84,7 @@ max 64 candidates per attempt; max 8 KiB per candidate; candidates containing
 
 256 rooms; 512 sockets; 8 accepted + 8 pending members per room; 64 KiB per
 message; 64 candidates per attempt; 8 KiB per candidate; heartbeat expected
-every 30 s, members expire after 5 min without heartbeat; per-IP rate limits
-per route; 5 auth failures in 10 min ignores the IP for 5 min. Tunable for
-tests via `HEARTBEAT_TTL_MS` and `GC_INTERVAL_MS`.
+every 30 s, members expire after 5 min without heartbeat; disconnect grace
+8 s after socket close without reconnect; per-IP rate limits per route; 5
+auth failures in 10 min ignores the IP for 5 min. Tunable for tests via
+`HEARTBEAT_TTL_MS`, `GC_INTERVAL_MS`, and `DISCONNECT_GRACE_MS`.

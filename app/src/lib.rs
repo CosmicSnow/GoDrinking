@@ -448,18 +448,26 @@ impl AppState {
                 .map_err(|_| "state lock poisoned".to_string())?;
             inner.owner.begin_join().map_err(redact_owner)?
         };
-        let signal = SignalClient::create_room(&base, nickname, password, false)
-            .map_err(|e| format!("create room: {e}"))?;
+        let mut signal = match SignalClient::create_room(&base, nickname, password, false) {
+            Ok(signal) => signal,
+            Err(e) => {
+                self.abort_join_fence(&join);
+                return Err(format!("create room: {e}"));
+            }
+        };
         let code = signal.code().to_owned();
         {
             let mut inner = self
                 .inner
                 .lock()
                 .map_err(|_| "state lock poisoned".to_string())?;
-            inner
-                .owner
-                .complete_opened(&join)
-                .map_err(redact_owner)?;
+            if let Err(e) = inner.owner.complete_opened(&join).map_err(redact_owner) {
+                drop(inner);
+                signal.leave();
+                signal.shutdown();
+                self.abort_join_fence(&join);
+                return Err(e);
+            }
             inner.signal = Some(signal);
             // Test-only handoff: publish the room code where the plan says,
             // so a second self-driven instance can join without humans.
@@ -493,22 +501,36 @@ impl AppState {
                 .map_err(|_| "state lock poisoned".to_string())?;
             inner.owner.begin_join().map_err(redact_owner)?
         };
-        let signal = SignalClient::join_room(&base, code, nickname, password)
-            .map_err(|e| format!("join room: {e}"))?;
+        let mut signal = match SignalClient::join_room(&base, code, nickname, password) {
+            Ok(signal) => signal,
+            Err(e) => {
+                self.abort_join_fence(&join);
+                return Err(format!("join room: {e}"));
+            }
+        };
         let member_id = signal.member_id().to_owned();
         {
             let mut inner = self
                 .inner
                 .lock()
                 .map_err(|_| "state lock poisoned".to_string())?;
-            inner
-                .owner
-                .complete_opened(&join)
-                .map_err(redact_owner)?;
+            if let Err(e) = inner.owner.complete_opened(&join).map_err(redact_owner) {
+                drop(inner);
+                signal.leave();
+                signal.shutdown();
+                self.abort_join_fence(&join);
+                return Err(e);
+            }
             inner.signal = Some(signal);
             inner.tasks.push(pump::spawn_pump(Arc::clone(self), app));
         }
         Ok(member_id)
+    }
+
+    fn abort_join_fence(&self, fence: &golive_core::owner::Fence) {
+        if let Ok(inner) = self.inner.lock() {
+            let _ = inner.owner.abort_join(fence);
+        }
     }
 
     /// Leaves the room: tasks aborted, media stopped, session closed
@@ -1184,6 +1206,7 @@ impl AppState {
             if let Some(alive) = inner.viewer_alive.take() {
                 alive.store(false, std::sync::atomic::Ordering::Release);
             }
+            inner.viewer_playback = None;
             inner.viewer.take()
         };
         if let Some(viewer) = viewer {

@@ -176,3 +176,29 @@ async fn shell_create_share_snapshot() {
     state.leave().await.expect("leave");
     state.leave().await.expect("leave idempotent");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_join_does_not_wedge_session() {
+    let server = ServerGuard::spawn().expect("server");
+    let host = Arc::new(AppState::new());
+    host.set_server(&server.base).expect("set_server");
+    let code = host
+        .create_room(None, "host", "good-password-1")
+        .await
+        .expect("create_room");
+
+    let guest = Arc::new(AppState::new());
+    guest.set_server(&server.base).expect("set_server");
+    assert!(
+        guest
+            .join_room(None, &code, "guest", "wrong-password")
+            .await
+            .is_err(),
+        "wrong password must fail"
+    );
+    guest
+        .join_room(None, &code, "guest", "good-password-1")
+        .await
+        .expect("retry after failed join must not be SessionBusy");
+    guest.leave().await.expect("leave");
+}

@@ -37,12 +37,14 @@ pub struct CaptureConfig {
 /// Builds an output config already clamped to backend bounds: SCK rejects
 /// degenerate or absurd sizes, so every caller funnels through here (pure,
 /// tested). Floor 64 keeps tiny windows valid without the old 320x240
-/// forced upscale; ceiling 4096 matches the encoder; fps 1..=60 feeds
-/// `minimumFrameInterval` directly.
+/// forced upscale; ceiling 8192 matches the encoder (5120×1440 fits); fps
+/// 1..=60 feeds `minimumFrameInterval` directly.
+pub const MAX_CAPTURE_DIM: u32 = 8192;
+
 pub fn capture_config_for(w: u32, h: u32, fps: u32) -> CaptureConfig {
     CaptureConfig {
-        width: w.clamp(64, 4096),
-        height: h.clamp(64, 4096),
+        width: w.clamp(64, MAX_CAPTURE_DIM),
+        height: h.clamp(64, MAX_CAPTURE_DIM),
         fps: fps.clamp(1, 60),
     }
 }
@@ -194,8 +196,8 @@ mod tests {
             CaptureConfig { width: 3456, height: 2234, fps: 60 }
         );
         assert_eq!(
-            capture_config_for(8000, 5000, 60),
-            CaptureConfig { width: 4096, height: 4096, fps: 60 }
+            capture_config_for(9000, 9000, 60),
+            CaptureConfig { width: MAX_CAPTURE_DIM, height: MAX_CAPTURE_DIM, fps: 60 }
         );
         // Degenerate/zero floors without the old forced 320x240 upscale.
         assert_eq!(

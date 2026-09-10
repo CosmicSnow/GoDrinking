@@ -28,6 +28,7 @@ const MAX_PENDING = 8;
 const MAX_WS = 512;
 const HEARTBEAT_TTL_MS = Number(process.env.HEARTBEAT_TTL_MS || 5 * 60 * 1000);
 const GC_INTERVAL_MS = Number(process.env.GC_INTERVAL_MS || 15 * 1000);
+const DISCONNECT_GRACE_MS = Number(process.env.DISCONNECT_GRACE_MS || 8 * 1000);
 const BODY_LIMIT = 64 * 1024;
 const MAX_CANDIDATE_BYTES = 8 * 1024;
 const MAX_CANDIDATES_PER_ATTEMPT = 64;
@@ -646,7 +647,19 @@ wss.on("connection", (ws, req, meta) => {
   log("info", ip, "ws", room.code, member.id);
   ws.on("message", (data) => handleWsMessage(room, member, data));
   ws.on("close", () => {
-    if (member.ws === ws) member.ws = null;
+    if (member.ws !== ws) return;
+    member.ws = null;
+    const tokenAtClose = member.token;
+    const memberId = member.id;
+    const code = room.code;
+    setTimeout(() => {
+      const currentRoom = rooms.get(code);
+      if (!currentRoom) return;
+      const current = currentRoom.members.get(memberId);
+      if (current && current.token === tokenAtClose && !current.ws) {
+        removeMember(currentRoom, memberId, "gone");
+      }
+    }, DISCONNECT_GRACE_MS);
   });
 });
 

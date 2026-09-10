@@ -121,6 +121,11 @@ export default function App() {
   // Permissão de captura negada (marcador "Gravação de Tela" do backend):
   // a UI renderiza o bloco honesto com o caminho manual. Sem retry.
   const [sourcesDenied, setSourcesDenied] = useState(false);
+  const selectedSourceDims = (): { w: number; h: number } | null => {
+    const selected = sources.find((item) => `${item.kind}:${item.id}` === source.trim());
+    if (!selected || selected.w < 2 || selected.h < 2) return null;
+    return { w: selected.w, h: selected.h };
+  };
   // Thumbs PNG (data URL) por "kind:id": cache lazy do modal Compartilhar
   // (busca sob demanda via handlePreviewsVisible; mock nunca busca).
   const [previews, setPreviews] = useState<Record<string, string>>({});
@@ -599,6 +604,19 @@ export default function App() {
     }
     void runIntent(async () => {
       await startShare(source.trim());
+      const resolved = resolveDesired({
+        resolution,
+        customW,
+        customH,
+        quality,
+        customBitrate,
+        customFps,
+        srcDims: selectedSourceDims(),
+      });
+      if (!("profile" in resolved)) return;
+      const preset = quality === "custom" ? undefined : quality;
+      const result = await setQualityCommand(resolved.profile, preset);
+      setEffective(result);
     });
   };
 
@@ -749,13 +767,6 @@ export default function App() {
     );
   }
 
-  // Dimensões da fonte quando conhecida (display:/window: listado com w×h);
-  // synthetic/movie não têm teto conhecido — o backend normaliza na borda.
-  const selectedSourceDims = (): { w: number; h: number } | null => {
-    const selected = sources.find((item) => `${item.kind}:${item.id}` === source.trim());
-    if (!selected || selected.w < 2 || selected.h < 2) return null;
-    return { w: selected.w, h: selected.h };
-  };
   const srcDims = selectedSourceDims();
   const shareLive = snapshot?.share.state === "live";
 

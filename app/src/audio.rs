@@ -4,7 +4,7 @@
 use golive_platform::{AudioApp, EncodedAudioPacket};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -115,7 +115,10 @@ fn audio_hub(
         let Ok(mut list) = subscribers.lock() else {
             break;
         };
-        list.retain(|tx| tx.try_send(packet.clone()).is_ok());
+        list.retain(|tx| match tx.try_send(packet.clone()) {
+            Ok(()) | Err(TrySendError::Full(_)) => true,
+            Err(TrySendError::Disconnected(_)) => false,
+        });
     }
 }
 

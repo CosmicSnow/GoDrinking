@@ -1043,6 +1043,7 @@ async fn on_viewer_envelope(
                 Ok(inner) => inner,
                 Err(_) => return,
             };
+            inner.viewer_playback = None;
             inner.viewer = Some(Arc::clone(&viewer));
             inner.viewer_alive = Some(Arc::clone(&alive));
             inner.viewer_playback = playback;

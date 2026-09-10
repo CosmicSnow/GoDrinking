@@ -99,7 +99,7 @@ export const linkLabel = (state: LinkState): string => LINK_LABEL[state] ?? stat
 // comando `set_quality`, efetivo autoritativo no snapshot/evento).
 // ---------------------------------------------------------------------------
 
-export type ResolutionSel = "480p" | "720p" | "1080p" | "1:1" | "custom";
+export type ResolutionSel = "480p" | "720p" | "1080p" | "5120x1440" | "1:1" | "custom";
 export type QualitySel = "low" | "medium" | "high" | "custom";
 
 export interface DesiredProfile {
@@ -113,9 +113,10 @@ export const RESOLUTION_DIMS: Record<Exclude<ResolutionSel, "custom" | "1:1">, {
   "480p": { w: 854, h: 480 },
   "720p": { w: 1280, h: 720 },
   "1080p": { w: 1920, h: 1080 },
+  "5120x1440": { w: 5120, h: 1440 },
 };
 
-const NATIVE_CAP = { w: 4096, h: 4096 };
+const NATIVE_CAP = { w: 8192, h: 8192 };
 
 function evenDim(value: number): number {
   return Math.max(2, value - (value % 2));
@@ -166,7 +167,7 @@ export function validateCustomDim(raw: string, axis: "largura" | "altura"): stri
   const value = parseUint(raw);
   if (value === null) return `${axis}: número inteiro.`;
   if (value < 2) return `${axis}: pelo menos 2 px.`;
-  if (value > 4096) return `${axis}: máximo 4096 px.`;
+  if (value > 8192) return `${axis}: máximo 8192 px.`;
   if (value % 2 !== 0) return `${axis}: use valor par (o encoder exige dimensão par).`;
   return null;
 }
@@ -199,7 +200,7 @@ export interface QualitySelection {
 /**
  * Resolve o perfil desejado ou lista os erros (custom inválido/incompleto).
  * Com fonte conhecida, barra upscale além dela; sem fonte conhecida, vale o
- * teto do backend (4096) e o próprio backend normaliza na borda.
+ * teto do backend (8192) e o próprio backend normaliza na borda.
  */
 export function resolveDesired(
   selection: QualitySelection,
@@ -276,6 +277,10 @@ export function formatDelayMs(delayMs: number | null): string {
 export interface QualityPanelProps extends QualitySelection {
   /** Só com share no ar os controles valem (perfil do share vivo). */
   shareLive: boolean;
+  /** Prefixo de ids (dois painéis no DOM: TX-config e modal Compartilhar). */
+  idPrefix?: string;
+  /** Staging no popup de fonte: edita o desejo sem share vivo; Aplicar some. */
+  staging?: boolean;
   busy: boolean;
   /** Efetivo autoritativo do backend (null = nenhuma leitura ainda). */
   effective: EffectiveQuality | null;
@@ -303,41 +308,43 @@ export function QualityPanel(props: QualityPanelProps) {
     shareLive, busy, effective, backend, backendNote, applying, applyError,
     resolution, onResolution, customW, onCustomW, customH, onCustomH,
     quality, onQuality, customBitrate, onCustomBitrate, customFps, onCustomFps, srcDims,
-    onApply,
+    onApply, staging = false, idPrefix = "",
   } = props;
   const resolved = resolveDesired({
     resolution, customW, customH, quality, customBitrate, customFps, srcDims,
   });
   const valid = "profile" in resolved;
-  // Fieldset libera digitação sempre que há share (sem `!valid`: com CUSTOM
-  // vazio o usuário precisa digitar para corrigir). Só o Aplicar gata em `valid`.
-  const fieldDisabled = !shareLive || busy || applying;
+  const fid = (name: string) => `${idPrefix}${name}`;
+  // Staging (popup de fonte) libera o desejo sem share vivo. Live: só com
+  // share. Sem `!valid` no fieldset: CUSTOM vazio precisa poder ser digitado.
+  const fieldDisabled = (!staging && !shareLive) || busy || applying;
   const disabled = fieldDisabled || !valid;
   return (
     <div className="quality">
-      {!shareLive ? (
+      {!shareLive && !staging ? (
         <p className="empty" role="status">{QUALITY_DISABLED_REASON}</p>
       ) : null}
       <fieldset disabled={fieldDisabled} aria-label="Perfil de qualidade">
         <div className="row">
           <div className="field">
-            <label htmlFor="resolution">Resolução</label>
+            <label htmlFor={fid("resolution")}>Resolução</label>
             <select
-              id="resolution"
+              id={fid("resolution")}
               value={resolution}
               onChange={(event) => onResolution(event.target.value as ResolutionSel)}
             >
               <option value="480p">480p · 854×480</option>
               <option value="720p">720p · 1280×720</option>
               <option value="1080p">1080p · 1920×1080</option>
+              <option value="5120x1440">5120×1440</option>
               <option value="1:1">1:1 · nativo da fonte</option>
               <option value="custom">Custom…</option>
             </select>
           </div>
           <div className="field">
-            <label htmlFor="quality">Qualidade</label>
+            <label htmlFor={fid("quality")}>Qualidade</label>
             <select
-              id="quality"
+              id={fid("quality")}
               value={quality}
               onChange={(event) => onQuality(event.target.value as QualitySel)}
             >
@@ -351,9 +358,9 @@ export function QualityPanel(props: QualityPanelProps) {
         {resolution === "custom" ? (
           <div className="row">
             <div className="field">
-              <label htmlFor="custom-w">Largura (px, par)</label>
+              <label htmlFor={fid("custom-w")}>Largura (px, par)</label>
               <input
-                id="custom-w"
+                id={fid("custom-w")}
                 value={customW}
                 onChange={(event) => onCustomW(event.target.value.replace(/\D/g, ""))}
                 placeholder="1280"
@@ -362,9 +369,9 @@ export function QualityPanel(props: QualityPanelProps) {
               />
             </div>
             <div className="field">
-              <label htmlFor="custom-h">Altura (px, par)</label>
+              <label htmlFor={fid("custom-h")}>Altura (px, par)</label>
               <input
-                id="custom-h"
+                id={fid("custom-h")}
                 value={customH}
                 onChange={(event) => onCustomH(event.target.value.replace(/\D/g, ""))}
                 placeholder="720"
@@ -377,9 +384,9 @@ export function QualityPanel(props: QualityPanelProps) {
         {quality === "custom" ? (
           <div className="row">
             <div className="field">
-              <label htmlFor="custom-bitrate">Bitrate (kbps)</label>
+              <label htmlFor={fid("custom-bitrate")}>Bitrate (kbps)</label>
               <input
-                id="custom-bitrate"
+                id={fid("custom-bitrate")}
                 value={customBitrate}
                 onChange={(event) => onCustomBitrate(event.target.value.replace(/\D/g, ""))}
                 placeholder="2000"
@@ -388,9 +395,9 @@ export function QualityPanel(props: QualityPanelProps) {
               />
             </div>
             <div className="field">
-              <label htmlFor="custom-fps">FPS</label>
+              <label htmlFor={fid("custom-fps")}>FPS</label>
               <input
-                id="custom-fps"
+                id={fid("custom-fps")}
                 value={customFps}
                 onChange={(event) => onCustomFps(event.target.value.replace(/\D/g, ""))}
                 placeholder="30"
@@ -408,23 +415,27 @@ export function QualityPanel(props: QualityPanelProps) {
           {srcDims ? ` (fonte ${srcDims.w}×${srcDims.h})` : " (fonte desconhecida: sem teto de upscale)"}
         </p>
       ) : null}
-      <div className="row">
-        <button
-          type="button"
-          className="primary"
-          onClick={onApply}
-          disabled={disabled}
-          title={
-            !shareLive
-              ? QUALITY_DISABLED_REASON
-              : !valid
-                ? "Corrija os erros do perfil custom."
-                : "Aplica o perfil ao share vivo"
-          }
-        >
-          {applying ? "Aplicando…" : "Aplicar qualidade"}
-        </button>
-      </div>
+      {staging ? (
+        <p className="hint">Este perfil entra junto com Compartilhar.</p>
+      ) : (
+        <div className="row">
+          <button
+            type="button"
+            className="primary"
+            onClick={onApply}
+            disabled={disabled}
+            title={
+              !shareLive
+                ? QUALITY_DISABLED_REASON
+                : !valid
+                  ? "Corrija os erros do perfil custom."
+                  : "Aplica o perfil ao share vivo"
+            }
+          >
+            {applying ? "Aplicando…" : "Aplicar qualidade"}
+          </button>
+        </div>
+      )}
       {applyError ? (
         <p className="error" role="alert">{applyError}</p>
       ) : null}
@@ -1604,6 +1615,7 @@ export function RoomScreen(props: RoomProps) {
             permissão, a listagem erra honesto acima — nunca volta vazia
             silenciosa.
           </p>
+          <QualityPanel {...quality} staging idPrefix="share-" />
           <div className="modal-foot">
             <button type="button" className="btn ghost" onClick={closeShare}>
               Cancelar

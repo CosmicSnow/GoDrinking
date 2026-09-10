@@ -4,6 +4,7 @@
 //!
 //! ```text
 //! Sala: Closed -> Joining -> Open -> Closing -> Closed
+//!             \-> Joining -> Closed  (JoinFailed: handshake abort)
 //! Share: Stopped -> Starting -> Live -> Stopping -> Stopped
 //! Link: Absent -> Negotiating -> Connected -> Closing -> Absent
 //! ```
@@ -45,6 +46,7 @@ pub enum SalaState {
 pub enum SalaEvent {
     BeginJoin,
     Opened,
+    JoinFailed,
     BeginClose,
     Closed,
 }
@@ -63,12 +65,14 @@ impl SalaState {
         let ev = match event {
             SalaEvent::BeginJoin => "BeginJoin",
             SalaEvent::Opened => "Opened",
+            SalaEvent::JoinFailed => "JoinFailed",
             SalaEvent::BeginClose => "BeginClose",
             SalaEvent::Closed => "Closed",
         };
         match (*self, event) {
             (SalaState::Closed, SalaEvent::BeginJoin) => Ok(SalaState::Joining),
             (SalaState::Joining, SalaEvent::Opened) => Ok(SalaState::Open),
+            (SalaState::Joining, SalaEvent::JoinFailed) => Ok(SalaState::Closed),
             (SalaState::Open, SalaEvent::BeginClose) => Ok(SalaState::Closing),
             (SalaState::Closing, SalaEvent::Closed) => Ok(SalaState::Closed),
             _ => Err(reject(self.name(), ev)),
@@ -199,6 +203,15 @@ mod tests {
         assert!(SalaState::Closed.apply(SalaEvent::Opened).is_err());
         assert!(SalaState::Open.apply(SalaEvent::BeginJoin).is_err());
         assert!(SalaState::Joining.apply(SalaEvent::Closed).is_err());
+    }
+
+    #[test]
+    fn sala_join_failed_returns_to_closed() {
+        let s = SalaState::Closed.apply(SalaEvent::BeginJoin).unwrap();
+        let s = s.apply(SalaEvent::JoinFailed).unwrap();
+        assert_eq!(s, SalaState::Closed);
+        assert!(SalaState::Open.apply(SalaEvent::JoinFailed).is_err());
+        assert!(SalaState::Closed.apply(SalaEvent::JoinFailed).is_err());
     }
 
     #[test]

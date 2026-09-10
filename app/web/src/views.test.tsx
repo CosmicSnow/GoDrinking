@@ -7,6 +7,7 @@ import {
   HomeScreen,
   QUALITY_DISABLED_REASON,
   QUALITY_PRESETS,
+  QualityPanel,
   RoomScreen,
   WINDOW_HINT,
   formatBps,
@@ -526,15 +527,16 @@ describe("qualidade (espelha QualityProfile; fio bloqueado)", () => {
     expect(QUALITY_PRESETS.high).toMatchObject({ w: 1920, h: 1080, bitrate_kbps: 10000, fps: 60 });
   });
 
-  it("dimensão custom: inteira, par, 2–4096", () => {
+  it("dimensão custom: inteira, par, 2–8192", () => {
     expect(validateCustomDim("", "largura")).not.toBeNull();
     expect(validateCustomDim("12.5", "largura")).not.toBeNull();
     expect(validateCustomDim("0", "largura")).not.toBeNull();
     expect(validateCustomDim("1", "altura")).not.toBeNull();
-    expect(validateCustomDim("4097", "largura")).not.toBeNull();
+    expect(validateCustomDim("8193", "largura")).not.toBeNull();
     expect(validateCustomDim("641", "largura")).toContain("par");
     expect(validateCustomDim("640", "largura")).toBeNull();
     expect(validateCustomDim("4096", "altura")).toBeNull();
+    expect(validateCustomDim("5120", "largura")).toBeNull();
   });
 
   it("bitrate 100–20000 kbps, fps 1–60", () => {
@@ -572,7 +574,7 @@ describe("qualidade (espelha QualityProfile; fio bloqueado)", () => {
     expect(custom).toEqual({ profile: { w: 640, h: 360, bitrate_kbps: 1000, fps: 24 } });
   });
 
-  it("1:1 usa a fonte par ou o teto 4096 quando a fonte é desconhecida", () => {
+  it("1:1 usa a fonte par ou o teto 8192 quando a fonte é desconhecida", () => {
     const native = resolveDesired({
       resolution: "1:1",
       customW: "",
@@ -593,7 +595,17 @@ describe("qualidade (espelha QualityProfile; fio bloqueado)", () => {
       customFps: "",
       srcDims: { w: 0, h: 0 },
     });
-    expect(unknown).toEqual({ profile: { w: 4096, h: 4096, bitrate_kbps: 10000, fps: 60 } });
+    expect(unknown).toEqual({ profile: { w: 8192, h: 8192, bitrate_kbps: 10000, fps: 60 } });
+    const uwqhd = resolveDesired({
+      resolution: "5120x1440",
+      customW: "",
+      customH: "",
+      quality: "high",
+      customBitrate: "",
+      customFps: "",
+      srcDims: { w: 5120, h: 1440 },
+    });
+    expect(uwqhd).toEqual({ profile: { w: 5120, h: 1440, bitrate_kbps: 10000, fps: 60 } });
   });
 
   it("janela 0×0 não barra custom acima de 1080p", () => {
@@ -660,6 +672,15 @@ describe("formatadores de contadores", () => {
 });
 
 describe("QualityPanel (integrado na sala)", () => {
+  it("staging no popup de fonte libera o desejo sem share vivo", () => {
+    const html = renderToStaticMarkup(
+      createElement(QualityPanel, qualityFixture({ shareLive: false, staging: true })),
+    );
+    expect(html).not.toContain(QUALITY_DISABLED_REASON);
+    expect(html).toContain("5120×1440");
+    expect(html).toContain("Este perfil entra junto com Compartilhar");
+  });
+
   it("share inativo: tudo desabilitado com motivo", () => {
     const html = renderToStaticMarkup(
       createElement(RoomScreen, roomProps({ quality: qualityFixture({ shareLive: false }) })),
