@@ -15,6 +15,9 @@ use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
+};
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
@@ -173,28 +176,35 @@ fn grab_wgc_frame(
     texture_to_bgra(device, context, &tex).ok()
 }
 
-pub fn thumbnail_window(id: &str) -> Result<BgraFrame, PlatformError> {
-    let hwnd = parse_hwnd(id)?;
-    let (device, context) = create_device(None)?;
-    let winrt = winrt_device(&device)?;
-    let item = capture_item(hwnd)?;
+/// Captures a single still from any WGC item (window or monitor) with a
+/// fresh pool/session, mirroring the live pump. WGC composes the item's
+/// current content regardless of desktop change events, so stills work even
+/// on a static screen (DXGI duplication only fires on presents — its lone
+/// `AcquireNextFrame(2000)` times out on an idle desktop).
+fn grab_still(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    winrt: &IDirect3DDevice,
+    item: &GraphicsCaptureItem,
+    id: &str,
+) -> Result<BgraFrame, PlatformError> {
     let size = item.Size().map_err(|e| map_windows(&e))?;
     if size.Width <= 0 || size.Height <= 0 {
         return Err(PlatformError::SourceGone { id: id.to_owned() });
     }
     let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
-        &winrt,
+        winrt,
         DirectXPixelFormat::B8G8R8A8UIntNormalized,
         2,
         size,
     )
     .map_err(|e| map_windows(&e))?;
-    let session = pool.CreateCaptureSession(&item).map_err(|e| map_windows(&e))?;
+    let session = pool.CreateCaptureSession(item).map_err(|e| map_windows(&e))?;
     session.StartCapture().map_err(|e| map_windows(&e))?;
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut grabbed = None;
     while Instant::now() < deadline {
-        if let Some(frame) = grab_wgc_frame(&device, &context, &pool) {
+        if let Some(frame) = grab_wgc_frame(device, context, &pool) {
             grabbed = Some(frame);
             break;
         }
@@ -203,6 +213,77 @@ pub fn thumbnail_window(id: &str) -> Result<BgraFrame, PlatformError> {
     let _ = session.Close();
     let _ = pool.Close();
     grabbed.ok_or_else(|| PlatformError::Internal("thumbnail vazio".into()))
+}
+
+pub fn thumbnail_window(id: &str) -> Result<BgraFrame, PlatformError> {
+    let hwnd = parse_hwnd(id)?;
+    let (device, context) = create_device(None)?;
+    let winrt = winrt_device(&device)?;
+    let item = capture_item(hwnd)?;
+    grab_still(&device, &context, &winrt, &item, id)
+}
+
+struct MonitorQuery<'a> {
+    id: &'a str,
+    found: Option<HMONITOR>,
+}
+
+/// Maps a DXGI display device name (`\\.\DISPLAY1`…) to its `HMONITOR`,
+/// needed for `IGraphicsCaptureItemInterop::CreateForMonitor`.
+fn monitor_for_display(id: &str) -> Option<HMONITOR> {
+    let mut query = MonitorQuery { id, found: None };
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(monitor_enum_proc),
+            LPARAM(&mut query as *mut MonitorQuery as isize),
+        );
+    }
+    query.found
+}
+
+unsafe extern "system" fn monitor_enum_proc(
+    hmonitor: HMONITOR,
+    _hdc: HDC,
+    _rect: *mut RECT,
+    lparam: LPARAM,
+) -> BOOL {
+    let query = unsafe { &mut *(lparam.0 as *mut MonitorQuery) };
+    if query.found.is_some() {
+        return false.into();
+    }
+    let mut info = MONITORINFOEXW::default();
+    info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+    if unsafe { GetMonitorInfoW(hmonitor, &mut info.monitorInfo) }.as_bool() {
+        let end = info
+            .szDevice
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(info.szDevice.len());
+        let name = String::from_utf16_lossy(&info.szDevice[..end]);
+        if name == query.id {
+            query.found = Some(hmonitor);
+            return false.into();
+        }
+    }
+    true.into()
+}
+
+/// One-shot display still via WGC: works on a static desktop (DXGI path for
+/// the live pump is untouched; `thumbnail_display` here only serves the UI).
+pub fn thumbnail_display(id: &str) -> Result<BgraFrame, PlatformError> {
+    let monitor = monitor_for_display(id)
+        .ok_or_else(|| PlatformError::SourceGone { id: id.to_owned() })?;
+    let (device, context) = create_device(None)?;
+    let winrt = winrt_device(&device)?;
+    let interop =
+        windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
+            .map_err(|e| map_windows(&e))?;
+    let item =
+        unsafe { interop.CreateForMonitor::<GraphicsCaptureItem>(monitor) }
+            .map_err(|e| map_windows(&e))?;
+    grab_still(&device, &context, &winrt, &item, id)
 }
 
 pub fn run_window(

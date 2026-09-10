@@ -1,5 +1,5 @@
-//! Windows capture backend: DXGI Desktop Duplication (displays) +
-//! Windows.Graphics.Capture (windows).
+//! Windows capture backend: DXGI Desktop Duplication pump (displays) +
+//! Windows.Graphics.Capture (windows, display stills).
 //!
 //! Mapping to the pure contract (`golive-platform`):
 //! - `enumerate()` lists DXGI outputs (displays) and top-level windows.
@@ -9,7 +9,8 @@
 //! - `start()` creates a D3D11 device, acquires duplication or a WGC
 //!   session, and spawns a pump thread feeding a bounded latest-only
 //!   channel of [`BgraFrame`]. Startup is rendezvous-bounded.
-//! - `thumbnail()` is a one-shot still (same BGRA shape as macOS).
+//! - `thumbnail()` is a one-shot still (same BGRA shape as macOS). Display
+//!   stills prefer WGC so an idle desktop still yields a frame.
 //!
 //! Frames out, errors typed. No RTP/WebRTC/lifecycle here. Titles, pixels,
 //! tokens, and SDP never reach logs (aggregate counts + kind only).
@@ -71,7 +72,9 @@ pub fn enumerate() -> Result<Vec<SourceInfo>, PlatformError> {
 }
 
 /// One-shot still for the share-modal preview. Failures are typed; titles
-/// and pixels never reach logs.
+/// and pixels never reach logs. Display stills prefer WGC (composes the
+/// current frame even on a static desktop) with a DXGI fallback; full
+/// display capture stays on the DXGI pump.
 pub fn thumbnail(kind: SourceKind, id: &str) -> Result<BgraFrame, PlatformError> {
     init_com();
     let id = id.trim();
@@ -79,7 +82,7 @@ pub fn thumbnail(kind: SourceKind, id: &str) -> Result<BgraFrame, PlatformError>
         return Err(PlatformError::InvalidSource { reason: "id vazio" });
     }
     match kind {
-        SourceKind::Display => dxgi::thumbnail_display(id),
+        SourceKind::Display => wgc::thumbnail_display(id).or_else(|_| dxgi::thumbnail_display(id)),
         SourceKind::Window => wgc::thumbnail_window(id),
     }
 }
