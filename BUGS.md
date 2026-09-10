@@ -8,6 +8,7 @@
 |---------|----------------------------------------------------------------|----------------|--------------------------|------------------|
 | BUG-001 | Compartilhamento de tela lento com hosts e viewers macOS/Windows | open — correção parcial, falta validar ao vivo | relatado após mudança PLI | Confirmado: gates de captura/ponte reiniciavam o intervalo a cada chegada, perdendo FPS com jitter. Regressão de 300 chegadas a 30 FPS com jitter de 1 ms: 151 encaminhadas antes, 300 após correção de cadência. Validar tela real e consumo de recursos antes de remover. `link_stats.bitrate_bps` mede RGBA apresentado, não bitrate H.264; não prova storm de IDR. |
 | BUG-002 | Windows lento + GPU ~40% de RTX 3090 só assistindo             | open (windows) | build Windows pós-DXGI   | Lado Windows (LLM Windows): checar decode por software, present loop sem vsync, upload de textura por frame. |
+| BUG-003 | Viewer repete `ice connected` a cada ~0,5–2 s a sessão toda    | open | log viewer do amigo (~150 linhas, sessão com watch+share) | `wire_ice_events` (media.rs) emite sem dedupe a cada transição Connected/Completed — connects succeeding = flap/retry loop, não causa do kick. Apurar gatilho (roster re-watch? ICE flap). |
 
 Validação BUG-001 (2026-09-09): checks/testes de app, core, platform e
 platform-macos passaram; web typecheck/test/build, testes do server e

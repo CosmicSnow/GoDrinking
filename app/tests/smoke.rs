@@ -138,6 +138,7 @@ async fn shell_create_share_snapshot() {
             nickname: "smoke".into(),
             code_file: dir.join("code").to_string_lossy().into_owned(),
             status_file: dir.join("status.json").to_string_lossy().into_owned(),
+            share: None,
         })
         .expect("set_e2e_plan");
     let code = state

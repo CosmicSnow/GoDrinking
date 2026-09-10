@@ -94,6 +94,21 @@ fn join_deadline(worker: JoinHandle<()>, deadline: Duration) -> bool {
     done_rx.recv_timeout(deadline).is_ok()
 }
 
+/// Stream-restart ordering for profile switches (`set_quality`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestartOrder {
+    /// Start the new stream first, retire the old one after: glitch-free
+    /// (same channel, latest-only). Requires the backend to tolerate two
+    /// concurrent streams on one source.
+    NewFirst,
+    /// Stop + join the old stream before spawning the new one: a brief
+    /// blackout gap, but the only order backends with single-stream sources
+    /// support (Windows DXGI allows one duplication per process per output —
+    /// a second `DuplicateOutput` while the old one is alive fails
+    /// E_INVALIDARG).
+    StopFirst,
+}
+
 /// A capturable source family. Implemented per OS (macOS backend,
 /// Windows stub, mock). All methods are synchronous and bounded; the
 /// first call that needs the OS may trigger its permission prompt.
@@ -108,4 +123,11 @@ pub trait VideoSource: Send + Sized {
 
     /// Start capture. May trigger the OS permission prompt on first use.
     fn start(&mut self, config: &CaptureConfig) -> Result<FrameStream, PlatformError>;
+
+    /// Restart ordering for a profile switch on one listed source. Default
+    /// is the glitch-free [`RestartOrder::NewFirst`]; backends whose OS
+    /// forbids concurrent streams on one source override per kind.
+    fn restart_order(_info: &SourceInfo) -> RestartOrder {
+        RestartOrder::NewFirst
+    }
 }

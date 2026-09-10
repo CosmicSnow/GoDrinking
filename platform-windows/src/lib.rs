@@ -15,8 +15,8 @@
 //! tokens, and SDP never reach logs (aggregate counts + kind only).
 
 use golive_platform::{
-    BgraFrame, CaptureConfig, CapturePacket, FrameStream, PlatformError, SourceInfo, SourceKind,
-    VideoSource,
+    BgraFrame, CaptureConfig, CapturePacket, FrameStream, PlatformError, RestartOrder, SourceInfo,
+    SourceKind, VideoSource,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -141,6 +141,20 @@ impl VideoSource for WindowsSource {
             }
         }
     }
+
+    fn restart_order(info: &SourceInfo) -> RestartOrder {
+        match info.kind {
+            // DXGI allows a single duplication per process per output: a
+            // second DuplicateOutput while the old stream is alive fails
+            // E_INVALIDARG, so the old stream must stop + join first
+            // (brief blackout gap during the switch).
+            SourceKind::Display => RestartOrder::StopFirst,
+            // WGC sessions are independent per (item, pool) objects and the
+            // DWM composes for concurrent sessions, so windows keep the
+            // glitch-free new-first restart.
+            SourceKind::Window => RestartOrder::NewFirst,
+        }
+    }
 }
 
 fn init_com() {
@@ -168,8 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn open_validates_without_os() {
-        let bad = SourceInfo {
+    fn open_validates_without_os() {        let bad = SourceInfo {
             kind: SourceKind::Display,
             id: "  ".into(),
             name: String::new(),
@@ -181,6 +194,26 @@ mod tests {
             PlatformError::InvalidSource { .. }
         ));
         assert!(WindowsSource::validated(&display("\\\\.\\DISPLAY1")).is_ok());
+    }
+
+    /// Restart ordering per kind (no OS: pure mapping). DXGI displays must
+    /// stop first (one duplication per process per output — a concurrent
+    /// DuplicateOutput fails E_INVALIDARG); WGC windows keep new-first.
+    /// Windows-only build: runs on Windows CI, not on macOS/Linux hosts.
+    #[test]
+    fn restart_order_is_stop_first_for_dxgi_displays() {
+        assert_eq!(
+            WindowsSource::restart_order(&display("\\\\.\\DISPLAY1")),
+            RestartOrder::StopFirst
+        );
+        let window = SourceInfo {
+            kind: SourceKind::Window,
+            id: "12345".into(),
+            name: "Janela".into(),
+            w: 0,
+            h: 0,
+        };
+        assert_eq!(WindowsSource::restart_order(&window), RestartOrder::NewFirst);
     }
 
     #[test]

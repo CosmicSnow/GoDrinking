@@ -2,7 +2,7 @@
 //! through this instead of touching the screen.
 
 use crate::error::PlatformError;
-use crate::traits::{FrameStream, NextError, VideoSource};
+use crate::traits::{FrameStream, NextError, RestartOrder, VideoSource};
 use crate::types::{BgraFrame, CaptureConfig, CapturePacket, PixelFormat, SourceInfo, SourceKind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -161,6 +161,13 @@ mod tests {
         let mut bad = info();
         bad.id.clear();
         assert!(MockSource::open(&bad).is_err());
+    }
+
+    #[test]
+    fn restart_order_defaults_to_new_first() {
+        // Backends without single-stream limits keep the glitch-free order;
+        // only constrained backends (Windows DXGI displays) override.
+        assert_eq!(MockSource::restart_order(&info()), RestartOrder::NewFirst);
     }
 
     #[test]

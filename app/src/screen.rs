@@ -25,7 +25,7 @@ use golive_core::media::{normalize_dims, ExternalFrame, I420Frame, QualityProfil
 use golive_core::trace::{Trace, Stage, Sample as TraceSample};
 use golive_platform::{
     BgraFrame, CaptureConfig, CapturePacket, FrameStream, NextError, PixelFormat, PlatformError,
-    SourceInfo, SourceKind, VideoSource,
+    RestartOrder, SourceInfo, SourceKind, VideoSource,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -40,13 +40,15 @@ const CHANNEL_DEPTH: usize = 2;
 /// Handle to a running bridge. `stop()` is idempotent and bounded; `Drop`
 /// stops best-effort. `reconfigure()` restarts the OS stream at a new
 /// profile without dropping the core channel (the core repeats its last
-/// frame across the gap).
+/// frame across the gap) — new-first where the backend tolerates concurrent
+/// streams, stop-first where it does not (see [`RestartOrder`]).
 pub struct BridgeHandle {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     info: SourceInfo,
     core_tx: mpsc::SyncSender<ExternalFrame>,
     live: Arc<Mutex<QualityProfile>>,
+    order: RestartOrder,
 }
 
 impl BridgeHandle {
@@ -57,23 +59,35 @@ impl BridgeHandle {
         }
     }
 
-    /// Transactional stream restart at `profile`: the new stream starts
-    /// FIRST (same core channel, latest-only — no glitch, no leak); only
-    /// then the old one stops. On failure the old stream keeps running and
-    /// `Err` surfaces typed. Bounded (SCK start rendezvous has a deadline).
+    /// Stream restart at `profile` on the same core channel (latest-only —
+    /// no leak). The sequencing follows [`RestartOrder`]: NewFirst starts
+    /// the replacement first and only then retires the old stream (a spawn
+    /// failure leaves the old stream running); StopFirst stops + joins the
+    /// old stream first (a spawn failure leaves no stream — the typed `Err`
+    /// rolls publishers back upstream, same as today; no resurrection).
+    /// Bounded (stream start rendezvous has a deadline).
     pub fn reconfigure(&mut self, profile: QualityProfile) -> Result<(), PlatformError> {
         let config = profile_config(&self.info, &profile);
-        let (thread, stop) = spawn_stream(
-            self.info.clone(),
-            config,
-            self.core_tx.clone(),
-            Arc::clone(&self.live),
+        let order = self.order;
+        // Disjoint field captures: the retire closure owns stop/thread, the
+        // spawn closure only reads info/channel/profile.
+        let (thread, stop, _) = restart(
+            order,
+            || {
+                self.stop.store(true, Ordering::Release);
+                if let Some(old) = self.thread.take() {
+                    let _ = old.join();
+                }
+            },
+            || {
+                spawn_stream(
+                    self.info.clone(),
+                    config,
+                    self.core_tx.clone(),
+                    Arc::clone(&self.live),
+                )
+            },
         )?;
-        // New stream is live: retire the old one, adopt the new.
-        self.stop.store(true, Ordering::Release);
-        if let Some(old) = self.thread.take() {
-            let _ = old.join();
-        }
         self.thread = Some(thread);
         self.stop = stop;
         Ok(())
@@ -83,6 +97,31 @@ impl BridgeHandle {
 impl Drop for BridgeHandle {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Restart sequencing contract (the hook-level seam `reconfigure` runs
+/// through): [`RestartOrder::NewFirst`] spawns the replacement first and
+/// only retires the old stream once the new one is live, so a spawn failure
+/// leaves the old stream untouched; [`RestartOrder::StopFirst`] retires the
+/// old stream first, so a spawn failure propagates with no stream left (the
+/// caller rolls back loudly instead of resurrecting). Pure ordering — the OS
+/// calls happen in the closures.
+fn restart<T, E>(
+    order: RestartOrder,
+    stop_old: impl FnOnce(),
+    spawn_new: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    match order {
+        RestartOrder::NewFirst => {
+            let built = spawn_new()?;
+            stop_old();
+            Ok(built)
+        }
+        RestartOrder::StopFirst => {
+            stop_old();
+            spawn_new()
+        }
     }
 }
 
@@ -96,16 +135,18 @@ fn profile_config(info: &SourceInfo, profile: &QualityProfile) -> CaptureConfig 
 }
 
 /// Spawns one OS stream + pump feeding `core_tx`. `open_stream` only
-/// returns once SCK rendezvoused started, so no second rendezvous here;
-/// thread-builder failure is the only spawn error. Shared by initial
-/// start and reconfigure.
+/// returns once the backend rendezvoused started, so no second rendezvous
+/// here; thread-builder failure is the only spawn error. Shared by initial
+/// start and reconfigure. Passes the backend's [`RestartOrder`] through so
+/// the handle stores it once (queried at the selection point in
+/// `open_stream`, never re-queried per switch).
 fn spawn_stream(
     info: SourceInfo,
     config: CaptureConfig,
     core_tx: mpsc::SyncSender<ExternalFrame>,
     live: Arc<Mutex<QualityProfile>>,
-) -> Result<(std::thread::JoinHandle<()>, Arc<AtomicBool>), PlatformError> {
-    let mut stream = open_stream(&info, &config)?;
+) -> Result<(std::thread::JoinHandle<()>, Arc<AtomicBool>, RestartOrder), PlatformError> {
+    let (mut stream, order) = open_stream(&info, &config)?;
     let stop = Arc::new(AtomicBool::new(false));
     let stop_ = Arc::clone(&stop);
     let thread = std::thread::Builder::new()
@@ -114,7 +155,7 @@ fn spawn_stream(
             pump_bridge(&mut stream, &core_tx, &stop_, &live, Instant::now);
         })
         .map_err(|e| PlatformError::Internal(format!("thread da ponte: {e}")))?;
-    Ok((thread, stop))
+    Ok((thread, stop, order))
 }
 
 /// Starts the OS stream for `info` and bridges it into core frames.
@@ -128,11 +169,11 @@ pub fn start_capture(
     live: Arc<Mutex<QualityProfile>>,
 ) -> Result<(mpsc::Receiver<ExternalFrame>, BridgeHandle), PlatformError> {
     let (core_tx, core_rx) = mpsc::sync_channel::<ExternalFrame>(CHANNEL_DEPTH);
-    let (thread, stop) =
+    let (thread, stop, order) =
         spawn_stream(info.clone(), config, core_tx.clone(), Arc::clone(&live))?;
     Ok((
         core_rx,
-        BridgeHandle { stop, thread: Some(thread), info: info.clone(), core_tx, live },
+        BridgeHandle { stop, thread: Some(thread), info: info.clone(), core_tx, live, order },
     ))
 }
 
@@ -160,11 +201,14 @@ pub fn start_capture_for(
     Ok((rx, handle, label))
 }
 
-/// Opens + starts the platform stream for one listed source.
+/// Opens + starts the platform stream for one listed source, alongside the
+/// backend's [`RestartOrder`] for that source (each arm answers through the
+/// platform abstraction — this stays the single cfg-gated selection point;
+/// `reconfigure` only ever reads the stored order, never re-queries).
 fn open_stream(
     info: &SourceInfo,
     config: &CaptureConfig,
-) -> Result<FrameStream, PlatformError> {
+) -> Result<(FrameStream, RestartOrder), PlatformError> {
     #[cfg(target_os = "macos")]
     {
         let mut source =
@@ -172,12 +216,14 @@ fn open_stream(
                 // open() is validation-only; surface as-is (typed upstream).
                 e
             })?;
-        source.start(config)
+        let stream = source.start(config)?;
+        Ok((stream, golive_platform_macos::ScSource::restart_order(info)))
     }
     #[cfg(target_os = "windows")]
     {
         let mut source = golive_platform_windows::WindowsSource::open(info)?;
-        source.start(config)
+        let stream = source.start(config)?;
+        Ok((stream, golive_platform_windows::WindowsSource::restart_order(info)))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -456,6 +502,69 @@ mod tests {
             px[3] = 255;
         }
         BgraFrame { w, h, stride: (w * 4) as usize, format: PixelFormat::Bgra8888, data }
+    }
+
+    /// Records hook calls for the restart-ordering tests below.
+    struct OrderLog {
+        events: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl OrderLog {
+        fn new() -> Self {
+            Self { events: std::sync::Mutex::new(Vec::new()) }
+        }
+
+        fn stop_old(&self) {
+            self.events.lock().expect("log lock").push("stop-old");
+        }
+
+        fn spawn_ok(&self) -> Result<(), PlatformError> {
+            self.events.lock().expect("log lock").push("spawn-new");
+            Ok(())
+        }
+
+        fn spawn_err(&self) -> Result<(), PlatformError> {
+            self.events.lock().expect("log lock").push("spawn-new");
+            Err(PlatformError::Internal("new spawn failed".into()))
+        }
+
+        fn events(&self) -> Vec<&'static str> {
+            self.events.lock().expect("log lock").clone()
+        }
+    }
+
+    #[test]
+    fn restart_new_first_spawns_before_stopping_old() {
+        // macOS SCK tolerates concurrent streams: the replacement is live
+        // before the old one retires (glitch-free), and a spawn failure
+        // never touches the old stream.
+        let log = OrderLog::new();
+        let out = restart(RestartOrder::NewFirst, || log.stop_old(), || log.spawn_ok());
+        assert!(out.is_ok());
+        assert_eq!(log.events(), vec!["spawn-new", "stop-old"]);
+        // Spawn failure: old stream untouched (no stop recorded).
+        let log = OrderLog::new();
+        let out = restart(RestartOrder::NewFirst, || log.stop_old(), || log.spawn_err());
+        assert!(out.is_err());
+        assert_eq!(log.events(), vec!["spawn-new"]);
+    }
+
+    #[test]
+    fn restart_stop_first_stops_old_before_spawning_new() {
+        // Windows DXGI allows one duplication per process per output: the
+        // old stream must be gone before DuplicateOutput runs again. A spawn
+        // failure then propagates with no stream left (loud rollback, never
+        // silent resurrection).
+        let log = OrderLog::new();
+        let out = restart(RestartOrder::StopFirst, || log.stop_old(), || log.spawn_ok());
+        assert!(out.is_ok());
+        assert_eq!(log.events(), vec!["stop-old", "spawn-new"]);
+        // Spawn failure: old already stopped, error surfaces typed.
+        let log = OrderLog::new();
+        let out: Result<(), PlatformError> =
+            restart(RestartOrder::StopFirst, || log.stop_old(), || log.spawn_err());
+        assert!(out.is_err());
+        assert_eq!(log.events(), vec!["stop-old", "spawn-new"]);
     }
 
     #[test]
