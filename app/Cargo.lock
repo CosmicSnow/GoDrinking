@@ -1856,7 +1856,7 @@ dependencies = [
 
 [[package]]
 name = "golive-app"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "base64 0.22.1",
  "golive-core",
@@ -1876,7 +1876,7 @@ dependencies = [
 
 [[package]]
 name = "golive-core"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "bytes",
  "golive-platform",
@@ -1901,14 +1901,14 @@ dependencies = [
 
 [[package]]
 name = "golive-platform"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "golive-platform-macos"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "block2 0.6.2",
  "dispatch2",
@@ -1924,7 +1924,7 @@ dependencies = [
 
 [[package]]
 name = "golive-platform-windows"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "golive-platform",
  "windows 0.62.2",

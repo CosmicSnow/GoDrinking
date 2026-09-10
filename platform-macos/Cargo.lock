@@ -31,14 +31,14 @@ dependencies = [
 
 [[package]]
 name = "golive-platform"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "golive-platform-macos"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "block2",
  "dispatch2",

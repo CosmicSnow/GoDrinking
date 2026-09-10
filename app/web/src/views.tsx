@@ -732,7 +732,7 @@ export function HomeScreen(props: HomeProps) {
               {error ? (
                 <p className="lobby-error" id="lobbyError" role="alert">{error}</p>
               ) : null}
-              <small id="lobbyNote">Tela direto de um PC para outro. O servidor só apresenta, nunca vê o vídeo.</small>
+              <small id="lobbyNote">Tela direto de um PC para outro. O servidor só apresenta, nunca vê o vídeo. <span style={{ opacity: 0.6, fontSize: 11 }}>· v0.7.0</span></small>
             </div>
           </div>
         </main>
