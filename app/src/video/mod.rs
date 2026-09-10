@@ -247,7 +247,7 @@ impl ViewState {
         if self.zoom <= MIN_ZOOM || !dx.is_finite() || !dy.is_finite() {
             return;
         }
-        let (ox, oy) = clamp_offset(self.ox + dx, self.oy + dy, rect, self.zoom);
+        let (ox, oy) = clamp_offset(self.ox - dx, self.oy - dy, rect, self.zoom);
         self.ox = ox;
         self.oy = oy;
     }
@@ -1262,10 +1262,23 @@ mod tests {
         let rect = Rect { x: 0, y: 0, w: 400, h: 300 };
         let mut view = ViewState::new();
         view.zoom_by(rect, (200.0, 150.0), 3.0);
-        view.pan_by(rect, 50.0, 40.0);
+        view.pan_by(rect, -50.0, -40.0);
         assert!(view.ox > 0.0 && view.oy > 0.0);
         view.zoom_by(rect, (200.0, 150.0), 0.05);
         assert_eq!((view.zoom, view.ox, view.oy), (1.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn pan_drags_the_picture_with_the_cursor() {
+        let rect = Rect { x: 0, y: 0, w: 400, h: 300 };
+        let mut view = ViewState::new();
+        view.zoom = 2.0;
+        view.ox = 100.0;
+        view.oy = 80.0;
+        view.pan_by(rect, 0.0, -10.0);
+        assert_eq!(view.oy, 90.0);
+        view.pan_by(rect, 10.0, 0.0);
+        assert_eq!(view.ox, 90.0);
     }
 
     #[test]
@@ -1276,10 +1289,9 @@ mod tests {
         view.pan_by(rect, 500.0, 500.0);
         assert_eq!((view.ox, view.oy), (0.0, 0.0));
         view.zoom_by(rect, (200.0, 150.0), 4.0);
-        // Way past the edge: clamped to (1200, 900), never negative.
-        view.pan_by(rect, 10_000.0, 10_000.0);
-        assert_eq!((view.ox, view.oy), (1200.0, 900.0));
         view.pan_by(rect, -10_000.0, -10_000.0);
+        assert_eq!((view.ox, view.oy), (1200.0, 900.0));
+        view.pan_by(rect, 10_000.0, 10_000.0);
         assert_eq!((view.ox, view.oy), (0.0, 0.0));
     }
 

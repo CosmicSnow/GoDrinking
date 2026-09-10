@@ -86,6 +86,7 @@ struct App {
     /// Latest frame, kept for zoom/pan/fullscreen re-renders (re-blits send
     /// no ack and touch no clock: only newly presented frames do).
     last: Option<Vec<u8>>,
+    scaled: Option<(u32, u32, usize, Vec<u32>)>,
 }
 
 impl App {
@@ -118,41 +119,46 @@ impl App {
     /// Zoom-aware blit + one-line help overlay. Returns whether a buffer was
     /// presented.
     fn blit(&mut self) -> bool {
-        let (window, surface) = match (self.window.as_ref(), self.surface.as_mut()) {
-            (Some(window), Some(surface)) => (window, surface),
-            _ => return false,
+        let Some(window) = self.window.as_ref() else {
+            return false;
         };
         let size = window.inner_size();
         let (vw, vh) = (size.width, size.height);
-        if vw == 0 || vh == 0 {
+        if vw == 0 || vh == 0 || self.surface.is_none() {
             return false;
         }
-        let rgba = match self.last.as_ref() {
-            Some(rgba) => rgba,
-            None => return false,
-        };
+        if self.last.is_none() {
+            return false;
+        }
         let rect = letterbox(self.src_w, self.src_h, vw, vh);
         if rect.w == 0 || rect.h == 0 {
             return false;
         }
-        // Zoomed picture size, then the visible window onto it at (ox, oy).
         let sw = (rect.w as f32 * self.view.zoom).round() as u32;
         let sh = (rect.h as f32 * self.view.zoom).round() as u32;
         if sw == 0 || sh == 0 {
             return false;
         }
-        let scaled_storage;
-        let scaled = if sw == self.src_w && sh == self.src_h {
-            rgba.as_slice()
-        } else {
-            scaled_storage = scale_rgba_bilinear(rgba, self.src_w, self.src_h, sw, sh);
-            &scaled_storage
-        };
-        let pixels = rgba_to_xrgb8888(scaled);
+        let src_ptr = self.last.as_ref().unwrap().as_ptr() as usize;
+        let hit = self.scaled.as_ref().is_some_and(|(cw, ch, ptr, pix)| {
+            *cw == sw && *ch == sh && *ptr == src_ptr && pix.len() == sw as usize * sh as usize
+        });
+        if !hit {
+            let pix = {
+                let rgba = self.last.as_ref().unwrap();
+                if sw == self.src_w && sh == self.src_h {
+                    rgba_to_xrgb8888(rgba)
+                } else {
+                    rgba_to_xrgb8888(&scale_rgba_bilinear(rgba, self.src_w, self.src_h, sw, sh))
+                }
+            };
+            self.scaled = Some((sw, sh, src_ptr, pix));
+        }
+        let pixels = self.scaled.as_ref().unwrap().3.as_slice();
         if pixels.len() != sw as usize * sh as usize {
             return false;
         }
-        let presented = if let Ok(mut buffer) = surface.buffer_mut() {
+        let presented = if let Ok(mut buffer) = self.surface.as_mut().unwrap().buffer_mut() {
             // Black bars are the default: fill all, then blit the visible
             // slice of the zoomed picture.
             buffer.fill(0);
@@ -531,6 +537,7 @@ fn run() -> Result<(), String> {
         interacted_at: Instant::now(),
         help_active: true,
         last: None,
+        scaled: None,
     };
     event_loop.set_control_flow(ControlFlow::Wait);
     event_loop
@@ -621,7 +628,7 @@ mod tests {
             ack: None, inbox: Arc::clone(&inbox), gone: false, src_w: 2, src_h: 2,
             view: ViewState::new(), cursor: (0.0, 0.0), dragging: false,
             drag_last: (0.0, 0.0), last_press: None, interacted_at: now,
-            help_active: false, last: None,
+            help_active: false, last: None, scaled: None,
         };
         let pixels = vec![42; 16];
         let allocation = pixels.as_ptr();
