@@ -70,32 +70,52 @@ pub fn texture_to_bgra(
     context: &ID3D11DeviceContext,
     tex: &ID3D11Texture2D,
 ) -> Result<BgraFrame, PlatformError> {
-    let mut desc = D3D11_TEXTURE2D_DESC::default();
-    unsafe { tex.GetDesc(&mut desc) };
-    desc.Usage = D3D11_USAGE_STAGING;
-    desc.BindFlags = 0;
-    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
-    desc.MiscFlags = 0;
-    let mut staging = None;
-    unsafe { device.CreateTexture2D(&desc, None, Some(&mut staging)) }
-        .map_err(|e| map_windows(&e))?;
-    let staging = staging.ok_or_else(|| PlatformError::Internal("staging vazio".into()))?;
-    unsafe { context.CopyResource(&staging, tex) };
-    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-    unsafe { context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
-        .map_err(|e| map_windows(&e))?;
-    let w = desc.Width;
-    let h = desc.Height;
-    let stride = mapped.RowPitch as usize;
-    let need = stride
-        .saturating_mul(h.saturating_sub(1) as usize)
-        .saturating_add((w as usize).saturating_mul(4));
-    let frame = if mapped.pData.is_null() {
-        None
-    } else {
-        let src = unsafe { std::slice::from_raw_parts(mapped.pData as *const u8, need) };
-        copy_tight_bgra(src, w, h, stride)
-    };
-    unsafe { context.Unmap(&staging, 0) };
-    frame.ok_or_else(|| PlatformError::Internal("frame BGRA vazio".into()))
+    Readback::new(device.clone(), context.clone()).texture_to_bgra(tex)
+}
+
+/// Device/context and staging have one lifetime; never reuse across devices.
+pub(crate) struct Readback {
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    staging: Option<(D3D11_TEXTURE2D_DESC, ID3D11Texture2D)>,
+}
+
+impl Readback {
+    pub(crate) fn new(device: ID3D11Device, context: ID3D11DeviceContext) -> Self {
+        Self { device, context, staging: None }
+    }
+
+    pub(crate) fn texture_to_bgra(&mut self, tex: &ID3D11Texture2D) -> Result<BgraFrame, PlatformError> {
+        let context = &self.context;
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { tex.GetDesc(&mut desc) };
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        desc.MiscFlags = 0;
+        let staging = crate::resource::cached(&mut self.staging, desc, || {
+            let mut staging = None;
+            unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut staging)) }
+                .map_err(|e| map_windows(&e))?;
+            staging.ok_or_else(|| PlatformError::Internal("staging vazio".into()))
+        })?;
+        unsafe { context.CopyResource(staging, tex) };
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe { context.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
+            .map_err(|e| map_windows(&e))?;
+        let w = desc.Width;
+        let h = desc.Height;
+        let stride = mapped.RowPitch as usize;
+        let need = stride
+            .saturating_mul(h.saturating_sub(1) as usize)
+            .saturating_add((w as usize).saturating_mul(4));
+        let frame = if mapped.pData.is_null() {
+            None
+        } else {
+            let src = unsafe { std::slice::from_raw_parts(mapped.pData as *const u8, need) };
+            copy_tight_bgra(src, w, h, stride)
+        };
+        unsafe { context.Unmap(staging, 0) };
+        frame.ok_or_else(|| PlatformError::Internal("frame BGRA vazio".into()))
+    }
 }

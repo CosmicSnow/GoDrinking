@@ -285,6 +285,19 @@ pub fn scale_bgra_nearest(src: &BgraFrame, dw: u32, dh: u32) -> BgraFrame {
     BgraFrame { w: dw, h: dh, stride: (dw as usize) * 4, format: PixelFormat::Bgra8888, data }
 }
 
+/// Keep tight, already-sized captures owned across the bridge handoff.
+fn prepare_bgra(src: BgraFrame, w: u32, h: u32) -> BgraFrame {
+    if (src.w, src.h) == (w, h) && w > 0 && h > 0
+        && src.stride == w as usize * 4
+        && src.data.len() == src.stride * h as usize
+        && src.format == PixelFormat::Bgra8888
+    {
+        src
+    } else {
+        scale_bgra_nearest(&src, w, h)
+    }
+}
+
 /// Bridge pump: platform packets → throttled core frames, latest-only.
 /// Surplus packets die on arrival (no conversion, no alloc); kept CPU
 /// frames convert at TARGET size; kept GPU packets forward retained
@@ -337,7 +350,7 @@ fn pump_bridge(
                 // Fit the capture into the profile (never upscale), so the
                 // encoder never sees anything above the contract.
                 let (tw, th) = normalize_dims(bgra.w, bgra.h, target.0, target.1);
-                let small = scale_bgra_nearest(&bgra, tw, th);
+                let small = prepare_bgra(bgra, tw, th);
                 match golive_platform::bgra_to_i420(&small) {
                     Ok(planar) => {
                         let mut data =
@@ -817,5 +830,33 @@ mod tests {
             ExternalFrame::Cpu(_) => panic!("GPU packet must not convert in the bridge"),
         }
         assert_eq!(RELEASES.load(Ordering::SeqCst), 1, "exactly one release");
+    }
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+
+    #[test]
+    fn bridge_keeps_matching_capture_allocation() {
+        let src = BgraFrame { w: 2, h: 2, stride: 8, format: PixelFormat::Bgra8888, data: (0..16).collect() };
+        let pixels = src.data.as_ptr();
+        let expected = golive_platform::bgra_to_i420(&src).unwrap();
+        let ready = prepare_bgra(src, 2, 2);
+        assert_eq!(ready.data.as_ptr(), pixels);
+        assert_eq!(golive_platform::bgra_to_i420(&ready).unwrap(), expected);
+    }
+
+    #[test]
+    fn bridge_preserves_padding_and_short_frame_normalization() {
+        for len in [0, 9, 20] {
+            let src = BgraFrame { w: 2, h: 2, stride: 12, format: PixelFormat::Bgra8888, data: vec![42; len] };
+            for dims in [(2, 2), (2, 4)] {
+                let expected = scale_bgra_nearest(&src, dims.0, dims.1);
+                let ready = prepare_bgra(src.clone(), dims.0, dims.1);
+                assert_eq!(ready.data, expected.data);
+                assert_eq!(ready.stride, expected.stride);
+            }
+        }
     }
 }

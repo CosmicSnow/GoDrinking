@@ -6,16 +6,18 @@
 
 | ID      | Sintoma                                                        | Status         | Desde                    | Suspeita / notas |
 |---------|----------------------------------------------------------------|----------------|--------------------------|------------------|
-| BUG-001 | Compartilhamento de tela lento com hosts e viewers macOS/Windows | open — correção parcial, falta validar ao vivo | relatado após mudança PLI | Confirmado: gates de captura/ponte reiniciavam o intervalo a cada chegada, perdendo FPS com jitter. Regressão de 300 chegadas a 30 FPS com jitter de 1 ms: 151 encaminhadas antes, 300 após correção de cadência. Validar tela real e consumo de recursos antes de remover. `link_stats.bitrate_bps` mede RGBA apresentado, não bitrate H.264; não prova storm de IDR. |
-| BUG-002 | Windows lento + GPU ~40% de RTX 3090 só assistindo             | open (windows) | build Windows pós-DXGI   | Lado Windows (LLM Windows): checar decode por software, present loop sem vsync, upload de textura por frame. |
+| BUG-001 | Compartilhamento de tela lento com hosts e viewers macOS/Windows | open — Mac validado ao vivo, falta Windows + CPU/GPU | relatado após mudança PLI | Confirmado: gates de captura/ponte reiniciavam o intervalo a cada chegada, perdendo FPS com jitter. Regressão de 300 chegadas a 30 FPS com jitter de 1 ms: 151 encaminhadas antes, 300 após correção de cadência. Validado ao vivo no Mac (viewer fresh ~28,6/s, Display-3 PASS 23 s). Aberto: host Windows 1080p60 emite ~13fps/~2,5 Mbps (medido no viewer LHYSYV, path sem perdas — teto no emissor, trace do host pendente) + CPU/GPU sustentados. `link_stats.bitrate_bps` mede RGBA apresentado, não bitrate H.264; não prova storm de IDR. |
+| BUG-002 | Windows lento + GPU ~40% de RTX 3090 só assistindo             | open (windows) | build Windows pós-DXGI   | Lado Windows (LLM Windows): checar decode por software, present loop sem vsync, upload de textura por frame. Evidência nova: viewer inocente (28fps local saudável, 0 repeats, path sem perdas); pipeline sem GPU em nenhum estágio (sem NVENC — 3090 não ajuda em nada hoje); host Windows emite ~13fps num alvo 60fps (ver BUG-001). |
 | BUG-003 | Viewer repete `ice connected` a cada ~0,5–2 s a sessão toda    | open | log viewer do amigo (~150 linhas, sessão com watch+share) | `wire_ice_events` (media.rs) emite sem dedupe a cada transição Connected/Completed — connects succeeding = flap/retry loop, não causa do kick. Apurar gatilho (roster re-watch? ICE flap). |
 
 Validação BUG-001 (2026-09-09): checks/testes de app, core, platform e
 platform-macos passaram; web typecheck/test/build, testes do server e
 `cargo xwin check --target x86_64-pc-windows-msvc` passaram. Build release
 macOS concluído. Após conceder Gravação de Tela, captura de display e
-apresentação no watcher local confirmadas; suavidade/FPS sustentado e CPU/GPU
-ainda não verificados. Usuário segue observando ~3,7 FPS. Achado adicional:
+apresentação no watcher local confirmadas; viewer local saudável
+(~28,6 fresh fps, 0 repeats, medido 2026-09-09). Observação antiga de
+~3,7 FPS superada no Mac; lentidão restante é host Windows (ver linha
+BUG-001). CPU/GPU sustentados ainda não verificados. Achado adicional:
 timeout de 250 ms no feeder reenvia o frame anterior e incrementa apresentados,
 podendo aparentar ~4 FPS sem frames novos. Instrumentação opt-in descrita em
 MEDIA_DEBUG.md separa captura, entrada, encode, RTP, decode e apresentações
@@ -32,11 +34,12 @@ OpenH264 otimizado 149/5 s; release 150/5 s. Conversão RGBA em
 opt-level=3 nos perfis dev de app/core. Verificação ao vivo da nova build,
 60 FPS e Windows ainda pendentes; não considerar o problema resolvido.
 
-Checks após ajuste: app `cargo check`/`cargo test` (57 + smoke), core
-`cargo test` (54 + 3 integração, incluindo movie com fixture), web
-`npm run typecheck`/`npm test` (67)/`npm run build`, server `npm test`,
-Windows cross-check passaram (6 avisos preexistentes no stub VT).
-Executável debug e helper recompilados com `tauri/custom-protocol`.
+Checks após ajuste: app `cargo test --lib` (69) + smoke compila, core
+`--lib` (56), platform (23), web vitest (68), `npm run build`,
+server `npm test`, `analyze-trace.py --self-test` (14) — todos verdes
+(medido 2026-09-09). `cargo xwin check` PENDENTE p/ RestartOrder
+(platform-windows não compila no host macOS). Executável debug e helper
+recompilados com `tauri/custom-protocol`.
 
 Validação Display-3 + geração (2026-09-09): harness `E2E_SHARE=display:3`
 (hook `--e2e-plan`, traces por instância + analyzer) verdict PASS em 23 s:
@@ -52,5 +55,8 @@ com recuperação total. Arquivos (não commitados): `app/src/lib.rs` (fix),
 `core/src/trace.rs` + `media.rs` + `video/mod.rs` (pli/max_gap),
 `scripts/e2e-packaged.sh` + `e2e.ts` (lane display + traces). Veredicto e
 traces do run em `e2e-artifacts/` (verdict.json + traces/host-trace +
-viewer-trace). Pendente: apurar possível reconnect loop do viewer (`ice
-connected` ~a cada 2 s ×60 no session log) como bug próprio.
+viewer-trace). Reconnect loop confirmado em log posterior e registrado
+como BUG-003 (linha da tabela). NOTA: todos os fixes citados nesta
+validação estão NÃO-COMMITADOS na árvore (~15 arquivos) — necessário
+commit antes de distribuir builds (o branch `fresh/native-core` do amigo
+não os contém).

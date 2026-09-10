@@ -29,7 +29,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::copy::{gate_open, initial_last_ns, interval_ns, now_ns};
-use crate::d3d::{create_device, texture_to_bgra};
+use crate::d3d::{create_device, Readback};
 use crate::map::map_windows;
 
 pub fn enumerate_windows() -> Result<Vec<SourceInfo>, PlatformError> {
@@ -167,13 +167,12 @@ fn texture_from_frame(
 }
 
 fn grab_wgc_frame(
-    device: &ID3D11Device,
-    context: &ID3D11DeviceContext,
+    readback: &mut Readback,
     pool: &Direct3D11CaptureFramePool,
 ) -> Option<BgraFrame> {
     let frame = pool.TryGetNextFrame().ok()?;
     let tex = texture_from_frame(&frame).ok()?;
-    texture_to_bgra(device, context, &tex).ok()
+    readback.texture_to_bgra(&tex).ok()
 }
 
 /// Captures a single still from any WGC item (window or monitor) with a
@@ -203,8 +202,9 @@ fn grab_still(
     session.StartCapture().map_err(|e| map_windows(&e))?;
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut grabbed = None;
+    let mut readback = Readback::new(device.clone(), context.clone());
     while Instant::now() < deadline {
-        if let Some(frame) = grab_wgc_frame(device, context, &pool) {
+        if let Some(frame) = grab_wgc_frame(&mut readback, &pool) {
             grabbed = Some(frame);
             break;
         }
@@ -372,9 +372,10 @@ pub fn run_window(
     );
     let interval = interval_ns(applied.fps);
     let last_ns = AtomicU64::new(initial_last_ns(now_ns(), interval));
+    let mut readback = Readback::new(device, context);
     let _ = ready_tx.send(Ok(()));
     while !stop_flag.load(Ordering::Acquire) {
-        match grab_wgc_frame(&device, &context, &pool) {
+        match grab_wgc_frame(&mut readback, &pool) {
             Some(frame) => {
                 let now = now_ns();
                 if gate_open(last_ns.load(Ordering::Relaxed), now, interval) {

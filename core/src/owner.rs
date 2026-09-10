@@ -380,6 +380,17 @@ impl Owner {
         Ok(())
     }
 
+    /// Read-only guard for work built outside the owner lock.
+    pub fn link_is_current(&self, fence: &Fence) -> bool {
+        let inner = self.inner.lock().expect("owner lock poisoned");
+        inner.session_state == SalaState::Open
+            && inner.session_id == Some(fence.session)
+            && inner.share_id == fence.share
+            && fence.link.and_then(|id| inner.links.get(&id)).is_some_and(|entry| {
+                entry.attempt == fence.attempt && entry.state.is_live()
+            })
+    }
+
     /// Closes exactly one watcher's link (`Closing`, fresh attempt).
     /// Idempotent while already closing.
     pub fn unwatch(&self, watcher: &str) -> Result<Fence, OwnerError> {
@@ -737,6 +748,26 @@ mod tests {
             owner.unwatch("ana"),
             Err(OwnerError::WatcherUnknown { .. })
         ));
+    }
+
+    #[test]
+    fn late_build_cannot_adopt_after_unwatch_rewatch_or_new_share() {
+        let owner = open_owner();
+        let share = owner.begin_share_start().unwrap();
+        owner.complete_share_live(&share).unwrap();
+        let pending = owner.watch("ana").unwrap();
+        assert!(owner.link_is_current(&pending));
+        let close = owner.unwatch("ana").unwrap();
+        assert!(!owner.link_is_current(&pending));
+        owner.complete_link_removed(&close).unwrap();
+        let current = owner.watch("ana").unwrap();
+        assert!(!owner.link_is_current(&pending));
+        assert!(owner.link_is_current(&current));
+        let stop = owner.begin_share_stop().unwrap();
+        owner.complete_share_stopped(&stop).unwrap();
+        let share = owner.begin_share_start().unwrap();
+        owner.complete_share_live(&share).unwrap();
+        assert!(!owner.link_is_current(&current));
     }
 
     #[test]

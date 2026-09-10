@@ -35,7 +35,8 @@ use openh264::decoder::Decoder;
 use openh264::encoder::{
     BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, Level, Profile,
 };
-use openh264::formats::{YUVBuffer, YUVSource};
+use openh264::formats::{YUVSlices, YUVSource};
+use std::borrow::Cow;
 use rtcp::packet::Packet as RtcpPacket;
 use rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
@@ -401,8 +402,12 @@ impl I420Frame {
         Self { w, h, data }
     }
 
-    fn yuv_buffer(&self) -> YUVBuffer {
-        YUVBuffer::from_vec(self.data.clone(), self.w, self.h)
+    fn yuv_buffer(&self) -> YUVSlices<'_> {
+        let pixels = self.w * self.h;
+        YUVSlices::new(
+            (&self.data[..pixels], &self.data[pixels..pixels + pixels / 4], &self.data[pixels + pixels / 4..]),
+            (self.w, self.h), (self.w, self.w / 2, self.w / 2),
+        )
     }
 }
 
@@ -444,15 +449,24 @@ fn synthetic_frame(w: usize, h: usize, n: u64) -> I420Frame {
 }
 
 /// Nearest-neighbor scale of an I420 frame (for movie normalization).
-fn scale_frame(src: &I420Frame, w: usize, h: usize) -> I420Frame {
+fn scale_frame(src: &I420Frame, w: usize, h: usize) -> Cow<'_, I420Frame> {
     if src.w == w && src.h == h {
-        return I420Frame {
-            w,
-            h,
-            data: src.data.clone(),
-        };
+        return Cow::Borrowed(src);
     }
-    let mut data = vec![0u8; w * h * 3 / 2];
+    let mut scaled = I420Frame { w, h, data: Vec::new() };
+    scale_frame_reusing(src, w, h, &mut scaled);
+    Cow::Owned(scaled)
+}
+
+/// The encode thread owns the scratch frame until synchronous encode returns.
+fn scale_frame_reusing<'a>(src: &'a I420Frame, w: usize, h: usize, scratch: &'a mut I420Frame) -> &'a I420Frame {
+    if (src.w, src.h) == (w, h) {
+        return src;
+    }
+    scratch.w = w;
+    scratch.h = h;
+    scratch.data.resize(w * h * 3 / 2, 0);
+    let data = &mut scratch.data;
     let (sy, su, sv) = (
         &src.data[..src.w * src.h],
         &src.data[src.w * src.h..src.w * src.h + src.w * src.h / 4],
@@ -471,7 +485,15 @@ fn scale_frame(src: &I420Frame, w: usize, h: usize) -> I420Frame {
             data[dv + row * (w / 2) + col] = sv[s];
         }
     }
-    I420Frame { w, h, data }
+    scratch
+}
+
+/// Capture silence is not a new picture. Repeat the last CPU frame when we
+/// have one; otherwise skip the tick. GPU buffers are one-shot, so a timeout
+/// after retained frames has no CPU holdover — inventing black would replace
+/// the still on the wire.
+fn cpu_holdover_on_timeout(last: Option<&I420Frame>) -> Option<&I420Frame> {
+    last
 }
 
 /// Split Annex-B into NAL byte-ranges (start codes included).
@@ -1312,6 +1334,7 @@ fn encode_loop(
     note_backend(backend, encoder.backend_name());
     let mut generation: u64 = 0;
     let mut ext_last: Option<I420Frame> = None;
+    let mut scaled = I420Frame { w: 0, h: 0, data: Vec::new() };
     let mut consecutive_skips: u32 = 0;
     let mut encode_trace = Trace::new(Stage::Encode);
     let mut source_trace = Trace::new(Stage::Source);
@@ -1353,16 +1376,16 @@ fn encode_loop(
         // 2. Fetch one frame at the current target dims. CPU frames scale
         // here; GPU buffers stay retained until the encode step routes
         // them (zero-copy submit or one conversion — see below).
-        enum PendingFrame {
-            Cpu(I420Frame),
+        enum PendingFrame<'a> {
+            Cpu(Cow<'a, I420Frame>),
             Gpu(GpuPixelBuffer),
         }
         let frame: PendingFrame = match &source {
             VideoSource::MovieFile(_) => {
                 let frames = movie_frames.as_ref().expect("preloaded above");
-                PendingFrame::Cpu(scale_frame(&frames[(n as usize) % frames.len()], target.0, target.1))
+                PendingFrame::Cpu(Cow::Borrowed(scale_frame_reusing(&frames[(n as usize) % frames.len()], target.0, target.1, &mut scaled)))
             }
-            VideoSource::SyntheticBall => PendingFrame::Cpu(synthetic_frame(target.0, target.1, n)),
+            VideoSource::SyntheticBall => PendingFrame::Cpu(Cow::Owned(synthetic_frame(target.0, target.1, n))),
             VideoSource::External(ext) => match {
                 let started = source_trace.start();
                 let received = ext.rx.recv_timeout(EXT_TICK);
@@ -1376,17 +1399,15 @@ fn encode_loop(
                 received
             } {
                 Ok(ExternalFrame::Cpu(frame)) => {
-                    ext_last = Some(frame.clone());
-                    PendingFrame::Cpu(scale_frame(&frame, target.0, target.1))
+                    ext_last = Some(frame);
+                    PendingFrame::Cpu(Cow::Borrowed(scale_frame_reusing(ext_last.as_ref().unwrap(), target.0, target.1, &mut scaled)))
                 }
                 // Retained GPU buffer: ownership moves into the encode
                 // step (submit or convert); a drop there releases it.
                 Ok(ExternalFrame::Gpu(gpu)) => PendingFrame::Gpu(gpu),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => match &ext_last {
-                    Some(last) => PendingFrame::Cpu(scale_frame(last, target.0, target.1)),
-                    // No frame yet: black until the first arrives (never a
-                    // stale picture from another source — there is none).
-                    None => PendingFrame::Cpu(I420Frame::black(target.0, target.1)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => match cpu_holdover_on_timeout(ext_last.as_ref()) {
+                    Some(last) => PendingFrame::Cpu(Cow::Borrowed(scale_frame_reusing(last, target.0, target.1, &mut scaled))),
+                    None => continue,
                 },
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     let _ = event_tx.send(MediaEvent::Error(format!(
@@ -1681,7 +1702,7 @@ fn preload_movie(path: &PathBuf) -> Result<Vec<I420Frame>, MediaError> {
         .into_iter()
         .map(|f| {
             let (w, h) = normalize_dims(f.w as u32, f.h as u32, 1920, 1080);
-            scale_frame(&f, w as usize, h as usize)
+            scale_frame(&f, w as usize, h as usize).into_owned()
         })
         .collect())
 }
@@ -2000,6 +2021,42 @@ fn wire_ice_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matching_scale_and_encoder_view_borrow_pixels() {
+        let frame = I420Frame { w: 4, h: 2, data: (0..12).collect() };
+        let scaled = scale_frame(&frame, 4, 2);
+        assert_eq!(scaled.data.as_ptr(), frame.data.as_ptr(), "identity scaling copies pixels");
+        let yuv = frame.yuv_buffer();
+        assert_eq!(yuv.y().as_ptr(), frame.data.as_ptr(), "encoder input copies pixels");
+        assert_eq!(yuv.u(), &[8, 9]);
+        assert_eq!(yuv.v(), &[10, 11]);
+        let small = scale_frame(&frame, 2, 2);
+        assert_eq!(small.data, [0, 2, 4, 6, 8, 10]);
+    }
+
+    #[test]
+    fn resized_frames_reuse_scratch_without_stale_pixels() {
+        let mut scratch = I420Frame { w: 0, h: 0, data: Vec::new() };
+        let frame = I420Frame { w: 4, h: 2, data: (0..12).collect() };
+        let first = scale_frame_reusing(&frame, 2, 2, &mut scratch);
+        assert_eq!(first.data, [0, 2, 4, 6, 8, 10]);
+        let allocation = first.data.as_ptr();
+        let next = I420Frame { w: 4, h: 2, data: vec![42; 12] };
+        let second = scale_frame_reusing(&next, 2, 2, &mut scratch);
+        assert_eq!(second.data, [42; 6]);
+        assert_eq!(second.data.as_ptr(), allocation);
+        assert_eq!(scale_frame_reusing(&next, 4, 2, &mut scratch).data.as_ptr(), next.data.as_ptr());
+    }
+
+    #[test]
+    fn idle_source_timeout_does_not_invent_black() {
+        assert!(cpu_holdover_on_timeout(None).is_none());
+        let last = I420Frame { w: 2, h: 2, data: vec![40; 6] };
+        let held = cpu_holdover_on_timeout(Some(&last)).unwrap();
+        assert_eq!(held.data.as_ptr(), last.data.as_ptr());
+        assert_ne!(held.data[..4], I420Frame::black(2, 2).data[..4]);
+    }
 
     #[test]
     fn contract_dims() {

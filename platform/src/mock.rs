@@ -2,7 +2,7 @@
 //! through this instead of touching the screen.
 
 use crate::error::PlatformError;
-use crate::traits::{FrameStream, NextError, RestartOrder, VideoSource};
+use crate::traits::{FrameStream, NextError, VideoSource};
 use crate::types::{BgraFrame, CaptureConfig, CapturePacket, PixelFormat, SourceInfo, SourceKind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -138,6 +138,7 @@ pub fn drive_lifecycle<S: VideoSource>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::RestartOrder;
 
     fn info() -> SourceInfo {
         SourceInfo {

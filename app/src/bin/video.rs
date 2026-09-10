@@ -90,8 +90,8 @@ struct App {
 }
 
 impl App {
-    fn render_frame(&mut self, rgba: &[u8]) {
-        self.last = Some(rgba.to_vec());
+    fn render_frame(&mut self, rgba: Vec<u8>) {
+        self.last = Some(rgba);
         if self.blit() {
             self.last_present = Instant::now();
             if self.frozen {
@@ -128,7 +128,7 @@ impl App {
         if vw == 0 || vh == 0 {
             return false;
         }
-        let rgba = match self.last.clone() {
+        let rgba = match self.last.as_ref() {
             Some(rgba) => rgba,
             None => return false,
         };
@@ -142,12 +142,14 @@ impl App {
         if sw == 0 || sh == 0 {
             return false;
         }
+        let scaled_storage;
         let scaled = if sw == self.src_w && sh == self.src_h {
-            rgba
+            rgba.as_slice()
         } else {
-            scale_rgba_bilinear(&rgba, self.src_w, self.src_h, sw, sh)
+            scaled_storage = scale_rgba_bilinear(rgba, self.src_w, self.src_h, sw, sh);
+            &scaled_storage
         };
-        let pixels = rgba_to_xrgb8888(&scaled);
+        let pixels = rgba_to_xrgb8888(scaled);
         if pixels.len() != sw as usize * sh as usize {
             return false;
         }
@@ -439,7 +441,7 @@ impl App {
         // Drain inbox (reader wakes us per frame; normally one item).
         while let Ok(msg) = self.inbox.try_recv() {
             match msg {
-                Inbox::Frame(rgba) => self.render_frame(&rgba),
+                Inbox::Frame(rgba) => self.render_frame(rgba),
                 Inbox::Gone => {
                     self.gone = true;
                     break;
@@ -602,4 +604,32 @@ fn read_frame(sock: &mut HelperStream, w: u32, h: u32) -> Result<Option<Vec<u8>>
         return Err(format!("read frame: {e}"));
     }
     Ok(Some(rgba))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inbox_transfers_pixels_without_copy_or_false_present() {
+        let (tx, rx) = mpsc::channel();
+        let now = Instant::now();
+        let mut app = App {
+            window: None, surface: None, _context: None,
+            base_title: String::new(), frozen: true, last_present: now,
+            ack: None, inbox: rx, gone: false, src_w: 2, src_h: 2,
+            view: ViewState::new(), cursor: (0.0, 0.0), dragging: false,
+            drag_last: (0.0, 0.0), last_press: None, interacted_at: now,
+            help_active: false, last: None,
+        };
+        let pixels = vec![42; 16];
+        let allocation = pixels.as_ptr();
+        tx.send(Inbox::Frame(pixels)).unwrap();
+        app.drain_inbox();
+        assert_eq!(app.last.as_ref().unwrap().as_ptr(), allocation);
+        assert_eq!(app.last.as_ref().unwrap(), &[42; 16]);
+        // No surface exists in this test: no ack and no fresh-frame clock.
+        assert_eq!(app.last_present, now);
+        assert!(app.frozen);
+    }
 }

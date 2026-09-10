@@ -14,10 +14,13 @@ use super::{AppState, WireIds};
 use golive_core::media::{MediaEvent, NativeViewer};
 use golive_core::owner::Fence;
 use golive_core::signal::{check_envelope, envelope_is_current, Envelope, EnvelopeKind, Incoming};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
+
+type PublisherOrigin = Weak<tokio::sync::Mutex<super::Publisher>>;
 
 const PUMP_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -51,18 +54,38 @@ pub fn spawn_pump(state: Arc<AppState>, app: Option<AppHandle>) -> tokio::task::
     })
 }
 
+fn origin_is_current(inner: &super::Inner, origin: Option<&PublisherOrigin>) -> bool {
+    origin.is_some_and(|origin| inner.publishers.values()
+        .any(|session| origin.ptr_eq(&Arc::downgrade(&session.publisher))))
+}
+
 /// Forwards one session's media events: owner attribution + redacted emit.
 pub fn spawn_forward(
     state: Arc<AppState>,
     app: Option<AppHandle>,
     mut events: mpsc::UnboundedReceiver<MediaEvent>,
     target: ForwardTarget,
+    origin: Option<PublisherOrigin>,
+    watch_alive: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
+            let _viewer_operation = match target {
+                ForwardTarget::Watch => Some(state.operations.lock().await),
+                ForwardTarget::Share => None,
+            };
+            if watch_alive.as_ref().is_some_and(|alive| !alive.load(std::sync::atomic::Ordering::Acquire)) {
+                continue;
+            }
+            // A stopped/replaced publisher may still have queued one-shot events.
+            if matches!(target, ForwardTarget::Share) && !state.inner.lock().is_ok_and(|inner| {
+                origin_is_current(&inner, origin.as_ref())
+            }) {
+                continue;
+            }
             match event {
                 MediaEvent::IceConnected => {
-                    apply_ice_connected(&state, target);
+                    apply_ice_connected(&state, target, origin.as_ref());
                     emit(&app, "media-event", &serde_json::json!({"kind": "ice-connected"}));
                 }
                 MediaEvent::VideoFrame { non_black, motion } => {
@@ -80,7 +103,7 @@ pub fn spawn_forward(
                 MediaEvent::Stats(stats) => {
                     merge_stats(&state, stats.frames_decoded, stats.keyframes_decoded, stats.ice_connected);
                     if stats.ice_connected {
-                        apply_ice_connected(&state, target);
+                        apply_ice_connected(&state, target, origin.as_ref());
                     }
                     // Generation fence (host side): the encode thread bumps
                     // it on every applied reconfig. First observer wins the
@@ -90,6 +113,9 @@ pub fn spawn_forward(
                         let bumped = {
                             let mut bumped = None;
                             if let Ok(mut inner) = state.inner.lock() {
+                                if !origin_is_current(&inner, origin.as_ref()) {
+                                    continue;
+                                }
                                 let current = inner.share_profile.map(|s| s.generation).unwrap_or(0);
                                 if stats.generation > current {
                                     if let Some(share) = inner.share_profile.as_mut() {
@@ -233,7 +259,7 @@ pub fn spawn_forward(
                             forward_viewer_candidate(&state, candidate).await;
                         }
                         ForwardTarget::Share => {
-                            forward_host_candidate(&state, candidate).await;
+                            forward_host_candidate(&state, candidate, origin.as_ref()).await;
                         }
                     }
                 }
@@ -243,7 +269,7 @@ pub fn spawn_forward(
                             forward_viewer_gathering_complete(&state).await;
                         }
                         ForwardTarget::Share => {
-                            forward_host_gathering_complete(&state).await;
+                            forward_host_gathering_complete(&state, origin.as_ref()).await;
                             emit(
                                 &app,
                                 "media-event",
@@ -271,12 +297,13 @@ fn emit(app: &Option<AppHandle>, event: &str, payload: &serde_json::Value) {
 
 /// Marks the live link Connected. Share uses the adopted watcher (never the
 /// idle template / HashMap::next — that left ICE "negotiating" forever).
-fn ice_fence(inner: &super::Inner, target: ForwardTarget) -> Option<Fence> {
+fn ice_fence(inner: &super::Inner, target: ForwardTarget, origin: Option<&PublisherOrigin>) -> Option<Fence> {
     match target {
         ForwardTarget::Watch => inner.viewer_fence,
         ForwardTarget::Share => {
             let watcher = select_host_trickle_target(
-                inner.publishers.iter().map(|(k, s)| (k.as_str(), &s.wire)),
+                inner.publishers.iter().map(|(k, s)| (k.as_str(), &s.wire, &s.publisher)),
+                origin?,
             )?
             .0;
             inner.publishers.get(&watcher).map(|session| session.owner_fence)
@@ -284,13 +311,13 @@ fn ice_fence(inner: &super::Inner, target: ForwardTarget) -> Option<Fence> {
     }
 }
 
-fn apply_ice_connected(state: &Arc<AppState>, target: ForwardTarget) {
+fn apply_ice_connected(state: &Arc<AppState>, target: ForwardTarget, origin: Option<&PublisherOrigin>) {
     let fence = {
         let inner = match state.inner.lock() {
             Ok(inner) => inner,
             Err(_) => return,
         };
-        ice_fence(&inner, target)
+        ice_fence(&inner, target, origin)
     };
     if let Some(fence) = fence {
         if let Ok(inner) = state.inner.lock() {
@@ -388,33 +415,31 @@ async fn forward_viewer_gathering_complete(state: &Arc<AppState>) {
     }
 }
 
-/// Pure host-trickle addressing (unit-tested below, no media/signal).
-///
-/// Returns the watcher + wire ids for host trickle-out: the adopted
-/// per-watcher link. The idle template (key `""`, empty wire until adopted
-/// on watch) is skipped. MVP holds a single live link — the pump's Share
-/// forward task serves the one adopted publisher — so the first live entry
-/// is the specific watcher; entries are `(member id, wire ids)`.
-fn select_host_trickle_target<'a>(
-    entries: impl Iterator<Item = (&'a str, &'a WireIds)>,
+/// Address only the publisher that owns this callback; adoption may move its
+/// map key from the idle template to a watcher without changing its identity.
+fn select_host_trickle_target<'a, T: 'a>(
+    entries: impl Iterator<Item = (&'a str, &'a WireIds, &'a Arc<T>)>,
+    origin: &Weak<T>,
 ) -> Option<(String, WireIds)> {
     entries
-        .filter(|(key, ids)| !key.is_empty() && !ids.session.is_empty())
-        .map(|(key, ids)| (key.to_owned(), ids.clone()))
+        .filter(|(key, ids, publisher)| !key.is_empty() && !ids.session.is_empty()
+            && origin.ptr_eq(&Arc::downgrade(publisher)))
+        .map(|(key, ids, _)| (key.to_owned(), ids.clone()))
         .next()
 }
 
 /// Host trickle-out: adopted per-watcher link's wire ids + watcher as `to`.
 /// Mirrors `forward_viewer_candidate` (same envelope shape/validation; the
 /// viewer already understands Candidate + ice-complete per PROTOCOL.md).
-async fn forward_host_candidate(state: &Arc<AppState>, candidate: String) {
+async fn forward_host_candidate(state: &Arc<AppState>, candidate: String, origin: Option<&PublisherOrigin>) {
     let (to, ids) = {
         let inner = match state.inner.lock() {
             Ok(inner) => inner,
             Err(_) => return,
         };
         match select_host_trickle_target(
-            inner.publishers.iter().map(|(k, s)| (k.as_str(), &s.wire)),
+            inner.publishers.iter().map(|(k, s)| (k.as_str(), &s.wire, &s.publisher)),
+            match origin { Some(origin) => origin, None => return },
         ) {
             Some(target) => target,
             None => return,
@@ -434,14 +459,15 @@ async fn forward_host_candidate(state: &Arc<AppState>, candidate: String) {
 
 /// Host gathering-complete: same `ice-complete` envelope the viewer path
 /// already emits (the viewer validates the fence and needs no PC action).
-async fn forward_host_gathering_complete(state: &Arc<AppState>) {
+async fn forward_host_gathering_complete(state: &Arc<AppState>, origin: Option<&PublisherOrigin>) {
     let (to, ids) = {
         let inner = match state.inner.lock() {
             Ok(inner) => inner,
             Err(_) => return,
         };
         match select_host_trickle_target(
-            inner.publishers.iter().map(|(k, s)| (k.as_str(), &s.wire)),
+            inner.publishers.iter().map(|(k, s)| (k.as_str(), &s.wire, &s.publisher)),
+            match origin { Some(origin) => origin, None => return },
         ) {
             Some(target) => target,
             None => return,
@@ -546,6 +572,7 @@ async fn handle_signal(state: &Arc<AppState>, app: &Option<AppHandle>, message: 
 
 /// Host path: register the watcher, ensure its publisher, offer.
 async fn on_watch(state: &Arc<AppState>, app: &Option<AppHandle>, watcher: &str) {
+    let _operation = state.operations.lock().await;
     let fence = {
         let inner = match state.inner.lock() {
             Ok(inner) => inner,
@@ -571,25 +598,21 @@ async fn on_watch(state: &Arc<AppState>, app: &Option<AppHandle>, watcher: &str)
         // session from the stored share source — the template is gone and
         // must never be re-fabricated from thin air (a synthetic fallback
         // here would silently share the wrong source).
-        let template = {
+        let adopted_template = {
             let mut inner = match state.inner.lock() {
                 Ok(inner) => inner,
                 Err(_) => return,
             };
-            inner.publishers.remove("")
-        };
-        if let Some(mut template) = template {
-            // Adopt the template publisher for this watcher.
-            template.owner_fence = fence;
-            template.wire = ids.clone();
-            {
-                let mut inner = match state.inner.lock() {
-                    Ok(inner) => inner,
-                    Err(_) => return,
-                };
+            if let Some(mut template) = inner.publishers.remove("") {
+                template.owner_fence = fence;
+                template.wire = ids.clone();
                 inner.publishers.insert(watcher.to_owned(), template);
+                true
+            } else {
+                false
             }
-        } else if !state
+        };
+        if !adopted_template && !state
             .adopt_fresh_session(app.clone(), watcher, fence, ids.clone())
             .await
         {
@@ -640,6 +663,7 @@ async fn on_watch(state: &Arc<AppState>, app: &Option<AppHandle>, watcher: &str)
 
 /// Host path: drop the watcher's publisher and link.
 async fn on_unwatch(state: &Arc<AppState>, watcher: &str) {
+    let _operation = state.operations.lock().await;
     let session = {
         let mut inner = match state.inner.lock() {
             Ok(inner) => inner,
@@ -689,10 +713,14 @@ fn push_present_frame(
     title: &str,
     presented: &Arc<std::sync::atomic::AtomicU64>,
     frame: golive_core::media::PresentedFrame,
+    alive: &std::sync::atomic::AtomicBool,
 ) {
+    if !alive.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     // Event-driven decode observation (feeds per-link stats; no polling
     // anywhere on this path).
-    state.note_link_frame(watcher, title, frame.w as u32, frame.h as u32);
+    state.note_link_frame(watcher, title, frame.w as u32, frame.h as u32, alive);
     let (fw, fh) = (frame.w as u32, frame.h as u32);
     let mut dead: Option<crate::video::VideoWindow> = None;
     let mut push: Option<crate::video::FramePush> = None;
@@ -704,6 +732,9 @@ fn push_present_frame(
             Ok(inner) => inner,
             Err(_) => return,
         };
+        if !alive.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         let contracted = inner.video_windows.get(watcher).map(|w| w.resolution());
         if window_fits(contracted, fw, fh) {
             push = inner.video_feeds.get(watcher).cloned();
@@ -734,6 +765,9 @@ fn push_present_frame(
                 Arc::clone(presented),
             );
             if let Ok(mut inner) = state.inner.lock() {
+                if !alive.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
                 inner.video_seq.insert(watcher.to_owned(), spawn_seq);
                 inner.video_windows.insert(watcher.to_owned(), window);
                 inner.video_feeds.insert(watcher.to_owned(), push.clone());
@@ -751,6 +785,7 @@ async fn on_envelope(
     from: &str,
     payload: &Envelope,
 ) {
+    let _operation = state.operations.lock().await;
     // Host link?
     let is_host_link = {
         let inner = match state.inner.lock() {
@@ -980,6 +1015,7 @@ async fn on_viewer_envelope(
         return;
     }
     if !has_viewer {
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         // Present path: latest-only feed per watched member. The native
         // window opens on the FIRST presented frame (never an idle black
@@ -988,9 +1024,10 @@ async fn on_viewer_envelope(
         let title = watcher_nickname(state, &watcher);
             let on_frame = {
                 let state = Arc::clone(state);
+                let alive = Arc::clone(&alive);
                 let presented = Arc::new(std::sync::atomic::AtomicU64::new(0));
                 Arc::new(move |frame: golive_core::media::PresentedFrame| {
-                    push_present_frame(&state, &watcher, &title, &presented, frame);
+                    push_present_frame(&state, &watcher, &title, &presented, frame, &alive);
             })
         };
         let viewer = match NativeViewer::start(None, event_tx, on_frame).await {
@@ -1003,11 +1040,14 @@ async fn on_viewer_envelope(
                 Err(_) => return,
             };
             inner.viewer = Some(Arc::clone(&viewer));
+            inner.viewer_alive = Some(Arc::clone(&alive));
             inner.tasks.push(spawn_forward(
                 Arc::clone(state),
                 app.clone(),
                 event_rx,
                 ForwardTarget::Watch,
+                None,
+                Some(alive),
             ));
         }
     }
@@ -1068,6 +1108,18 @@ mod present_respawn_tests {
     }
 
     #[test]
+    fn retired_present_callback_does_not_reopen_a_window() {
+        let state = Arc::new(AppState::new());
+        let presented = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let alive = std::sync::atomic::AtomicBool::new(false);
+        push_present_frame(&state, "watcher", "watcher", &presented, frame(2, 2), &alive);
+        let inner = state.inner.lock().unwrap();
+        assert!(inner.video_windows.is_empty());
+        assert!(inner.video_feeds.is_empty());
+        assert!(inner.link_tracks.is_empty());
+    }
+
+    #[test]
     fn fit_decision_reuses_match_respawns_mismatch() {
         // Same dims (bitrate/fps-only applies): reuse, old path untouched.
         assert!(window_fits(Some((1280, 720)), 1280, 720));
@@ -1114,7 +1166,7 @@ mod present_respawn_tests {
             inner.video_feeds.insert("watcher".to_owned(), push);
         }
         // Same-dims frame: exact old path, same window, feed untouched.
-        push_present_frame(&state, "watcher", "watcher", &presented, frame(64, 36));
+        push_present_frame(&state, "watcher", "watcher", &presented, frame(64, 36), &std::sync::atomic::AtomicBool::new(true));
         {
             let inner = state.inner.lock().expect("state lock");
             assert_eq!(inner.video_windows.get("watcher").expect("window").resolution(), (64, 36));
@@ -1123,7 +1175,7 @@ mod present_respawn_tests {
         // New-dims frame (post quality-apply): the stale 64x36 window is
         // replaced, and the frame lands in the fresh feed. The replacement
         // reserves the next per-link sequence for the respawn line.
-        push_present_frame(&state, "watcher", "watcher", &presented, frame(32, 18));
+        push_present_frame(&state, "watcher", "watcher", &presented, frame(32, 18), &std::sync::atomic::AtomicBool::new(true));
         {
             let inner = state.inner.lock().expect("state lock");
             let window = inner.video_windows.get("watcher").expect("respawned window");
@@ -1133,7 +1185,7 @@ mod present_respawn_tests {
             assert_eq!(inner.next_video_seq, 2, "counter advances past the reservation");
         }
         // Steady state again: same-dims frames reuse without respawn.
-        push_present_frame(&state, "watcher", "watcher", &presented, frame(32, 18));
+        push_present_frame(&state, "watcher", "watcher", &presented, frame(32, 18), &std::sync::atomic::AtomicBool::new(true));
         {
             let inner = state.inner.lock().expect("state lock");
             let window = inner.video_windows.get("watcher").expect("window");
@@ -1143,7 +1195,7 @@ mod present_respawn_tests {
         }
         // A second link gets its own sequence: interleaved links stay
         // distinguishable from one flapping link in the session log.
-        push_present_frame(&state, "other", "other", &presented, frame(64, 36));
+        push_present_frame(&state, "other", "other", &presented, frame(64, 36), &std::sync::atomic::AtomicBool::new(true));
         {
             let inner = state.inner.lock().expect("state lock");
             assert_eq!(inner.video_seq.get("other"), Some(&2), "second link gets seq #2");
@@ -1175,9 +1227,10 @@ mod host_trickle_tests {
     fn template_without_watcher_is_dropped() {
         // Idle template (key "", empty wire): no watcher adopted yet.
         let template = WireIds::default();
-        let entries = [("", &template)];
+        let publisher = Arc::new(());
+        let entries = [("", &template, &publisher)];
         assert!(
-            select_host_trickle_target(entries.iter().map(|(k, v)| (*k, *v))).is_none()
+            select_host_trickle_target(entries.iter().copied(), &Arc::downgrade(&publisher)).is_none()
         );
     }
 
@@ -1185,8 +1238,9 @@ mod host_trickle_tests {
     fn adopted_link_is_addressed_to_its_watcher() {
         let template = WireIds::default();
         let live = wire("7");
-        let entries = [("", &template), ("watcher-abc", &live)];
-        let (to, ids) = select_host_trickle_target(entries.iter().map(|(k, v)| (*k, *v)))
+        let publisher = Arc::new(());
+        let entries = [("", &template, &publisher), ("watcher-abc", &live, &publisher)];
+        let (to, ids) = select_host_trickle_target(entries.iter().copied(), &Arc::downgrade(&publisher))
             .expect("adopted link selected");
         assert_eq!(to, "watcher-abc");
         assert_eq!(ids.session, "7");
@@ -1194,10 +1248,26 @@ mod host_trickle_tests {
 
     #[test]
     fn no_links_selects_nothing() {
-        let entries: [(&str, &WireIds); 0] = [];
+        let publisher = Arc::new(());
+        let entries: [(&str, &WireIds, &Arc<()>); 0] = [];
         assert!(
-            select_host_trickle_target(entries.iter().map(|(k, v)| (*k, *v))).is_none()
+            select_host_trickle_target(entries.iter().copied(), &Arc::downgrade(&publisher)).is_none()
         );
+    }
+
+    #[test]
+    fn callback_origin_survives_adoption_and_never_targets_another_publisher() {
+        let first = Arc::new(());
+        let second = Arc::new(());
+        let origin = Arc::downgrade(&second);
+        let a = wire("first");
+        let b = wire("second");
+        let entries = [("a", &a, &first), ("b", &b, &second)];
+        let (to, ids) = select_host_trickle_target(entries.into_iter(), &origin).unwrap();
+        assert_eq!((to.as_str(), ids.session.as_str()), ("b", "second"));
+        assert!(select_host_trickle_target([("a", &a, &first)].into_iter(), &origin).is_none());
+        assert!(select_host_trickle_target([("", &b, &second)].into_iter(), &origin).is_none());
+        assert!(select_host_trickle_target([("b", &b, &second)].into_iter(), &origin).is_some());
     }
 
     #[test]
@@ -1274,6 +1344,7 @@ mod rewatch_tests {
                 .await
                 .expect("template builds");
         assert!(bridge.is_none(), "synthetic owns no bridge");
+        let publisher = Arc::new(tokio::sync::Mutex::new(publisher));
         {
             let mut inner = state.inner.lock().expect("state lock");
             inner.share_source = Some(ShareSource::Synthetic);
@@ -1284,7 +1355,7 @@ mod rewatch_tests {
             inner.publishers.insert(
                 String::new(),
                 crate::PublishSession {
-                    publisher: Arc::new(tokio::sync::Mutex::new(publisher)),
+                    publisher: Arc::clone(&publisher),
                     owner_fence: golive_core::owner::Fence::idle(),
                     wire: WireIds::default(),
                     remote_ready: false,
@@ -1297,6 +1368,8 @@ mod rewatch_tests {
                 None,
                 event_rx,
                 ForwardTarget::Share,
+                Some(Arc::downgrade(&publisher)),
+                None,
             ));
         }
     }
@@ -1487,5 +1560,37 @@ mod rewatch_tests {
             assert!(inner.share_source.is_none(), "stop clears the stored source");
         }
         state.leave().await.expect("leave");
+    }
+}
+
+#[cfg(test)]
+mod retired_events_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn retired_viewer_events_cannot_mark_new_watch_connected() {
+        let state = Arc::new(AppState::new());
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(MediaEvent::IceConnected).unwrap();
+        drop(tx);
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        spawn_forward(Arc::clone(&state), None, rx, ForwardTarget::Watch, None, Some(alive)).await.unwrap();
+        assert!(!state.inner.lock().unwrap().media_counters.connected);
+    }
+
+    #[tokio::test]
+    async fn retired_publisher_stats_cannot_consume_new_share_generation() {
+        let state = Arc::new(AppState::new());
+        let expected = super::super::EffectiveQuality {
+            profile: golive_core::media::Quality::P720.profile(), generation: 0,
+        };
+        state.inner.lock().unwrap().share_profile = Some(expected);
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(MediaEvent::Stats(golive_core::media::MediaStats {
+            generation: 99, ..Default::default()
+        })).unwrap();
+        drop(tx);
+        spawn_forward(Arc::clone(&state), None, rx, ForwardTarget::Share, Some(Weak::new()), None).await.unwrap();
+        assert_eq!(state.inner.lock().unwrap().share_profile.unwrap().generation, 0);
     }
 }

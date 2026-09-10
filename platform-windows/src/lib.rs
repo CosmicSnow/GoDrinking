@@ -27,6 +27,7 @@ mod copy;
 mod d3d;
 mod dxgi;
 mod map;
+mod resource;
 mod wgc;
 
 pub use copy::{copy_tight_bgra, gate_open, initial_last_ns, interval_ns};

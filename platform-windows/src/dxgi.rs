@@ -5,17 +5,15 @@ use golive_platform::{
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
-use std::time::Duration;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
     IDXGIResource, DXGI_OUTPUT_DESC,
 };
-use windows::Win32::Graphics::Dxgi::Common::DXGI_MODE_ROTATION_IDENTITY;
 
 use crate::copy::{gate_open, initial_last_ns, interval_ns, now_ns};
-use crate::d3d::{create_device, texture_to_bgra};
+use crate::d3d::{create_device, texture_to_bgra, Readback};
 use crate::map::{denied, is_access_lost, is_wait_timeout, map_windows};
 
 pub fn enumerate_displays() -> Result<Vec<SourceInfo>, PlatformError> {
@@ -50,7 +48,6 @@ pub fn enumerate_displays() -> Result<Vec<SourceInfo>, PlatformError> {
             let rect = desc.DesktopCoordinates;
             let w = rect.right.saturating_sub(rect.left).max(0) as u32;
             let h = rect.bottom.saturating_sub(rect.top).max(0) as u32;
-            let _ = desc.Rotation == DXGI_MODE_ROTATION_IDENTITY;
             out.push(SourceInfo {
                 kind: SourceKind::Display,
                 id,
@@ -174,7 +171,9 @@ pub fn run_display(
             return;
         }
     };
-    let (device, context, mut dup) = opened;
+    let (device, context, dup) = opened;
+    let mut dup = Some(dup);
+    let mut readback = Readback::new(device.clone(), context);
     let applied = golive_platform::capture_config_for(config.width, config.height, config.fps);
     eprintln!(
         "golive: capture {}x{}@{}fps (display)",
@@ -186,13 +185,13 @@ pub fn run_display(
     while !stop_flag.load(Ordering::Acquire) {
         let mut info = windows::Win32::Graphics::Dxgi::DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
-        match unsafe { dup.AcquireNextFrame(100, &mut info, &mut resource) } {
+        match unsafe { dup.as_ref().unwrap().AcquireNextFrame(100, &mut info, &mut resource) } {
             Ok(()) => {
                 let now = now_ns();
                 if gate_open(last_ns.load(Ordering::Relaxed), now, interval) {
                     if let Some(resource) = resource {
                         if let Ok(tex) = resource.cast::<ID3D11Texture2D>() {
-                            if let Ok(frame) = texture_to_bgra(&device, &context, &tex) {
+                            if let Ok(frame) = readback.texture_to_bgra(&tex) {
                                 let _ = frame_tx.try_send(CapturePacket::Cpu(frame));
                                 last_ns.store(
                                     golive_platform::cadence::advance_capture_clock(
@@ -204,13 +203,14 @@ pub fn run_display(
                         }
                     }
                 }
-                let _ = unsafe { dup.ReleaseFrame() };
+                let _ = unsafe { dup.as_ref().unwrap().ReleaseFrame() };
             }
             Err(e) if is_wait_timeout(e.code().0) => continue,
             Err(e) if is_access_lost(e.code().0) => {
-                let _ = unsafe { dup.ReleaseFrame() };
-                match open_duplication(&adapter, &output) {
-                    Ok((_, _, new_dup)) => dup = new_dup,
+                match crate::resource::replace_after_drop(&mut dup, || {
+                    unsafe { output.DuplicateOutput(&device) }.map_err(|e| map_windows(&e))
+                }) {
+                    Ok(()) => {},
                     Err(error) => {
                         if let Ok(mut guard) = error_slot.lock() {
                             *guard = Some(error);
@@ -220,7 +220,6 @@ pub fn run_display(
                 }
             }
             Err(e) => {
-                let _ = unsafe { dup.ReleaseFrame() };
                 if let Ok(mut guard) = error_slot.lock() {
                     *guard = Some(map_windows(&e));
                 }
@@ -228,8 +227,6 @@ pub fn run_display(
             }
         }
     }
-    let _ = dup;
-    let _ = Duration::from_millis(0);
 }
 
 pub fn empty_is_denied(list: &[SourceInfo]) -> Result<Vec<SourceInfo>, PlatformError> {

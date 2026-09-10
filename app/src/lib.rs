@@ -200,6 +200,9 @@ pub struct PublishSession {
 /// tests can hold it without a Tauri app.
 pub struct AppState {
     inner: Mutex<Inner>,
+    /// Serialize command/signal operations across awaits; media callbacks and
+    /// snapshots still use only the short Inner lock, so reconfig Stats can land.
+    operations: tokio::sync::Mutex<()>,
     /// Session file log (packaged verification). Disabled until `run_with`
     /// inits it from the platform log dir; silent no-op before that (and
     /// in every unit test).
@@ -278,6 +281,7 @@ struct Inner {
     viewer_media_task: Option<tokio::task::JoinHandle<()>>,
     adopted: Option<WireIds>,
     viewer_fence: Option<Fence>,
+    viewer_alive: Option<Arc<std::sync::atomic::AtomicBool>>,
     viewer_remote_ready: bool,
     viewer_pending_remote: Vec<String>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -342,6 +346,7 @@ impl AppState {
                 viewer_media_task: None,
                 adopted: None,
                 viewer_fence: None,
+                viewer_alive: None,
                 viewer_remote_ready: false,
                 viewer_pending_remote: Vec::new(),
                 tasks: Vec::new(),
@@ -359,6 +364,7 @@ impl AppState {
                 share_source: None,
             }),
             session_log: Mutex::new(session_log::SessionLog::disabled()),
+            operations: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -425,6 +431,7 @@ impl AppState {
         nickname: &str,
         password: &str,
     ) -> Result<String, String> {
+        let _operation = self.operations.lock().await;
         let base = self.base()?;
         let join = {
             let inner = self
@@ -469,6 +476,7 @@ impl AppState {
         nickname: &str,
         password: &str,
     ) -> Result<String, String> {
+        let _operation = self.operations.lock().await;
         let base = self.base()?;
         let join = {
             let inner = self
@@ -498,6 +506,7 @@ impl AppState {
     /// Leaves the room: tasks aborted, media stopped, session closed
     /// best-effort. Idempotent.
     pub async fn leave(self: &Arc<Self>) -> Result<(), String> {
+        let _operation = self.operations.lock().await;
         let (signal, publishers, viewer) = {
             let mut inner = self
                 .inner
@@ -512,6 +521,9 @@ impl AppState {
             inner.share_profile = None;
             inner.share_capture = None;
             inner.share_source = None;
+            if let Some(alive) = inner.viewer_alive.take() {
+                alive.store(false, std::sync::atomic::Ordering::Release);
+            }
             (
                 inner.signal.take(),
                 std::mem::take(&mut inner.publishers),
@@ -558,6 +570,7 @@ impl AppState {
         app: Option<AppHandle>,
         source: &str,
     ) -> Result<(), String> {
+        let _operation = self.operations.lock().await;
         let source = ShareSource::parse(source)?;
         // Live capture profile for bridges (starts at the default; every
         // bridge thread shares it so `set_quality` re-clamps mid-share).
@@ -616,6 +629,8 @@ impl AppState {
                 app,
                 event_rx,
                 pump::ForwardTarget::Share,
+                Some(Arc::downgrade(&template)),
+                None,
             ));
             // Stash the idle publisher as the template for the first watch.
             // Single-shot: adopting moves it to the watcher; later watches
@@ -754,13 +769,16 @@ impl AppState {
         fence: Fence,
         wire: WireIds,
     ) -> bool {
+        // Caller on_watch holds operations across this build/adoption.
         // Gate + snapshot under one short lock; the build runs outside it.
         let (source, live, profile) = {
             let inner = match self.inner.lock() {
                 Ok(inner) => inner,
                 Err(_) => return false,
             };
-            if inner.owner.snapshot().share.state != golive_core::state::ShareState::Live {
+            if inner.owner.snapshot().share.state != golive_core::state::ShareState::Live
+                || !inner.owner.link_is_current(&fence)
+            {
                 return false;
             }
             let Some(source) = inner.share_source.clone() else {
@@ -806,7 +824,9 @@ impl AppState {
             Some(mut inner) => {
                 // The share may have died while the build ran: refuse instead
                 // of resurrecting anything.
-                if inner.owner.snapshot().share.state != golive_core::state::ShareState::Live {
+                if inner.owner.snapshot().share.state != golive_core::state::ShareState::Live
+                    || !inner.owner.link_is_current(&fence)
+                {
                     FreshDecision::ShareGone
                 // A concurrent watch may have adopted first: keep the winner
                 // and drop the spare (a session IS live, so the caller still
@@ -833,6 +853,8 @@ impl AppState {
                         app,
                         event_rx,
                         pump::ForwardTarget::Share,
+                        Some(Arc::downgrade(&publisher)),
+                        None,
                     ));
                     FreshDecision::Inserted
                 }
@@ -844,7 +866,11 @@ impl AppState {
         match decision {
             FreshDecision::Inserted => {}
             // Spare / stillborn build: stop it outside the lock.
-            FreshDecision::ShareGone | FreshDecision::Taken => {
+            FreshDecision::ShareGone => {
+                stop_fresh_parts(&publisher, &mut bridge).await;
+                return false;
+            }
+            FreshDecision::Taken => {
                 stop_fresh_parts(&publisher, &mut bridge).await;
             }
         }
@@ -862,6 +888,7 @@ impl AppState {
     /// Stops sharing: media stopped, bridges torn down, links cleared
     /// deterministically.
     pub async fn stop_share(self: &Arc<Self>) -> Result<(), String> {
+        let _operation = self.operations.lock().await;
         let publishers = {
             let mut inner = self
                 .inner
@@ -928,6 +955,7 @@ impl AppState {
         app: Option<AppHandle>,
         args: SetQualityArgs,
     ) -> Result<EffectiveQuality, String> {
+        let _operation = self.operations.lock().await;
         if let Some(preset) = args.preset.as_deref() {
             match preset {
                 "low" | "medium" | "high" => {}
@@ -1081,6 +1109,7 @@ impl AppState {
 
     /// Registers watch intent for a member (viewer side).
     pub async fn watch(self: &Arc<Self>, member: &str) -> Result<(), String> {
+        let _operation = self.operations.lock().await;
         if member.trim().is_empty() {
             return Err("member must not be empty".into());
         }
@@ -1109,6 +1138,7 @@ impl AppState {
 
     /// Removes our watch intent and tears down viewer media.
     pub async fn unwatch(self: &Arc<Self>, member: &str) -> Result<(), String> {
+        let _operation = self.operations.lock().await;
         let viewer = {
             let mut inner = self
                 .inner
@@ -1116,6 +1146,9 @@ impl AppState {
                 .map_err(|_| "state lock poisoned".to_string())?;
             if let Some(signal) = inner.signal.as_ref() {
                 let _ = signal.watch(member, false);
+            }
+            if let Some(alive) = inner.viewer_alive.take() {
+                alive.store(false, std::sync::atomic::Ordering::Release);
             }
             inner.viewer.take()
         };
@@ -1292,8 +1325,11 @@ impl AppState {
 
     /// Records one decoded frame for a watched member (called from the
     /// `on_frame` present callback: event-driven, never polled).
-    pub fn note_link_frame(&self, member: &str, title: &str, w: u32, h: u32) {
+    pub fn note_link_frame(&self, member: &str, title: &str, w: u32, h: u32, alive: &std::sync::atomic::AtomicBool) {
         if let Ok(mut inner) = self.inner.lock() {
+            if !alive.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
             let track = inner.link_tracks.entry(member.to_owned()).or_default();
             track.decoded += 1;
             if track.title.is_empty() {
@@ -2069,5 +2105,34 @@ mod quality_tests {
                 assert!(!lower.contains(banned), "secret-adjacent in note: {note}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod operation_tests {
+    use super::*;
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    #[tokio::test]
+    async fn unwatch_cannot_clear_fences_during_another_operation() {
+        let state = Arc::new(AppState::new());
+        let fence = {
+            let mut inner = state.inner.lock().unwrap();
+            let join = inner.owner.begin_join().unwrap();
+            inner.owner.complete_opened(&join).unwrap();
+            let fence = inner.owner.watch("ana").unwrap();
+            inner.viewer_fence = Some(fence);
+            fence
+        };
+        // Represents an offer/quality command suspended at an await.
+        let operation = state.operations.lock().await;
+        let mut unwatch = Box::pin(state.unwatch("ana"));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(unwatch.as_mut().poll(&mut context), Poll::Pending));
+        assert_eq!(state.inner.lock().unwrap().viewer_fence, Some(fence));
+        drop(operation);
+        unwatch.await.unwrap();
+        assert!(state.inner.lock().unwrap().viewer_fence.is_none());
     }
 }
