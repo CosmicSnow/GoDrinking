@@ -130,7 +130,11 @@ fn restart<T, E>(
 /// bounds. The SCK stream scales in capture, so the callback never sees
 /// full-res pixels.
 fn profile_config(info: &SourceInfo, profile: &QualityProfile) -> CaptureConfig {
-    let (tw, th) = normalize_dims(info.w, info.h, profile.w, profile.h);
+    let (tw, th) = if info.w >= 2 && info.h >= 2 {
+        normalize_dims(info.w, info.h, profile.w, profile.h)
+    } else {
+        (profile.w, profile.h)
+    };
     golive_platform::capture_config_for(tw, th, profile.fps)
 }
 
@@ -181,7 +185,7 @@ pub fn start_capture(
 /// frames. Pre-flight safe: on error nothing was started and nothing leaks.
 /// `label` uses kind+id only — never the user-facing name (titles stay out
 /// of logs). Capture asks the OS for at most the profile fps (clamped to
-/// the backend's 1..=30 range); the bridge gate below enforces it exactly.
+/// the backend's 1..=60 range); the bridge gate below enforces it exactly.
 pub fn start_capture_for(
     kind: SourceKind,
     id: &str,
@@ -285,6 +289,45 @@ pub fn scale_bgra_nearest(src: &BgraFrame, dw: u32, dh: u32) -> BgraFrame {
     BgraFrame { w: dw, h: dh, stride: (dw as usize) * 4, format: PixelFormat::Bgra8888, data }
 }
 
+/// Bilinear BGRA downscale (honors stride). Same empty/zero contract as nearest.
+pub fn scale_bgra_bilinear(src: &BgraFrame, dw: u32, dh: u32) -> BgraFrame {
+    if src.w == 0 || src.h == 0 || dw == 0 || dh == 0 || src.data.is_empty() {
+        return BgraFrame {
+            w: dw,
+            h: dh,
+            stride: (dw as usize) * 4,
+            format: PixelFormat::Bgra8888,
+            data: Vec::new(),
+        };
+    }
+    let (sw, sh, dw_us, dh_us) = (src.w as usize, src.h as usize, dw as usize, dh as usize);
+    let mut data = vec![0u8; dw_us * dh_us * 4];
+    let (sw_f, sh_f, dw_f, dh_f) = (src.w as f32, src.h as f32, dw as f32, dh as f32);
+    for y in 0..dh_us {
+        let sy = (y as f32 + 0.5) * sh_f / dh_f - 0.5;
+        let y0 = (sy.floor() as i64).clamp(0, src.h as i64 - 1) as usize;
+        let y1 = (y0 + 1).min(sh - 1);
+        let fy = (sy - y0 as f32).clamp(0.0, 1.0);
+        for x in 0..dw_us {
+            let sx = (x as f32 + 0.5) * sw_f / dw_f - 0.5;
+            let x0 = (sx.floor() as i64).clamp(0, src.w as i64 - 1) as usize;
+            let x1 = (x0 + 1).min(sw - 1);
+            let fx = (sx - x0 as f32).clamp(0.0, 1.0);
+            let d = (y * dw_us + x) * 4;
+            for c in 0..4 {
+                let sample = |px: usize, py: usize| -> f32 {
+                    let s = py * src.stride + px * 4 + c;
+                    if s < src.data.len() { src.data[s] as f32 } else { 0.0 }
+                };
+                let top = sample(x0, y0) + (sample(x1, y0) - sample(x0, y0)) * fx;
+                let bot = sample(x0, y1) + (sample(x1, y1) - sample(x0, y1)) * fx;
+                data[d + c] = (top + (bot - top) * fy).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    BgraFrame { w: dw, h: dh, stride: dw_us * 4, format: PixelFormat::Bgra8888, data }
+}
+
 /// Keep tight, already-sized captures owned across the bridge handoff.
 fn prepare_bgra(src: BgraFrame, w: u32, h: u32) -> BgraFrame {
     if (src.w, src.h) == (w, h) && w > 0 && h > 0
@@ -294,7 +337,7 @@ fn prepare_bgra(src: BgraFrame, w: u32, h: u32) -> BgraFrame {
     {
         src
     } else {
-        scale_bgra_nearest(&src, w, h)
+        scale_bgra_bilinear(&src, w, h)
     }
 }
 
@@ -691,6 +734,18 @@ mod tests {
     }
 
     #[test]
+    fn scale_bgra_bilinear_identity_and_empty() {
+        let src = BgraFrame {
+            w: 2, h: 2, stride: 8, format: PixelFormat::Bgra8888,
+            data: (0..16).collect(),
+        };
+        let same = scale_bgra_bilinear(&src, 2, 2);
+        assert_eq!(same.stride, 8);
+        assert_eq!(same.data.len(), 16);
+        assert!(scale_bgra_bilinear(&src, 0, 2).data.is_empty());
+    }
+
+    #[test]
     fn preview_encode_downscales_and_emits_png_data_url() {
         use base64::Engine as _;
         // Pure (no OS): 512x256 solid → long side 256, PNG magic after base64.
@@ -852,7 +907,7 @@ mod allocation_tests {
         for len in [0, 9, 20] {
             let src = BgraFrame { w: 2, h: 2, stride: 12, format: PixelFormat::Bgra8888, data: vec![42; len] };
             for dims in [(2, 2), (2, 4)] {
-                let expected = scale_bgra_nearest(&src, dims.0, dims.1);
+                let expected = scale_bgra_bilinear(&src, dims.0, dims.1);
                 let ready = prepare_bgra(src.clone(), dims.0, dims.1);
                 assert_eq!(ready.data, expected.data);
                 assert_eq!(ready.stride, expected.stride);

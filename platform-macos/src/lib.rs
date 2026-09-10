@@ -179,13 +179,13 @@ pub fn enumerate() -> Result<Vec<SourceInfo>, PlatformError> {
             } else {
                 title
             };
-            // Window size isn't exposed pre-stream; filled at start().
+            let (w, h) = window_even_size(&window);
             out.push(SourceInfo {
                 kind: SourceKind::Window,
                 id: window.windowID().to_string(),
                 name,
-                w: 0,
-                h: 0,
+                w,
+                h,
             });
         }
     }
@@ -610,6 +610,22 @@ fn extract_bgra(sample: &objc2_core_media::CMSampleBuffer) -> Option<BgraFrame> 
 /// Supervisor body: enumerate → match id → filter → config → stream → pump
 /// until stop. Reports readiness once; SCK teardown always runs on exit.
 #[allow(clippy::too_many_lines)]
+fn window_even_size(window: &SCWindow) -> (u32, u32) {
+    let frame = unsafe { window.frame() };
+    let w = (frame.size.width.round().max(0.0) as u32).max(2) & !1;
+    let h = (frame.size.height.round().max(0.0) as u32).max(2) & !1;
+    (w.max(2), h.max(2))
+}
+
+fn fit_capture_size(native_w: u32, native_h: u32, config: &CaptureConfig) -> CaptureConfig {
+    let scale = (config.width as f64 / native_w.max(1) as f64)
+        .min(config.height as f64 / native_h.max(1) as f64)
+        .min(1.0);
+    let w = ((native_w as f64 * scale) as u32).max(2) & !1;
+    let h = ((native_h as f64 * scale) as u32).max(2) & !1;
+    golive_platform::capture_config_for(w, h, config.fps)
+}
+
 fn run_capture(
     info: SourceInfo,
     config: CaptureConfig,
@@ -634,6 +650,7 @@ fn run_capture(
     // SAFETY: all objects below are created and consumed on this thread;
     // callbacks only move owned data (channels, flags).
     unsafe {
+        let mut tracked_window: Option<Retained<SCWindow>> = None;
         let filter: Option<Retained<SCContentFilter>> = match info.kind {
             SourceKind::Display => {
                 let id: u32 = match info.id.parse() {
@@ -675,10 +692,13 @@ fn run_capture(
                     }
                 };
                 match content.windows().iter().find(|w| w.windowID() == id) {
-                    Some(window) => Some(SCContentFilter::initWithDesktopIndependentWindow(
-                        SCContentFilter::alloc(),
-                        &window,
-                    )),
+                    Some(window) => {
+                        tracked_window = Some(window.clone());
+                        Some(SCContentFilter::initWithDesktopIndependentWindow(
+                            SCContentFilter::alloc(),
+                            &window,
+                        ))
+                    }
                     None => {
                         fail(PlatformError::SourceGone { id: info.id.clone() });
                         return;
@@ -691,10 +711,12 @@ fn run_capture(
             return;
         };
         let stream_config = SCStreamConfiguration::new();
-        // Backend-bounded config (pure builder, tested): profile-sized
-        // output (GPU/capture-side downscale — full-res NEVER reaches the
-        // callback) + minimum interval so surplus frames are never born.
-        let applied = golive_platform::capture_config_for(config.width, config.height, config.fps);
+        let applied = if let Some(window) = tracked_window.as_ref() {
+            let (nw, nh) = window_even_size(window);
+            fit_capture_size(nw, nh, &config)
+        } else {
+            golive_platform::capture_config_for(config.width, config.height, config.fps)
+        };
         stream_config.setWidth(applied.width as usize);
         stream_config.setHeight(applied.height as usize);
         stream_config.setPixelFormat(kCVPixelFormatType_32BGRA);
@@ -768,9 +790,19 @@ fn run_capture(
             }
         }
         let _ = ready_tx.send(Ok(()));
-        // Park until stop; teardown below runs on every exit (indicators out).
+        let mut last_capture = (applied.width, applied.height);
         while !stop_flag.load(Ordering::Acquire) {
             std::thread::sleep(Duration::from_millis(50));
+            if let Some(window) = tracked_window.as_ref() {
+                let (nw, nh) = window_even_size(window);
+                let next = fit_capture_size(nw, nh, &config);
+                if (next.width, next.height) != last_capture {
+                    stream_config.setWidth(next.width as usize);
+                    stream_config.setHeight(next.height as usize);
+                    stream.updateConfiguration_completionHandler(&stream_config, None);
+                    last_capture = (next.width, next.height);
+                }
+            }
         }
         let stopped = std::sync::mpsc::channel::<()>();
         let stopped_tx = stopped.0;

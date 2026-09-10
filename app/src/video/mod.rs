@@ -54,9 +54,10 @@ use std::time::{Duration, Instant};
 pub const HELPER_NAME: &str = "golive-video";
 pub const PROTOCOL_MAGIC: &[u8; 4] = b"GLV1";
 pub const PROTOCOL_VERSION_NOTE: &str = "v1";
-/// Window 960x540; any aspect letterboxes inside.
-pub const WINDOW_W: u32 = 960;
-pub const WINDOW_H: u32 = 540;
+/// Default helper window (16:9). Source is letterboxed inside (contain);
+/// the user drag-resizes. Ultrawide sources get black bars, not a 1:1 window.
+pub const WINDOW_W: u32 = 1280;
+pub const WINDOW_H: u32 = 720;
 /// Feeder retries connecting while the helper binds.
 const CONNECT_RETRIES: u32 = 50;
 const CONNECT_RETRY_WAIT: Duration = Duration::from_millis(100);
@@ -96,6 +97,12 @@ pub fn letterbox(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Rect {
         w,
         h,
     }
+}
+
+/// Opening size is a 16:9 frame, not the source pixels. Blit letterboxes
+/// the picture inside (`object-fit: contain`); zoom/pan still apply.
+pub fn initial_window_size(_src_w: u32, _src_h: u32) -> (u32, u32) {
+    (WINDOW_W, WINDOW_H)
 }
 
 /// Nearest-neighbor RGBA scale. Empty output on zero sizes (never panics).
@@ -351,7 +358,7 @@ fn glyph_3x5(c: char) -> [u8; 5] {
 }
 
 /// One-line help copy (single line, ASCII only by construction).
-pub const HELP_LINE: &str = "WHEEL: ZOOM  DRAG: PAN  F / DBL-CLICK: FULLSCREEN  ESC: EXIT";
+pub const HELP_LINE: &str = "RESIZE EDGES  WHEEL: ZOOM  DRAG: PAN  F / DBL-CLICK: FULLSCREEN  ESC: EXIT";
 
 /// Pixel width of `text` at `scale` (3px glyph + 1px tracking).
 pub fn text_width_px(text: &str, scale: u32) -> u32 {
@@ -939,6 +946,9 @@ mod tests {
         assert_eq!((rect.w, rect.h), (303, 540));
         assert_eq!(rect.y, 0);
         assert_eq!(rect.x, (960 - 303) / 2);
+        // Ultrawide in 16:9: full width, bars top/bottom (contain).
+        let rect = letterbox(3440, 1440, 1280, 720);
+        assert_eq!(rect, Rect { x: 0, y: (720 - 535) / 2, w: 1280, h: 535 });
         // Degenerate inputs never panic, never negative.
         assert_eq!(
             letterbox(0, 720, 960, 540),
@@ -948,6 +958,13 @@ mod tests {
             letterbox(1280, 720, 0, 0),
             Rect { x: 0, y: 0, w: 0, h: 0 }
         );
+    }
+
+    #[test]
+    fn initial_window_is_contain_frame_not_source_pixels() {
+        for src in [(1920, 1080), (3440, 1440), (3840, 1600), (0, 720)] {
+            assert_eq!(initial_window_size(src.0, src.1), (WINDOW_W, WINDOW_H));
+        }
     }
 
     #[test]

@@ -339,11 +339,12 @@ pub fn run_window(
             return;
         }
     };
-    let pool = match Direct3D11CaptureFramePool::CreateFreeThreaded(
+    let mut pool_size = SizeInt32 { Width: size.Width, Height: size.Height };
+    let mut pool = match Direct3D11CaptureFramePool::CreateFreeThreaded(
         &winrt,
         DirectXPixelFormat::B8G8R8A8UIntNormalized,
         2,
-        SizeInt32 { Width: size.Width, Height: size.Height },
+        pool_size,
     ) {
         Ok(pool) => pool,
         Err(e) => {
@@ -375,6 +376,22 @@ pub fn run_window(
     let mut readback = Readback::new(device, context);
     let _ = ready_tx.send(Ok(()));
     while !stop_flag.load(Ordering::Acquire) {
+        if let Ok(now) = item.Size() {
+            if now.Width > 0
+                && now.Height > 0
+                && (now.Width != pool_size.Width || now.Height != pool_size.Height)
+                && pool
+                    .Recreate(
+                        &winrt,
+                        DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                        2,
+                        now,
+                    )
+                    .is_ok()
+            {
+                pool_size = now;
+            }
+        }
         match grab_wgc_frame(&mut readback, &pool) {
             Some(frame) => {
                 let now = now_ns();

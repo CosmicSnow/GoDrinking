@@ -34,6 +34,13 @@
 #[allow(dead_code)]
 type OSStatus = i32;
 
+/// Bytes allowed in one `window_secs` of compressed output. OBS-style 1.5×
+/// headroom so AverageBitRate is not starved by a tight hard cap.
+pub fn data_rate_limit_bytes(bitrate_bps: u32, window_secs: f64, overshoot: f64) -> i32 {
+    let bytes = (bitrate_bps as f64 / 8.0) * window_secs * overshoot;
+    bytes.round().clamp(1.0, i32::MAX as f64) as i32
+}
+
 /// Convert planar I420 (tight, even dims) to NV12 (Y + interleaved UV).
 /// Pure; the contract dims reaching here are always even (see normalize).
 pub fn i420_to_nv12(w: usize, h: usize, y: &[u8], u: &[u8], v: &[u8]) -> Vec<u8> {
@@ -91,17 +98,21 @@ mod backend {
     use super::{avcc_to_annexb, OSStatus};
     use crate::media::MediaError;
     use objc2_core_foundation::{
-        CFBoolean, CFDictionary, CFNumber, CFRetained, kCFBooleanFalse, kCFBooleanTrue,
+        CFArray, CFBoolean, CFDictionary, CFNumber, CFRetained, kCFBooleanFalse, kCFBooleanTrue,
         kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks,
     };
     use objc2_core_media::{kCMVideoCodecType_H264, CMTime, CMTimeFlags, CMSampleBuffer};
     use objc2_core_video::{CVImageBuffer, CVPixelBuffer, CVPixelBufferPool};
     use objc2_video_toolbox::{
         kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
-        kVTCompressionPropertyKey_ExpectedFrameRate, kVTCompressionPropertyKey_MaxKeyFrameInterval,
+        kVTCompressionPropertyKey_DataRateLimits, kVTCompressionPropertyKey_ExpectedFrameRate,
+        kVTCompressionPropertyKey_MaxKeyFrameInterval,
+        kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
+        kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
         kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_RealTime,
         kVTEncodeFrameOptionKey_ForceKeyFrame,
         kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel,
+        kVTProfileLevel_H264_High_AutoLevel,
         kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,
         VTCompressionSession, VTEncodeInfoFlags, VTSession, VTSessionSetProperty,
     };
@@ -363,38 +374,86 @@ mod backend {
             Ok(())
         }
 
+        fn set_data_rate_limits(&self) -> Result<(), MediaError> {
+            const WINDOW_SECS: f64 = 1.0;
+            const OVERSHOOT: f64 = 1.5;
+            let bytes = CFNumber::new_i32(super::data_rate_limit_bytes(
+                self.bitrate_bps.max(100_000),
+                WINDOW_SECS,
+                OVERSHOOT,
+            ));
+            let window = CFNumber::new_f64(WINDOW_SECS);
+            let limits = CFArray::from_retained_objects(&[bytes, window]);
+            // SAFETY: session alive; key/value match VT DataRateLimits (bytes, seconds).
+            let status = unsafe {
+                VTSessionSetProperty(
+                    self.as_vt_session(),
+                    &*kVTCompressionPropertyKey_DataRateLimits,
+                    Some(&limits),
+                )
+            };
+            // -12900 = kVTPropertyNotSupportedErr: keep ABR, do not fail share.
+            if status != 0 && status != -12900 {
+                return Err(MediaError::HwUnavailable(format!(
+                    "data rate limits rejected, status {status}"
+                )));
+            }
+            Ok(())
+        }
+
         fn setup(&mut self) -> Result<(), MediaError> {
             self.set_number(
                 unsafe { &*kVTCompressionPropertyKey_AverageBitRate },
                 self.bitrate_bps.max(100_000) as i32,
             )?;
+            // OBS: DataRateLimits so ABR actually spends the requested bits.
+            // Unsupported on some GPUs — continue, never fail the session.
+            self.set_data_rate_limits()?;
             self.set_number(
                 unsafe { &*kVTCompressionPropertyKey_MaxKeyFrameInterval },
                 (2 * self.fps as u32).max(2) as i32,
             )?;
+            let _ = self.set_number(
+                unsafe { &*kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration },
+                2,
+            );
             self.set_bool(unsafe { &*kVTCompressionPropertyKey_RealTime }, true)?;
             self.set_bool(
                 unsafe { &*kVTCompressionPropertyKey_AllowFrameReordering },
                 false,
             )?;
+            let _ = self.set_bool(
+                unsafe { &*kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality },
+                false,
+            );
             self.set_number(
                 unsafe { &*kVTCompressionPropertyKey_ExpectedFrameRate },
                 self.fps as i32,
             )?;
-            // Constrained-Baseline-compatible profile; AutoLevel fits dims.
-            // (Separate call: the value is a string, not a number.)
+            // High matches OBS default (CABAC + 8×8). SDP still advertises
+            // Constrained Baseline; OpenH264 on our viewer decodes High.
+            // Fall back if this GPU rejects High.
             // SAFETY: session alive (field); Apple-owned constant strings.
-            let status = unsafe {
+            let high = unsafe {
                 VTSessionSetProperty(
                     self.as_vt_session(),
                     &*kVTCompressionPropertyKey_ProfileLevel,
-                    Some(&*kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel),
+                    Some(&*kVTProfileLevel_H264_High_AutoLevel),
                 )
             };
-            if status != 0 {
-                return Err(MediaError::HwUnavailable(format!(
-                    "profile rejected, status {status}"
-                )));
+            if high != 0 {
+                let status = unsafe {
+                    VTSessionSetProperty(
+                        self.as_vt_session(),
+                        &*kVTCompressionPropertyKey_ProfileLevel,
+                        Some(&*kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel),
+                    )
+                };
+                if status != 0 {
+                    return Err(MediaError::HwUnavailable(format!(
+                        "profile rejected, status {status}"
+                    )));
+                }
             }
             let status = unsafe { self.session_ref().prepare_to_encode_frames() };
             if status != 0 {
@@ -780,6 +839,12 @@ pub use backend::{probe_hardware, VtEncoder};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_rate_limit_matches_obs_headroom() {
+        assert_eq!(data_rate_limit_bytes(8_000_000, 1.0, 1.5), 1_500_000);
+        assert_eq!(data_rate_limit_bytes(0, 1.0, 1.5), 1);
+    }
 
     #[test]
     fn nv12_interleaves_chroma() {

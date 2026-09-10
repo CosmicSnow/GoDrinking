@@ -37,12 +37,12 @@ pub struct CaptureConfig {
 /// Builds an output config already clamped to backend bounds: SCK rejects
 /// degenerate or absurd sizes, so every caller funnels through here (pure,
 /// tested). Floor 64 keeps tiny windows valid without the old 320x240
-/// forced upscale; ceiling 1920x1080 bounds the callback copy; fps
-/// 1..=60 feeds `minimumFrameInterval` directly.
+/// forced upscale; ceiling 4096 matches the encoder; fps 1..=60 feeds
+/// `minimumFrameInterval` directly.
 pub fn capture_config_for(w: u32, h: u32, fps: u32) -> CaptureConfig {
     CaptureConfig {
-        width: w.clamp(64, 1920),
-        height: h.clamp(64, 1080),
+        width: w.clamp(64, 4096),
+        height: h.clamp(64, 4096),
         fps: fps.clamp(1, 60),
     }
 }
@@ -189,10 +189,13 @@ mod tests {
             capture_config_for(742, 480, 15),
             CaptureConfig { width: 742, height: 480, fps: 15 }
         );
-        // Full Retina never reaches the callback: ceiling 1920x1080.
         assert_eq!(
             capture_config_for(3456, 2234, 120),
-            CaptureConfig { width: 1920, height: 1080, fps: 60 }
+            CaptureConfig { width: 3456, height: 2234, fps: 60 }
+        );
+        assert_eq!(
+            capture_config_for(8000, 5000, 60),
+            CaptureConfig { width: 4096, height: 4096, fps: 60 }
         );
         // Degenerate/zero floors without the old forced 320x240 upscale.
         assert_eq!(

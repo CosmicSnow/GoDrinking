@@ -501,7 +501,7 @@ describe("qualidade (espelha QualityProfile; fio bloqueado)", () => {
   it("presets seguem o backend (HIGH = 10000 kbps)", () => {
     expect(QUALITY_PRESETS.low).toMatchObject({ w: 854, h: 480, bitrate_kbps: 800, fps: 15 });
     expect(QUALITY_PRESETS.medium).toMatchObject({ w: 1280, h: 720, bitrate_kbps: 2000, fps: 30 });
-    expect(QUALITY_PRESETS.high).toMatchObject({ w: 1920, h: 1080, bitrate_kbps: 10000, fps: 30 });
+    expect(QUALITY_PRESETS.high).toMatchObject({ w: 1920, h: 1080, bitrate_kbps: 10000, fps: 60 });
   });
 
   it("dimensão custom: inteira, par, 2–4096", () => {
@@ -548,6 +548,43 @@ describe("qualidade (espelha QualityProfile; fio bloqueado)", () => {
       srcDims: { w: 1920, h: 1080 },
     });
     expect(custom).toEqual({ profile: { w: 640, h: 360, bitrate_kbps: 1000, fps: 24 } });
+  });
+
+  it("1:1 usa a fonte par ou o teto 4096 quando a fonte é desconhecida", () => {
+    const native = resolveDesired({
+      resolution: "1:1",
+      customW: "",
+      customH: "",
+      quality: "high",
+      customBitrate: "",
+      customFps: "",
+      srcDims: { w: 3440, h: 1440 },
+    });
+    expect(native).toEqual({ profile: { w: 3440, h: 1440, bitrate_kbps: 10000, fps: 60 } });
+
+    const unknown = resolveDesired({
+      resolution: "1:1",
+      customW: "",
+      customH: "",
+      quality: "high",
+      customBitrate: "",
+      customFps: "",
+      srcDims: { w: 0, h: 0 },
+    });
+    expect(unknown).toEqual({ profile: { w: 4096, h: 4096, bitrate_kbps: 10000, fps: 60 } });
+  });
+
+  it("janela 0×0 não barra custom acima de 1080p", () => {
+    const custom = resolveDesired({
+      resolution: "custom",
+      customW: "2560",
+      customH: "1440",
+      quality: "high",
+      customBitrate: "",
+      customFps: "",
+      srcDims: { w: 0, h: 0 },
+    });
+    expect(custom).toEqual({ profile: { w: 2560, h: 1440, bitrate_kbps: 10000, fps: 60 } });
   });
 
   it("barra upscale além da fonte conhecida; sem fonte, sem teto extra", () => {

@@ -700,7 +700,8 @@ export default function App() {
   // synthetic/movie não têm teto conhecido — o backend normaliza na borda.
   const selectedSourceDims = (): { w: number; h: number } | null => {
     const selected = sources.find((item) => `${item.kind}:${item.id}` === source.trim());
-    return selected ? { w: selected.w, h: selected.h } : null;
+    if (!selected || selected.w < 2 || selected.h < 2) return null;
+    return { w: selected.w, h: selected.h };
   };
   const srcDims = selectedSourceDims();
   const shareLive = snapshot?.share.state === "live";

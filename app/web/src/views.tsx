@@ -98,7 +98,7 @@ export const linkLabel = (state: LinkState): string => LINK_LABEL[state] ?? stat
 // comando `set_quality`, efetivo autoritativo no snapshot/evento).
 // ---------------------------------------------------------------------------
 
-export type ResolutionSel = "480p" | "720p" | "1080p" | "custom";
+export type ResolutionSel = "480p" | "720p" | "1080p" | "1:1" | "custom";
 export type QualitySel = "low" | "medium" | "high" | "custom";
 
 export interface DesiredProfile {
@@ -108,11 +108,22 @@ export interface DesiredProfile {
   fps: number;
 }
 
-export const RESOLUTION_DIMS: Record<Exclude<ResolutionSel, "custom">, { w: number; h: number }> = {
+export const RESOLUTION_DIMS: Record<Exclude<ResolutionSel, "custom" | "1:1">, { w: number; h: number }> = {
   "480p": { w: 854, h: 480 },
   "720p": { w: 1280, h: 720 },
   "1080p": { w: 1920, h: 1080 },
 };
+
+const NATIVE_CAP = { w: 4096, h: 4096 };
+
+function evenDim(value: number): number {
+  return Math.max(2, value - (value % 2));
+}
+
+function usableSrcDims(dims: { w: number; h: number } | null): { w: number; h: number } | null {
+  if (!dims || dims.w < 2 || dims.h < 2) return null;
+  return dims;
+}
 
 export const QUALITY_PRESETS: Record<
   Exclude<QualitySel, "custom">,
@@ -120,7 +131,7 @@ export const QUALITY_PRESETS: Record<
 > = {
   low: { w: 854, h: 480, bitrate_kbps: 800, fps: 15, label: "LOW · 800 kbps · 15 fps" },
   medium: { w: 1280, h: 720, bitrate_kbps: 2000, fps: 30, label: "MEDIUM · 2000 kbps · 30 fps" },
-  high: { w: 1920, h: 1080, bitrate_kbps: 10000, fps: 30, label: "HIGH · 10000 kbps · 30 fps" },
+  high: { w: 1920, h: 1080, bitrate_kbps: 10000, fps: 60, label: "HIGH · 10000 kbps · 60 fps" },
 };
 
 /** Formata o efetivo autoritativo (perfil + geração do fence). */
@@ -195,6 +206,7 @@ export function resolveDesired(
   const errors: string[] = [];
   let w = 0;
   let h = 0;
+  const srcDims = usableSrcDims(selection.srcDims);
   if (selection.resolution === "custom") {
     const wError = validateCustomDim(selection.customW, "largura");
     const hError = validateCustomDim(selection.customH, "altura");
@@ -202,10 +214,18 @@ export function resolveDesired(
     if (hError) errors.push(hError);
     w = parseUint(selection.customW) ?? 0;
     h = parseUint(selection.customH) ?? 0;
-    if (!wError && !hError && selection.srcDims) {
-      const { w: srcW, h: srcH } = selection.srcDims;
+    if (!wError && !hError && srcDims) {
+      const { w: srcW, h: srcH } = srcDims;
       if (w > srcW || h > srcH)
         errors.push(`sem upscale além da fonte (${srcW}×${srcH}).`);
+    }
+  } else if (selection.resolution === "1:1") {
+    if (srcDims) {
+      w = evenDim(srcDims.w);
+      h = evenDim(srcDims.h);
+    } else {
+      w = NATIVE_CAP.w;
+      h = NATIVE_CAP.h;
     }
   } else {
     ({ w, h } = RESOLUTION_DIMS[selection.resolution]);
@@ -309,6 +329,7 @@ export function QualityPanel(props: QualityPanelProps) {
               <option value="480p">480p · 854×480</option>
               <option value="720p">720p · 1280×720</option>
               <option value="1080p">1080p · 1920×1080</option>
+              <option value="1:1">1:1 · nativo da fonte</option>
               <option value="custom">Custom…</option>
             </select>
           </div>
@@ -430,7 +451,7 @@ export interface ViewerLinksProps {
 }
 
 export const WINDOW_HINT =
-  "Na janela do vídeo: roda = zoom · arrastar = pan · F ou duplo-clique = tela cheia · Esc sai.";
+  "Na janela do vídeo: arraste as bordas para redimensionar · roda = zoom · arrastar = pan · F ou duplo-clique = tela cheia · Esc sai.";
 
 export function ViewerLinksPanel({ links, watching }: ViewerLinksProps) {
   if (links === null) {

@@ -20,15 +20,15 @@
 
 use golive_app::video::{
     connect_helper, draw_text, help_visible, is_double_click, letterbox, rgba_to_xrgb8888,
-    scale_rgba_bilinear, text_height_px, text_width_px, HelperStream, ViewState, HELP_LINE,
-    WINDOW_H, WINDOW_W,
+    initial_window_size, scale_rgba_bilinear, text_height_px, text_width_px, HelperStream,
+    ViewState, HELP_LINE,
 };
 use std::io::{Read, Write};
 use std::num::NonZeroU32;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -255,10 +255,12 @@ impl ApplicationHandler<UserWake> for App {
         if self.window.is_some() {
             return;
         }
+        let (win_w, win_h) = initial_window_size(self.src_w, self.src_h);
         let attrs = Window::default_attributes()
             .with_title(&self.base_title)
-            .with_inner_size(LogicalSize::new(WINDOW_W as f64, WINDOW_H as f64))
-            .with_resizable(false);
+            .with_inner_size(PhysicalSize::new(win_w, win_h))
+            .with_min_inner_size(PhysicalSize::new(320u32, 180u32))
+            .with_resizable(true);
         let window: Arc<Window> = match event_loop.create_window(attrs) {
             Ok(window) => Arc::new(window),
             Err(e) => {

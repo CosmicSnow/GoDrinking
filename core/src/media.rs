@@ -4,7 +4,7 @@
 //!
 //! Contract: H.264 Constrained Baseline (packetization-mode=1, 42e01f) +
 //! Opus 48 kHz modeled (audio track lands later; this step is video-only —
-//! the requested E2E asserts video), 720p30/1080p30. No TURN anywhere.
+//! the requested E2E asserts video), 720p30/1080p60. No TURN anywhere.
 //!
 //! Design notes (hard lessons, enforced):
 //! - Trickle ICE from day one: candidates + ice-complete flow as envelopes.
@@ -106,9 +106,8 @@ impl Quality {
 ///   congested networks; software 480p15 costs single-digit ms/frame.
 /// - MEDIUM `1280x720 @ 2000 kbps @ 30 fps`: the historical defaults,
 ///   byte-identical to the previous hardcoded contract.
-/// - HIGH `1920x1080 @ 10000 kbps @ 30 fps`: spec bitrate; 30 fps (not 60)
-///   because software 1080p60 does not hold on most machines — use the
-///   hardware engine for headroom (see `EngineKind`).
+/// - HIGH `1920x1080 @ 10000 kbps @ 60 fps`: screen-share ladder (OBS-like
+///   1080p60). Software may not hold 60; Auto picks VideoToolbox on macOS.
 ///
 /// Validation ranges: dims `2..=4096` (any parity in, even out — see
 /// [`normalize_dims`]); bitrate `100..=20000` kbps (below 100 the control
@@ -133,7 +132,7 @@ impl QualityProfile {
     }
 
     pub fn high() -> Self {
-        Self { w: 1920, h: 1080, bitrate_kbps: 10_000, fps: 30 }
+        Self { w: 1920, h: 1080, bitrate_kbps: 10_000, fps: 60 }
     }
 
     pub fn custom(w: u32, h: u32, bitrate_kbps: u32, fps: u32) -> Result<Self, QualityError> {
@@ -790,10 +789,15 @@ fn strip_start_code(nal: &[u8]) -> &[u8] {
 /// H.264 level tier by pixel count: HD and below is 3.1, above is 4.0.
 /// Matches the historical mapping (720p→3.1, 1080p→4.0).
 fn level_for(w: usize, h: usize) -> Level {
-    if (w as u64) * (h as u64) <= 1280 * 720 {
+    let pixels = (w as u64).saturating_mul(h as u64);
+    if pixels <= 1280 * 720 {
         Level::Level_3_1
+    } else if pixels <= 1920 * 1080 {
+        Level::Level_4_1
+    } else if pixels <= 2560 * 1440 {
+        Level::Level_5_0
     } else {
-        Level::Level_4_0
+        Level::Level_5_1
     }
 }
 
@@ -1400,11 +1404,27 @@ fn encode_loop(
             } {
                 Ok(ExternalFrame::Cpu(frame)) => {
                     ext_last = Some(frame);
+                    let needed = encode_target_for_frame(
+                        ext_last.as_ref().unwrap().w,
+                        ext_last.as_ref().unwrap().h,
+                        &profile,
+                    );
+                    try_retarget_encoder(
+                        &mut encoder, &mut target, &profile, engine,
+                        &mut generation, &backend, &event_tx, census, needed,
+                    );
                     PendingFrame::Cpu(Cow::Borrowed(scale_frame_reusing(ext_last.as_ref().unwrap(), target.0, target.1, &mut scaled)))
                 }
                 // Retained GPU buffer: ownership moves into the encode
                 // step (submit or convert); a drop there releases it.
-                Ok(ExternalFrame::Gpu(gpu)) => PendingFrame::Gpu(gpu),
+                Ok(ExternalFrame::Gpu(gpu)) => {
+                    let needed = encode_target_for_frame(gpu.w as usize, gpu.h as usize, &profile);
+                    try_retarget_encoder(
+                        &mut encoder, &mut target, &profile, engine,
+                        &mut generation, &backend, &event_tx, census, needed,
+                    );
+                    PendingFrame::Gpu(gpu)
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => match cpu_holdover_on_timeout(ext_last.as_ref()) {
                     Some(last) => PendingFrame::Cpu(Cow::Borrowed(scale_frame_reusing(last, target.0, target.1, &mut scaled))),
                     None => continue,
@@ -1604,14 +1624,49 @@ fn native_dims(source: &VideoSource, profile: &QualityProfile, movie: Option<&Ve
     }
 }
 
+fn encode_target_for_frame(src_w: usize, src_h: usize, profile: &QualityProfile) -> (usize, usize) {
+    let (w, h) = profile.normalized_dims(src_w.max(2) as u32, src_h.max(2) as u32);
+    (w.max(2) as usize, h.max(2) as usize)
+}
+
+fn try_retarget_encoder(
+    encoder: &mut VideoEncoder,
+    target: &mut (usize, usize),
+    profile: &QualityProfile,
+    engine: EngineKind,
+    generation: &mut u64,
+    backend: &Arc<std::sync::Mutex<Option<&'static str>>>,
+    event_tx: &mpsc::UnboundedSender<MediaEvent>,
+    census: &Arc<std::sync::Mutex<CandidateCensus>>,
+    needed: (usize, usize),
+) {
+    if needed == *target || needed.0 < 2 || needed.1 < 2 {
+        return;
+    }
+    match VideoEncoder::new(profile, needed.0, needed.1, engine) {
+        Ok(new_encoder) => {
+            *encoder = new_encoder;
+            *target = needed;
+            *generation = generation.wrapping_add(1);
+            encoder.force_intra();
+            note_backend(backend, encoder.backend_name());
+            let _ = event_tx.send(MediaEvent::Stats(MediaStats {
+                census: census_snapshot(census),
+                generation: *generation,
+                ..Default::default()
+            }));
+        }
+        Err(_) => {}
+    }
+}
+
 fn initial_target(
     source: &VideoSource,
     profile: &QualityProfile,
     movie: Option<&Vec<I420Frame>>,
 ) -> (usize, usize) {
     let (sw, sh) = native_dims(source, profile, movie);
-    let (w, h) = profile.normalized_dims(sw, sh);
-    (w as usize, h as usize)
+    encode_target_for_frame(sw as usize, sh as usize, profile)
 }
 
 /// Build the encoder backend for a target. Software always works;
@@ -2348,7 +2403,7 @@ mod tests {
         let medium = QualityProfile::medium();
         assert_eq!((medium.w, medium.h, medium.bitrate_kbps, medium.fps), (1280, 720, 2000, 30));
         let high = QualityProfile::high();
-        assert_eq!((high.w, high.h, high.bitrate_kbps, high.fps), (1920, 1080, 10_000, 30));
+        assert_eq!((high.w, high.h, high.bitrate_kbps, high.fps), (1920, 1080, 10_000, 60));
         for preset in [low, medium, high] {
             preset.validate().expect("presets are valid");
         }
@@ -2411,10 +2466,22 @@ mod tests {
     }
 
     #[test]
+    fn encode_target_follows_source_within_profile() {
+        let cap = QualityProfile::high();
+        assert_eq!(encode_target_for_frame(800, 600, &cap), (800, 600));
+        let fitted = cap.normalized_dims(3440, 1440);
+        assert_eq!(encode_target_for_frame(3440, 1440, &cap), (fitted.0 as usize, fitted.1 as usize));
+        assert!(fitted.0 <= 1920 && fitted.1 <= 1080);
+        let native = QualityProfile::custom(4096, 4096, 10_000, 60).unwrap();
+        assert_eq!(encode_target_for_frame(3440, 1440, &native), (3440, 1440));
+        assert_eq!(encode_target_for_frame(1200, 900, &native), (1200, 900));
+    }
+
+    #[test]
     fn pacing_and_keyframe_cadence_follow_fps() {
         assert_eq!(QualityProfile::low().frame_duration(), Duration::from_micros(1_000_000 / 15));
         assert_eq!(QualityProfile::medium().frame_duration(), Duration::from_micros(1_000_000 / 30));
-        assert_eq!(QualityProfile::high().frame_duration(), Duration::from_micros(1_000_000 / 30));
+        assert_eq!(QualityProfile::high().frame_duration(), Duration::from_micros(1_000_000 / 60));
         assert_eq!(QualityProfile::low().keyframe_interval_frames(), 30);
         assert_eq!(QualityProfile::medium().keyframe_interval_frames(), 60);
         // floor of 2 frames keeps tiny fps sane.
