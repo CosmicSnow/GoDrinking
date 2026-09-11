@@ -207,6 +207,30 @@ mod backend {
             fps: u32,
             backend: &'static str,
         ) -> Result<Self, MediaError> {
+            let result = Self::from_activation_inner(
+                activation.clone(),
+                w,
+                h,
+                bitrate_bps,
+                fps,
+                backend,
+            );
+            if result.is_err() {
+                unsafe {
+                    let _ = activation.ShutdownObject();
+                }
+            }
+            result
+        }
+
+        fn from_activation_inner(
+            activation: IMFActivate,
+            w: usize,
+            h: usize,
+            bitrate_bps: u32,
+            fps: u32,
+            backend: &'static str,
+        ) -> Result<Self, MediaError> {
             let transform: IMFTransform = unsafe { activation.ActivateObject() }
                 .map_err(|e| hw_err(format!("MFT activate {e}")))?;
             let events: IMFMediaEventGenerator = transform
@@ -559,7 +583,25 @@ mod backend {
         fps: u32,
         bitrate_bps: u32,
     ) -> Result<(), MediaError> {
-        let output = video_type(MFVideoFormat_H264, w, h, fps, Some(bitrate_bps))?;
+        let mut last = hw_err("SetOutputType");
+        for baseline in [false, true] {
+            match set_types(transform, w, h, fps, bitrate_bps, baseline) {
+                Ok(()) => return Ok(()),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+
+    fn set_types(
+        transform: &IMFTransform,
+        w: usize,
+        h: usize,
+        fps: u32,
+        bitrate_bps: u32,
+        baseline: bool,
+    ) -> Result<(), MediaError> {
+        let output = video_type(MFVideoFormat_H264, w, h, fps, Some((bitrate_bps, baseline)))?;
         unsafe { transform.SetOutputType(OUTPUT_STREAM, &output, 0) }
             .map_err(|e| hw_err(format!("SetOutputType {e}")))?;
         let input = video_type(MFVideoFormat_NV12, w, h, fps, None)?;
@@ -573,7 +615,7 @@ mod backend {
         w: usize,
         h: usize,
         fps: u32,
-        bitrate: Option<u32>,
+        bitrate: Option<(u32, bool)>,
     ) -> Result<IMFMediaType, MediaError> {
         let media_type =
             unsafe { MFCreateMediaType() }.map_err(|e| hw_err(format!("MFCreateMediaType {e}")))?;
@@ -598,13 +640,18 @@ mod backend {
                     .SetUINT32(&MF_MT_DEFAULT_STRIDE, w as u32)
                     .map_err(|e| hw_err(format!("stride {e}")))?;
             }
-            if let Some(bps) = bitrate {
+            if let Some((bps, baseline)) = bitrate {
                 media_type
                     .SetUINT32(&MF_MT_AVG_BITRATE, bps)
                     .map_err(|e| hw_err(format!("bitrate {e}")))?;
-                media_type
-                    .SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)
-                    .ok();
+                if baseline {
+                    media_type
+                        .SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)
+                        .ok();
+                    media_type
+                        .SetUINT32(&MF_MT_MPEG2_LEVEL, eAVEncH264VLevel4_1.0 as u32)
+                        .ok();
+                }
             }
         }
         Ok(media_type)

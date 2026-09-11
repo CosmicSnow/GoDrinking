@@ -740,12 +740,11 @@ impl VideoEncoder {
                     Err(e) if selected == EngineKind::Hardware => {
                         let encoder = Self::new(profile, w, h, EngineKind::Software)?;
                         eprintln!(
-                            "golive: encode backend={} target={}x{} (hw failed; software fallback)",
+                            "golive: encode backend={} target={}x{} (hw failed ({e}); software fallback)",
                             encoder.backend_name(),
                             encoder.dims().0,
                             encoder.dims().1
                         );
-                        let _ = e;
                         Ok(encoder)
                     }
                     Err(e) => Err(e),
