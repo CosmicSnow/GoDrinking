@@ -201,3 +201,83 @@ async fn failed_join_does_not_wedge_session() {
         .expect("retry after failed join must not be SessionBusy");
     guest.leave().await.expect("leave");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peers_watch_each_other_while_sharing() {
+    run_mutual_watch(true).await;
+    run_mutual_watch(false).await;
+}
+
+async fn run_mutual_watch(room_creator_shares_first: bool) {
+    let server = ServerGuard::spawn().expect("server");
+    let a = Arc::new(AppState::new());
+    let b = Arc::new(AppState::new());
+    a.set_server(&server.base).unwrap();
+    b.set_server(&server.base).unwrap();
+    let code = a
+        .create_room(None, "alpha", "duplex-test-password")
+        .await
+        .unwrap();
+    b.join_room(None, &code, "bravo", "duplex-test-password")
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (a_id, b_id) = loop {
+        let a_id = b
+            .get_roster()
+            .into_iter()
+            .find(|m| m.nickname == "alpha")
+            .map(|m| m.id);
+        let b_id = a
+            .get_roster()
+            .into_iter()
+            .find(|m| m.nickname == "bravo")
+            .map(|m| m.id);
+        if let (Some(a_id), Some(b_id)) = (a_id, b_id) {
+            break (a_id, b_id);
+        }
+        assert!(Instant::now() < deadline, "rosters must arrive");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let (a, b, a_id, b_id) = if room_creator_shares_first {
+        (a, b, a_id, b_id)
+    } else {
+        (b, a, b_id, a_id)
+    };
+    a.start_share(None, "synthetic", None).await.unwrap();
+    b.watch(&a_id).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while b.get_media_counters().unwrap().frames < 3 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let first = b.get_media_counters().unwrap().frames;
+    if first < 3 {
+        a.leave().await.unwrap();
+        b.leave().await.unwrap();
+        panic!("initial A -> B must deliver video: {first}");
+    }
+    b.start_share(None, "synthetic", None).await.unwrap();
+    a.watch(&b_id).await.unwrap();
+    let baseline = b.get_media_counters().unwrap().frames;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if a.get_media_counters().unwrap().frames >= 3
+            && b.get_media_counters().unwrap().frames >= baseline + 3
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let reverse = a.get_media_counters().unwrap().frames;
+    let forward = b
+        .get_media_counters()
+        .unwrap()
+        .frames
+        .saturating_sub(baseline);
+    a.leave().await.unwrap();
+    b.leave().await.unwrap();
+    assert!(
+        reverse >= 3 && forward >= 3,
+        "both directions must deliver video: A -> B fresh={forward}, B -> A={reverse}"
+    );
+}

@@ -942,15 +942,22 @@ async fn on_envelope(
     payload: &Envelope,
 ) {
     let _operation = state.operations.lock().await;
-    // Host link?
-    let is_host_link = {
-        let inner = match state.inner.lock() {
-            Ok(inner) => inner,
-            Err(_) => return,
-        };
-        inner.publishers.contains_key(from)
+    // The same member can publish to us and watch us simultaneously.
+    // Offers belong to our viewer, answers to our publisher. Trickle is
+    // bidirectional, so its wire fence identifies the destination session.
+    let to_publisher = match payload.kind {
+        EnvelopeKind::Offer => false,
+        EnvelopeKind::Answer => true,
+        EnvelopeKind::Candidate | EnvelopeKind::IceComplete => {
+            let inner = match state.inner.lock() {
+                Ok(inner) => inner,
+                Err(_) => return,
+            };
+            inner.publishers.get(from)
+                .is_some_and(|session| current(&session.wire, payload))
+        }
     };
-    if is_host_link {
+    if to_publisher {
         on_host_envelope(state, from, payload).await;
     } else {
         on_viewer_envelope(state, app, from, payload).await;
