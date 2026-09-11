@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -491,14 +491,12 @@ fn opus_loop(
             match encoder.encode_float(&frame, &mut output) {
                 Ok(size) if size > 0 => {
                     output.truncate(size);
-                    if opus_tx
-                        .try_send(EncodedAudioPacket {
-                            data: output,
-                            duration: Duration::from_millis(20),
-                        })
-                        .is_err()
-                    {
-                        return;
+                    match opus_tx.try_send(EncodedAudioPacket {
+                        data: output,
+                        duration: Duration::from_millis(20),
+                    }) {
+                        Ok(()) | Err(TrySendError::Full(_)) => {}
+                        Err(TrySendError::Disconnected(_)) => return,
                     }
                 }
                 _ => {}

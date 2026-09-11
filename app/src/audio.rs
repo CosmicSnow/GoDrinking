@@ -150,10 +150,23 @@ impl ViewerPlayback {
                 let channels = config.channels() as usize;
                 let q = Arc::clone(&worker_queue);
                 let err_fn = |_err| {};
+                let stream_config = config.config();
                 let stream = match config.sample_format() {
                     cpal::SampleFormat::F32 => device.build_output_stream(
-                        &config.into(),
+                        &stream_config,
                         move |data: &mut [f32], _| fill_output(data, channels, sample_rate, &q),
+                        err_fn,
+                        None,
+                    ),
+                    cpal::SampleFormat::I16 => device.build_output_stream(
+                        &stream_config,
+                        move |data: &mut [i16], _| {
+                            let mut tmp = vec![0f32; data.len()];
+                            fill_output(&mut tmp, channels, sample_rate, &q);
+                            for (dst, src) in data.iter_mut().zip(tmp.iter()) {
+                                *dst = (src.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                            }
+                        },
                         err_fn,
                         None,
                     ),

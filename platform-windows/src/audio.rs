@@ -5,7 +5,7 @@
 use golive_platform::{AudioApp, EncodedAudioPacket, PlatformError};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -264,12 +264,9 @@ fn wasapi_loop(
             if frames == 0 {
                 break;
             }
-            let Ok(info) = loopback.capture.read_from_device_to_deque(&mut bytes) else {
+            let Ok(_info) = loopback.capture.read_from_device_to_deque(&mut bytes) else {
                 break;
             };
-            if info.flags.silent {
-                continue;
-            }
             while bytes.len() >= 8 {
                 let mut frame = [0_u8; 8];
                 for byte in frame.iter_mut() {
@@ -284,14 +281,12 @@ fn wasapi_loop(
                 match encoder.encode_float(&frame, &mut output) {
                     Ok(size) if size > 0 => {
                         output.truncate(size);
-                        if opus_tx
-                            .try_send(EncodedAudioPacket {
-                                data: output,
-                                duration: Duration::from_millis(20),
-                            })
-                            .is_err()
-                        {
-                            return;
+                        match opus_tx.try_send(EncodedAudioPacket {
+                            data: output,
+                            duration: Duration::from_millis(20),
+                        }) {
+                            Ok(()) | Err(TrySendError::Full(_)) => {}
+                            Err(TrySendError::Disconnected(_)) => return,
                         }
                     }
                     _ => {}
