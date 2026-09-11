@@ -123,8 +123,8 @@ async fn shell_create_share_snapshot() {
 
     // Bad inputs are rejected without side effects.
     assert!(state.set_server("not-a-url").is_err());
-    assert!(state.start_share(None, "bogus").await.is_err());
-    assert!(state.start_share(None, "synthetic").await.is_err()); // not in a room
+    assert!(state.start_share(None, "bogus", None).await.is_err());
+    assert!(state.start_share(None, "synthetic", None).await.is_err()); // not in a room
 
     // create → share → snapshot(Live with a share id).
     // With a plan installed, the room code is also published to code_file.
@@ -154,10 +154,9 @@ async fn shell_create_share_snapshot() {
     assert_eq!(state.e2e_read_code().expect("read code"), code);
     let _ = std::fs::remove_dir_all(&dir);
     state
-        .start_share(None, "synthetic")
+        .start_share(None, "synthetic", None)
         .await
         .expect("start_share");
-    // The encoder runs for real; give it a moment, then snapshot.
     tokio::time::sleep(Duration::from_secs(2)).await;
     let snap = state.get_snapshot().expect("snapshot");
     assert_eq!(

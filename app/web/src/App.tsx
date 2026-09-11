@@ -620,7 +620,6 @@ export default function App() {
       return;
     }
     void runIntent(async () => {
-      await startShare(source.trim());
       const resolved = resolveDesired({
         resolution,
         customW,
@@ -630,10 +629,11 @@ export default function App() {
         customFps,
         srcDims: selectedSourceDims(),
       });
-      if (!("profile" in resolved)) return;
-      const preset = quality === "custom" ? undefined : quality;
-      const result = await setQualityCommand(resolved.profile, preset);
-      setEffective(result);
+      const profile = "profile" in resolved ? resolved.profile : undefined;
+      await startShare(source.trim(), profile);
+      if (profile) {
+        setEffective({ profile, generation: 0 });
+      }
     });
   };
 

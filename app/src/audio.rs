@@ -65,6 +65,32 @@ impl ShareAudio {
         })
     }
 
+    pub fn start_for_window(window_id: &str) -> Result<Self, String> {
+        let (hub_tx, hub_rx) = mpsc::sync_channel::<EncodedAudioPacket>(16);
+        let subscribers: Arc<Mutex<Vec<SyncSender<EncodedAudioPacket>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let hub_subs = Arc::clone(&subscribers);
+        let hub = std::thread::Builder::new()
+            .name("golive-audio-hub".into())
+            .spawn(move || audio_hub(hub_rx, hub_subs))
+            .map_err(|error| error.to_string())?;
+        let tap = match start_window_tap(window_id, hub_tx.clone()) {
+            Ok(tap) => tap,
+            Err(error) => {
+                drop(hub_tx);
+                let _ = hub.join();
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            tap: Some(tap),
+            excluded: Vec::new(),
+            hub_tx,
+            subscribers,
+            _hub: hub,
+        })
+    }
+
     pub fn subscribe(&self) -> Receiver<EncodedAudioPacket> {
         let (tx, rx) = mpsc::sync_channel(16);
         if let Ok(mut list) = self.subscribers.lock() {
@@ -95,6 +121,20 @@ impl ShareAudio {
     pub fn live(&self) -> bool {
         self.tap.is_some()
     }
+}
+
+fn start_window_tap(window_id: &str, tx: SyncSender<EncodedAudioPacket>) -> Result<OsTap, String> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(pid) = golive_platform_windows::window_pid(window_id) {
+            return golive_platform_windows::start_audio_tap_include(pid, tx)
+                .map(|inner| OsTap { _inner: inner })
+                .map_err(|error| error.to_string());
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = window_id;
+    start_tap(&[], tx)
 }
 
 fn start_tap(

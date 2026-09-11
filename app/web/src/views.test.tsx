@@ -157,6 +157,52 @@ describe("rótulos de estado (espelham core/src/state.rs)", () => {
   });
 });
 
+describe("RoomScreen AO VIVO honesto", () => {
+  const members: RoomMember[] = [
+    { id: "m-1", nickname: "Ana", master: true, share: false },
+    { id: "m-2", nickname: "Bia", master: false, share: true },
+  ];
+
+  it("ICE connected sem frame apresentado não mostra AO VIVO", () => {
+    const html = renderToStaticMarkup(
+      createElement(
+        RoomScreen,
+        roomProps({
+          roster: members,
+          watching: ["m-2"],
+          snapshot: snapshotFixture({
+            share: { id: "share:1", state: "live" },
+            links: [{ id: "link:1", watcher: "m-2", state: "connected" }],
+            watchers: ["m-2"],
+          }),
+          linkStats: [linkFixture({ member: "m-2", presented: 0 })],
+        }),
+      ),
+    );
+    expect(html).not.toContain("AO VIVO");
+    expect(html).toContain("Conectando");
+  });
+
+  it("ICE connected com frame apresentado mostra AO VIVO", () => {
+    const html = renderToStaticMarkup(
+      createElement(
+        RoomScreen,
+        roomProps({
+          roster: members,
+          watching: ["m-2"],
+          snapshot: snapshotFixture({
+            share: { id: "share:1", state: "live" },
+            links: [{ id: "link:1", watcher: "m-2", state: "connected" }],
+            watchers: ["m-2"],
+          }),
+          linkStats: [linkFixture({ member: "m-2", presented: 12 })],
+        }),
+      ),
+    );
+    expect(html).toContain("AO VIVO");
+  });
+});
+
 describe("HomeScreen", () => {
   it("renderiza criar/entrar sem vazar a senha de volta", () => {
     const html = renderToStaticMarkup(

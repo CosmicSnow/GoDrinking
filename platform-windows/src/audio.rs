@@ -111,6 +111,25 @@ pub fn start_audio_tap(
             }
         }
     }
+    spawn_device_loopback(opus_tx)
+}
+
+pub fn start_audio_tap_include(
+    pid: u32,
+    opus_tx: SyncSender<EncodedAudioPacket>,
+) -> Result<AudioTap, PlatformError> {
+    let _ = wasapi::initialize_mta();
+    if pid != 0 && is_process_loopback_supported() {
+        if let Ok(client) = wasapi::AudioClient::new_application_loopback_client(pid, true) {
+            if let Ok(tap) = spawn_loopback(client, opus_tx.clone(), "include") {
+                return Ok(tap);
+            }
+        }
+    }
+    spawn_device_loopback(opus_tx)
+}
+
+fn spawn_device_loopback(opus_tx: SyncSender<EncodedAudioPacket>) -> Result<AudioTap, PlatformError> {
     let enumerator = wasapi::DeviceEnumerator::new()
         .map_err(|error| PlatformError::Internal(format!("WASAPI enumerator: {error}")))?;
     let device = enumerator

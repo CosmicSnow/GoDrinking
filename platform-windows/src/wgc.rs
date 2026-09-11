@@ -25,7 +25,8 @@ use windows::Win32::System::WinRT::Direct3D11::{
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetClassNameW, GetWindowLongW, GetWindowRect, GetWindowTextW,
-    IsIconic, IsWindowVisible, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, WS_CHILD, WS_EX_TOOLWINDOW,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, WS_CHILD,
+    WS_EX_TOOLWINDOW,
 };
 
 use crate::copy::{gate_open, initial_last_ns, interval_ns, now_ns};
@@ -124,6 +125,13 @@ fn is_cloaked(hwnd: HWND) -> bool {
 
 fn hwnd_id(hwnd: HWND) -> String {
     (hwnd.0 as usize).to_string()
+}
+
+pub fn window_pid(id: &str) -> Option<u32> {
+    let hwnd = parse_hwnd(id).ok()?;
+    let mut pid = 0u32;
+    let _ = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    (pid != 0).then_some(pid)
 }
 
 fn parse_hwnd(id: &str) -> Result<HWND, PlatformError> {

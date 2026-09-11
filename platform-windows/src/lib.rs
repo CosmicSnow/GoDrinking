@@ -31,7 +31,11 @@ mod map;
 mod resource;
 mod wgc;
 
-pub use audio::{is_process_loopback_supported, list_audio_apps, start_audio_tap, AudioTap};
+pub use audio::{
+    is_process_loopback_supported, list_audio_apps, start_audio_tap, start_audio_tap_include,
+    AudioTap,
+};
+pub use wgc::window_pid;
 
 pub use copy::{copy_tight_bgra, gate_open, initial_last_ns, interval_ns};
 
@@ -201,6 +205,7 @@ mod tests {
             PlatformError::InvalidSource { .. }
         ));
         assert!(WindowsSource::validated(&display("\\\\.\\DISPLAY1")).is_ok());
+        assert!(crate::window_pid("not-a-hwnd").is_none());
     }
 
     /// Restart ordering per kind (no OS: pure mapping). DXGI displays must

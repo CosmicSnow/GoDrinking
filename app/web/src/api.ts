@@ -7,8 +7,9 @@
  * - create_room {nickname, password} -> string (código da sala)
  * - join_room {code, nickname, password} -> string (nosso member id)
  * - leave {} -> ()
- * - start_share {source} -> ()  ("synthetic", "movie:/caminho",
- *   "display:<id>", "window:<id>")
+ * - start_share {source, w?, h?, bitrateKbps?, fps?} -> ()
+ *   ("synthetic", "movie:/caminho", "display:<id>", "window:<id>");
+ *   perfil opcional (senão 720p30)
  * - stop_share {} -> ()
  * - set_quality {w, h, bitrate_kbps, fps, preset?} -> {profile, generation}
  *   (top-level, sem wrapper; preset "low"|"medium"|"high" é hint de display,
@@ -140,9 +141,19 @@ export function leaveRoom(): Promise<void> {
   return invoke<void>("leave");
 }
 
-/** Inicia o share ("synthetic" ou "movie:/caminho"). */
-export function startShare(source: string): Promise<void> {
-  return invoke<void>("start_share", { source });
+/** Inicia o share. Perfil opcional: sem ele o backend usa 720p30. */
+export function startShare(source: string, profile?: QualityProfile): Promise<void> {
+  if (!profile) {
+    return invoke<void>("start_share", { source });
+  }
+  const { w, h, bitrate_kbps, fps } = profile;
+  return invoke<void>("start_share", {
+    source,
+    w,
+    h,
+    bitrateKbps: bitrate_kbps,
+    fps,
+  });
 }
 
 /** Para o share (links e captura liberados no backend). */

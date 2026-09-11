@@ -840,6 +840,19 @@ mod tests {
     }
 
     #[test]
+    fn two_concurrent_watch_intents_stay_independent() {
+        let owner = open_owner();
+        owner.watch("host-a").unwrap();
+        owner.watch("host-b").unwrap();
+        let mut names = owner.watchers();
+        names.sort();
+        assert_eq!(names, vec!["host-a".to_owned(), "host-b".to_owned()]);
+        let fence = owner.unwatch("host-a").unwrap();
+        owner.complete_link_removed(&fence).unwrap();
+        assert_eq!(owner.watchers(), vec!["host-b".to_owned()]);
+    }
+
+    #[test]
     fn snapshot_is_observational() {
         let owner = open_owner();
         let before = owner.snapshot();

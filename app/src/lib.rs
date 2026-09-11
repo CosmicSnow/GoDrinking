@@ -41,6 +41,27 @@ pub enum ShareSource {
     Window(String),
 }
 
+pub(crate) fn initial_share_profile(
+    profile: Option<QualityProfile>,
+) -> Result<QualityProfile, String> {
+    match profile {
+        Some(profile) => {
+            profile
+                .validate()
+                .map_err(|e| format!("qualidade: {e}"))?;
+            Ok(profile)
+        }
+        None => Ok(Quality::P720.profile()),
+    }
+}
+
+pub(crate) fn window_audio_id(source: &ShareSource) -> Option<&str> {
+    match source {
+        ShareSource::Window(id) => Some(id.as_str()),
+        _ => None,
+    }
+}
+
 impl ShareSource {
     fn parse(raw: &str) -> Result<Self, String> {
         if raw == "synthetic" {
@@ -206,6 +227,15 @@ pub struct PublishSession {
     pub bridge: Option<screen::BridgeHandle>,
 }
 
+pub(crate) struct WatchSession {
+    pub fence: Fence,
+    pub viewer: Option<Arc<tokio::sync::Mutex<NativeViewer>>>,
+    pub adopted: Option<WireIds>,
+    pub alive: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub remote_ready: bool,
+    pub pending_remote: Vec<String>,
+}
+
 /// Shared shell state. Managed as `Arc<AppState>` so background tasks and
 /// tests can hold it without a Tauri app.
 pub struct AppState {
@@ -287,13 +317,7 @@ struct Inner {
     owner: Owner,
     signal: Option<SignalClient>,
     publishers: HashMap<String, PublishSession>,
-    viewer: Option<Arc<tokio::sync::Mutex<NativeViewer>>>,
-    viewer_media_task: Option<tokio::task::JoinHandle<()>>,
-    adopted: Option<WireIds>,
-    viewer_fence: Option<Fence>,
-    viewer_alive: Option<Arc<std::sync::atomic::AtomicBool>>,
-    viewer_remote_ready: bool,
-    viewer_pending_remote: Vec<String>,
+    viewers: HashMap<String, WatchSession>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     /// Present only when launched with `--e2e-plan`. Gates every test-only
     /// command; the normal UI path never sees it.
@@ -356,13 +380,7 @@ impl AppState {
                 owner: Owner::new(),
                 signal: None,
                 publishers: HashMap::new(),
-                viewer: None,
-                viewer_media_task: None,
-                adopted: None,
-                viewer_fence: None,
-                viewer_alive: None,
-                viewer_remote_ready: false,
-                viewer_pending_remote: Vec::new(),
+                viewers: HashMap::new(),
                 tasks: Vec::new(),
                 e2e_plan: None,
                 media_counters: MediaCounters::default(),
@@ -545,7 +563,7 @@ impl AppState {
     /// best-effort. Idempotent.
     pub async fn leave(self: &Arc<Self>) -> Result<(), String> {
         let _operation = self.operations.lock().await;
-        let (signal, publishers, viewer, audio) = {
+        let (signal, publishers, viewers, audio) = {
             let mut inner = self
                 .inner
                 .lock()
@@ -553,26 +571,24 @@ impl AppState {
             for task in inner.tasks.drain(..) {
                 task.abort();
             }
-            if let Some(task) = inner.viewer_media_task.take() {
-                task.abort();
-            }
             inner.share_profile = None;
             inner.share_capture = None;
             inner.share_source = None;
-            if let Some(alive) = inner.viewer_alive.take() {
-                alive.store(false, std::sync::atomic::Ordering::Release);
+            for session in inner.viewers.values() {
+                if let Some(alive) = session.alive.as_ref() {
+                    alive.store(false, std::sync::atomic::Ordering::Release);
+                }
             }
             let audio = inner.audio.take();
             inner.viewer_playback = None;
             (
                 inner.signal.take(),
                 std::mem::take(&mut inner.publishers),
-                inner.viewer.take(),
+                std::mem::take(&mut inner.viewers),
                 audio,
             )
         };
         drop(audio);
-        // Outside the lock: network + media teardown.
         if let Some(mut signal) = signal {
             signal.leave();
             signal.shutdown();
@@ -583,19 +599,16 @@ impl AppState {
                 bridge.stop();
             }
         }
-        if let Some(viewer) = viewer {
-            viewer.lock().await.stop().await;
+        for (_, session) in viewers {
+            if let Some(viewer) = session.viewer {
+                viewer.lock().await.stop().await;
+            }
         }
-        // Native video windows close with the session (no orphan windows).
         self.close_all_video_windows();
         let mut inner = self
             .inner
             .lock()
             .map_err(|_| "state lock poisoned".to_string())?;
-        inner.adopted = None;
-        inner.viewer_fence = None;
-        inner.viewer_remote_ready = false;
-        inner.viewer_pending_remote.clear();
         // Best-effort close; absence of a session is not an error here.
         if let Ok(close) = inner.owner.begin_close() {
             let _ = inner.owner.complete_closed(&close);
@@ -611,16 +624,18 @@ impl AppState {
         self: &Arc<Self>,
         app: Option<AppHandle>,
         source: &str,
+        profile: Option<QualityProfile>,
     ) -> Result<(), String> {
         let _operation = self.operations.lock().await;
         let source = ShareSource::parse(source)?;
-        // Live capture profile for bridges (starts at the default; every
-        // bridge thread shares it so `set_quality` re-clamps mid-share).
-        let live_profile = Arc::new(Mutex::new(Quality::P720.profile()));
-        let start_profile = Quality::P720.profile();
-        let mut share_audio = match &source {
-            ShareSource::Display(_) | ShareSource::Window(_) => audio::ShareAudio::start(Vec::new()).ok(),
-            ShareSource::Synthetic | ShareSource::Movie(_) => None,
+        let start_profile = initial_share_profile(profile)?;
+        let live_profile = Arc::new(Mutex::new(start_profile));
+        let mut share_audio = match window_audio_id(&source) {
+            Some(id) => audio::ShareAudio::start_for_window(id).ok(),
+            None if matches!(source, ShareSource::Display(_)) => {
+                audio::ShareAudio::start(Vec::new()).ok()
+            }
+            None => None,
         };
         let audio_rx = share_audio.as_ref().map(|session| session.subscribe());
         // Build the template session BEFORE touching lifecycle (pre-flight):
@@ -678,6 +693,7 @@ impl AppState {
                 pump::ForwardTarget::Share,
                 Some(Arc::downgrade(&template)),
                 None,
+                None,
             ));
             // Stash the idle publisher as the template for the first watch.
             // Single-shot: adopting moves it to the watcher; later watches
@@ -694,10 +710,8 @@ impl AppState {
                     bridge: template_bridge,
                 },
             );
-            // Default effective quality: MEDIUM (== Quality::P720, the fixed
-            // start profile). `set_quality` moves it live from here.
             inner.share_profile = Some(EffectiveQuality {
-                profile: Quality::P720.profile(),
+                profile: start_profile,
                 generation: 0,
             });
             // Remember the source descriptor + shared live profile so late
@@ -713,7 +727,6 @@ impl AppState {
             ShareSource::Display(_) => "display",
             ShareSource::Window(_) => "window",
         };
-        let start_profile = Quality::P720.profile();
         let audio_live = {
             let inner = self.inner.lock().map_err(|_| "state lock poisoned".to_string())?;
             inner.audio.as_ref().map(|session| session.live()).unwrap_or(false)
@@ -915,6 +928,7 @@ impl AppState {
                         event_rx,
                         pump::ForwardTarget::Share,
                         Some(Arc::downgrade(&publisher)),
+                        None,
                         None,
                     ));
                     FreshDecision::Inserted
@@ -1189,7 +1203,17 @@ impl AppState {
                 .inner
                 .lock()
                 .map_err(|_| "state lock poisoned".to_string())?;
-            inner.viewer_fence = Some(fence);
+            inner.viewers.insert(
+                member.to_owned(),
+                WatchSession {
+                    fence,
+                    viewer: None,
+                    adopted: None,
+                    alive: None,
+                    remote_ready: false,
+                    pending_remote: Vec::new(),
+                },
+            );
             if let Some(signal) = inner.signal.as_ref() {
                 signal.watch(member, true).map_err(|e| format!("watch: {e}"))?;
             } else {
@@ -1203,7 +1227,7 @@ impl AppState {
     /// Removes our watch intent and tears down viewer media.
     pub async fn unwatch(self: &Arc<Self>, member: &str) -> Result<(), String> {
         let _operation = self.operations.lock().await;
-        let viewer = {
+        let session = {
             let mut inner = self
                 .inner
                 .lock()
@@ -1211,16 +1235,22 @@ impl AppState {
             if let Some(signal) = inner.signal.as_ref() {
                 let _ = signal.watch(member, false);
             }
-            if let Some(alive) = inner.viewer_alive.take() {
+            let session = inner.viewers.remove(member);
+            if let Some(alive) = session.as_ref().and_then(|item| item.alive.as_ref()) {
                 alive.store(false, std::sync::atomic::Ordering::Release);
             }
-            inner.viewer_playback = None;
-            inner.viewer.take()
+            if inner.viewers.is_empty() {
+                inner.viewer_playback = None;
+                inner.media_counters.connected = false;
+                inner.media_counters.frames = 0;
+                inner.media_counters.keyframes = 0;
+                inner.media_counters.keyframes_seen = false;
+            }
+            session
         };
-        if let Some(viewer) = viewer {
+        if let Some(viewer) = session.and_then(|item| item.viewer) {
             viewer.lock().await.stop().await;
         }
-        // The watched link's window closes here (never lingers unwatched).
         self.close_video_window(member);
         let mut inner = self
             .inner
@@ -1229,14 +1259,6 @@ impl AppState {
         if let Ok(fence) = inner.owner.unwatch(member) {
             let _ = inner.owner.complete_link_removed(&fence);
         }
-        inner.adopted = None;
-        inner.viewer_fence = None;
-        inner.viewer_remote_ready = false;
-        inner.viewer_pending_remote.clear();
-        inner.media_counters.connected = false;
-        inner.media_counters.frames = 0;
-        inner.media_counters.keyframes = 0;
-        inner.media_counters.keyframes_seen = false;
         drop(inner);
         self.session_log(format!("unwatch member={}", session_log::short_id(member)));
         Ok(())
@@ -1604,8 +1626,22 @@ async fn start_share(
     state: State<'_, Arc<AppState>>,
     app: AppHandle,
     source: String,
+    w: Option<u32>,
+    h: Option<u32>,
+    bitrate_kbps: Option<u32>,
+    fps: Option<u32>,
 ) -> Result<(), String> {
-    state.start_share(Some(app), &source).await
+    let profile = match (w, h, bitrate_kbps, fps) {
+        (None, None, None, None) => None,
+        (Some(w), Some(h), Some(bitrate_kbps), Some(fps)) => Some(QualityProfile {
+            w,
+            h,
+            bitrate_kbps,
+            fps,
+        }),
+        _ => return Err("qualidade inicial incompleta".into()),
+    };
+    state.start_share(Some(app), &source, profile).await
 }
 
 #[tauri::command]
@@ -1652,9 +1688,8 @@ async fn set_audio_exclusions(
 }
 
 #[tauri::command]
-async fn watch(app: AppHandle, state: State<'_, Arc<AppState>>, member: String) -> Result<(), String> {
-    let fence = state.watch(&member).await?;
-    pump::arm_negotiate_timeout(Arc::clone(&state), Some(app), member, fence);
+async fn watch(state: State<'_, Arc<AppState>>, member: String) -> Result<(), String> {
+    let _fence = state.watch(&member).await?;
     Ok(())
 }
 
@@ -1888,6 +1923,31 @@ mod share_source_tests {
         assert!(ShareSource::parse("movie:").is_err());
         assert!(ShareSource::parse("screen").is_err());
         assert!(ShareSource::parse("").is_err());
+    }
+
+    #[test]
+    fn window_share_uses_window_audio_display_does_not() {
+        let window = ShareSource::parse("window:42").unwrap();
+        let display = ShareSource::parse("display:\\\\.\\DISPLAY1").unwrap();
+        assert_eq!(window_audio_id(&window), Some("42"));
+        assert_eq!(window_audio_id(&display), None);
+        assert_eq!(window_audio_id(&ShareSource::Synthetic), None);
+    }
+
+    #[test]
+    fn initial_share_profile_keeps_requested_high_not_720p() {
+        let high = Quality::P1080.profile();
+        let got = initial_share_profile(Some(high)).expect("high");
+        assert_eq!((got.w, got.h, got.fps), (1920, 1080, 60));
+        let default = initial_share_profile(None).expect("default");
+        assert_eq!((default.w, default.h, default.fps), (1280, 720, 30));
+        assert!(initial_share_profile(Some(QualityProfile {
+            w: 1,
+            h: 1,
+            bitrate_kbps: 10,
+            fps: 0,
+        }))
+        .is_err());
     }
 
     // NOTE: Display/Window must never resolve to synthetic silently. That
@@ -2233,22 +2293,109 @@ mod operation_tests {
     #[tokio::test]
     async fn unwatch_cannot_clear_fences_during_another_operation() {
         let state = Arc::new(AppState::new());
-        let fence = {
+        {
             let mut inner = state.inner.lock().unwrap();
             let join = inner.owner.begin_join().unwrap();
             inner.owner.complete_opened(&join).unwrap();
             let fence = inner.owner.watch("ana").unwrap();
-            inner.viewer_fence = Some(fence);
-            fence
-        };
-        // Represents an offer/quality command suspended at an await.
+            inner.viewers.insert(
+                "ana".into(),
+                WatchSession {
+                    fence,
+                    viewer: None,
+                    adopted: None,
+                    alive: None,
+                    remote_ready: false,
+                    pending_remote: Vec::new(),
+                },
+            );
+        }
         let operation = state.operations.lock().await;
         let mut unwatch = Box::pin(state.unwatch("ana"));
         let mut context = Context::from_waker(Waker::noop());
         assert!(matches!(unwatch.as_mut().poll(&mut context), Poll::Pending));
-        assert_eq!(state.inner.lock().unwrap().viewer_fence, Some(fence));
+        assert!(state.inner.lock().unwrap().viewers.contains_key("ana"));
         drop(operation);
         unwatch.await.unwrap();
-        assert!(state.inner.lock().unwrap().viewer_fence.is_none());
+        assert!(!state.inner.lock().unwrap().viewers.contains_key("ana"));
+    }
+
+    #[tokio::test]
+    async fn watch_two_hosts_keeps_independent_sessions() {
+        let state = Arc::new(AppState::new());
+        {
+            let mut inner = state.inner.lock().unwrap();
+            let join = inner.owner.begin_join().unwrap();
+            inner.owner.complete_opened(&join).unwrap();
+            for host in ["host-a", "host-b"] {
+                let fence = inner.owner.watch(host).unwrap();
+                inner.viewers.insert(
+                    host.into(),
+                    WatchSession {
+                        fence,
+                        viewer: None,
+                        adopted: None,
+                        alive: None,
+                        remote_ready: false,
+                        pending_remote: Vec::new(),
+                    },
+                );
+            }
+        }
+        {
+            let inner = state.inner.lock().unwrap();
+            assert_eq!(inner.viewers.len(), 2);
+            assert!(inner.viewers.contains_key("host-a"));
+            assert!(inner.viewers.contains_key("host-b"));
+            let mut names = inner.owner.watchers();
+            names.sort();
+            assert_eq!(names, vec!["host-a".to_owned(), "host-b".to_owned()]);
+        }
+        state.unwatch("host-a").await.unwrap();
+        {
+            let inner = state.inner.lock().unwrap();
+            assert!(!inner.viewers.contains_key("host-a"));
+            assert!(inner.viewers.contains_key("host-b"));
+            assert_eq!(inner.owner.watchers(), vec!["host-b".to_owned()]);
+        }
+    }
+
+    #[tokio::test]
+    async fn unwatch_one_host_does_not_wipe_the_other_session_or_counters() {
+        let state = Arc::new(AppState::new());
+        {
+            let mut inner = state.inner.lock().unwrap();
+            let join = inner.owner.begin_join().unwrap();
+            inner.owner.complete_opened(&join).unwrap();
+            for host in ["host-a", "host-b"] {
+                let fence = inner.owner.watch(host).unwrap();
+                inner.viewers.insert(
+                    host.into(),
+                    WatchSession {
+                        fence,
+                        viewer: None,
+                        adopted: Some(WireIds {
+                            session: "1".into(),
+                            share: "2".into(),
+                            link: host.into(),
+                            attempt: "1".into(),
+                        }),
+                        alive: None,
+                        remote_ready: true,
+                        pending_remote: vec!["cand".into()],
+                    },
+                );
+            }
+            inner.media_counters.connected = true;
+            inner.media_counters.frames = 40;
+        }
+        state.unwatch("host-a").await.unwrap();
+        let inner = state.inner.lock().unwrap();
+        let other = inner.viewers.get("host-b").expect("host-b remains");
+        assert_eq!(other.adopted.as_ref().map(|ids| ids.link.as_str()), Some("host-b"));
+        assert!(other.remote_ready);
+        assert_eq!(other.pending_remote.len(), 1);
+        assert!(inner.media_counters.connected);
+        assert_eq!(inner.media_counters.frames, 40);
     }
 }

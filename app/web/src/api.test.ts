@@ -102,6 +102,14 @@ describe("intents (comando certo, args certos)", () => {
   it("start_share leva a fonte opaca; stop_share não leva args", async () => {
     await startShare("synthetic");
     expect(mockInvoke).toHaveBeenCalledWith("start_share", { source: "synthetic" });
+    await startShare("synthetic", { w: 1920, h: 1080, bitrate_kbps: 10000, fps: 60 });
+    expect(mockInvoke).toHaveBeenCalledWith("start_share", {
+      source: "synthetic",
+      w: 1920,
+      h: 1080,
+      bitrateKbps: 10000,
+      fps: 60,
+    });
     await startShare("movie:/tmp/a.mp4");
     expect(mockInvoke).toHaveBeenCalledWith("start_share", { source: "movie:/tmp/a.mp4" });
     await stopShare();
