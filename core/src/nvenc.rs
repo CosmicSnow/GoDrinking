@@ -248,7 +248,9 @@ mod backend {
             .ok();
             set_codec_u32(&codec_api, &CODECAPI_AVEncCommonMeanBitRate, bitrate_bps).ok();
             set_codec_u32(&codec_api, &CODECAPI_AVEncMPVGOPSize, fps.max(1) * 2).ok();
+            set_codec_u32(&codec_api, &CODECAPI_AVEncMPVDefaultBPictureCount, 0).ok();
             set_codec_bool(&codec_api, &CODECAPI_AVLowLatencyMode, true).ok();
+            set_codec_bool(&codec_api, &CODECAPI_AVEncH264CABACEnable, false).ok();
             configure_types(&transform, w, h, fps, bitrate_bps)?;
             let output_info = unsafe { transform.GetOutputStreamInfo(OUTPUT_STREAM) }
                 .map_err(|e| hw_err(format!("output info {e}")))?;
@@ -584,8 +586,11 @@ mod backend {
         bitrate_bps: u32,
     ) -> Result<(), MediaError> {
         let mut last = hw_err("SetOutputType");
-        for baseline in [false, true] {
-            match set_types(transform, w, h, fps, bitrate_bps, baseline) {
+        for profile in [
+            eAVEncH264VProfile_ConstrainedBase.0 as u32,
+            eAVEncH264VProfile_Base.0 as u32,
+        ] {
+            match set_types(transform, w, h, fps, bitrate_bps, profile) {
                 Ok(()) => return Ok(()),
                 Err(e) => last = e,
             }
@@ -599,9 +604,9 @@ mod backend {
         h: usize,
         fps: u32,
         bitrate_bps: u32,
-        baseline: bool,
+        profile: u32,
     ) -> Result<(), MediaError> {
-        let output = video_type(MFVideoFormat_H264, w, h, fps, Some((bitrate_bps, baseline)))?;
+        let output = video_type(MFVideoFormat_H264, w, h, fps, Some((bitrate_bps, profile)))?;
         unsafe { transform.SetOutputType(OUTPUT_STREAM, &output, 0) }
             .map_err(|e| hw_err(format!("SetOutputType {e}")))?;
         let input = video_type(MFVideoFormat_NV12, w, h, fps, None)?;
@@ -615,7 +620,7 @@ mod backend {
         w: usize,
         h: usize,
         fps: u32,
-        bitrate: Option<(u32, bool)>,
+        bitrate: Option<(u32, u32)>,
     ) -> Result<IMFMediaType, MediaError> {
         let media_type =
             unsafe { MFCreateMediaType() }.map_err(|e| hw_err(format!("MFCreateMediaType {e}")))?;
@@ -640,18 +645,16 @@ mod backend {
                     .SetUINT32(&MF_MT_DEFAULT_STRIDE, w as u32)
                     .map_err(|e| hw_err(format!("stride {e}")))?;
             }
-            if let Some((bps, baseline)) = bitrate {
+            if let Some((bps, profile)) = bitrate {
                 media_type
                     .SetUINT32(&MF_MT_AVG_BITRATE, bps)
                     .map_err(|e| hw_err(format!("bitrate {e}")))?;
-                if baseline {
-                    media_type
-                        .SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)
-                        .ok();
-                    media_type
-                        .SetUINT32(&MF_MT_MPEG2_LEVEL, eAVEncH264VLevel4_1.0 as u32)
-                        .ok();
-                }
+                media_type
+                    .SetUINT32(&MF_MT_MPEG2_PROFILE, profile)
+                    .ok();
+                media_type
+                    .SetUINT32(&MF_MT_MPEG2_LEVEL, eAVEncH264VLevel4_1.0 as u32)
+                    .ok();
             }
         }
         Ok(media_type)
