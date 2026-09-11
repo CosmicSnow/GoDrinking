@@ -16,6 +16,7 @@ import {
   linkLabel,
   resolveDesired,
   salaLabel,
+  shareIntentFromResolved,
   shareLabel,
   sourceKindOf,
   watchingStillLive,
@@ -725,6 +726,15 @@ describe("qualidade (espelha QualityProfile; fio bloqueado)", () => {
       srcDims: null,
     });
     expect("errors" in result && result.errors.length).toBeGreaterThanOrEqual(4);
+  });
+
+  it("intenção de share: válido vira perfil, inválido vira erro (nunca default silencioso)", () => {
+    const valid = shareIntentFromResolved({
+      profile: { w: 5120, h: 1440, bitrate_kbps: 10000, fps: 60 },
+    });
+    expect(valid).toEqual({ profile: { w: 5120, h: 1440, bitrate_kbps: 10000, fps: 60 } });
+    const invalid = shareIntentFromResolved({ errors: ["sem upscale além da fonte (5120×1440)."] });
+    expect("error" in invalid && invalid.error).toContain("sem upscale");
   });
 });
 

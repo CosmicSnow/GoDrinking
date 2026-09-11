@@ -147,11 +147,13 @@ pub fn spawn_forward(
                         };
                         if let Some(effective) = bumped {
                             state.session_log(format!(
-                                "quality applied generation={} profile={}x{}@{}",
+                                "quality applied generation={} profile={}x{}@{} encode={}x{}",
                                 effective.generation,
                                 effective.profile.w,
                                 effective.profile.h,
                                 effective.profile.fps,
+                                stats.encode_w,
+                                stats.encode_h,
                             ));
                             emit(
                                 &app,

@@ -261,6 +261,19 @@ export function resolveDesired(
   return { profile: { w, h, bitrate_kbps, fps } };
 }
 
+/**
+ * Intenção de início de share a partir do desejo resolvido. Seleção
+ * inválida (custom incompleto, upscale além da fonte) vira erro visível —
+ * nunca início silencioso no perfil default (o usuário que pediu "máximo
+ * do monitor" não pode acordar em 720p sem saber por quê).
+ */
+export function shareIntentFromResolved(
+  resolved: { profile: DesiredProfile } | { errors: string[] },
+): { profile: DesiredProfile } | { error: string } {
+  if ("profile" in resolved) return { profile: resolved.profile };
+  return { error: resolved.errors.join(" ") };
+}
+
 // ---------------------------------------------------------------------------
 // Formatação de contadores (pt-BR; "—" honesto quando ausente).
 // ---------------------------------------------------------------------------

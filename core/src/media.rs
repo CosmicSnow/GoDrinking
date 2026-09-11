@@ -323,6 +323,11 @@ pub struct MediaStats {
     /// Adding a field is reader-compatible (no new event variant needed,
     /// which keeps downstream matches compiling).
     pub generation: u64,
+    /// Actual encoder dims behind this Stats (post-fit: hardware step-down
+    /// or software fit, never the raw request). Numbers only, redaction-safe.
+    /// `0` means unknown (older sender path that never built an encoder).
+    pub encode_w: usize,
+    pub encode_h: usize,
 }
 
 /// Redacted ICE census: kinds and families, never addresses.
@@ -836,6 +841,25 @@ fn strip_start_code(nal: &[u8]) -> &[u8] {
 pub fn fit_openh264_dims(w: usize, h: usize) -> (usize, usize) {
     const LONG: usize = 1920;
     const SHORT: usize = 1080;
+    if w < 2 || h < 2 {
+        return (2, 2);
+    }
+    let (long, short, portrait) = if w >= h { (w, h, false) } else { (h, w, true) };
+    let scale = (LONG as f64 / long as f64).min(SHORT as f64 / short as f64).min(1.0);
+    let long = ((long as f64 * scale) as usize).max(2) & !1;
+    let short = ((short as f64 * scale) as usize).max(2) & !1;
+    if portrait { (short, long) } else { (long, short) }
+}
+
+/// Hardware encode box: Media Foundation inbox H.264 MFTs refuse widths past
+/// 4096 (`SetOutputType 0x80041000` at 5120 wide on NVENC/RTX 3070, while
+/// 4096×1152 and 3840×2160 encode fine). Aspect-fit into 4096×4096,
+/// even-floored, never upscaling. Pure; idempotent. This is the step-down
+/// the Auto cascade tries before giving up to software, so a 5120×1440
+/// monitor still emits 4096×1152 NVENC instead of 1920×540 software.
+pub fn fit_hardware_dims(w: usize, h: usize) -> (usize, usize) {
+    const LONG: usize = 4096;
+    const SHORT: usize = 4096;
     if w < 2 || h < 2 {
         return (2, 2);
     }
@@ -1487,6 +1511,10 @@ fn encode_loop(
         };
     note_backend(backend, encoder.backend_name());
     let mut generation: u64 = 0;
+    // Retarget stability: maps the last frame-derived `needed` dims to the
+    // dims they actually built, so converged sizes (software fit / hardware
+    // step-down) never rebuild. Cleared on every applied reconfig.
+    let mut retarget_cache: Option<((usize, usize), (usize, usize))> = None;
     let mut ext_last: Option<I420Frame> = None;
     let mut scaled = I420Frame { w: 0, h: 0, data: Vec::new() };
     let mut consecutive_skips: u32 = 0;
@@ -1503,12 +1531,15 @@ fn encode_loop(
                         encoder = new_encoder;
                         target = new_target;
                         profile = next;
+                        retarget_cache = None;
                         generation = generation.wrapping_add(1);
                         encoder.force_intra();
                         note_backend(backend, encoder.backend_name());
                         let _ = event_tx.send(MediaEvent::Stats(MediaStats {
                             census: census_snapshot(census),
                             generation,
+                            encode_w: new_target.0,
+                            encode_h: new_target.1,
                             ..Default::default()
                         }));
                     }
@@ -1562,6 +1593,7 @@ fn encode_loop(
                     try_retarget_encoder(
                         &mut encoder, &mut target, &profile, engine,
                         &mut generation, &backend, &event_tx, census, needed,
+                        &mut retarget_cache,
                     );
                     PendingFrame::Cpu(Cow::Borrowed(scale_frame_reusing(ext_last.as_ref().unwrap(), target.0, target.1, &mut scaled)))
                 }
@@ -1572,6 +1604,7 @@ fn encode_loop(
                     try_retarget_encoder(
                         &mut encoder, &mut target, &profile, engine,
                         &mut generation, &backend, &event_tx, census, needed,
+                        &mut retarget_cache,
                     );
                     PendingFrame::Gpu(gpu)
                 }
@@ -1789,13 +1822,25 @@ fn try_retarget_encoder(
     event_tx: &mpsc::UnboundedSender<MediaEvent>,
     census: &Arc<std::sync::Mutex<CandidateCensus>>,
     needed: (usize, usize),
+    retarget_cache: &mut Option<((usize, usize), (usize, usize))>,
 ) {
     if needed == *target || needed.0 < 2 || needed.1 < 2 {
         return;
     }
-        match VideoEncoder::new(profile, needed.0, needed.1, engine) {
-        Ok(new_encoder) => {
-            *target = new_encoder.dims();
+    // Converged earlier: this `needed` already builds the live `target`
+    // (software fit or hardware step-down swallow the difference). Rebuilding
+    // here would swap an identical encoder while bumping the generation fence
+    // and forcing an IDR on EVERY frame — the 5120x1440 session-log storm.
+    if *retarget_cache == Some((needed, *target)) {
+        return;
+    }
+    match build_best(profile, needed, engine) {
+        Ok((new_encoder, new_dims)) => {
+            *retarget_cache = Some((needed, new_dims));
+            if new_dims == *target {
+                return; // converged: keep the live encoder, no fence churn.
+            }
+            *target = new_dims;
             *encoder = new_encoder;
             *generation = generation.wrapping_add(1);
             encoder.force_intra();
@@ -1803,6 +1848,8 @@ fn try_retarget_encoder(
             let _ = event_tx.send(MediaEvent::Stats(MediaStats {
                 census: census_snapshot(census),
                 generation: *generation,
+                encode_w: new_dims.0,
+                encode_h: new_dims.1,
                 ..Default::default()
             }));
         }
@@ -1819,18 +1866,67 @@ fn initial_target(
     encode_target_for_frame(sw as usize, sh as usize, profile)
 }
 
+/// Best-effort builder for the encode loop. Explicit engines keep exact
+/// [`VideoEncoder::new`] semantics (Software fits internally, Hardware fails
+/// hard when absent). Auto keeps probe-then-hardware-first but steps down
+/// instead of collapsing straight to software: full size, then one
+/// aspect-preserving step into the hardware box ([`fit_hardware_dims`]),
+/// then software. Every step is a fixed point for its backend, and the
+/// retarget cache pins the choice frame to frame, so oversize requests
+/// converge (4096x1152 NVENC on 5120-wide-capable boxes, software fit
+/// elsewhere) instead of rebuilding per frame.
+fn build_best(
+    profile: &QualityProfile,
+    needed: (usize, usize),
+    engine: EngineKind,
+) -> Result<(VideoEncoder, (usize, usize)), MediaError> {
+    if !matches!(engine, EngineKind::Auto) {
+        let encoder = VideoEncoder::new(profile, needed.0, needed.1, engine)?;
+        let dims = encoder.dims();
+        return Ok((encoder, dims));
+    }
+    let (hw, _) = probe_cached();
+    if !hw {
+        let encoder = VideoEncoder::new(profile, needed.0, needed.1, EngineKind::Software)?;
+        let dims = encoder.dims();
+        return Ok((encoder, dims));
+    }
+    // Hardware first at full size (unchanged: VideoToolbox 5K, NVENC up to
+    // the MFT width cap).
+    match VideoEncoder::new(profile, needed.0, needed.1, EngineKind::Hardware) {
+        Ok(encoder) => {
+            let dims = encoder.dims();
+            Ok((encoder, dims))
+        }
+        Err(_) => {
+            let stepped = fit_hardware_dims(needed.0, needed.1);
+            if stepped != needed {
+                if let Ok(encoder) =
+                    VideoEncoder::new(profile, stepped.0, stepped.1, EngineKind::Hardware)
+                {
+                    let dims = encoder.dims();
+                    return Ok((encoder, dims));
+                }
+            }
+            let encoder = VideoEncoder::new(profile, needed.0, needed.1, EngineKind::Software)?;
+            let dims = encoder.dims();
+            Ok((encoder, dims))
+        }
+    }
+}
+
 /// Build the encoder backend for a target. Software always works;
 /// hardware is probed (Auto) or demanded (Hardware → hard fail).
+/// Routed through [`build_best`] so oversize requests converge to the
+/// strongest encodable size (hardware step-down, else software fit).
 fn build_encoder(
     profile: &QualityProfile,
     source: &VideoSource,
     engine: EngineKind,
     movie: Option<&Vec<I420Frame>>,
 ) -> Result<(VideoEncoder, (usize, usize)), MediaError> {
-    let requested = initial_target(source, profile, movie);
-    let encoder = VideoEncoder::new(profile, requested.0, requested.1, engine)?;
-    let dims = encoder.dims();
-    Ok((encoder, dims))
+    let needed = initial_target(source, profile, movie);
+    build_best(profile, needed, engine)
 }
 
 /// Drain pending reconfigs, keeping only the latest (a burst of UI drags
@@ -2388,6 +2484,175 @@ mod tests {
     }
 
     #[test]
+    fn oversize_external_frames_never_rebuild_per_frame() {
+        // Regression: with an oversize profile on the software path the
+        // encode target (fitted, e.g. 2000x1000 -> 1920x960) could never
+        // equal the frame-derived `needed` (unfitted), so the retarget check
+        // rebuilt the encoder, bumped the generation fence and forced an IDR
+        // on EVERY frame (session-log storm ~5/s, fence churn drowning out
+        // set_quality, 5120x1440 collapsing to a 1920x540 slideshow).
+        // Steady frames at a fixed size must not move the generation at all.
+        fn gray(w: usize, h: usize, v: u8) -> I420Frame {
+            let mut data = vec![0u8; w * h * 3 / 2];
+            data[..w * h].fill(v);
+            data[w * h..].fill(128);
+            I420Frame { w, h, data }
+        }
+        let profile = QualityProfile::custom(2000, 1000, 2000, 30).expect("profile");
+        let (ext_tx, ext_rx) = std::sync::mpsc::sync_channel::<ExternalFrame>(8);
+        let source = VideoSource::External(ExternalSource {
+            rx: ext_rx,
+            label: "storm-repro".into(),
+        });
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<MediaEvent>();
+        let slot = Arc::new(FrameSlot::default());
+        let (_reconfig_tx, reconfig_rx) = std::sync::mpsc::channel::<QualityProfile>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_ = Arc::clone(&stop);
+        let slot_ = Arc::clone(&slot);
+        let backend_ = Arc::new(std::sync::Mutex::new(None));
+        let census_ = Arc::new(std::sync::Mutex::new(CandidateCensus::default()));
+        let intra_ = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::spawn(move || {
+            encode_loop(
+                source,
+                profile,
+                EngineKind::Software,
+                &stop_,
+                &slot_,
+                &backend_,
+                &census_,
+                &event_tx,
+                &reconfig_rx,
+                &intra_,
+            );
+        });
+        let feeder = std::thread::spawn(move || {
+            for n in 0..24u8 {
+                if ext_tx.send(ExternalFrame::Cpu(gray(2000, 1000, 16 + n))).is_err() {
+                    break;
+                }
+            }
+        });
+        // Drain units on a throwaway runtime; decode the first to prove the
+        // software fit still applies (output stays 1920x960, never native).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let mut decoded_dims = None;
+        let mut decoder = H264Decoder::new().expect("decoder");
+        for take in 0..10 {
+            let got = rt.block_on(async {
+                tokio::time::timeout(Duration::from_secs(15), slot.take()).await
+            });
+            let (unit, _) = got.unwrap_or_else(|_| panic!("unit {take} arrives"));
+            assert!(!unit.is_empty(), "poison pill never counted");
+            if decoded_dims.is_none() {
+                if let Some(picture) = decoder.decode(&unit).expect("decode") {
+                    decoded_dims = Some((picture.frame.w, picture.frame.h));
+                }
+            }
+        }
+        feeder.join().expect("feeder drains into the loop");
+        stop.store(true, Ordering::Release);
+        handle.join().expect("encode loop thread");
+        assert_eq!(decoded_dims, Some((1920, 960)), "software fit still caps output");
+        let mut bumps = 0u32;
+        let mut keyframes = 0u32;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                MediaEvent::Stats(stats) if stats.generation > 0 => bumps += 1,
+                MediaEvent::Keyframe => keyframes += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(bumps, 0, "steady oversize frames must not bump the generation");
+        assert!(keyframes <= 3, "no per-frame IDR storm (saw {keyframes})");
+    }
+
+    #[test]
+    fn auto_external_oversize_converges_to_strongest_encodable() {
+        // End-to-end loop with EngineKind::Auto, a 5120x1440 profile and
+        // 5120x1440 injected frames (the 32:9 monitor case): the loop must
+        // converge with zero generation churn and land the strongest
+        // encodable size — hardware step-down (4096x1152 NVENC) where a GPU
+        // encoder exists, software fit otherwise. Serialized with the HW
+        // env-hook tests (process-global env mutation).
+        let _guard = HW_ENV_LOCK.lock().expect("hw lock");
+        fn gray(w: usize, h: usize, v: u8) -> I420Frame {
+            let mut data = vec![0u8; w * h * 3 / 2];
+            data[..w * h].fill(v);
+            data[w * h..].fill(128);
+            I420Frame { w, h, data }
+        }
+        let profile = QualityProfile::custom(5120, 1440, 10_000, 30).expect("profile");
+        let (ext_tx, ext_rx) = std::sync::mpsc::sync_channel::<ExternalFrame>(8);
+        let source = VideoSource::External(ExternalSource {
+            rx: ext_rx,
+            label: "auto-converge".into(),
+        });
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<MediaEvent>();
+        let slot = Arc::new(FrameSlot::default());
+        let (_reconfig_tx, reconfig_rx) = std::sync::mpsc::channel::<QualityProfile>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_ = Arc::clone(&stop);
+        let slot_ = Arc::clone(&slot);
+        let backend_ = Arc::new(std::sync::Mutex::new(None));
+        let backend_probe = Arc::clone(&backend_);
+        let census_ = Arc::new(std::sync::Mutex::new(CandidateCensus::default()));
+        let intra_ = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::spawn(move || {
+            encode_loop(
+                source,
+                profile,
+                EngineKind::Auto,
+                &stop_,
+                &slot_,
+                &backend_,
+                &census_,
+                &event_tx,
+                &reconfig_rx,
+                &intra_,
+            );
+        });
+        let feeder = std::thread::spawn(move || {
+            for n in 0..16u8 {
+                if ext_tx.send(ExternalFrame::Cpu(gray(5120, 1440, 16 + n))).is_err() {
+                    break;
+                }
+            }
+        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        for take in 0..8 {
+            let got = rt.block_on(async {
+                tokio::time::timeout(Duration::from_secs(20), slot.take()).await
+            });
+            let (unit, _) = got.unwrap_or_else(|_| panic!("unit {take} arrives"));
+            assert!(!unit.is_empty(), "poison pill never counted");
+        }
+        feeder.join().expect("feeder drains into the loop");
+        stop.store(true, Ordering::Release);
+        handle.join().expect("encode loop thread");
+        let mut bumps = 0u32;
+        while let Ok(event) = event_rx.try_recv() {
+            if let MediaEvent::Stats(stats) = event {
+                if stats.generation > 0 {
+                    bumps += 1;
+                }
+            }
+        }
+        assert_eq!(bumps, 0, "auto loop must converge without per-frame rebuilds");
+        let backend = backend_probe.lock().expect("backend cell").unwrap_or("none");
+        if probe_hardware().is_ok() {
+            assert_ne!(backend, "openh264", "hardware must carry the 5120-wide share");
+        }
+    }
+
+    #[test]
     fn encoder_emits_annexb_idr_then_deltas() {
         let mut enc = H264Encoder::new(Quality::P720).expect("encoder");
         let mut saw_idr = false;
@@ -2771,6 +3036,62 @@ mod tests {
         assert_eq!(fit_openh264_dims(5120, 1440), (1920, 540));
         assert_eq!(fit_openh264_dims(1920, 1080), (1920, 1080));
         assert_eq!(fit_openh264_dims(3840, 2160), (1920, 1080));
+    }
+
+    #[test]
+    fn fit_hardware_caps_each_axis_at_4096_preserving_aspect() {
+        // Media Foundation inbox H.264 MFTs refuse widths past 4096
+        // (SetOutputType 0x80041000 at 5120 wide); inside the box is identity.
+        assert_eq!(fit_hardware_dims(5120, 1440), (4096, 1152));
+        assert_eq!(fit_hardware_dims(1440, 5120), (1152, 4096));
+        assert_eq!(fit_hardware_dims(4096, 1152), (4096, 1152));
+        assert_eq!(fit_hardware_dims(3840, 2160), (3840, 2160));
+        assert_eq!(fit_hardware_dims(1920, 1080), (1920, 1080));
+        assert_eq!(fit_hardware_dims(8192, 8192), (4096, 4096));
+        assert_eq!(fit_hardware_dims(0, 1080), (2, 2));
+        // Idempotent: fitting twice is a fixed point (retarget stability).
+        for (w, h) in [(5120, 1440), (4096, 1152), (3440, 1440), (1920, 1080)] {
+            let once = fit_hardware_dims(w, h);
+            assert_eq!(fit_hardware_dims(once.0, once.1), once);
+            assert_eq!(once.0 % 2, 0);
+            assert_eq!(once.1 % 2, 0);
+        }
+    }
+
+    #[test]
+    fn build_best_software_keeps_exact_fit_semantics() {
+        // Explicit Software engine: identical to VideoEncoder::new, portable
+        // (no hardware probe involved).
+        let profile = QualityProfile::custom(5120, 1440, 10_000, 30).expect("profile");
+        let (enc, dims) =
+            build_best(&profile, (5120, 1440), EngineKind::Software).expect("software builds");
+        assert_eq!(dims, (1920, 540));
+        assert_eq!(enc.dims(), (1920, 540));
+        assert_eq!(enc.backend_name(), "openh264");
+        let small = QualityProfile::custom(1280, 720, 2000, 30).expect("profile");
+        let (_, dims) =
+            build_best(&small, (1280, 720), EngineKind::Software).expect("software builds");
+        assert_eq!(dims, (1280, 720));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn build_best_auto_steps_down_to_hardware_before_software() {
+        // 5120-wide exceeds the MF width cap; Auto must land the strongest
+        // encodable size: hardware at the 4096 box when a GPU encoder exists,
+        // software fit otherwise. Branched on the live probe so the test is
+        // deterministic per machine (never assumes hardware).
+        let profile = QualityProfile::custom(5120, 1440, 10_000, 30).expect("profile");
+        let (enc, dims) =
+            build_best(&profile, (5120, 1440), EngineKind::Auto).expect("auto always lands");
+        if probe_hardware().is_ok() {
+            assert_eq!(dims, (4096, 1152));
+            assert_eq!(enc.dims(), (4096, 1152));
+            assert_ne!(enc.backend_name(), "openh264", "hardware must win at 4096x1152");
+        } else {
+            assert_eq!(dims, (1920, 540));
+            assert_eq!(enc.backend_name(), "openh264");
+        }
     }
 
     #[test]

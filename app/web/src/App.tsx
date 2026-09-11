@@ -59,6 +59,7 @@ import {
   HomeScreen,
   RoomScreen,
   resolveDesired,
+  shareIntentFromResolved,
   watchingStillLive,
   validateCode,
   validateNickname,
@@ -629,11 +630,12 @@ export default function App() {
         customFps,
         srcDims: selectedSourceDims(),
       });
-      const profile = "profile" in resolved ? resolved.profile : undefined;
-      await startShare(source.trim(), profile);
-      if (profile) {
-        setEffective({ profile, generation: 0 });
+      const intent = shareIntentFromResolved(resolved);
+      if ("error" in intent) {
+        throw new Error(intent.error);
       }
+      await startShare(source.trim(), intent.profile);
+      setEffective({ profile: intent.profile, generation: 0 });
     });
   };
 
