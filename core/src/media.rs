@@ -1979,13 +1979,19 @@ impl NativeViewer {
                 let census = Arc::clone(&census);
                 let pc_pli = Arc::clone(&pc_pli);
                 Box::pin(async move {
-                    if track.kind() == RTPCodecType::Audio {
-                        if let Some(on_audio) = on_audio {
-                            audio_read_loop(track, on_audio).await;
+                    // webrtc holds its on_track handler mutex until this future
+                    // returns. A lifetime-long read here prevents the other
+                    // media track from starting, depending on which arrives first.
+                    // Closing the peer connection ends both RTP readers.
+                    tokio::spawn(async move {
+                        if track.kind() == RTPCodecType::Audio {
+                            if let Some(on_audio) = on_audio {
+                                audio_read_loop(track, on_audio).await;
+                            }
+                            return;
                         }
-                        return;
-                    }
-                    read_loop(track, &pc_pli, &event_tx, &on_frame, &census).await;
+                        read_loop(track, &pc_pli, &event_tx, &on_frame, &census).await;
+                    });
                 })
             }));
         }
@@ -2572,15 +2578,29 @@ mod tests {
 
     async fn rtp_pair(
         audio: bool,
+        audio_after_video: bool,
     ) -> (u64, bool, bool, u64) {
         let (pub_tx, mut pub_rx) = mpsc::unbounded_channel::<MediaEvent>();
         let (view_tx, mut view_rx) = mpsc::unbounded_channel::<MediaEvent>();
-        let audio_rx = if audio {
-            let (_audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<EncodedAudioPacket>(4);
-            Some(audio_rx)
-        } else {
-            None
-        };
+        let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<EncodedAudioPacket>(4);
+        let audio_rx = audio.then_some(audio_rx);
+        let samples: Vec<f32> = (0..960)
+            .flat_map(|n| {
+                let v = (n as f32 * std::f32::consts::TAU * 440.0 / 48_000.0).sin() * 0.25;
+                [v, v]
+            })
+            .collect();
+        let mut encoder =
+            opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Audio)
+                .expect("audio encoder");
+        let mut encoded = vec![0u8; 4000];
+        let audio_frames = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counted_audio = Arc::clone(&audio_frames);
+        let on_audio: Arc<dyn Fn(&[f32]) + Send + Sync> = Arc::new(move |pcm| {
+            if pcm.iter().any(|sample| sample.abs() > 0.001) {
+                counted_audio.fetch_add(1, Ordering::Relaxed);
+            }
+        });
         let frames = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let counted = Arc::clone(&frames);
         let on_frame = Arc::new(move |_frame: PresentedFrame| {
@@ -2596,7 +2616,7 @@ mod tests {
         )
         .await
         .expect("publisher");
-        let mut viewer = NativeViewer::start_with_audio(Some(vec![]), view_tx, on_frame, None)
+        let mut viewer = NativeViewer::start_with_audio(Some(vec![]), view_tx, on_frame, Some(on_audio))
             .await
             .expect("viewer");
         let offer = publisher.create_offer().await.expect("offer");
@@ -2606,7 +2626,17 @@ mod tests {
         let mut pub_ice = false;
         let mut view_ice = false;
         let mut errors = 0u64;
-        while frames.load(Ordering::Relaxed) == 0 && tokio::time::Instant::now() < deadline {
+        while (frames.load(Ordering::Relaxed) < 3
+            || (audio && audio_frames.load(Ordering::Relaxed) < 3))
+            && tokio::time::Instant::now() < deadline
+        {
+            if audio && (!audio_after_video || frames.load(Ordering::Relaxed) > 0) {
+                let len = encoder.encode_float(&samples, &mut encoded).unwrap();
+                let _ = audio_tx.try_send(EncodedAudioPacket {
+                    data: encoded[..len].to_vec(),
+                    duration: Duration::from_millis(20),
+                });
+            }
             while let Ok(event) = pub_rx.try_recv() {
                 match event {
                     MediaEvent::IceCandidate { candidate } => {
@@ -2632,12 +2662,19 @@ mod tests {
         let got = frames.load(Ordering::Relaxed);
         publisher.stop().await;
         viewer.stop().await;
+        if audio {
+            assert!(
+                got >= 3 && audio_frames.load(Ordering::Relaxed) >= 3,
+                "both media must arrive: video={got} audio={}",
+                audio_frames.load(Ordering::Relaxed)
+            );
+        }
         (got, pub_ice, view_ice, errors)
     }
 
     #[tokio::test]
     async fn video_frames_flow_video_only() {
-        let (got, pub_ice, view_ice, errors) = rtp_pair(false).await;
+        let (got, pub_ice, view_ice, errors) = rtp_pair(false, false).await;
         assert!(
             got > 0,
             "video-only must present (frames={got} pub_ice={pub_ice} view_ice={view_ice} errors={errors})"
@@ -2646,11 +2683,20 @@ mod tests {
 
     #[tokio::test]
     async fn video_frames_flow_when_audio_track_is_attached() {
-        let (got, pub_ice, view_ice, errors) = rtp_pair(true).await;
+        let (got, pub_ice, view_ice, errors) = rtp_pair(true, false).await;
         assert!(
             got > 0,
             "video must present with audio attached (frames={got} pub_ice={pub_ice} view_ice={view_ice} errors={errors})"
         );
+    }
+
+    #[tokio::test]
+    async fn audio_and_video_flow_after_repeated_peer_teardown() {
+        // Each watch creates a new native viewer. Also force video to arrive
+        // before audio, so success cannot depend on the track arrival order.
+        for _ in 0..3 {
+            rtp_pair(true, true).await;
+        }
     }
 
     #[test]
