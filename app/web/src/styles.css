@@ -10,7 +10,26 @@
 [hidden]{display:none!important}
 html,body{height:100%}
 body{background:var(--bg);color:var(--txt);font-family:var(--font);font-size:14px;-webkit-font-smoothing:antialiased}
-button{font-family:inherit}
+button,input,select{font-family:inherit}
+select{
+  appearance:none;
+  -webkit-appearance:none;
+  color-scheme:dark;
+  width:100%;
+  background-color:#111214;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'><path fill='%23949ba4' d='M1.2 1.5 6 6.3 10.8 1.5' stroke='%23949ba4' stroke-width='1.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  background-repeat:no-repeat;
+  background-position:right 12px center;
+  background-size:12px;
+  border:1px solid var(--line);
+  border-radius:8px;
+  color:var(--txt);
+  padding:10px 32px 10px 12px;
+  font-size:14px;
+  cursor:pointer;
+}
+select:disabled{opacity:.55;cursor:wait}
+select:focus{outline:2px solid var(--blurple);border-color:var(--blurple)}
 
 /* ── App ── */
 .app{min-height:100vh;display:flex;flex-direction:column}

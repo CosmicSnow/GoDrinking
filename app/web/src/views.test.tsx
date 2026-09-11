@@ -18,6 +18,7 @@ import {
   salaLabel,
   shareLabel,
   sourceKindOf,
+  watchingStillLive,
   validateBitrate,
   validateCode,
   validateCustomDim,
@@ -311,6 +312,21 @@ describe("RoomScreen (snapshot → markup, sem inferência)", () => {
     expect(idle).toContain("Sem transmissões");
     expect(idle).not.toContain("tile-view-m-9");
     expect(idle).toContain("Zé");
+  });
+
+  it("topo da sala não tem Compartilhar (fica no rodapé)", () => {
+    const html = renderToStaticMarkup(createElement(RoomScreen, roomProps()));
+    expect((html.match(/data-hook="share-open"/g) ?? []).length).toBe(1);
+    expect(html).toContain("Sair da sala");
+  });
+
+  it("watching cai quando o host para de transmitir", () => {
+    const entries: RoomMember[] = [
+      { id: "m-1", nickname: "Ana", master: true, share: false },
+      { id: "m-2", nickname: "Bia", master: false, share: true },
+    ];
+    expect(watchingStillLive(["m-1", "m-2"], entries)).toEqual(["m-2"]);
+    expect(watchingStillLive(["m-1"], entries)).toEqual([]);
   });
 
   it("membro assistido mostra Parar de ver", () => {

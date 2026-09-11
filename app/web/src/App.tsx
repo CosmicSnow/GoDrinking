@@ -59,6 +59,7 @@ import {
   HomeScreen,
   RoomScreen,
   resolveDesired,
+  watchingStillLive,
   validateCode,
   validateNickname,
   validatePassword,
@@ -244,11 +245,16 @@ export default function App() {
       return;
     }
     try {
-      // Pull explícito do roster guardado (o evento "roster" do join pode
-      // ter chegado antes do listen montar — eventos não têm backlog).
-      setRoster(await getRoster());
+      const entries = await getRoster();
+      setRoster(entries);
+      setWatching((current) => {
+        const next = watchingStillLive(current, entries);
+        for (const id of current.filter((id) => !next.includes(id))) {
+          void unwatchMember(id).catch(() => undefined);
+        }
+        return next;
+      });
     } catch {
-      // Roster também chega via evento; sem ele, mantém o atual.
       setRoster((current) => current);
     }
     try {
@@ -286,6 +292,14 @@ export default function App() {
       if (cancelled) return;
       if (event.kind === "roster") {
         setRoster(event.entries);
+        setWatching((current) => {
+          const next = watchingStillLive(current, event.entries);
+          const dropped = current.filter((id) => !next.includes(id));
+          for (const id of dropped) {
+            void unwatchMember(id).catch(() => undefined);
+          }
+          return next;
+        });
       } else if (event.kind === "kicked") {
         setError("Você foi removido da sala.");
       }

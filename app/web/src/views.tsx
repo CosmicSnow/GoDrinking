@@ -25,6 +25,11 @@ import type {
 // Validação (espelha as regras do backend; mensagens sem segredos).
 // ---------------------------------------------------------------------------
 
+export function watchingStillLive(watching: string[], entries: RoomMember[]): string[] {
+  const live = new Set(entries.filter((entry) => entry.share).map((entry) => entry.id));
+  return watching.filter((id) => live.has(id));
+}
+
 export function validateNickname(nickname: string): string | null {
   const name = nickname.trim();
   if (name.length < 2 || name.length > 24)
@@ -1074,15 +1079,6 @@ export function RoomScreen(props: RoomProps) {
           ) : null}
         </div>
         <div className="top-actions">
-          <button
-            type="button"
-            className="btn ghost"
-            data-hook="share-open"
-            onClick={openShare}
-            disabled={busy}
-          >
-            Compartilhar
-          </button>
           <button type="button" className="btn danger-b" onClick={onLeave} disabled={busy}>
             Sair da sala
           </button>

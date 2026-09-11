@@ -807,11 +807,12 @@ fn strip_start_code(nal: &[u8]) -> &[u8] {
     }
 }
 
-/// OpenH264's rust wrapper refuses anything outside 3840×2160 (or 2160×3840
-/// portrait). 5120×1440 must still produce a stream: fit, never fail silent.
+/// OpenH264 software cannot hold 3840×1080 in realtime (Windows has no
+/// VideoToolbox; the crate also hard-fails above 3840×2160). Cap to 1080p
+/// so a 5120×1440 window still emits video instead of audio-only.
 pub fn fit_openh264_dims(w: usize, h: usize) -> (usize, usize) {
-    const LONG: usize = 3840;
-    const SHORT: usize = 2160;
+    const LONG: usize = 1920;
+    const SHORT: usize = 1080;
     if w < 2 || h < 2 {
         return (2, 2);
     }
@@ -2693,22 +2694,22 @@ mod tests {
 
     #[test]
     fn fit_openh264_keeps_5120x1440_inside_3840x2160() {
-        assert_eq!(fit_openh264_dims(5120, 1440), (3840, 1080));
+        assert_eq!(fit_openh264_dims(5120, 1440), (1920, 540));
         assert_eq!(fit_openh264_dims(1920, 1080), (1920, 1080));
-        assert_eq!(fit_openh264_dims(3840, 2160), (3840, 2160));
+        assert_eq!(fit_openh264_dims(3840, 2160), (1920, 1080));
     }
 
     #[test]
     fn encode_decode_ultrawide_5120x1440() {
         let profile = QualityProfile::custom(5120, 1440, 20_000, 30).expect("profile");
         let mut enc = H264Encoder::new_with_profile(&profile, 5120, 1440).expect("encoder");
-        assert_eq!((enc.w, enc.h), (3840, 1080));
+        assert_eq!((enc.w, enc.h), (1920, 540));
         let mut dec = H264Decoder::new().expect("decoder");
         let mut pictures = 0;
         for n in 0..4 {
-            let unit = enc.encode(&synthetic_frame(3840, 1080, n)).expect("encode");
+            let unit = enc.encode(&synthetic_frame(1920, 540, n)).expect("encode");
             if let Some(picture) = dec.decode(&unit).expect("decode") {
-                assert_eq!((picture.frame.w, picture.frame.h), (3840, 1080));
+                assert_eq!((picture.frame.w, picture.frame.h), (1920, 540));
                 pictures += 1;
             }
         }
