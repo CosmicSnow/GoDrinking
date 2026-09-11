@@ -19,6 +19,7 @@ import {
   shareLabel,
   sourceKindOf,
   watchingStillLive,
+  tileIsLive,
   validateBitrate,
   validateCode,
   validateCustomDim,
@@ -147,6 +148,12 @@ describe("rótulos de estado (espelham core/src/state.rs)", () => {
     expect(shareLabel("live")).toBe("No ar");
     expect(linkLabel("negotiating")).toBe("Negociando");
     expect(linkLabel("connected")).toBe("Conectado");
+  });
+
+  it("AO VIVO só com ICE e frame apresentado", () => {
+    expect(tileIsLive(false, 10)).toBe(false);
+    expect(tileIsLive(true, 0)).toBe(false);
+    expect(tileIsLive(true, 1)).toBe(true);
   });
 });
 

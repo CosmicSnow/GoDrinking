@@ -23,6 +23,16 @@ use tokio::sync::mpsc;
 type PublisherOrigin = Weak<tokio::sync::Mutex<super::Publisher>>;
 
 const PUMP_INTERVAL: Duration = Duration::from_millis(50);
+pub(crate) const NEGOTIATE_TIMEOUT: Duration = Duration::from_secs(12);
+pub(crate) const MEDIA_WATCHDOG: Duration = Duration::from_secs(8);
+
+pub(crate) fn negotiate_stale(elapsed: Duration) -> bool {
+    elapsed >= NEGOTIATE_TIMEOUT
+}
+
+pub(crate) fn media_watchdog_trip(frames: u64, elapsed: Duration) -> bool {
+    frames == 0 && elapsed >= MEDIA_WATCHDOG
+}
 
 /// Which session a forward task serves (for owner fence attribution).
 #[derive(Clone, Copy)]
@@ -83,10 +93,26 @@ pub fn spawn_forward(
             }) {
                 continue;
             }
+            let mut fail_member: Option<String> = None;
             match event {
                 MediaEvent::IceConnected => {
-                    apply_ice_connected(&state, target, origin.as_ref());
+                    let first = apply_ice_connected(&state, target, origin.as_ref());
                     emit(&app, "media-event", &serde_json::json!({"kind": "ice-connected"}));
+                    if first && matches!(target, ForwardTarget::Watch) {
+                        arm_media_watchdog(
+                            Arc::clone(&state),
+                            app.clone(),
+                            target,
+                            origin.clone(),
+                            watch_alive.clone(),
+                        );
+                    }
+                }
+                MediaEvent::IceFailed => {
+                    emit(&app, "media-event", &serde_json::json!({"kind": "ice-failed"}));
+                    state.session_log("ice failed".to_string());
+                    reset_media_counters(&state);
+                    fail_member = failed_member(&state, target, origin.as_ref());
                 }
                 MediaEvent::VideoFrame { non_black, motion } => {
                     bump_frame(&state, non_black);
@@ -102,9 +128,6 @@ pub fn spawn_forward(
                 }
                 MediaEvent::Stats(stats) => {
                     merge_stats(&state, stats.frames_decoded, stats.keyframes_decoded, stats.ice_connected);
-                    if stats.ice_connected {
-                        apply_ice_connected(&state, target, origin.as_ref());
-                    }
                     // Generation fence (host side): the encode thread bumps
                     // it on every applied reconfig. First observer wins the
                     // authoritative `quality` event; the snapshot
@@ -279,8 +302,18 @@ pub fn spawn_forward(
                     }
                 }
                 MediaEvent::Error(_) => {
-                    // Detail stays out of the frontend; kind only.
                     emit(&app, "media-event", &serde_json::json!({"kind": "error"}));
+                }
+            }
+            drop(_viewer_operation);
+            if let Some(member) = fail_member {
+                match target {
+                    ForwardTarget::Watch => {
+                        let _ = state.unwatch(&member).await;
+                    }
+                    ForwardTarget::Share => {
+                        on_unwatch(&state, &member).await;
+                    }
                 }
             }
         }
@@ -311,21 +344,118 @@ fn ice_fence(inner: &super::Inner, target: ForwardTarget, origin: Option<&Publis
     }
 }
 
-fn apply_ice_connected(state: &Arc<AppState>, target: ForwardTarget, origin: Option<&PublisherOrigin>) {
+fn apply_ice_connected(state: &Arc<AppState>, target: ForwardTarget, origin: Option<&PublisherOrigin>) -> bool {
     let fence = {
         let inner = match state.inner.lock() {
             Ok(inner) => inner,
-            Err(_) => return,
+            Err(_) => return false,
         };
         ice_fence(&inner, target, origin)
     };
-    if let Some(fence) = fence {
-        if let Ok(inner) = state.inner.lock() {
-            let _ = inner.owner.link_connected(&fence);
+    let Some(fence) = fence else {
+        return false;
+    };
+    let ok = state
+        .inner
+        .lock()
+        .ok()
+        .and_then(|inner| inner.owner.link_connected(&fence).ok())
+        .is_some();
+    if ok {
+        bump_connected(state);
+        state.session_log("ice connected".to_string());
+    }
+    ok
+}
+
+fn reset_media_counters(state: &Arc<AppState>) {
+    if let Ok(mut inner) = state.inner.lock() {
+        inner.media_counters.connected = false;
+        inner.media_counters.frames = 0;
+        inner.media_counters.keyframes = 0;
+        inner.media_counters.keyframes_seen = false;
+    }
+}
+
+fn failed_member(
+    state: &Arc<AppState>,
+    target: ForwardTarget,
+    origin: Option<&PublisherOrigin>,
+) -> Option<String> {
+    let inner = state.inner.lock().ok()?;
+    match target {
+        ForwardTarget::Watch => inner.owner.watchers().first().cloned(),
+        ForwardTarget::Share => {
+            let watcher = select_host_trickle_target(
+                inner.publishers.iter().map(|(k, s)| (k.as_str(), &s.wire, &s.publisher)),
+                origin?,
+            )?
+            .0;
+            Some(watcher.to_owned())
         }
     }
-    bump_connected(state);
-    state.session_log("ice connected".to_string());
+}
+
+pub(crate) fn arm_negotiate_timeout(
+    state: Arc<AppState>,
+    app: Option<AppHandle>,
+    member: String,
+    fence: Fence,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(NEGOTIATE_TIMEOUT).await;
+        let stale = {
+            let Ok(inner) = state.inner.lock() else {
+                return;
+            };
+            inner.viewer_fence == Some(fence)
+                && inner.owner.snapshot().links.iter().any(|link| {
+                    link.state == golive_core::state::LinkState::Negotiating
+                })
+        };
+        if !stale {
+            return;
+        }
+        emit(&app, "media-event", &serde_json::json!({"kind": "ice-failed"}));
+        state.session_log("ice timeout".to_string());
+        reset_media_counters(&state);
+        let _ = state.unwatch(&member).await;
+    });
+}
+
+fn arm_media_watchdog(
+    state: Arc<AppState>,
+    app: Option<AppHandle>,
+    target: ForwardTarget,
+    origin: Option<PublisherOrigin>,
+    watch_alive: Option<Arc<std::sync::atomic::AtomicBool>>,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(MEDIA_WATCHDOG).await;
+        if watch_alive.as_ref().is_some_and(|alive| !alive.load(std::sync::atomic::Ordering::Acquire)) {
+            return;
+        }
+        let frames = state
+            .inner
+            .lock()
+            .ok()
+            .map(|inner| inner.media_counters.frames)
+            .unwrap_or(0);
+        if !media_watchdog_trip(frames, MEDIA_WATCHDOG) {
+            return;
+        }
+        emit(&app, "media-event", &serde_json::json!({"kind": "ice-failed"}));
+        state.session_log("ice watchdog no frames".to_string());
+        reset_media_counters(&state);
+        if let Some(member) = failed_member(&state, target, origin.as_ref()) {
+            match target {
+                ForwardTarget::Watch => {
+                    let _ = state.unwatch(&member).await;
+                }
+                ForwardTarget::Share => on_unwatch(&state, &member).await,
+            }
+        }
+    });
 }
 
 /// Backend-observed counters (polled by `get_media_counters`; kinds only).
@@ -351,12 +481,11 @@ fn bump_keyframe(state: &Arc<AppState>) {
     }
 }
 
-fn merge_stats(state: &Arc<AppState>, frames: u64, keyframes: u64, ice: bool) {
+fn merge_stats(state: &Arc<AppState>, frames: u64, keyframes: u64, _ice: bool) {
     if let Ok(mut inner) = state.inner.lock() {
         let counters = &mut inner.media_counters;
         counters.frames = counters.frames.max(frames);
         counters.keyframes = counters.keyframes.max(keyframes);
-        counters.connected = counters.connected || ice;
     }
 }
 
@@ -1600,5 +1729,36 @@ mod retired_events_tests {
         drop(tx);
         spawn_forward(Arc::clone(&state), None, rx, ForwardTarget::Share, Some(Weak::new()), None).await.unwrap();
         assert_eq!(state.inner.lock().unwrap().share_profile.unwrap().generation, 0);
+    }
+
+    #[tokio::test]
+    async fn stats_ice_flag_does_not_mark_connected() {
+        let state = Arc::new(AppState::new());
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(MediaEvent::Stats(golive_core::media::MediaStats {
+            ice_connected: true,
+            frames_decoded: 30,
+            ..Default::default()
+        }))
+        .unwrap();
+        drop(tx);
+        spawn_forward(Arc::clone(&state), None, rx, ForwardTarget::Watch, None, None)
+            .await
+            .unwrap();
+        assert!(!state.inner.lock().unwrap().media_counters.connected);
+    }
+
+    #[test]
+    fn negotiate_stale_trips_at_limit() {
+        assert!(!negotiate_stale(Duration::from_secs(11)));
+        assert!(negotiate_stale(NEGOTIATE_TIMEOUT));
+        assert!(negotiate_stale(Duration::from_secs(13)));
+    }
+
+    #[test]
+    fn media_watchdog_needs_zero_frames_and_elapsed() {
+        assert!(!media_watchdog_trip(1, MEDIA_WATCHDOG));
+        assert!(!media_watchdog_trip(0, Duration::from_secs(7)));
+        assert!(media_watchdog_trip(0, MEDIA_WATCHDOG));
     }
 }

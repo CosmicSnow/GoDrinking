@@ -318,6 +318,9 @@ export default function App() {
         if (event.backend_note !== undefined) setBackendNote(event.backend_note);
       } else if (event.kind === "quality") {
         setEffective({ profile: event.profile, generation: event.generation });
+      } else if (event.kind === "ice-failed") {
+        setError("Falha ao conectar. Tente ver de novo.");
+        setWatching([]);
       }
       setLastMedia(mediaSummary(event));
       void refresh();

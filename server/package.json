@@ -1,6 +1,6 @@
 {
   "name": "golive-sala-server",
-  "version": "0.7.0",
+  "version": "0.7.4",
   "private": true,
   "description": "GoLive Sala signaling server: RAM-only, signaling-only (JSON). Never touches media.",
   "type": "module",

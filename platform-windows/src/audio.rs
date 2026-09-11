@@ -96,21 +96,21 @@ pub fn start_audio_tap(
     excluded_tokens: &[String],
     opus_tx: SyncSender<EncodedAudioPacket>,
 ) -> Result<AudioTap, PlatformError> {
-    if !excluded_tokens.is_empty() {
-        if is_process_loopback_supported() {
-            if let Some((name, pid)) = resolve_exclusion_root(excluded_tokens) {
-                match wasapi::AudioClient::new_application_loopback_client(pid, false) {
-                    Ok(client) => match spawn_loopback(client, opus_tx.clone(), "process") {
-                        Ok(tap) => return Ok(tap),
-                        Err(_) => {}
-                    },
-                    Err(_) => {}
+    let _ = wasapi::initialize_mta();
+    if is_process_loopback_supported() {
+        let target = if excluded_tokens.iter().any(|token| !token.trim().is_empty()) {
+            resolve_exclusion_root(excluded_tokens)
+        } else {
+            Some((String::new(), std::process::id()))
+        };
+        if let Some((_name, pid)) = target {
+            if let Ok(client) = wasapi::AudioClient::new_application_loopback_client(pid, false) {
+                if let Ok(tap) = spawn_loopback(client, opus_tx.clone(), "process") {
+                    return Ok(tap);
                 }
-                let _ = name;
             }
         }
     }
-    let _ = wasapi::initialize_mta();
     let enumerator = wasapi::DeviceEnumerator::new()
         .map_err(|error| PlatformError::Internal(format!("WASAPI enumerator: {error}")))?;
     let device = enumerator
@@ -195,16 +195,13 @@ fn spawn_loopback(
     kind: &str,
 ) -> Result<AudioTap, PlatformError> {
     let desired = wasapi::WaveFormat::new(32, 32, &wasapi::SampleType::Float, 48_000, 2, None);
-    let mode = wasapi::StreamMode::EventsShared {
+    let mode = wasapi::StreamMode::PollingShared {
         autoconvert: true,
         buffer_duration_hns: 200_000,
     };
     client
         .initialize_client(&desired, &wasapi::Direction::Capture, &mode)
         .map_err(|error| PlatformError::Internal(format!("WASAPI {kind} init: {error}")))?;
-    let event = client
-        .set_get_eventhandle()
-        .map_err(|error| PlatformError::Internal(format!("WASAPI event: {error}")))?;
     let capture = client
         .get_audiocaptureclient()
         .map_err(|error| PlatformError::Internal(format!("WASAPI capture: {error}")))?;
@@ -214,15 +211,11 @@ fn spawn_loopback(
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = Arc::clone(&shutdown);
-    let loopback = WasapiLoopback {
-        _client: client,
-        capture,
-        event,
-    };
+    let loopback = WasapiLoopback { client, capture };
     let thread = thread::Builder::new()
         .name("golive-audio-opus".into())
         .spawn(move || {
-            let _ = wasapi_loop(loopback, opus_tx, worker_shutdown);
+            wasapi_loop(loopback, opus_tx, worker_shutdown);
         })
         .map_err(|error| PlatformError::Internal(error.to_string()))?;
 
@@ -235,18 +228,24 @@ fn spawn_loopback(
 }
 
 struct WasapiLoopback {
-    _client: wasapi::AudioClient,
+    client: wasapi::AudioClient,
     capture: wasapi::AudioCaptureClient,
-    event: wasapi::Handle,
 }
 
 unsafe impl Send for WasapiLoopback {}
+
+impl Drop for WasapiLoopback {
+    fn drop(&mut self) {
+        let _ = self.client.stop_stream();
+    }
+}
 
 fn wasapi_loop(
     loopback: WasapiLoopback,
     opus_tx: SyncSender<EncodedAudioPacket>,
     shutdown: Arc<AtomicBool>,
 ) {
+    let _ = wasapi::initialize_mta();
     let Ok(mut encoder) = opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Voip)
     else {
         return;
@@ -254,9 +253,7 @@ fn wasapi_loop(
     let mut pcm = Vec::<f32>::new();
     let mut bytes = VecDeque::<u8>::new();
     while !shutdown.load(Ordering::Acquire) {
-        if loopback.event.wait_for_event(100).is_err() {
-            continue;
-        }
+        let mut got = false;
         loop {
             let Ok(Some(frames)) = loopback.capture.get_next_packet_size() else {
                 break;
@@ -267,6 +264,7 @@ fn wasapi_loop(
             let Ok(_info) = loopback.capture.read_from_device_to_deque(&mut bytes) else {
                 break;
             };
+            got = true;
             while bytes.len() >= 8 {
                 let mut frame = [0_u8; 8];
                 for byte in frame.iter_mut() {
@@ -292,6 +290,9 @@ fn wasapi_loop(
                     _ => {}
                 }
             }
+        }
+        if !got {
+            thread::sleep(Duration::from_millis(5));
         }
     }
 }

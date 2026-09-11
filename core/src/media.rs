@@ -300,6 +300,8 @@ pub enum MediaEvent {
     IceGatheringComplete,
     /// ICE reached Connected/Completed.
     IceConnected,
+    /// ICE reached Failed (terminal). Disconnected/Closed stay Error.
+    IceFailed,
     /// A decoded frame arrived with validation results.
     VideoFrame { non_black: bool, motion: bool },
     /// A keyframe (IDR) was decoded.
@@ -2143,7 +2145,6 @@ async fn read_loop(
                     on_frame(picture.frame);
                     if stats.frames_decoded % 30 == 0 {
                         let mut snapshot = stats.clone();
-                        snapshot.ice_connected = true;
                         snapshot.census = census_snapshot(census);
                         let _ = event_tx.send(MediaEvent::Stats(snapshot));
                     }
@@ -2238,16 +2239,22 @@ fn wire_ice_events(
     }
     {
         let event_tx = event_tx.clone();
-        // State transitions are rare; consumers dedupe. No flag needed.
+        let connected_sent = Arc::new(AtomicBool::new(false));
         pc.on_ice_connection_state_change(Box::new(move |state: RTCIceConnectionState| {
             let event_tx = event_tx.clone();
+            let connected_sent = Arc::clone(&connected_sent);
             Box::pin(async move {
                 use RTCIceConnectionState::*;
                 match state {
                     Connected | Completed => {
-                        let _ = event_tx.send(MediaEvent::IceConnected);
+                        if !connected_sent.swap(true, Ordering::SeqCst) {
+                            let _ = event_tx.send(MediaEvent::IceConnected);
+                        }
                     }
-                    Failed | Disconnected | Closed => {
+                    Failed => {
+                        let _ = event_tx.send(MediaEvent::IceFailed);
+                    }
+                    Disconnected | Closed => {
                         let _ = event_tx.send(MediaEvent::Error(format!("ice {state:?}")));
                     }
                     _ => {}

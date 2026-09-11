@@ -214,52 +214,52 @@ mod tests {
 
     unsafe extern "C-unwind" fn mock_release(ptr: *mut c_void) {
         assert!(!ptr.is_null());
-        mock_release_count().fetch_add(1, Ordering::SeqCst);
+        (*(ptr as *const AtomicU64)).fetch_add(1, Ordering::SeqCst);
     }
 
-    fn mock_release_count() -> &'static AtomicU64 {
-        static COUNT: AtomicU64 = AtomicU64::new(0);
-        &COUNT
-    }
-
-    fn mock_gpu() -> GpuPixelBuffer {
-        // SAFETY: dangling-but-non-null pointer with a counting release;
-        // nothing dereferences it, Drop only calls the counter.
-        unsafe { GpuPixelBuffer::from_raw(0x1000 as *mut c_void, 64, 48, 256, mock_release) }
+    fn mock_gpu(count: &AtomicU64) -> GpuPixelBuffer {
+        unsafe {
+            GpuPixelBuffer::from_raw(
+                count as *const AtomicU64 as *mut c_void,
+                64,
+                48,
+                256,
+                mock_release,
+            )
+        }
     }
 
     #[test]
     fn gpu_handle_releases_exactly_once_on_drop() {
-        mock_release_count().store(0, Ordering::SeqCst);
+        let count = AtomicU64::new(0);
         {
-            let _gpu = mock_gpu();
+            let _gpu = mock_gpu(&count);
             assert_eq!(_gpu.w, 64);
         }
-        assert_eq!(mock_release_count().load(Ordering::SeqCst), 1);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn gpu_handle_take_transfers_ownership_drop_goes_inert() {
-        mock_release_count().store(0, Ordering::SeqCst);
-        let mut gpu = mock_gpu();
+        let count = AtomicU64::new(0);
+        let mut gpu = mock_gpu(&count);
         let raw = gpu.take();
         assert!(!raw.is_null());
         drop(gpu);
-        assert_eq!(mock_release_count().load(Ordering::SeqCst), 0, "taken handle must not release");
-        // SAFETY: balances the take above (test-only release).
+        assert_eq!(count.load(Ordering::SeqCst), 0, "taken handle must not release");
         unsafe { mock_release(raw) };
-        assert_eq!(mock_release_count().load(Ordering::SeqCst), 1);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn gpu_handle_crosses_threads_like_the_capture_channel() {
-        mock_release_count().store(0, Ordering::SeqCst);
+        let count = AtomicU64::new(0);
         let (tx, rx) = std::sync::mpsc::sync_channel::<CapturePacket>(2);
-        tx.send(CapturePacket::Gpu(mock_gpu())).unwrap();
+        tx.send(CapturePacket::Gpu(mock_gpu(&count))).unwrap();
         drop(tx);
         let packet = rx.recv().unwrap();
         assert!(matches!(packet, CapturePacket::Gpu(_)));
         drop(packet);
-        assert_eq!(mock_release_count().load(Ordering::SeqCst), 1);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }

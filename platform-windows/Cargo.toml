@@ -1,6 +1,6 @@
 [package]
 name = "golive-platform-windows"
-version = "0.7.0"
+version = "0.7.4"
 edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
 description = "GoLive Windows capture backend (DXGI displays + WGC windows) behind the golive-platform contract."

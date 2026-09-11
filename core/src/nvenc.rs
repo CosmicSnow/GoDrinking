@@ -10,6 +10,26 @@
 //! (converted from I420 by [`crate::vt::i420_to_nv12`]); output is Annex-B
 //! with SPS/PPS on every IDR — identical to the software/VideoToolbox paths.
 
+pub fn h264_level_idc(w: usize, h: usize, fps: u32) -> u32 {
+    let mb = ((w + 15) / 16).saturating_mul((h + 15) / 16);
+    let mbps = mb.saturating_mul(fps.max(1) as usize);
+    if mb <= 3600 && mbps <= 108_000 {
+        31
+    } else if mb <= 5120 && mbps <= 216_000 {
+        32
+    } else if mb <= 8192 && mbps <= 245_760 {
+        41
+    } else if mb <= 8704 && mbps <= 522_240 {
+        42
+    } else if mb <= 22_080 && mbps <= 589_824 {
+        50
+    } else if mb <= 36_864 && mbps <= 983_040 {
+        51
+    } else {
+        52
+    }
+}
+
 /// Rank hardware MFTs so Auto always picks the strongest GPU encoder first.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn classify_hw_encoder(friendly: &str) -> &'static str {
@@ -588,14 +608,17 @@ mod backend {
         fps: u32,
         bitrate_bps: u32,
     ) -> Result<(), MediaError> {
+        let level = super::h264_level_idc(w, h, fps);
         let mut last = hw_err("SetOutputType");
         for profile in [
             eAVEncH264VProfile_ConstrainedBase.0 as u32,
             eAVEncH264VProfile_Base.0 as u32,
         ] {
-            match set_types(transform, w, h, fps, bitrate_bps, profile) {
-                Ok(()) => return Ok(()),
-                Err(e) => last = e,
+            for maybe_level in [Some(level), None] {
+                match set_types(transform, w, h, fps, bitrate_bps, profile, maybe_level) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => last = e,
+                }
             }
         }
         Err(last)
@@ -608,8 +631,15 @@ mod backend {
         fps: u32,
         bitrate_bps: u32,
         profile: u32,
+        level: Option<u32>,
     ) -> Result<(), MediaError> {
-        let output = video_type(MFVideoFormat_H264, w, h, fps, Some((bitrate_bps, profile)))?;
+        let output = video_type(
+            MFVideoFormat_H264,
+            w,
+            h,
+            fps,
+            Some((bitrate_bps, profile, level)),
+        )?;
         unsafe { transform.SetOutputType(OUTPUT_STREAM, &output, 0) }
             .map_err(|e| hw_err(format!("SetOutputType {e}")))?;
         let input = video_type(MFVideoFormat_NV12, w, h, fps, None)?;
@@ -623,7 +653,7 @@ mod backend {
         w: usize,
         h: usize,
         fps: u32,
-        bitrate: Option<(u32, u32)>,
+        bitrate: Option<(u32, u32, Option<u32>)>,
     ) -> Result<IMFMediaType, MediaError> {
         let media_type =
             unsafe { MFCreateMediaType() }.map_err(|e| hw_err(format!("MFCreateMediaType {e}")))?;
@@ -648,16 +678,16 @@ mod backend {
                     .SetUINT32(&MF_MT_DEFAULT_STRIDE, w as u32)
                     .map_err(|e| hw_err(format!("stride {e}")))?;
             }
-            if let Some((bps, profile)) = bitrate {
+            if let Some((bps, profile, level)) = bitrate {
                 media_type
                     .SetUINT32(&MF_MT_AVG_BITRATE, bps)
                     .map_err(|e| hw_err(format!("bitrate {e}")))?;
                 media_type
                     .SetUINT32(&MF_MT_MPEG2_PROFILE, profile)
                     .ok();
-                media_type
-                    .SetUINT32(&MF_MT_MPEG2_LEVEL, eAVEncH264VLevel4_1.0 as u32)
-                    .ok();
+                if let Some(level) = level {
+                    media_type.SetUINT32(&MF_MT_MPEG2_LEVEL, level).ok();
+                }
             }
         }
         Ok(media_type)
@@ -854,5 +884,53 @@ mod tests {
         );
         assert_eq!(classify_hw_encoder("AMDh264Encoder"), "amf");
         assert_eq!(classify_hw_encoder("Mystery GPU Encoder"), "mfhw");
+    }
+
+    #[test]
+    fn h264_level_follows_frame_size_and_fps() {
+        assert_eq!(h264_level_idc(320, 240, 15), 31);
+        assert_eq!(h264_level_idc(1280, 720, 30), 31);
+        assert_eq!(h264_level_idc(1280, 720, 60), 32);
+        assert_eq!(h264_level_idc(1920, 1080, 30), 41);
+        assert_eq!(h264_level_idc(1920, 1080, 60), 42);
+        assert_eq!(h264_level_idc(2560, 1440, 30), 50);
+        assert_eq!(h264_level_idc(5120, 1440, 30), 51);
+        assert_eq!(h264_level_idc(5120, 1440, 60), 52);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn nvenc_encodes_1080p60_when_hardware_exists() {
+        match super::NvencEncoder::new(1920, 1080, 10_000_000, 60, true) {
+            Ok(mut enc) => {
+                assert!(
+                    matches!(enc.backend_name(), "nvenc" | "qsv" | "amf" | "mfhw"),
+                    "backend {}",
+                    enc.backend_name()
+                );
+                assert_eq!(enc.dims(), (1920, 1080));
+                let mut nv12 = vec![16u8; 1920 * 1080];
+                nv12.extend(std::iter::repeat(128u8).take(1920 * 1080 / 2));
+                let mut got = false;
+                for _ in 0..12 {
+                    if let Ok(Some(unit)) = enc.encode_nv12(&nv12) {
+                        if !unit.is_empty() {
+                            got = true;
+                            break;
+                        }
+                    }
+                }
+                assert!(got, "NVENC 1080p60 produced no unit");
+            }
+            Err(e) => {
+                let detail = e.to_string();
+                assert!(
+                    detail.contains("no NV12")
+                        || detail.contains("GOLIVE_DISABLE_HW")
+                        || detail.contains("Windows-only"),
+                    "1080p60 hardware encode failed: {e}"
+                );
+            }
+        }
     }
 }

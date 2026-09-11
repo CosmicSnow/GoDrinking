@@ -99,6 +99,10 @@ export const salaLabel = (state: SalaState): string => SALA_LABEL[state] ?? stat
 export const shareLabel = (state: ShareState): string => SHARE_LABEL[state] ?? state;
 export const linkLabel = (state: LinkState): string => LINK_LABEL[state] ?? state;
 
+export function tileIsLive(iceConnected: boolean, presented: number): boolean {
+  return iceConnected && presented > 0;
+}
+
 // ---------------------------------------------------------------------------
 // Qualidade (espelha core/src/media.rs `QualityProfile`; aplicada via
 // comando `set_quality`, efetivo autoritativo no snapshot/evento).
@@ -753,7 +757,7 @@ export function HomeScreen(props: HomeProps) {
               {error ? (
                 <p className="lobby-error" id="lobbyError" role="alert">{error}</p>
               ) : null}
-              <small id="lobbyNote">Tela direto de um PC para outro. O servidor só apresenta, nunca vê o vídeo. <span style={{ opacity: 0.6, fontSize: 11 }}>· v0.7.0</span></small>
+              <small id="lobbyNote">Tela direto de um PC para outro. O servidor só apresenta, nunca vê o vídeo. <span style={{ opacity: 0.6, fontSize: 11 }}>· v0.7.4</span></small>
             </div>
           </div>
         </main>
@@ -897,7 +901,9 @@ function Tile(props: TileProps) {
             >
               {wantsWatch ? "Parar de ver" : "Ver"}
             </button>
-            <span className="watch-note">Scroll = zoom · Duplo-clique = resetar</span>
+            <span className="watch-note">
+              {wantsWatch ? "Conectando…" : "Scroll = zoom · Duplo-clique = resetar"}
+            </span>
           </div>
         )}
       </div>
@@ -955,6 +961,15 @@ export function RoomScreen(props: RoomProps) {
   const connectedIds = new Set(
     links.filter((link) => link.state === "connected").map((link) => link.watcher),
   );
+  const presentedByMember = new Map(
+    (linkStats ?? []).map((link) => [link.member, link.presented] as const),
+  );
+  const liveFor = (member: RoomMember): boolean => {
+    const ice = connectedIds.has(member.nickname) || connectedIds.has(member.id);
+    const presented =
+      presentedByMember.get(member.id) ?? presentedByMember.get(member.nickname) ?? 0;
+    return tileIsLive(ice, presented);
+  };
 
   // Estados puramente visuais.
   const [pinnedId, setPinnedId] = useState<string | null>(null);
@@ -1134,7 +1149,7 @@ export function RoomScreen(props: RoomProps) {
                         member={member}
                         self={self}
                         wantsWatch={watchingSet.has(member.id)}
-                        connected={connectedIds.has(member.nickname) || connectedIds.has(member.id)}
+                        connected={liveFor(member)}
                         pinned={pinnedId === member.id}
                         muted={muteAll || mutedIds.has(member.id)}
                         busy={busy}
@@ -1170,7 +1185,7 @@ export function RoomScreen(props: RoomProps) {
                             member={member}
                             self={self}
                             wantsWatch={watchingSet.has(member.id)}
-                            connected={connectedIds.has(member.nickname) || connectedIds.has(member.id)}
+                            connected={liveFor(member)}
                             pinned={false}
                             muted={muteAll || mutedIds.has(member.id)}
                             busy={busy}

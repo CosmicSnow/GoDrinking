@@ -48,9 +48,16 @@ impl ShareAudio {
             .name("golive-audio-hub".into())
             .spawn(move || audio_hub(hub_rx, hub_subs))
             .map_err(|error| error.to_string())?;
-        let tap = start_tap(&excluded, hub_tx.clone());
+        let tap = match start_tap(&excluded, hub_tx.clone()) {
+            Ok(tap) => tap,
+            Err(error) => {
+                drop(hub_tx);
+                let _ = hub.join();
+                return Err(error);
+            }
+        };
         Ok(Self {
-            tap: tap.ok(),
+            tap: Some(tap),
             excluded,
             hub_tx,
             subscribers,
@@ -146,25 +153,36 @@ impl ViewerPlayback {
                     let _ = ready_tx.send(false);
                     return;
                 };
-                let sample_rate = config.sample_rate().0;
+                let sample_rate = config.sample_rate().0.max(1);
                 let channels = config.channels() as usize;
                 let q = Arc::clone(&worker_queue);
                 let err_fn = |_err| {};
                 let stream_config = config.config();
+                let step = 48_000.0 / f64::from(sample_rate);
                 let stream = match config.sample_format() {
                     cpal::SampleFormat::F32 => device.build_output_stream(
                         &stream_config,
-                        move |data: &mut [f32], _| fill_output(data, channels, sample_rate, &q),
+                        {
+                            let mut acc = 1.0 - step;
+                            let mut hold = [0.0f32; 2];
+                            move |data: &mut [f32], _| {
+                                fill_output(data, channels, step, &mut acc, &mut hold, &q)
+                            }
+                        },
                         err_fn,
                         None,
                     ),
                     cpal::SampleFormat::I16 => device.build_output_stream(
                         &stream_config,
-                        move |data: &mut [i16], _| {
-                            let mut tmp = vec![0f32; data.len()];
-                            fill_output(&mut tmp, channels, sample_rate, &q);
-                            for (dst, src) in data.iter_mut().zip(tmp.iter()) {
-                                *dst = (src.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                        {
+                            let mut acc = 1.0 - step;
+                            let mut hold = [0.0f32; 2];
+                            move |data: &mut [i16], _| {
+                                let mut tmp = vec![0f32; data.len()];
+                                fill_output(&mut tmp, channels, step, &mut acc, &mut hold, &q);
+                                for (dst, src) in data.iter_mut().zip(tmp.iter()) {
+                                    *dst = (src.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                                }
                             }
                         },
                         err_fn,
@@ -191,6 +209,8 @@ impl ViewerPlayback {
             })
             .ok()?;
         if !ready_rx.recv_timeout(Duration::from_secs(2)).unwrap_or(false) {
+            stop.store(true, Ordering::Release);
+            let _ = thread.join();
             return None;
         }
         PLAYBACK_QUEUE.store(Some(queue));
@@ -240,30 +260,68 @@ impl QueueSlot {
 
 static PLAYBACK_QUEUE: QueueSlot = QueueSlot::new();
 
-fn fill_output(data: &mut [f32], out_ch: usize, out_rate: u32, queue: &Mutex<VecDeque<f32>>) {
+fn fill_output(
+    data: &mut [f32],
+    out_ch: usize,
+    step: f64,
+    acc: &mut f64,
+    hold: &mut [f32; 2],
+    queue: &Mutex<VecDeque<f32>>,
+) {
     let Ok(mut buf) = queue.lock() else {
         data.fill(0.0);
         return;
     };
     for frame in data.chunks_mut(out_ch.max(1)) {
-        let (l, r) = if buf.len() >= 2 {
-            (buf.pop_front().unwrap_or(0.0), buf.pop_front().unwrap_or(0.0))
-        } else {
-            (0.0, 0.0)
-        };
+        *acc += step;
+        while *acc >= 1.0 {
+            *acc -= 1.0;
+            if buf.len() >= 2 {
+                hold[0] = buf.pop_front().unwrap_or(0.0);
+                hold[1] = buf.pop_front().unwrap_or(0.0);
+            } else {
+                hold[0] = 0.0;
+                hold[1] = 0.0;
+            }
+        }
         if out_ch == 1 {
-            frame[0] = (l + r) * 0.5;
+            frame[0] = (hold[0] + hold[1]) * 0.5;
         } else {
-            frame[0] = l;
-            frame[1] = r;
+            frame[0] = hold[0];
+            frame[1] = hold[1];
             for sample in frame.iter_mut().skip(2) {
                 *sample = 0.0;
             }
         }
     }
-    let _ = out_rate;
 }
 
 pub fn playback_callback() -> Arc<dyn Fn(&[f32]) + Send + Sync> {
     Arc::new(|samples: &[f32]| ViewerPlayback::push(samples))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fill_output_keeps_48k_stereo_1_to_1() {
+        let queue = Mutex::new(VecDeque::from(vec![0.5, -0.5, 0.25, -0.25]));
+        let mut acc = 0.0;
+        let mut hold = [0.0f32; 2];
+        let mut out = [0.0f32; 4];
+        fill_output(&mut out, 2, 1.0, &mut acc, &mut hold, &queue);
+        assert_eq!(out, [0.5, -0.5, 0.25, -0.25]);
+        assert!(queue.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fill_output_holds_sample_when_device_is_faster() {
+        let queue = Mutex::new(VecDeque::from(vec![1.0, 0.0]));
+        let mut acc = 0.5;
+        let mut hold = [0.0f32; 2];
+        let mut out = [0.0f32; 4];
+        fill_output(&mut out, 2, 0.5, &mut acc, &mut hold, &queue);
+        assert_eq!(out, [1.0, 0.0, 1.0, 0.0]);
+    }
 }

@@ -1172,7 +1172,7 @@ impl AppState {
     }
 
     /// Registers watch intent for a member (viewer side).
-    pub async fn watch(self: &Arc<Self>, member: &str) -> Result<(), String> {
+    pub async fn watch(self: &Arc<Self>, member: &str) -> Result<Fence, String> {
         let _operation = self.operations.lock().await;
         if member.trim().is_empty() {
             return Err("member must not be empty".into());
@@ -1197,7 +1197,7 @@ impl AppState {
             }
         }
         self.session_log(format!("watch member={}", session_log::short_id(member)));
-        Ok(())
+        Ok(fence)
     }
 
     /// Removes our watch intent and tears down viewer media.
@@ -1233,6 +1233,10 @@ impl AppState {
         inner.viewer_fence = None;
         inner.viewer_remote_ready = false;
         inner.viewer_pending_remote.clear();
+        inner.media_counters.connected = false;
+        inner.media_counters.frames = 0;
+        inner.media_counters.keyframes = 0;
+        inner.media_counters.keyframes_seen = false;
         drop(inner);
         self.session_log(format!("unwatch member={}", session_log::short_id(member)));
         Ok(())
@@ -1648,8 +1652,10 @@ async fn set_audio_exclusions(
 }
 
 #[tauri::command]
-async fn watch(state: State<'_, Arc<AppState>>, member: String) -> Result<(), String> {
-    state.watch(&member).await
+async fn watch(app: AppHandle, state: State<'_, Arc<AppState>>, member: String) -> Result<(), String> {
+    let fence = state.watch(&member).await?;
+    pump::arm_negotiate_timeout(Arc::clone(&state), Some(app), member, fence);
+    Ok(())
 }
 
 #[tauri::command]

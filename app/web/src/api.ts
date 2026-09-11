@@ -35,7 +35,7 @@
  * contagens — nunca SDP, candidates ou tokens):
  * - "signal-event": admitted | pending | roster | watch | unwatch |
  *   signal | kicked | gone
- * - "media-event": ice-connected | frame | keyframe | stats |
+ * - "media-event": ice-connected | ice-failed | frame | keyframe | stats |
  *   gathering-complete | error
  */
 
@@ -85,6 +85,7 @@ export type SignalEvent =
 
 export type MediaEvent =
   | { kind: "ice-connected" }
+  | { kind: "ice-failed" }
   | { kind: "frame"; non_black: boolean; motion: boolean }
   | { kind: "keyframe" }
   | {
