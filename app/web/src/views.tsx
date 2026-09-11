@@ -153,6 +153,10 @@ export function formatEffective(effective: EffectiveQuality): string {
  */
 export function formatBackend(backend: string | null, note: string | null): string {
   if (backend === "videotoolbox") return "Codificador: VideoToolbox (hardware)";
+  if (backend === "nvenc") return "Codificador: NVENC (hardware)";
+  if (backend === "qsv") return "Codificador: Intel Quick Sync (hardware)";
+  if (backend === "amf") return "Codificador: AMD AMF (hardware)";
+  if (backend === "mfhw") return "Codificador: GPU (hardware)";
   if (backend === "openh264") {
     return note
       ? `Codificador: OpenH264 (software) — ${note}`
@@ -289,7 +293,7 @@ export interface QualityPanelProps extends QualitySelection {
   busy: boolean;
   /** Efetivo autoritativo do backend (null = nenhuma leitura ainda). */
   effective: EffectiveQuality | null;
-  /** Codificador vivo (`videotoolbox`/`openh264`; null = sem leitura). */
+  /** Codificador vivo (`videotoolbox`/`nvenc`/`openh264`; null = sem leitura). */
   backend: string | null;
   /** Motivo do fallback software (null no hardware). */
   backendNote: string | null;
@@ -1259,6 +1263,10 @@ export function RoomScreen(props: RoomProps) {
               <div>
                 <dt>Share</dt>
                 <dd>{snapshot ? shareLabel(snapshot.share.state) : "—"}</dd>
+              </div>
+              <div>
+                <dt>Codificador</dt>
+                <dd data-testid="diag-backend">{formatBackend(quality.backend, quality.backendNote)}</dd>
               </div>
               <div>
                 <dt>Links</dt>

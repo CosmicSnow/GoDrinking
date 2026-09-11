@@ -2034,6 +2034,7 @@ dependencies = [
  "ureq",
  "webrtc",
  "webrtc-media",
+ "windows 0.62.2",
 ]
 
 [[package]]

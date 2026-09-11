@@ -734,6 +734,11 @@ describe("QualityPanel (integrado na sala)", () => {
       createElement(RoomScreen, roomProps({ quality: qualityFixture({ backend: "videotoolbox" }) })),
     );
     expect(hw).toContain("Codificador: VideoToolbox (hardware)");
+    const nvenc = renderToStaticMarkup(
+      createElement(RoomScreen, roomProps({ quality: qualityFixture({ backend: "nvenc" }) })),
+    );
+    expect(nvenc).toContain("Codificador: NVENC (hardware)");
+    expect(nvenc).toContain('data-testid="diag-backend">Codificador: NVENC (hardware)');
     const sw = renderToStaticMarkup(
       createElement(
         RoomScreen,
@@ -763,10 +768,10 @@ describe("QualityPanel (integrado na sala)", () => {
 
   it("selo nunca inventa rótulo para backend desconhecido", () => {
     const html = renderToStaticMarkup(
-      createElement(RoomScreen, roomProps({ quality: qualityFixture({ backend: "nvenc" }) })),
+      createElement(RoomScreen, roomProps({ quality: qualityFixture({ backend: "fooenc" }) })),
     );
     expect(html).toContain("Codificador: ainda sem leitura");
-    expect(html).not.toContain("nvenc");
+    expect(html).not.toContain("fooenc");
   });
 
   it("aplicando mostra progresso; erro do comando sai verbatim", () => {

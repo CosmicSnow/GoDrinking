@@ -48,6 +48,16 @@ objc2-core-media = "0.3"
 objc2-core-video = "0.3"
 objc2-video-toolbox = "0.3"
 
+# NVENC / QSV / AMF via Media Foundation (Windows only). Driver MFT, no
+# NVIDIA Video Codec SDK to ship. Same probe-then-use contract as VT.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Variant",
+] }
+
 # RGBA conversion is on the live receive path; unoptimized OpenH264 misses
 # the 720p30 frame budget even when native decoding is fast.
 [profile.dev.package.openh264]

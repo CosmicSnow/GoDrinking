@@ -221,7 +221,7 @@ pub enum EngineKind {
     Auto,
     /// OpenH264 software, always. Deterministic everywhere.
     Software,
-    /// VideoToolbox, hard fail (`HwUnavailable`) if absent. Never silent.
+    /// Platform hardware (VideoToolbox / NVENC), hard fail if absent.
     Hardware,
 }
 
@@ -644,6 +644,8 @@ pub enum VideoEncoder {
     Software(H264Encoder),
     #[cfg(target_os = "macos")]
     Hardware(crate::vt::VtEncoder),
+    #[cfg(target_os = "windows")]
+    Hardware(crate::nvenc::NvencEncoder),
 }
 
 /// One real probe per process (a VT session + frame costs single-digit ms,
@@ -699,10 +701,22 @@ impl VideoEncoder {
                         true,
                     )?))
                 }
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(target_os = "windows")]
+                {
+                    Ok(Self::Hardware(crate::nvenc::NvencEncoder::new(
+                        w,
+                        h,
+                        profile.bitrate_kbps * 1000,
+                        profile.fps,
+                        true,
+                    )?))
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                 {
                     let _ = (profile, w, h);
-                    Err(MediaError::HwUnavailable("VideoToolbox is macOS-only".into()))
+                    Err(MediaError::HwUnavailable(
+                        "no hardware encoder on this platform".into(),
+                    ))
                 }
             }
             EngineKind::Auto => {
@@ -745,7 +759,7 @@ impl VideoEncoder {
     pub fn encode_frame(&mut self, frame: &I420Frame) -> Result<Option<Vec<u8>>, MediaError> {
         match self {
             Self::Software(enc) => enc.encode(frame).map(Some),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             Self::Hardware(enc) => {
                 let nv12 = crate::vt::i420_to_nv12(
                     frame.w,
@@ -762,7 +776,7 @@ impl VideoEncoder {
     pub fn force_intra(&mut self) {
         match self {
             Self::Software(enc) => enc.force_intra(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             Self::Hardware(enc) => enc.force_intra(),
         }
     }
@@ -770,7 +784,7 @@ impl VideoEncoder {
     pub fn dims(&self) -> (usize, usize) {
         match self {
             Self::Software(enc) => (enc.w, enc.h),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             Self::Hardware(enc) => enc.dims(),
         }
     }
@@ -780,6 +794,8 @@ impl VideoEncoder {
             Self::Software(_) => "openh264",
             #[cfg(target_os = "macos")]
             Self::Hardware(_) => "videotoolbox",
+            #[cfg(target_os = "windows")]
+            Self::Hardware(enc) => enc.backend_name(),
         }
     }
 }
@@ -791,9 +807,15 @@ pub fn probe_hardware() -> Result<(), MediaError> {
     {
         crate::vt::probe_hardware()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
-        Err(MediaError::HwUnavailable("VideoToolbox is macOS-only".into()))
+        crate::nvenc::probe_hardware()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Err(MediaError::HwUnavailable(
+            "no hardware encoder on this platform".into(),
+        ))
     }
 }
 
@@ -2859,7 +2881,10 @@ mod tests {
         // Unhooked, Auto always yields a working encoder (either backend).
         let auto = VideoEncoder::new(&QualityProfile::low(), 320, 240, EngineKind::Auto)
             .expect("auto resolves");
-        assert!(matches!(auto.backend_name(), "openh264" | "videotoolbox"));
+        assert!(matches!(
+            auto.backend_name(),
+            "openh264" | "videotoolbox" | "nvenc" | "qsv" | "amf" | "mfhw"
+        ));
         // Hook bypasses the process cache: a primed cache never leaks
         // hardware into a forced-fallback decision (called twice on purpose).
         std::env::set_var("GOLIVE_DISABLE_HW", "1");

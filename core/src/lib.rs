@@ -16,5 +16,6 @@ pub mod signal;
 pub mod state;
 pub mod trace;
 // Private: hardware backend surface is `media::{EngineKind, VideoEncoder}`;
-// objc2 types never leak past `vt.rs`.
+// objc2/MF types never leak past `vt.rs` / `nvenc.rs`.
+mod nvenc;
 mod vt;

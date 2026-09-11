@@ -251,7 +251,7 @@ export interface MediaCounters {
   links: LinkStats[];
   /** Efetivo autoritativo; None fora do share. */
   effective: EffectiveQuality | null;
-  /** Codificador vivo (`videotoolbox`/`openh264`); null até o primeiro build. */
+  /** Codificador vivo (`videotoolbox`/`nvenc`/`openh264`); null até o primeiro build. */
   backend: string | null;
   /** Motivo do fallback software; null no hardware ou sem backend. */
   backend_note: string | null;

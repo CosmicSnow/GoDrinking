@@ -105,7 +105,7 @@ pub struct MediaCounters {
     /// `None` when not sharing. Generation bumps async via `media-event`.
     #[serde(default)]
     pub effective: Option<EffectiveQuality>,
-    /// Live encode backend (`videotoolbox`/`openh264`) for the UI badge
+    /// Live encode backend (`videotoolbox`/`nvenc`/`openh264`) for the UI badge
     /// and diagnostics. First publisher reporting wins; `None` until the
     /// encode thread finishes its first build. Read on snapshot/event —
     /// never polled.
@@ -124,10 +124,18 @@ pub struct MediaCounters {
 /// itself failed (exact status lives in the session log). Pure + tested.
 pub fn backend_note_for(backend: Option<&str>) -> Option<String> {
     match backend {
-        None | Some("videotoolbox") => None,
+        None | Some("videotoolbox") | Some("nvenc") | Some("qsv") | Some("amf") | Some("mfhw") => {
+            None
+        }
         Some("openh264") => Some(
-            if cfg!(not(target_os = "macos")) {
-                "sem VideoToolbox nesta plataforma".to_owned()
+            if cfg!(target_os = "windows") {
+                if std::env::var_os("GOLIVE_DISABLE_HW").is_some() {
+                    "hardware desabilitado (GOLIVE_DISABLE_HW)".to_owned()
+                } else {
+                    "NVENC indisponível — usando OpenH264 (software)".to_owned()
+                }
+            } else if cfg!(not(target_os = "macos")) {
+                "sem aceleração de hardware nesta plataforma".to_owned()
             } else if std::env::var_os("GOLIVE_DISABLE_HW").is_some() {
                 "hardware desabilitado (GOLIVE_DISABLE_HW)".to_owned()
             } else {
@@ -2187,6 +2195,7 @@ mod quality_tests {
         // Hardware and absence carry no note.
         assert_eq!(backend_note_for(None), None);
         assert_eq!(backend_note_for(Some("videotoolbox")), None);
+        assert_eq!(backend_note_for(Some("nvenc")), None);
         assert_eq!(backend_note_for(Some("whatever")), None);
         // Software fallback always explains itself, never with secrets.
         let hook_was_set = std::env::var_os("GOLIVE_DISABLE_HW").is_some();
