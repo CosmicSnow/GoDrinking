@@ -117,7 +117,9 @@ mod backend {
 
     fn ensure_com_mf() -> Result<(), MediaError> {
         unsafe {
-            CoInitializeEx(None, COINIT_MULTITHREADED).map_err(|e| hw_err(format!("COM init {e}")))?;
+            CoInitializeEx(None, COINIT_MULTITHREADED)
+                .ok()
+                .map_err(|e| hw_err(format!("COM init {e}")))?;
         }
         static MF: OnceLock<Result<(), String>> = OnceLock::new();
         match MF.get_or_init(|| {
