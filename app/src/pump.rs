@@ -1097,7 +1097,9 @@ async fn on_viewer_envelope(
                 }
             }
         }
-        Err(_) => {}
+            Err(_) => {
+                state.session_log("answer failed".to_string());
+            }
     }
 }
 

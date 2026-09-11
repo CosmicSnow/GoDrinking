@@ -51,6 +51,7 @@ use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::api::media_engine::MIME_TYPE_OPUS;
 use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTPCodecType};
+use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
 use webrtc::rtp_transceiver::RTCPFeedback;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
@@ -587,6 +588,7 @@ impl H264Encoder {
         if w < 2 || h < 2 || w > MAX_DIM as usize || h > MAX_DIM as usize || w % 2 != 0 || h % 2 != 0 {
             return Err(MediaError::Codec(format!("backend dims must be even 2..={MAX_DIM}: {w}x{h}")));
         }
+        let (w, h) = fit_openh264_dims(w, h);
         let config = EncoderConfig::new()
             .bitrate(BitRate::from_bps(profile.bitrate_kbps * 1000))
             .max_frame_rate(FrameRate::from_hz(profile.fps as f32))
@@ -708,9 +710,6 @@ impl VideoEncoder {
                 let selected = decide_engine(hw);
                 match Self::new(profile, w, h, selected) {
                     Ok(encoder) => {
-                        // ONE decision log line (backend + target + motive).
-                        // Reasons are redacted kinds only — never SDP,
-                        // candidates, pixels or tokens.
                         let motive = if hw {
                             "probe ok".to_owned()
                         } else {
@@ -719,13 +718,22 @@ impl VideoEncoder {
                         eprintln!(
                             "golive: encode backend={} target={}x{} ({motive})",
                             encoder.backend_name(),
-                            w,
-                            h
+                            encoder.dims().0,
+                            encoder.dims().1
                         );
                         Ok(encoder)
                     }
-                    // Unreachable for Software; explicit Hardware fail-high
-                    // surfaces here unchanged.
+                    Err(e) if selected == EngineKind::Hardware => {
+                        let encoder = Self::new(profile, w, h, EngineKind::Software)?;
+                        eprintln!(
+                            "golive: encode backend={} target={}x{} (hw failed; software fallback)",
+                            encoder.backend_name(),
+                            encoder.dims().0,
+                            encoder.dims().1
+                        );
+                        let _ = e;
+                        Ok(encoder)
+                    }
                     Err(e) => Err(e),
                 }
             }
@@ -759,6 +767,14 @@ impl VideoEncoder {
         }
     }
 
+    pub fn dims(&self) -> (usize, usize) {
+        match self {
+            Self::Software(enc) => (enc.w, enc.h),
+            #[cfg(target_os = "macos")]
+            Self::Hardware(enc) => enc.dims(),
+        }
+    }
+
     pub fn backend_name(&self) -> &'static str {
         match self {
             Self::Software(_) => "openh264",
@@ -789,6 +805,21 @@ fn strip_start_code(nal: &[u8]) -> &[u8] {
     } else {
         nal
     }
+}
+
+/// OpenH264's rust wrapper refuses anything outside 3840×2160 (or 2160×3840
+/// portrait). 5120×1440 must still produce a stream: fit, never fail silent.
+pub fn fit_openh264_dims(w: usize, h: usize) -> (usize, usize) {
+    const LONG: usize = 3840;
+    const SHORT: usize = 2160;
+    if w < 2 || h < 2 {
+        return (2, 2);
+    }
+    let (long, short, portrait) = if w >= h { (w, h, false) } else { (h, w, true) };
+    let scale = (LONG as f64 / long as f64).min(SHORT as f64 / short as f64).min(1.0);
+    let long = ((long as f64 * scale) as usize).max(2) & !1;
+    let short = ((short as f64 * scale) as usize).max(2) & !1;
+    if portrait { (short, long) } else { (long, short) }
 }
 
 /// H.264 level tier by pixel count: HD and below is 3.1, above is 4.0.
@@ -1738,10 +1769,10 @@ fn try_retarget_encoder(
     if needed == *target || needed.0 < 2 || needed.1 < 2 {
         return;
     }
-    match VideoEncoder::new(profile, needed.0, needed.1, engine) {
+        match VideoEncoder::new(profile, needed.0, needed.1, engine) {
         Ok(new_encoder) => {
+            *target = new_encoder.dims();
             *encoder = new_encoder;
-            *target = needed;
             *generation = generation.wrapping_add(1);
             encoder.force_intra();
             note_backend(backend, encoder.backend_name());
@@ -1772,9 +1803,10 @@ fn build_encoder(
     engine: EngineKind,
     movie: Option<&Vec<I420Frame>>,
 ) -> Result<(VideoEncoder, (usize, usize)), MediaError> {
-    let target = initial_target(source, profile, movie);
-    let encoder = VideoEncoder::new(profile, target.0, target.1, engine)?;
-    Ok((encoder, target))
+    let requested = initial_target(source, profile, movie);
+    let encoder = VideoEncoder::new(profile, requested.0, requested.1, engine)?;
+    let dims = encoder.dims();
+    Ok((encoder, dims))
 }
 
 /// Drain pending reconfigs, keeping only the latest (a burst of UI drags
@@ -1946,6 +1978,11 @@ impl NativeViewer {
             .set_remote_description(offer)
             .await
             .map_err(|e| MediaError::Transport(format!("set remote: {e}")))?;
+        for transceiver in self.pc.get_transceivers().await {
+            transceiver
+                .set_direction(RTCRtpTransceiverDirection::Recvonly)
+                .await;
+        }
         let answer = self
             .pc
             .create_answer(None)
@@ -2489,6 +2526,102 @@ mod tests {
         publisher.stop().await;
         assert!(sdp.contains("m=audio"), "audio track advertised");
         assert!(sdp.contains("opus") || sdp.contains("OPUS") || sdp.contains("Opus"));
+        let (event_tx, _event_rx) = mpsc::unbounded_channel::<MediaEvent>();
+        let on_frame = Arc::new(|_frame: PresentedFrame| {});
+        let mut viewer = NativeViewer::start_with_audio(None, event_tx, on_frame, None)
+            .await
+            .expect("viewer starts");
+        let answer = viewer.set_remote_offer(&sdp).await.expect("answer");
+        viewer.stop().await;
+        assert!(answer.contains("m=video"), "answer keeps video");
+        assert!(answer.contains("m=audio"), "answer keeps audio");
+        assert!(
+            !answer.contains("m=video 0"),
+            "video m-line must not be rejected"
+        );
+    }
+
+    async fn rtp_pair(
+        audio: bool,
+    ) -> (u64, bool, bool, u64) {
+        let (pub_tx, mut pub_rx) = mpsc::unbounded_channel::<MediaEvent>();
+        let (view_tx, mut view_rx) = mpsc::unbounded_channel::<MediaEvent>();
+        let audio_rx = if audio {
+            let (_audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<EncodedAudioPacket>(4);
+            Some(audio_rx)
+        } else {
+            None
+        };
+        let frames = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counted = Arc::clone(&frames);
+        let on_frame = Arc::new(move |_frame: PresentedFrame| {
+            counted.fetch_add(1, Ordering::Relaxed);
+        });
+        let mut publisher = Publisher::start_with_profile_and_audio(
+            VideoSource::SyntheticBall,
+            QualityProfile::low(),
+            EngineKind::Software,
+            Some(vec![]),
+            pub_tx,
+            audio_rx,
+        )
+        .await
+        .expect("publisher");
+        let mut viewer = NativeViewer::start_with_audio(Some(vec![]), view_tx, on_frame, None)
+            .await
+            .expect("viewer");
+        let offer = publisher.create_offer().await.expect("offer");
+        let answer = viewer.set_remote_offer(&offer).await.expect("answer");
+        publisher.set_remote_answer(&answer).await.expect("set answer");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let mut pub_ice = false;
+        let mut view_ice = false;
+        let mut errors = 0u64;
+        while frames.load(Ordering::Relaxed) == 0 && tokio::time::Instant::now() < deadline {
+            while let Ok(event) = pub_rx.try_recv() {
+                match event {
+                    MediaEvent::IceCandidate { candidate } => {
+                        let _ = viewer.add_remote_candidate(&candidate).await;
+                    }
+                    MediaEvent::IceConnected => pub_ice = true,
+                    MediaEvent::Error(_) => errors += 1,
+                    _ => {}
+                }
+            }
+            while let Ok(event) = view_rx.try_recv() {
+                match event {
+                    MediaEvent::IceCandidate { candidate } => {
+                        let _ = publisher.add_remote_candidate(&candidate).await;
+                    }
+                    MediaEvent::IceConnected => view_ice = true,
+                    MediaEvent::Error(_) => errors += 1,
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        let got = frames.load(Ordering::Relaxed);
+        publisher.stop().await;
+        viewer.stop().await;
+        (got, pub_ice, view_ice, errors)
+    }
+
+    #[tokio::test]
+    async fn video_frames_flow_video_only() {
+        let (got, pub_ice, view_ice, errors) = rtp_pair(false).await;
+        assert!(
+            got > 0,
+            "video-only must present (frames={got} pub_ice={pub_ice} view_ice={view_ice} errors={errors})"
+        );
+    }
+
+    #[tokio::test]
+    async fn video_frames_flow_when_audio_track_is_attached() {
+        let (got, pub_ice, view_ice, errors) = rtp_pair(true).await;
+        assert!(
+            got > 0,
+            "video must present with audio attached (frames={got} pub_ice={pub_ice} view_ice={view_ice} errors={errors})"
+        );
     }
 
     #[test]
@@ -2556,6 +2689,30 @@ mod tests {
         // Legacy mapping: P720 is the historical default, P1080 follows HIGH.
         assert_eq!(Quality::P720.profile(), QualityProfile::medium());
         assert_eq!(Quality::P1080.profile(), QualityProfile::high());
+    }
+
+    #[test]
+    fn fit_openh264_keeps_5120x1440_inside_3840x2160() {
+        assert_eq!(fit_openh264_dims(5120, 1440), (3840, 1080));
+        assert_eq!(fit_openh264_dims(1920, 1080), (1920, 1080));
+        assert_eq!(fit_openh264_dims(3840, 2160), (3840, 2160));
+    }
+
+    #[test]
+    fn encode_decode_ultrawide_5120x1440() {
+        let profile = QualityProfile::custom(5120, 1440, 20_000, 30).expect("profile");
+        let mut enc = H264Encoder::new_with_profile(&profile, 5120, 1440).expect("encoder");
+        assert_eq!((enc.w, enc.h), (3840, 1080));
+        let mut dec = H264Decoder::new().expect("decoder");
+        let mut pictures = 0;
+        for n in 0..4 {
+            let unit = enc.encode(&synthetic_frame(3840, 1080, n)).expect("encode");
+            if let Some(picture) = dec.decode(&unit).expect("decode") {
+                assert_eq!((picture.frame.w, picture.frame.h), (3840, 1080));
+                pictures += 1;
+            }
+        }
+        assert!(pictures >= 1, "software still emits after fitting 5120x1440");
     }
 
     #[test]

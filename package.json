@@ -3,6 +3,7 @@
   "version": "0.7.0",
   "private": true,
   "scripts": {
-    "build:windows": "npm --prefix app/web run build && cd app && cargo tauri build"
+    "build:windows": "npm --prefix app/web run build && cd app && cargo tauri build",
+    "build:release": "npm --prefix app/web run build && cd app && cargo tauri build --no-bundle -- --bin golive-app --bin golive-video"
   }
 }
