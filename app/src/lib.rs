@@ -228,6 +228,8 @@ pub struct PublishSession {
 }
 
 pub(crate) struct WatchSession {
+    /// Independent output stream; the OS mixes simultaneous watched hosts.
+    playback: Option<audio::ViewerPlayback>,
     pub fence: Fence,
     pub viewer: Option<Arc<tokio::sync::Mutex<NativeViewer>>>,
     pub adopted: Option<WireIds>,
@@ -355,8 +357,6 @@ struct Inner {
     share_capture: Option<Arc<Mutex<QualityProfile>>>,
     /// System-audio tap + Opus fanout for the live share (Display/Window).
     audio: Option<audio::ShareAudio>,
-    /// Viewer speakers; dropped with the native viewer.
-    viewer_playback: Option<audio::ViewerPlayback>,
     /// Session-log dedupe: last backend name logged + whether the ICE
     /// census line went out (log once per process, not per Stats event).
     last_logged_backend: Option<String>,
@@ -392,7 +392,6 @@ impl AppState {
                 share_profile: None,
                 share_capture: None,
                 audio: None,
-                viewer_playback: None,
                 last_logged_backend: None,
                 census_logged: false,
                 share_source: None,
@@ -580,7 +579,6 @@ impl AppState {
                 }
             }
             let audio = inner.audio.take();
-            inner.viewer_playback = None;
             (
                 inner.signal.take(),
                 std::mem::take(&mut inner.publishers),
@@ -1196,7 +1194,15 @@ impl AppState {
                 .inner
                 .lock()
                 .map_err(|_| "state lock poisoned".to_string())?;
-            inner.owner.watch(member).map_err(redact_owner)?
+            if inner.signal.is_none() {
+                return Err("not in a room".into());
+            }
+            // Repeated UI/roster intent is idempotent. Replacing this entry
+            // loses ownership of the live viewer and its callbacks.
+            if let Some(session) = inner.viewers.get(member) {
+                return Ok(session.fence);
+            }
+            inner.owner.watch_remote(member).map_err(redact_owner)?
         };
         {
             let mut inner = self
@@ -1206,6 +1212,7 @@ impl AppState {
             inner.viewers.insert(
                 member.to_owned(),
                 WatchSession {
+                    playback: None,
                     fence,
                     viewer: None,
                     adopted: None,
@@ -1240,7 +1247,6 @@ impl AppState {
                 alive.store(false, std::sync::atomic::Ordering::Release);
             }
             if inner.viewers.is_empty() {
-                inner.viewer_playback = None;
                 inner.media_counters.connected = false;
                 inner.media_counters.frames = 0;
                 inner.media_counters.keyframes = 0;
@@ -1256,7 +1262,7 @@ impl AppState {
             .inner
             .lock()
             .map_err(|_| "state lock poisoned".to_string())?;
-        if let Ok(fence) = inner.owner.unwatch(member) {
+        if let Ok(fence) = inner.owner.unwatch_remote(member) {
             let _ = inner.owner.complete_link_removed(&fence);
         }
         drop(inner);
@@ -2297,10 +2303,11 @@ mod operation_tests {
             let mut inner = state.inner.lock().unwrap();
             let join = inner.owner.begin_join().unwrap();
             inner.owner.complete_opened(&join).unwrap();
-            let fence = inner.owner.watch("ana").unwrap();
+            let fence = inner.owner.watch_remote("ana").unwrap();
             inner.viewers.insert(
                 "ana".into(),
                 WatchSession {
+                    playback: None,
                     fence,
                     viewer: None,
                     adopted: None,
@@ -2328,10 +2335,11 @@ mod operation_tests {
             let join = inner.owner.begin_join().unwrap();
             inner.owner.complete_opened(&join).unwrap();
             for host in ["host-a", "host-b"] {
-                let fence = inner.owner.watch(host).unwrap();
+                let fence = inner.owner.watch_remote(host).unwrap();
                 inner.viewers.insert(
                     host.into(),
                     WatchSession {
+                        playback: None,
                         fence,
                         viewer: None,
                         adopted: None,
@@ -2368,10 +2376,11 @@ mod operation_tests {
             let join = inner.owner.begin_join().unwrap();
             inner.owner.complete_opened(&join).unwrap();
             for host in ["host-a", "host-b"] {
-                let fence = inner.owner.watch(host).unwrap();
+                let fence = inner.owner.watch_remote(host).unwrap();
                 inner.viewers.insert(
                     host.into(),
                     WatchSession {
+                        playback: None,
                         fence,
                         viewer: None,
                         adopted: Some(WireIds {

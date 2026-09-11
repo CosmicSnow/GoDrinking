@@ -889,7 +889,7 @@ async fn run_two_peer(
         return fail(&mut world, missing);
     }
     let host_id = world.viewer.host_id.clone().expect("checked");
-    let viewer_fence = match world.viewer.owner.watch(&host_id) {
+    let viewer_fence = match world.viewer.owner.watch_remote(&host_id) {
         Ok(fence) => fence,
         Err(e) => return fail(&mut world, format!("viewer watch: {e:?}")),
     };
@@ -984,7 +984,7 @@ async fn run_two_peer(
     if let Some(mut media) = world.viewer.media.take() {
         media.stop().await;
     }
-    if let Ok(fence) = world.viewer.owner.unwatch(&host_id) {
+    if let Ok(fence) = world.viewer.owner.unwatch_remote(&host_id) {
         let _ = world.viewer.owner.complete_link_removed(&fence);
     }
     if let Err(missing) = world
@@ -1053,7 +1053,7 @@ async fn run_two_peer(
         let fence = world
             .viewer
             .owner
-            .watch(&host_id)
+            .watch_remote(&host_id)
             .map_err(|e| format!("{e:?}"))?;
         world.viewer.owner_fence = Some(fence);
         world

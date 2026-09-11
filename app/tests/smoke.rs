@@ -274,8 +274,21 @@ async fn run_mutual_watch(room_creator_shares_first: bool) {
         .unwrap()
         .frames
         .saturating_sub(baseline);
-    a.leave().await.unwrap();
+    // Repeated UI intent must not leave an unowned viewer running after stop.
+    b.watch(&a_id).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    b.unwatch(&a_id).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let after_unwatch = b.get_media_counters().unwrap().frames;
     b.leave().await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !a.get_snapshot().unwrap().links.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let orphan_links = a.get_snapshot().unwrap().links.len();
+    a.leave().await.unwrap();
+    assert_eq!(orphan_links, 0, "departed peer must not leave media links behind");
+    assert_eq!(after_unwatch, 0, "duplicate watch must not leave ghost video after unwatch");
     assert!(
         reverse >= 3 && forward >= 3,
         "both directions must deliver video: A -> B fresh={forward}, B -> A={reverse}"

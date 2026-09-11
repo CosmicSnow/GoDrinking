@@ -140,6 +140,7 @@ impl From<TransitionError> for OwnerError {
 
 #[derive(Clone, Debug)]
 struct LinkEntry {
+    receiving: bool,
     id: LinkId,
     watcher: String,
     state: LinkState,
@@ -155,7 +156,7 @@ struct Inner {
     share_state: ShareState,
     share_attempt: Option<AttemptId>,
     links: HashMap<LinkId, LinkEntry>,
-    watcher_to_link: HashMap<String, LinkId>,
+    watcher_to_link: HashMap<(String, bool), LinkId>,
     roster: HashMap<String, RosterEntry>,
 }
 
@@ -312,8 +313,8 @@ impl Owner {
         })
     }
 
-    /// Completes a stop: `Stopped`, share IDs cleared, all links removed
-    /// deterministically (watcher list becomes empty). IDEMPOTENT: completing
+    /// Completes a stop: `Stopped`, share IDs and publishing links cleared.
+    /// Receiving links survive. IDEMPOTENT: completing
     /// an already-stopped share is a no-op (never a wedged state).
     pub fn complete_share_stopped(&self, fence: &Fence) -> Result<(), OwnerError> {
         let mut inner = self.inner.lock().expect("owner lock poisoned");
@@ -324,8 +325,8 @@ impl Owner {
         inner.share_state = inner.share_state.apply(ShareEvent::Stopped)?;
         inner.share_id = None;
         inner.share_attempt = None;
-        inner.links.clear();
-        inner.watcher_to_link.clear();
+        inner.links.retain(|_, entry| entry.receiving);
+        inner.watcher_to_link.retain(|(_, receiving), _| *receiving);
         Ok(())
     }
 
@@ -336,6 +337,16 @@ impl Owner {
     /// previous generation turns stale. Requires an open session; a live
     /// share is NOT required to register intent.
     pub fn watch(&self, watcher: &str) -> Result<Fence, OwnerError> {
+        self.watch_direction(watcher, false)
+    }
+
+    /// Registers our reception of a remote share, independently of whether
+    /// that same member watches us. Its lifetime is not our local share's.
+    pub fn watch_remote(&self, host: &str) -> Result<Fence, OwnerError> {
+        self.watch_direction(host, true)
+    }
+
+    fn watch_direction(&self, watcher: &str, receiving: bool) -> Result<Fence, OwnerError> {
         if watcher.trim().is_empty() {
             return Err(OwnerError::InvalidInput {
                 reason: "watcher must not be empty".into(),
@@ -344,8 +355,9 @@ impl Owner {
         let mut inner = self.inner.lock().expect("owner lock poisoned");
         require_session_open(&inner)?;
         let session = inner.session_id.expect("session checked open");
-        let share = inner.share_id;
-        if let Some(link_id) = inner.watcher_to_link.get(watcher).copied() {
+        let share = if receiving { None } else { inner.share_id };
+        let key = (watcher.to_owned(), receiving);
+        if let Some(link_id) = inner.watcher_to_link.get(&key).copied() {
             // Same link: ADVANCE the attempt (never re-roll). The rendezvous
             // rejects offers numerically lower than the current attempt for
             // the same session/share/link key, so a fresh random id would go
@@ -366,6 +378,7 @@ impl Owner {
         inner.links.insert(
             link_id,
             LinkEntry {
+                receiving,
                 id: link_id,
                 watcher: watcher.to_owned(),
                 state,
@@ -374,7 +387,7 @@ impl Owner {
         );
         inner
             .watcher_to_link
-            .insert(watcher.to_owned(), link_id);
+            .insert(key, link_id);
         Ok(Fence {
             session,
             share,
@@ -396,21 +409,30 @@ impl Owner {
         let inner = self.inner.lock().expect("owner lock poisoned");
         inner.session_state == SalaState::Open
             && inner.session_id == Some(fence.session)
-            && inner.share_id == fence.share
             && fence.link.and_then(|id| inner.links.get(&id)).is_some_and(|entry| {
-                entry.attempt == fence.attempt && entry.state.is_live()
+                let share = if entry.receiving { None } else { inner.share_id };
+                share == fence.share && entry.attempt == fence.attempt && entry.state.is_live()
             })
     }
 
     /// Closes exactly one watcher's link (`Closing`, fresh attempt).
     /// Idempotent while already closing.
     pub fn unwatch(&self, watcher: &str) -> Result<Fence, OwnerError> {
+        self.unwatch_direction(watcher, false)
+    }
+
+    /// Stops only our reception; a publisher to the same member survives.
+    pub fn unwatch_remote(&self, host: &str) -> Result<Fence, OwnerError> {
+        self.unwatch_direction(host, true)
+    }
+
+    fn unwatch_direction(&self, watcher: &str, receiving: bool) -> Result<Fence, OwnerError> {
         let mut inner = self.inner.lock().expect("owner lock poisoned");
         let session = inner.session_id.ok_or(OwnerError::NoSession)?;
-        let share = inner.share_id;
+        let share = if receiving { None } else { inner.share_id };
         let link_id = inner
             .watcher_to_link
-            .get(watcher)
+            .get(&(watcher.to_owned(), receiving))
             .copied()
             .ok_or_else(|| OwnerError::WatcherUnknown {
                 watcher: watcher.to_owned(),
@@ -456,7 +478,7 @@ impl Owner {
         entry.state = entry.state.apply(LinkEvent::Removed)?;
         debug_assert_eq!(entry.state, LinkState::Absent);
         let entry = inner.links.remove(&link_id).expect("checked above");
-        inner.watcher_to_link.remove(&entry.watcher);
+        inner.watcher_to_link.remove(&(entry.watcher, entry.receiving));
         Ok(())
     }
 
@@ -595,6 +617,7 @@ fn live_watchers(inner: &Inner) -> Vec<String> {
         .map(|entry| entry.watcher.clone())
         .collect();
     out.sort();
+    out.dedup();
     out
 }
 
@@ -633,6 +656,33 @@ mod tests {
         let fence = owner.begin_join().expect("begin join");
         owner.complete_opened(&fence).expect("opened");
         owner
+    }
+
+    #[test]
+    fn receiving_and_publishing_have_independent_lifetimes() {
+        let owner = open_owner();
+        let receive = owner.watch_remote("peer").unwrap();
+        owner.link_connected(&receive).unwrap();
+        let share = owner.begin_share_start().unwrap();
+        owner.complete_share_live(&share).unwrap();
+        assert!(owner.link_is_current(&receive));
+        let publish = owner.watch("peer").unwrap();
+        owner.link_connected(&publish).unwrap();
+        assert_ne!(receive.link, publish.link);
+        assert_eq!(owner.watchers(), vec!["peer".to_owned()]);
+        let stop_receive = owner.unwatch_remote("peer").unwrap();
+        owner.complete_link_removed(&stop_receive).unwrap();
+        assert!(owner.link_is_current(&publish));
+        assert!(!owner.link_is_current(&receive));
+        let next_receive = owner.watch_remote("peer").unwrap();
+        let stop_share = owner.begin_share_stop().unwrap();
+        owner.complete_share_stopped(&stop_share).unwrap();
+        assert!(owner.link_is_current(&next_receive));
+        assert!(!owner.link_is_current(&publish));
+        let close = owner.begin_close().unwrap();
+        owner.complete_closed(&close).unwrap();
+        assert!(owner.watchers().is_empty());
+        assert!(owner.snapshot().links.is_empty());
     }
 
     #[test]

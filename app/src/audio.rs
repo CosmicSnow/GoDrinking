@@ -170,6 +170,7 @@ fn audio_hub(
 }
 
 pub struct ViewerPlayback {
+    queue: Arc<Mutex<VecDeque<f32>>>,
     stop: Arc<AtomicBool>,
     _thread: Option<JoinHandle<()>>,
 }
@@ -253,52 +254,38 @@ impl ViewerPlayback {
             let _ = thread.join();
             return None;
         }
-        PLAYBACK_QUEUE.store(Some(queue));
         Some(Self {
+            queue,
             stop,
             _thread: Some(thread),
         })
     }
 
-    pub fn push(samples: &[f32]) {
-        if let Some(queue) = PLAYBACK_QUEUE.load() {
+    pub fn callback(&self) -> Arc<dyn Fn(&[f32]) + Send + Sync> {
+        let queue = Arc::clone(&self.queue);
+        let stop = Arc::clone(&self.stop);
+        Arc::new(move |samples| {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
             if let Ok(mut buf) = queue.lock() {
                 if buf.len() > 48_000 * 2 {
                     buf.clear();
                 }
                 buf.extend(samples.iter().copied());
             }
-        }
+        })
     }
 }
 
 impl Drop for ViewerPlayback {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        PLAYBACK_QUEUE.store(None);
         if let Some(thread) = self._thread.take() {
             let _ = thread.join();
         }
     }
 }
-
-struct QueueSlot(std::sync::Mutex<Option<Arc<Mutex<VecDeque<f32>>>>>);
-
-impl QueueSlot {
-    const fn new() -> Self {
-        Self(std::sync::Mutex::new(None))
-    }
-    fn store(&self, value: Option<Arc<Mutex<VecDeque<f32>>>>) {
-        if let Ok(mut slot) = self.0.lock() {
-            *slot = value;
-        }
-    }
-    fn load(&self) -> Option<Arc<Mutex<VecDeque<f32>>>> {
-        self.0.lock().ok().and_then(|slot| slot.clone())
-    }
-}
-
-static PLAYBACK_QUEUE: QueueSlot = QueueSlot::new();
 
 fn fill_output(
     data: &mut [f32],
@@ -336,13 +323,38 @@ fn fill_output(
     }
 }
 
-pub fn playback_callback() -> Arc<dyn Fn(&[f32]) + Send + Sync> {
-    Arc::new(|samples: &[f32]| ViewerPlayback::push(samples))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_another_playback_does_not_silence_the_first() {
+        // Exercise the production callback and Drop without an OS device.
+        let first_queue = Arc::new(Mutex::new(VecDeque::new()));
+        let first = ViewerPlayback {
+            queue: Arc::clone(&first_queue),
+            stop: Arc::new(AtomicBool::new(false)),
+            _thread: None,
+        };
+        let first_callback = first.callback();
+        let second_queue = Arc::new(Mutex::new(VecDeque::new()));
+        let second = ViewerPlayback {
+            queue: Arc::clone(&second_queue),
+            stop: Arc::new(AtomicBool::new(false)),
+            _thread: None,
+        };
+        let retired_callback = second.callback();
+        retired_callback(&[0.25, -0.25]);
+        assert!(first_queue.lock().unwrap().is_empty());
+        assert_eq!(second_queue.lock().unwrap().len(), 2);
+        drop(second);
+        retired_callback(&[0.75, -0.75]);
+        assert_eq!(second_queue.lock().unwrap().len(), 2, "retired audio is ignored");
+        first_callback(&[0.5, -0.5]);
+        assert_eq!(first_queue.lock().unwrap().len(), 2,
+            "closing another watch must not disconnect the first audio output");
+        drop(first);
+    }
 
     #[test]
     fn fill_output_keeps_48k_stereo_1_to_1() {

@@ -685,6 +685,30 @@ async fn handle_signal(state: &Arc<AppState>, app: &Option<AppHandle>, message: 
                     None => return,
                 }
             };
+            // A departed/kicked peer cannot send an unwatch. Retire both
+            // directions from the authoritative roster instead of waiting
+            // for an eventual transport failure to release media resources.
+            let (departed_viewers, departed_publishers) = {
+                let inner = match state.inner.lock() {
+                    Ok(inner) => inner,
+                    Err(_) => return,
+                };
+                let absent = |member: &&String| {
+                    !roster.entries.iter().any(|entry| entry.id == **member)
+                };
+                (
+                    inner.viewers.keys().filter(absent).cloned().collect::<Vec<_>>(),
+                    inner.publishers.keys()
+                        .filter(|member| !member.is_empty())
+                        .filter(absent).cloned().collect::<Vec<_>>(),
+                )
+            };
+            for member in departed_viewers {
+                let _ = state.unwatch(&member).await;
+            }
+            for member in departed_publishers {
+                on_unwatch(state, &member).await;
+            }
             emit(
                 app,
                 "signal-event",
@@ -1188,7 +1212,7 @@ async fn on_viewer_envelope(
         let playback = crate::audio::ViewerPlayback::start();
         let on_audio = playback
             .as_ref()
-            .map(|_| crate::audio::playback_callback());
+            .map(crate::audio::ViewerPlayback::callback);
         let viewer = match NativeViewer::start_with_audio(None, event_tx, on_frame, on_audio).await {
             Ok(viewer) => Arc::new(tokio::sync::Mutex::new(viewer)),
             Err(_) => return,
@@ -1198,10 +1222,8 @@ async fn on_viewer_envelope(
                 Ok(inner) => inner,
                 Err(_) => return,
             };
-            if inner.viewer_playback.is_none() {
-                inner.viewer_playback = playback;
-            }
             if let Some(session) = inner.viewers.get_mut(from) {
+                session.playback = playback;
                 session.viewer = Some(Arc::clone(&viewer));
                 session.alive = Some(Arc::clone(&alive));
             }
@@ -1605,6 +1627,37 @@ mod rewatch_tests {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn publishing_and_stopping_preserve_the_reverse_watch() {
+        let state = Arc::new(AppState::new());
+        open_live_share(&state);
+        seed_synthetic_template(&state).await;
+        let receive_fence = {
+            let mut inner = state.inner.lock().unwrap();
+            let fence = inner.owner.watch_remote("peer").unwrap();
+            inner.viewers.insert("peer".into(), crate::WatchSession {
+                playback: None,
+                fence,
+                viewer: None,
+                adopted: None,
+                alive: None,
+                remote_ready: false,
+                pending_remote: Vec::new(),
+            });
+            fence
+        };
+        on_watch(&state, &None, "peer").await;
+        let connected = state.inner.lock().unwrap().owner.link_connected(&receive_fence);
+        on_unwatch(&state, "peer").await;
+        let after_unwatch = state.inner.lock().unwrap().owner.link_is_current(&receive_fence);
+        state.stop_share().await.unwrap();
+        let after_stop = state.inner.lock().unwrap().owner.link_is_current(&receive_fence);
+        state.leave().await.unwrap();
+        assert!(connected.is_ok(), "incoming watch must not invalidate our receiving fence");
+        assert!(after_unwatch, "remote unwatch must preserve our receiving link");
+        assert!(after_stop, "stopping our share must preserve our receiving link");
     }
 
     #[test]
