@@ -281,6 +281,9 @@ mod backend {
                 backend,
             };
             enc.start_stream()?;
+            if let Ok(Some(header)) = enc.sequence_header() {
+                enc.sps_pps = header;
+            }
             let _ = enc.bitrate_bps;
             Ok(enc)
         }
