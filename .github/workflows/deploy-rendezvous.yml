@@ -79,6 +79,6 @@ jobs:
         working-directory: server
         run: |
           docker compose -f docker-compose.app.yml pull
-          docker compose -f docker-compose.app.yml stop godrinking-rendezvous-prod || true
+          docker rm -f godrinking-rendezvous-prod || true
           docker compose -f docker-compose.app.yml up -d --force-recreate
           docker image prune -f
