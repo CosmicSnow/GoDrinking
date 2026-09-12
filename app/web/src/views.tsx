@@ -32,6 +32,33 @@ export function watchingStillLive(watching: string[], entries: RoomMember[]): st
   return watching.filter((id) => live.has(id));
 }
 
+/** Uma linha por app (id). Mutados primeiro; o restante em ordem alfabética. */
+export function visibleAudioApps(
+  apps: AudioApp[],
+  excluded: string[],
+  query = "",
+  soundOnly = false,
+): AudioApp[] {
+  const muted = new Set(excluded);
+  const byId = new Map<string, AudioApp>();
+  for (const app of apps) {
+    if (soundOnly && !app.emitting_audio) continue;
+    if (query && !app.name.toLowerCase().includes(query.toLowerCase())) continue;
+    const previous = byId.get(app.id);
+    if (!previous) {
+      byId.set(app.id, app);
+      continue;
+    }
+    if (app.emitting_audio && !previous.emitting_audio) byId.set(app.id, app);
+  }
+  return [...byId.values()].sort((left, right) => {
+    const leftMuted = muted.has(left.id) ? 0 : 1;
+    const rightMuted = muted.has(right.id) ? 0 : 1;
+    if (leftMuted !== rightMuted) return leftMuted - rightMuted;
+    return left.name.localeCompare(right.name, "pt-BR", { sensitivity: "base" });
+  });
+}
+
 export function validateNickname(nickname: string): string | null {
   const name = nickname.trim();
   if (name.length < 2 || name.length > 24)
@@ -1100,11 +1127,7 @@ export function RoomScreen(props: RoomProps) {
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shareOpen, shareTab, sources]);
-  const audioFiltered = audioApps.filter((item) => {
-    if (audioSoundOnly && !item.emitting_audio) return false;
-    if (audioQuery && !item.name.toLowerCase().includes(audioQuery.toLowerCase())) return false;
-    return true;
-  });
+  const audioFiltered = visibleAudioApps(audioApps, audioExcluded, audioQuery, audioSoundOnly);
 
   return (
     <div className="app" data-state="inside" data-hook="room-shell">
@@ -1445,7 +1468,7 @@ export function RoomScreen(props: RoomProps) {
                   {audioFiltered.map((app) => {
                     const excluded = audioExcluded.includes(app.id);
                     return (
-                      <li key={`${app.pid}-${app.id}`}>
+                      <li key={app.id}>
                         <button
                           type="button"
                           className={`app-row${excluded ? " sel" : ""}`}

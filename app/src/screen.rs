@@ -463,20 +463,23 @@ pub struct PreviewImage {
     pub h: u32,
 }
 
-/// Lazy one-shot preview for one listed source: matches kind:id in the
-/// current enumeration (gone → `SourceGone`), grabs a single frame, and
-/// encodes it via [`encode_preview`]. Caller-driven (modal pulls), never
-/// polled. Never logs titles/pixels.
+/// Lazy one-shot preview for one listed source. Grabs by kind:id without
+/// re-enumerating the whole desktop (the Windows tab used to stall the
+/// UI by doing a full SCK round-trip per thumbnail). Caller-driven
+/// (modal pulls), never polled. Never logs titles/pixels.
 pub fn preview_source(kind: SourceKind, id: &str) -> Result<PreviewImage, PlatformError> {
-    let info = enumerate_sources()?
-        .into_iter()
-        .find(|item| item.kind == kind && item.id == id)
-        .ok_or_else(|| PlatformError::SourceGone { id: id.to_owned() })?;
+    let info = SourceInfo {
+        kind,
+        id: id.to_owned(),
+        name: String::new(),
+        w: 0,
+        h: 0,
+    };
     let frame = thumbnail_for(&info)?;
     if frame.w == 0 || frame.h == 0 || frame.data.is_empty() {
         return Err(PlatformError::Internal("thumbnail vazio".into()));
     }
-    encode_preview(&frame, info.w, info.h)
+    encode_preview(&frame, frame.w as u32, frame.h as u32)
 }
 
 /// Platform grab for one listed source (single synchronous still).

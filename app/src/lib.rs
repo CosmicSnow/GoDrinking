@@ -1774,8 +1774,15 @@ fn get_roster(state: State<'_, Arc<AppState>>) -> Vec<RosterMember> {
 }
 
 #[tauri::command]
-fn preview_source(state: State<'_, Arc<AppState>>, kind: String, id: String) -> SourcePreview {
-    state.preview_source(&kind, &id)
+async fn preview_source(
+    state: State<'_, Arc<AppState>>,
+    kind: String,
+    id: String,
+) -> Result<SourcePreview, String> {
+    let owned = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || owned.preview_source(&kind, &id))
+        .await
+        .map_err(|e| format!("preview: {e}"))
 }
 
 #[tauri::command]

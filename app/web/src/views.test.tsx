@@ -21,6 +21,7 @@ import {
   shareLabel,
   sourceKindOf,
   watchingStillLive,
+  visibleAudioApps,
   isSelf,
   roomTilesClassName,
   stageCellClassName,
@@ -35,7 +36,7 @@ import {
   validateSource,
   type QualityPanelProps,
 } from "./views";
-import type { LinkStats, OwnerSnapshot, RoomMember } from "./api";
+import type { AudioApp, LinkStats, OwnerSnapshot, RoomMember } from "./api";
 
 const noop = (..._args: unknown[]): void => undefined;
 
@@ -413,6 +414,33 @@ describe("RoomScreen (snapshot → markup, sem inferência)", () => {
     expect(html).toContain("audio-list");
     expect(html).toContain("audio-card");
     expect(html).not.toContain("Disponível durante o compartilhamento de tela.");
+  });
+
+  it("lista de áudio junta o mesmo app e sobe os mutados", () => {
+    const apps: AudioApp[] = [
+      { name: "Safari", id: "com.apple.Safari", pid: 8, emitting_audio: false },
+      { name: "Chrome", id: "com.google.Chrome", pid: 11, emitting_audio: false },
+      { name: "Chrome", id: "com.google.Chrome", pid: 12, emitting_audio: true },
+      { name: "Discord", id: "com.hnc.Discord", pid: 9, emitting_audio: true },
+    ];
+    const listed = visibleAudioApps(apps, ["com.google.Chrome"], "", false);
+    expect(listed.map((app) => app.id)).toEqual(["com.google.Chrome", "com.hnc.Discord", "com.apple.Safari"]);
+    expect(listed.filter((app) => app.id === "com.google.Chrome")).toHaveLength(1);
+    expect(listed[0]?.emitting_audio).toBe(true);
+    const html = renderToStaticMarkup(
+      createElement(
+        RoomScreen,
+        roomProps({
+          snapshot: snapshotFixture({ share: { id: "s1", state: "live" } }),
+          audioApps: apps,
+          audioExcluded: ["com.google.Chrome"],
+        }),
+      ),
+    );
+    const names = [...html.matchAll(/<b>([^<]+)<\/b>/g)].map((match) => match[1]);
+    expect(names.filter((name) => name === "Chrome")).toHaveLength(1);
+    expect(names.indexOf("Chrome")).toBeLessThan(names.indexOf("Discord"));
+    expect(names.indexOf("Discord")).toBeLessThan(names.indexOf("Safari"));
   });
 
   it("ninguém compartilhando: palco vazio honesto, sidebar intacta", () => {

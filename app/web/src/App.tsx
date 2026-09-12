@@ -136,6 +136,8 @@ export default function App() {
   // Chaves já pedidas (ok ou null): evita refetch e rajadas; limpo a cada
   // listagem/saída para acompanhar a lista fresca.
   const previewsSeen = useRef<Set<string>>(new Set());
+  const previewQueue = useRef<SourceInfo[]>([]);
+  const previewInFlight = useRef(0);
   const [caps, setCaps] = useState<CapabilitySet | null>(null);
   const [audioApps, setAudioApps] = useState<AudioApp[]>([]);
   const [audioExcluded, setAudioExcluded] = useState<string[]>([]);
@@ -606,20 +608,33 @@ export default function App() {
    */
   const handlePreviewsVisible = (items: SourceInfo[]): void => {
     if (isMock || items.length === 0) return;
+    const pump = (): void => {
+      while (previewInFlight.current < 3) {
+        const item = previewQueue.current.shift();
+        if (!item) return;
+        const key = `${item.kind}:${item.id}`;
+        previewInFlight.current += 1;
+        previewSource(item.kind, item.id).then(
+          (preview) => {
+            if (preview.data_url) {
+              const dataUrl: string = preview.data_url;
+              setPreviews((current) => ({ ...current, [key]: dataUrl }));
+            }
+          },
+          () => undefined,
+        ).finally(() => {
+          previewInFlight.current = Math.max(0, previewInFlight.current - 1);
+          pump();
+        });
+      }
+    };
     for (const item of items) {
       const key = `${item.kind}:${item.id}`;
       if (previews[key] !== undefined || previewsSeen.current.has(key)) continue;
       previewsSeen.current.add(key);
-      previewSource(item.kind, item.id).then(
-        (preview) => {
-          if (preview.data_url) {
-            const dataUrl: string = preview.data_url;
-            setPreviews((current) => ({ ...current, [key]: dataUrl }));
-          }
-        },
-        () => undefined,
-      );
+      previewQueue.current.push(item);
     }
+    pump();
   };
 
   const handleShare = (): void => {
