@@ -21,6 +21,9 @@ import {
   shareLabel,
   sourceKindOf,
   watchingStillLive,
+  roomTilesClassName,
+  stageCellClassName,
+  stageMembers,
   tileIsLive,
   validateBitrate,
   validateCode,
@@ -182,10 +185,10 @@ describe("RoomScreen AO VIVO honesto", () => {
       ),
     );
     expect(html).not.toContain("AO VIVO");
-    expect(html).toContain("Conectando");
+    expect(html).toContain("Aguardando vídeo");
   });
 
-  it("ICE connected com frame apresentado mostra AO VIVO", () => {
+  it("contadores de outra superfície não anunciam AO VIVO antes do canvas desenhar", () => {
     const html = renderToStaticMarkup(
       createElement(
         RoomScreen,
@@ -201,7 +204,21 @@ describe("RoomScreen AO VIVO honesto", () => {
         }),
       ),
     );
-    expect(html).toContain("AO VIVO");
+    expect(html).not.toContain("AO VIVO");
+    expect(html).toContain("<canvas");
+    expect(html).toContain("Volume de Bia");
+    expect(html).toContain("Pop-up");
+    expect(html).not.toContain("janela nativa");
+  });
+
+  it("pin deixa o tile no centro e os outros na mesma ordem (fila CSS)", () => {
+    expect(roomTilesClassName(false)).toBe("tiles room-tiles");
+    expect(roomTilesClassName(true)).toBe("tiles room-tiles focused");
+    expect(["a", "b", "c"].map((id) => stageCellClassName(id, "b"))).toEqual([
+      "stage-cell",
+      "stage-cell primary-cell",
+      "stage-cell",
+    ]);
   });
 });
 
@@ -334,6 +351,25 @@ describe("RoomScreen (snapshot → markup, sem inferência)", () => {
     expect(html).toContain("tile-view-m-2");
     // Sidebar continua com todo mundo.
     expect(html).toContain("(você)");
+  });
+
+  it("palco omite o próprio share; só os outros entram no grid", () => {
+    const bothShare: RoomMember[] = [
+      { id: "m-1", nickname: "Ana", master: true, share: true },
+      { id: "m-2", nickname: "Bia", master: false, share: true },
+    ];
+    expect(stageMembers(bothShare, "m-1", "Ana").map((m) => m.id)).toEqual(["m-2"]);
+    const html = renderToStaticMarkup(createElement(RoomScreen, roomProps({ roster: bothShare })));
+    expect(html).not.toContain("tile-view-m-1");
+    expect(html).toContain("tile-view-m-2");
+    expect(html).toContain("(você)");
+    const alone = renderToStaticMarkup(
+      createElement(RoomScreen, roomProps({
+        roster: [{ id: "m-1", nickname: "Ana", master: true, share: true }],
+      })),
+    );
+    expect(alone).toContain("Sem transmissões");
+    expect(alone).not.toContain("tile-view-m-1");
   });
 
   it("share live lista apps para ignorar áudio", () => {

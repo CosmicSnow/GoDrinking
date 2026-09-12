@@ -1,3 +1,4 @@
+import { StreamPlayer } from "./StreamPlayer";
 /**
  * Sala mínima: intenções explícitas + snapshots do dono + 2 eventos Tauri.
  *
@@ -775,6 +776,7 @@ export default function App() {
       <main data-testid="e2e-status">
         <h1>GoLive e2e {e2ePlan.role}</h1>
         <p>{summary}</p>
+        {e2eReport?.watchedMember ? <StreamPlayer member={e2eReport.watchedMember} nickname="host-e2e" /> : null}
       </main>
     );
   }

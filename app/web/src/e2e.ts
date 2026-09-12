@@ -60,6 +60,7 @@ export interface E2eReport {
   /** set_quality aplicado mid-share pelo caminho real do invoke + geração bumpada. */
   qualityApplied: boolean;
   detail?: string;
+  watchedMember?: string;
 }
 
 /** Acha quem está compartilhando (não somos nós). Puro e testável. */
@@ -253,7 +254,7 @@ async function runViewer(plan: E2ePlan, onReport: (r: E2eReport) => void): Promi
         watching = true;
         report.phase = "watching";
         void emit();
-        watchMember(sharer).catch(() => {
+        watchMember(sharer).then(() => { report.watchedMember = sharer; void emit(); }).catch(() => {
           watching = false;
         });
       }

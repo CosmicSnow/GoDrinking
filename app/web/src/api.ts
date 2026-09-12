@@ -96,7 +96,7 @@ export type MediaEvent =
       ice: boolean;
       host: number;
       srflx: number;
-      /** Frames presented in native windows (acks). Omitted by old shells. */
+      /** Frames presented on the in-room / pop-up surface (acks). Omitted by old shells. */
       presented?: number;
       /** Per-link (lado viewer; host recebe []). Omitted by old shells. */
       links?: LinkStats[];
@@ -113,7 +113,7 @@ export interface ViewerStats {
   frames: number;
   keyframes: number;
   ice: boolean;
-  /** Frames presented in the native window (distinct from decoded). */
+  /** Frames presented on the in-room / pop-up surface (distinct from decoded). */
   presented: number;
 }
 
@@ -259,7 +259,7 @@ export interface MediaCounters {
   keyframes: number;
   keyframes_seen: boolean;
   presented: number;
-  /** Um item por membro assistido com janela nativa; vazio ocioso/host. */
+  /** Um item por membro assistido (sala ou pop-up); vazio ocioso/host. */
   links: LinkStats[];
   /** Efetivo autoritativo; None fora do share. */
   effective: EffectiveQuality | null;
@@ -393,3 +393,24 @@ export function onSignalEvent(cb: (payload: SignalEvent) => void): Promise<Unlis
 export function onMediaEvent(cb: (payload: MediaEvent) => void): Promise<UnlistenFn> {
   return listen<MediaEvent>("media-event", (event) => cb(event.payload));
 }
+
+// Binary presentation channel: sequence/width/height (u32 LE), then RGBA.
+export interface PlayerState {
+  member: string;
+  title: string;
+  popup: boolean;
+  volume: number;
+  muted: boolean;
+  mute_all: boolean;
+}
+export { Channel, isTauri } from "@tauri-apps/api/core";
+export const playerAttach = (member: string, token: string, channel: import("@tauri-apps/api/core").Channel<ArrayBuffer>) =>
+  invoke<PlayerState>("player_attach", { member, token, channel });
+export const playerDetach = (member: string, token: string) => invoke<void>("player_detach", { member, token });
+export const playerAck = (member: string, token: string, seq: number, drawn: boolean) => invoke<void>("player_ack", { member, token, seq, drawn });
+export const playerContext = () => invoke<PlayerState>("player_context");
+export const playerPopup = (member: string, popup: boolean) => invoke<void>("player_popup", { member, popup });
+export const playerAudio = (member: string, volume: number, muted: boolean) => invoke<void>("player_audio", { member, volume, muted });
+export const playerMuteAll = (muted: boolean) => invoke<void>("player_mute_all", { muted });
+export const onPlayerState = (cb: (state: PlayerState) => void) => listen<PlayerState>("player-state", e => cb(e.payload));
+export const onPlayerEnded = (cb: (member: string) => void) => listen<string>("player-ended", e => cb(e.payload));

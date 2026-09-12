@@ -7,6 +7,8 @@
  */
 
 import { useEffect, useRef, useState } from "react";
+import { StreamPlayer } from "./StreamPlayer";
+import { isTauri, playerMuteAll } from "./api";
 import type {
   AudioApp,
   CapabilitySet,
@@ -502,7 +504,16 @@ export interface ViewerLinksProps {
 }
 
 export const WINDOW_HINT =
-  "Na janela do vídeo: arraste as bordas para redimensionar · roda = zoom · arrastar = pan · F ou duplo-clique = tela cheia · Esc sai.";
+  "No vídeo: roda = zoom · arrastar = mover · F ou duplo-clique = tela cheia · 0 = restaurar zoom · Pop-up = janela separada · Voltar à sala = encaixar novamente.";
+
+/** Palco: pin não reordena tiles (o StreamPlayer continua montado). */
+export function roomTilesClassName(pinned: boolean): string {
+  return `tiles room-tiles${pinned ? " focused" : ""}`;
+}
+
+export function stageCellClassName(memberId: string, pinnedId: string | null): string {
+  return `stage-cell${pinnedId === memberId ? " primary-cell" : ""}`;
+}
 
 export function ViewerLinksPanel({ links, watching }: ViewerLinksProps) {
   if (links === null) {
@@ -849,7 +860,17 @@ const isSelf = (member: RoomMember, selfId: string | null, selfNickname: string)
   (selfId !== null && member.id === selfId) ||
   (selfId === null && member.nickname === selfNickname);
 
+/** Palco: só os outros que compartilham. O próprio share não ganha tile de Ver. */
+export function stageMembers(
+  roster: RoomMember[],
+  selfId: string | null,
+  selfNickname: string,
+): RoomMember[] {
+  return roster.filter((member) => member.share && !isSelf(member, selfId, selfNickname));
+}
+
 interface TileProps {
+  native?: boolean;
   member: RoomMember;
   self: boolean;
   wantsWatch: boolean;
@@ -879,6 +900,7 @@ function Tile(props: TileProps) {
       showToast("Tela cheia indisponível aqui.");
     }
   };
+  if (wantsWatch && props.native) return <StreamPlayer member={member.id} nickname={member.nickname} pinned={pinned} onPin={onPin} onStop={onUnwatch} />;
   return (
     <article
       className="tile"
@@ -1009,10 +1031,10 @@ export function RoomScreen(props: RoomProps) {
   const { toast, show } = useToast();
 
   const sharingMembers = roster.filter((member) => member.share);
-  // Palco mostra SOMENTE quem compartilha; sidebar continua com todo mundo.
-  const pinned = pinnedId ? sharingMembers.find((member) => member.id === pinnedId) ?? null : null;
-  const gridMembers = pinned ? [pinned] : sharingMembers;
-  const stripMembers = pinned ? sharingMembers.filter((member) => member.id !== pinned.id) : [];
+  // Palco: só os outros que compartilham. Sidebar continua com todo mundo.
+  const othersSharing = stageMembers(roster, selfId, selfNickname);
+  const pinned = pinnedId ? othersSharing.find((member) => member.id === pinnedId) ?? null : null;
+
 
   const say = (message: string): void => show(message);
 
@@ -1140,7 +1162,7 @@ export function RoomScreen(props: RoomProps) {
             </div>
             <div className="stage-head-actions">
               <div className="stage-hint">
-                Scroll = zoom · Arrastar = mover · Duplo-clique = resetar
+                Roda = zoom · Arrastar = mover · Duplo-clique = tela cheia · 0 = restaurar
               </div>
               <button
                 type="button"
@@ -1162,70 +1184,40 @@ export function RoomScreen(props: RoomProps) {
           ) : null}
 
           <section className="stage" aria-label="Transmissões da sala">
-            {sharingMembers.length === 0 ? (
+            {othersSharing.length === 0 ? (
               <div className="empty-stage">Sem transmissões</div>
             ) : (
               <>
-                <div className={`tiles${pinned ? " solo" : ""}`} data-hook="tile-grid">
-                  {gridMembers.map((member) => {
-                    const self = isSelf(member, selfId, selfNickname);
-                    return (
-                      <Tile
-                        key={member.id}
-                        member={member}
-                        self={self}
-                        wantsWatch={watchingSet.has(member.id)}
-                        connected={liveFor(member)}
-                        pinned={pinnedId === member.id}
-                        muted={muteAll || mutedIds.has(member.id)}
-                        busy={busy}
-                        onWatch={() => {
-                          onWatch(member.id);
-                          say(`Pedindo para assistir ${member.nickname}…`);
-                        }}
-                        onUnwatch={() => {
-                          onUnwatch(member.id);
-                          say(`Parou de ver ${member.nickname}.`);
-                        }}
-                        onPin={() => {
-                          setPinnedId((current) => (current === member.id ? null : member.id));
-                          say(pinnedId === member.id
-                            ? "Vídeo desafixado — volta ao grid."
-                            : `${member.nickname} fixado na área principal.`);
-                        }}
-                        onToggleMute={() => toggleMuteId(member.id, member.nickname)}
-                        showToast={say}
-                      />
-                    );
-                  })}
+                <div className={roomTilesClassName(!!pinned)} data-hook="tile-grid">
+                  {othersSharing.map((member) => <div key={member.id} className={stageCellClassName(member.id, pinnedId)}>
+                    <Tile
+                      native={!mock}
+                      member={member}
+                      self={isSelf(member, selfId, selfNickname)}
+                      wantsWatch={watchingSet.has(member.id)}
+                      connected={liveFor(member)}
+                      pinned={pinnedId === member.id}
+                      muted={muteAll || mutedIds.has(member.id)}
+                      busy={busy}
+                      onWatch={() => {
+                        onWatch(member.id);
+                        say(`Pedindo para assistir ${member.nickname}…`);
+                      }}
+                      onUnwatch={() => {
+                        onUnwatch(member.id);
+                        say(`Parou de ver ${member.nickname}.`);
+                      }}
+                      onPin={() => {
+                        setPinnedId((current) => (current === member.id ? null : member.id));
+                        say(pinnedId === member.id
+                          ? "Vídeo desafixado — volta ao grid."
+                          : `${member.nickname} fixado no centro.`);
+                      }}
+                      onToggleMute={() => toggleMuteId(member.id, member.nickname)}
+                      showToast={say}
+                    />
+                  </div>)}
                 </div>
-                {pinned ? (
-                  <>
-                    <p className="strip-label">Na sala agora — clique em desafixar para voltar ao grid</p>
-                    <div className="strip">
-                      {stripMembers.map((member) => {
-                        const self = isSelf(member, selfId, selfNickname);
-                        return (
-                          <Tile
-                            key={member.id}
-                            member={member}
-                            self={self}
-                            wantsWatch={watchingSet.has(member.id)}
-                            connected={liveFor(member)}
-                            pinned={false}
-                            muted={muteAll || mutedIds.has(member.id)}
-                            busy={busy}
-                            onWatch={() => onWatch(member.id)}
-                            onUnwatch={() => onUnwatch(member.id)}
-                            onPin={() => setPinnedId(member.id)}
-                            onToggleMute={() => toggleMuteId(member.id, member.nickname)}
-                            showToast={say}
-                          />
-                        );
-                      })}
-                    </div>
-                  </>
-                ) : null}
               </>
             )}
           </section>
@@ -1235,7 +1227,9 @@ export function RoomScreen(props: RoomProps) {
               type="button"
               className={`ctl${muteAll ? " muted" : ""}`}
               onClick={() => {
-                setMuteAll((current) => !current);
+                if (!mock && isTauri()) {
+                  void playerMuteAll(!muteAll).then(() => setMuteAll(!muteAll)).catch(e => say(String(e)));
+                } else setMuteAll(!muteAll);
                 say(muteAll ? "Áudio geral ativado." : "Tudo silenciado.");
               }}
               title="Silenciar tudo"
@@ -1477,7 +1471,7 @@ export function RoomScreen(props: RoomProps) {
           </section>
 
           <p className="foot-note">
-            Cada watch abre uma janela nativa com o vídeo. O estado acima é o real do backend.
+            O vídeo aparece na sala. Pop-up abre só aquela transmissão em outra janela.
           </p>
         </aside>
       </div>

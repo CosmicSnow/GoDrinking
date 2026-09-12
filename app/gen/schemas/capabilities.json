@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Minimal capabilities: frontend may listen to backend events and backend may emit them. Nothing else.","local":true,"windows":["main"],"permissions":["core:event:allow-listen","core:event:allow-emit","core:event:allow-unlisten"]}}
+{"default":{"identifier":"default","description":"Minimal capabilities: frontend may listen to backend events and backend may emit them. Nothing else.","local":true,"windows":["main","player-*"],"permissions":["core:event:allow-listen","core:event:allow-emit","core:event:allow-unlisten"]}}

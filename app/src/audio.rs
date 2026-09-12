@@ -170,6 +170,7 @@ fn audio_hub(
 }
 
 pub struct ViewerPlayback {
+    gain: Arc<std::sync::atomic::AtomicU32>,
     queue: Arc<Mutex<VecDeque<f32>>>,
     stop: Arc<AtomicBool>,
     _thread: Option<JoinHandle<()>>,
@@ -180,6 +181,8 @@ impl ViewerPlayback {
         let queue: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::with_capacity(48_000)));
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
+        let gain = Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits()));
+        let worker_gain = Arc::clone(&gain);
         let worker_queue = Arc::clone(&queue);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<bool>();
         let thread = std::thread::Builder::new()
@@ -207,7 +210,8 @@ impl ViewerPlayback {
                             let mut acc = 1.0 - step;
                             let mut hold = [0.0f32; 2];
                             move |data: &mut [f32], _| {
-                                fill_output(data, channels, step, &mut acc, &mut hold, &q)
+                                fill_output(data, channels, step, &mut acc, &mut hold, &q);
+                                apply_gain(data, f32::from_bits(worker_gain.load(Ordering::Relaxed)))
                             }
                         },
                         err_fn,
@@ -221,6 +225,7 @@ impl ViewerPlayback {
                             move |data: &mut [i16], _| {
                                 let mut tmp = vec![0f32; data.len()];
                                 fill_output(&mut tmp, channels, step, &mut acc, &mut hold, &q);
+                                apply_gain(&mut tmp, f32::from_bits(worker_gain.load(Ordering::Relaxed)));
                                 for (dst, src) in data.iter_mut().zip(tmp.iter()) {
                                     *dst = (src.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
                                 }
@@ -255,11 +260,14 @@ impl ViewerPlayback {
             return None;
         }
         Some(Self {
+            gain,
             queue,
             stop,
             _thread: Some(thread),
         })
     }
+
+    pub fn set_gain(&self, gain: f32) { self.gain.store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed); }
 
     pub fn callback(&self) -> Arc<dyn Fn(&[f32]) + Send + Sync> {
         let queue = Arc::clone(&self.queue);
@@ -285,6 +293,10 @@ impl Drop for ViewerPlayback {
             let _ = thread.join();
         }
     }
+}
+
+fn apply_gain(data: &mut [f32], gain: f32) {
+    for sample in data { *sample *= gain; }
 }
 
 fn fill_output(
@@ -328,10 +340,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn playback_volume_scales_actual_samples_and_mute_is_silent() {
+        let mut samples = [0.8, -0.4, 0.0];
+        apply_gain(&mut samples, 0.5);
+        assert_eq!(samples, [0.4, -0.2, 0.0]);
+        apply_gain(&mut samples, 0.0);
+        assert_eq!(samples, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
     fn dropping_another_playback_does_not_silence_the_first() {
         // Exercise the production callback and Drop without an OS device.
         let first_queue = Arc::new(Mutex::new(VecDeque::new()));
         let first = ViewerPlayback {
+            gain: Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits())),
             queue: Arc::clone(&first_queue),
             stop: Arc::new(AtomicBool::new(false)),
             _thread: None,
@@ -339,6 +361,7 @@ mod tests {
         let first_callback = first.callback();
         let second_queue = Arc::new(Mutex::new(VecDeque::new()));
         let second = ViewerPlayback {
+            gain: Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits())),
             queue: Arc::clone(&second_queue),
             stop: Arc::new(AtomicBool::new(false)),
             _thread: None,

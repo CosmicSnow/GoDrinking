@@ -1257,6 +1257,9 @@ pub struct Publisher {
     /// is owned by the encode thread + the task itself — this handle is the
     /// only publisher-side state the recovery needs.
     rtcp_task: Option<tokio::task::JoinHandle<()>>,
+    /// Shared with the encode thread and the RTCP task. `request_keyframe`
+    /// arms it so a late watcher can recover the startup IDR it missed.
+    intra_requested: Arc<AtomicBool>,
 }
 
 impl Publisher {
@@ -1466,7 +1469,14 @@ impl Publisher {
             slot,
             backend,
             rtcp_task: Some(rtcp_task),
+            intra_requested,
         })
+    }
+
+    /// Next encoded unit starts with an IDR. Used when a watcher joins after
+    /// the startup keyframe has already left the latest-only slot.
+    pub fn request_keyframe(&self) {
+        self.intra_requested.store(true, Ordering::Release);
     }
 
     /// Live encoder backend for counters/diagnostics (`None` until the
@@ -2322,6 +2332,17 @@ async fn read_loop(
                         snapshot.census = census_snapshot(census);
                         let _ = event_tx.send(MediaEvent::Stats(snapshot));
                     }
+                } else if stats.frames_decoded == 0 {
+                    // Pre-IDR deltas: decoder returns None and nothing is
+                    // presented. Ask once per debounce window — same path as
+                    // an AU gap — so a late join does not stay black until
+                    // the host happens to reconfigure.
+                    let sent = maybe_send_pli(pc, &mut last_pli, packet.header.ssrc).await;
+                    decode_trace.record(TraceSample {
+                        pli_sent: sent as u64,
+                        pli_suppressed: (!sent) as u64,
+                        ..Default::default()
+                    }, None);
                 }
                 unit.clear();
             } // end non-stale branch
@@ -2856,6 +2877,21 @@ mod tests {
         enc.force_intra();
         let unit = enc.encode(&synthetic_frame(1280, 720, 1)).expect("encode");
         assert!(contains_idr(&unit), "PLI-equivalent forces an observed IDR");
+    }
+
+    #[test]
+    fn keyframe_wait_without_first_picture_arms_pli() {
+        // Pre-IDR deltas decode to None; that wait must arm the same
+        // debounce the AU-gap path uses, or a late join stays black until
+        // the host reconfigures.
+        let mut last: HashMap<u32, Instant> = HashMap::new();
+        let now = Instant::now();
+        assert!(pli_due(&mut last, 7, now), "first wait arms one PLI");
+        assert!(!pli_due(&mut last, 7, now), "wait storm still one PLI");
+        assert!(
+            pli_due(&mut last, 7, now + PLI_DEBOUNCE),
+            "window re-arms if the IDR still has not landed"
+        );
     }
 
     #[tokio::test]
@@ -3461,6 +3497,57 @@ mod tests {
         }
         publisher.stop().await;
         assert_eq!(backend, Some("openh264"));
+    }
+
+    #[tokio::test]
+    async fn request_keyframe_forces_idr_without_reconfig() {
+        // Watcher join after the startup IDR: request_keyframe must force a
+        // new IDR on the live encoder without bumping generation.
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<MediaEvent>();
+        let mut publisher = Publisher::start_with_profile(
+            VideoSource::SyntheticBall,
+            QualityProfile::low(),
+            EngineKind::Software,
+            None,
+            event_tx,
+        )
+        .await
+        .expect("publisher starts");
+        let mut saw_live_idr = false;
+        let live_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while !saw_live_idr {
+            let remaining = live_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, event_rx.recv()).await {
+                Ok(Some(MediaEvent::Keyframe)) => saw_live_idr = true,
+                Ok(Some(MediaEvent::Error(detail))) => panic!("encode failed: {detail}"),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(saw_live_idr, "startup IDR observed");
+        publisher.request_keyframe();
+        let mut saw_join_idr = false;
+        let join_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !saw_join_idr {
+            let remaining = join_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, event_rx.recv()).await {
+                Ok(Some(MediaEvent::Keyframe)) => saw_join_idr = true,
+                Ok(Some(MediaEvent::Stats(stats))) => {
+                    assert_eq!(stats.generation, 0, "join IDR must not bump quality generation");
+                }
+                Ok(Some(MediaEvent::Error(detail))) => panic!("encode failed: {detail}"),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        publisher.stop().await;
+        assert!(saw_join_idr, "request_keyframe lands an IDR without reconfig");
     }
 
     #[tokio::test]

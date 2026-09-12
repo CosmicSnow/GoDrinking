@@ -172,7 +172,7 @@ pub fn spawn_forward(
                             .inner
                             .lock()
                             .map(|inner| {
-                                inner.video_windows.values().map(|w| w.presented()).sum::<u64>()
+                                inner.video_windows.values().map(|w| w.presented()).sum::<u64>() + inner.players.values().map(|p| p.presented).sum::<u64>()
                             })
                             .unwrap_or(0)
                     };
@@ -913,6 +913,10 @@ fn push_present_frame(
     // Event-driven decode observation (feeds per-link stats; no polling
     // anywhere on this path).
     state.note_link_frame(watcher, title, frame.w as u32, frame.h as u32, alive);
+    if state.inner.lock().map(|inner| inner.desktop.is_some()).unwrap_or(true) {
+        state.present_inline(watcher, frame, alive);
+        return;
+    }
     let (fw, fh) = (frame.w as u32, frame.h as u32);
     let mut dead: Option<crate::video::VideoWindow> = None;
     let mut push: Option<crate::video::FramePush> = None;
@@ -1083,6 +1087,7 @@ async fn on_host_envelope(state: &Arc<AppState>, watcher: &str, payload: &Envelo
                 };
                 let _ = ok;
                 if publisher.lock().await.set_remote_answer(&sdp).await.is_ok() {
+                    publisher.lock().await.request_keyframe();
                     // Narrow scope: take the queue, drop the guard, then
                     // await. std guards never cross an await (also keeps the
                     // pump future Send).
@@ -1288,6 +1293,18 @@ async fn on_viewer_envelope(
                 Ok(inner) => inner,
                 Err(_) => return,
             };
+            if let Some(output) = playback.as_ref() {
+                let gain = if inner.player_mute_all {
+                    0.0
+                } else {
+                    inner
+                        .players
+                        .get(from)
+                        .map(|p| if p.state.muted { 0.0 } else { p.state.volume })
+                        .unwrap_or(1.0)
+                };
+                output.set_gain(gain);
+            }
             if let Some(session) = inner.viewers.get_mut(from) {
                 session.playback = playback;
                 session.viewer = Some(Arc::clone(&viewer));

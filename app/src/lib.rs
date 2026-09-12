@@ -12,6 +12,7 @@
 //!   behind `tokio::sync::Mutex`, the sync core behind short std locks).
 
 pub mod audio;
+pub mod player;
 pub mod pump;
 pub mod screen;
 pub mod session_log;
@@ -327,6 +328,9 @@ impl E2ePlan {
 }
 
 struct Inner {
+    desktop: Option<AppHandle>,
+    players: HashMap<String, player::Surface>,
+    player_mute_all: bool,
     server_base: String,
     owner: Owner,
     signal: Option<SignalClient>,
@@ -388,6 +392,9 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(Inner {
+                desktop: None,
+                players: HashMap::new(),
+                player_mute_all: false,
                 server_base: DEFAULT_SERVER.to_owned(),
                 owner: Owner::new(),
                 signal: None,
@@ -1419,7 +1426,7 @@ impl AppState {
             .map_err(|_| "state lock poisoned".to_string())
             .map(|inner| {
                 let mut counters = inner.media_counters.clone();
-                counters.presented = inner.video_windows.values().map(|w| w.presented()).sum();
+                counters.presented = inner.video_windows.values().map(|w| w.presented()).sum::<u64>() + inner.players.values().map(|p| p.presented).sum::<u64>();
                 counters.links = Self::link_stats_locked(&inner);
                 counters.effective = inner.share_profile;
                 counters.backend = Self::encode_backend_locked(&inner);
@@ -1472,6 +1479,19 @@ impl AppState {
                 }
             })
             .collect();
+        links.extend(inner.players.iter().filter_map(|(member, surface)| {
+            let track = inner.link_tracks.get(member)?;
+            let mut stats = surface.stats.lock().ok()?;
+            let now = std::time::Instant::now();
+            Some(video::LinkStats {
+                member: member.clone(), title: track.title.clone(), codec: video::LINK_CODEC.into(),
+                width: track.w, height: track.h, decoded: track.decoded, presented: surface.presented,
+                dropped: track.decoded.saturating_sub(surface.presented),
+                render_fps: stats.render_fps(now),
+                bitrate_bps: stats.bitrate_bps(now), bitrate_note: video::BITRATE_NOTE.into(),
+                delay_estimate_ms: None, delay_note: video::DELAY_NOTE.into(), dropped_note: video::DROPPED_NOTE.into(),
+            })
+        }));
         links.sort_by(|a, b| a.member.cmp(&b.member));
         links
     }
@@ -1506,6 +1526,7 @@ impl AppState {
     /// Tears down (and forgets) the video window + feed for one member.
     /// Idempotent; bounded (feeder joins promptly, child reaped).
     pub fn close_video_window(&self, member: &str) {
+        self.remove_player(member);
         let mut window = {
             match self.inner.lock() {
                 Ok(mut inner) => {
@@ -1524,6 +1545,9 @@ impl AppState {
 
     /// Tears down all video windows. Idempotent; bounded.
     pub fn close_all_video_windows(&self) {
+        let members = self.inner.lock().map(|inner| inner.players.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
+        for member in members { self.remove_player(&member); }
+        if let Ok(mut inner) = self.inner.lock() { inner.player_mute_all = false; }
         let mut windows = match self.inner.lock() {
             Ok(mut inner) => {
                 inner.video_feeds.clear();
@@ -1785,6 +1809,7 @@ pub fn run_with(state: Arc<AppState>) {
     tauri::Builder::default()
         .manage(state)
         .setup(move |app| {
+            if let Ok(mut inner) = log_state.inner.lock() { inner.desktop = Some(app.handle().clone()); }
             match app.path().app_log_dir() {
                 Ok(dir) => log_state.set_session_log(session_log::SessionLog::init_in(&dir)),
                 Err(e) => eprintln!("golive: log dir unavailable: {e}"),
@@ -1793,6 +1818,13 @@ pub fn run_with(state: Arc<AppState>) {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            player::player_attach,
+            player::player_detach,
+            player::player_ack,
+            player::player_context,
+            player::player_audio,
+            player::player_mute_all,
+            player::player_popup,
             create_room,
             join_room,
             leave,

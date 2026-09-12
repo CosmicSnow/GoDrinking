@@ -294,3 +294,31 @@ async fn run_mutual_watch(room_creator_shares_first: bool) {
         "both directions must deliver video: A -> B fresh={forward}, B -> A={reverse}"
     );
 }
+
+/// Native UI fixture: three real, independent senders in one local room.
+/// Run explicitly with GOLIVE_PLAYER_FIXTURE_DIR set, join using room.json,
+/// and create a `stop` file to shut everything down (ten-minute safety limit).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "interactive player fixture; requires GOLIVE_PLAYER_FIXTURE_DIR"]
+async fn three_sender_player_fixture() {
+    let dir = PathBuf::from(std::env::var("GOLIVE_PLAYER_FIXTURE_DIR").expect("fixture directory"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let server = ServerGuard::spawn().unwrap();
+    let first = Arc::new(AppState::new());
+    first.set_server(&server.base).unwrap();
+    let code = first.create_room(None, "Tela Um", "player-test").await.unwrap();
+    let mut senders = vec![first];
+    for name in ["Tela Dois", "Tela Tres"] {
+        let sender = Arc::new(AppState::new());
+        sender.set_server(&server.base).unwrap();
+        sender.join_room(None, &code, name, "player-test").await.unwrap();
+        senders.push(sender);
+    }
+    for sender in &senders {
+        sender.start_share(None, "synthetic", Some(golive_core::media::QualityProfile { w: 640, h: 360, fps: 15, bitrate_kbps: 1200 })).await.unwrap();
+    }
+    std::fs::write(dir.join("room.json"), serde_json::to_vec(&serde_json::json!({"server": server.base, "code": code, "password": "player-test"})).unwrap()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(600);
+    while Instant::now() < deadline && !dir.join("stop").exists() { tokio::time::sleep(Duration::from_millis(200)).await; }
+    for sender in senders { sender.leave().await.unwrap(); }
+}

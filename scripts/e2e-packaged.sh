@@ -8,7 +8,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-ART="$ROOT/e2e-artifacts"
+ART="${E2E_ARTIFACTS:-$ROOT/e2e-artifacts}"
 # Build profile do bundle sob teste (default debug = comportamento existente;
 # release via E2E_PROFILE=release, que é o que o lane Display-3 valida).
 E2E_PROFILE="${E2E_PROFILE:-debug}"

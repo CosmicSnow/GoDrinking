@@ -7,7 +7,11 @@ const { mockInvoke, mockListen } = vi.hoisted(() => ({
   mockListen: vi.fn(),
 }));
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: mockInvoke }));
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: mockInvoke,
+  Channel: class Channel {},
+  isTauri: () => false,
+}));
 vi.mock("@tauri-apps/api/event", () => ({ listen: mockListen }));
 
 import { getE2ePlan, type E2ePlan } from "./api";

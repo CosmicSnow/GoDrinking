@@ -7,7 +7,11 @@ const { mockInvoke, mockListen } = vi.hoisted(() => ({
   mockListen: vi.fn(),
 }));
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: mockInvoke }));
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: mockInvoke,
+  Channel: class Channel {},
+  isTauri: () => false,
+}));
 vi.mock("@tauri-apps/api/event", () => ({ listen: mockListen }));
 
 import {
@@ -30,6 +34,10 @@ import {
   stopShare,
   unwatchMember,
   watchMember,
+  playerAck,
+  playerAudio,
+  playerMuteAll,
+  playerPopup,
 } from "./api";
 
 beforeEach(() => {
@@ -259,5 +267,27 @@ describe("contadores de mídia (fallback observacional com links)", () => {
     mockInvoke.mockResolvedValueOnce(counters);
     await expect(getMediaCounters()).resolves.toEqual(counters);
     expect(mockInvoke).toHaveBeenCalledWith("get_media_counters");
+  });
+});
+
+describe("player inline (comando certo, args certos)", () => {
+  it("player_popup move só o membro pedido", async () => {
+    mockInvoke.mockResolvedValueOnce(undefined);
+    await playerPopup("m-2", true);
+    expect(mockInvoke).toHaveBeenCalledWith("player_popup", { member: "m-2", popup: true });
+  });
+
+  it("player_audio e mute-all levam ganho 0–1", async () => {
+    mockInvoke.mockResolvedValue(undefined);
+    await playerAudio("m-2", 0.4, false);
+    expect(mockInvoke).toHaveBeenCalledWith("player_audio", { member: "m-2", volume: 0.4, muted: false });
+    await playerMuteAll(true);
+    expect(mockInvoke).toHaveBeenCalledWith("player_mute_all", { muted: true });
+  });
+
+  it("player_ack confirma o frame desenhado", async () => {
+    mockInvoke.mockResolvedValueOnce(undefined);
+    await playerAck("m-2", "tok", 9, true);
+    expect(mockInvoke).toHaveBeenCalledWith("player_ack", { member: "m-2", token: "tok", seq: 9, drawn: true });
   });
 });
