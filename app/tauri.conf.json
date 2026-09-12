@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "GoLive",
+  "productName": "goDrinking",
   "version": "0.7.4",
   "identifier": "dev.golive.sala",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "GoLive",
+        "title": "goDrinking",
         "width": 1100,
         "height": 700
       }

@@ -1,4 +1,4 @@
-# GoLive — Frontier Handoff
+# goDrinking — Frontier Handoff
 
 You are taking over a nearly-ready Sala-first video rooms app
 (native Rust core + Tauri shell + React frontend + Node rendezvous server,

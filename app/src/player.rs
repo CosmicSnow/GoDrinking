@@ -417,7 +417,7 @@ pub async fn player_popup(
     };
     let built =
         WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("index.html?player=1".into()))
-            .title(if title.is_empty() { "GoLive" } else { &title })
+            .title(if title.is_empty() { "goDrinking" } else { &title })
             .inner_size(960.0, 600.0)
             .min_inner_size(400.0, 280.0)
             .build();

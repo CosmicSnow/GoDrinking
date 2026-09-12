@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze GoLive opt-in media trace files (JSONL, numeric-only, no PII).
+"""Analyze goDrinking opt-in media trace files (JSONL, numeric-only, no PII).
 
 Usage:
     python3 scripts/analyze-trace.py <trace-dir-or-files...>
@@ -316,7 +316,7 @@ def run_self_test():
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="Summarize GoLive media trace JSONL (numeric-only, no PII).")
+        description="Summarize goDrinking media trace JSONL (numeric-only, no PII).")
     ap.add_argument("inputs", nargs="*",
                     help="trace files or directories holding *.jsonl")
     ap.add_argument("--self-test", action="store_true",

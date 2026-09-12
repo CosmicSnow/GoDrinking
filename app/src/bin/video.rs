@@ -521,7 +521,7 @@ fn run() -> Result<(), String> {
         window: None,
         surface: None,
         _context: None,
-        base_title: format!("GoLive — {title} · {src_w}x{src_h}"),
+        base_title: format!("goDrinking — {title} · {src_w}x{src_h}"),
         frozen: false,
         last_present: Instant::now(),
         ack: Some(ack),

@@ -3,7 +3,7 @@ name = "golive-platform"
 version = "0.7.4"
 edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
-description = "GoLive capture platform abstraction: trait, types, converters, capabilities. Zero OS dependencies — backends plug in per OS."
+description = "goDrinking capture platform abstraction: trait, types, converters, capabilities. Zero OS dependencies — backends plug in per OS."
 
 [lib]
 name = "golive_platform"

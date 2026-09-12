@@ -12,7 +12,7 @@ ART="${E2E_ARTIFACTS:-$ROOT/e2e-artifacts}"
 # Build profile do bundle sob teste (default debug = comportamento existente;
 # release via E2E_PROFILE=release, que é o que o lane Display-3 valida).
 E2E_PROFILE="${E2E_PROFILE:-debug}"
-APP="$ROOT/app/target/$E2E_PROFILE/bundle/macos/GoLive.app"
+APP="$ROOT/app/target/$E2E_PROFILE/bundle/macos/goDrinking.app"
 # Fonte do share do host (default synthetic = comportamento existente;
 # display:<id> para o lane Display-3, movie:<path> idem). Validada no parse
 # do plano (app/src/lib.rs); aqui só repasse.
@@ -164,7 +164,7 @@ WINDOWS_OK=true
 if ! swift "$ROOT/scripts/winlist.swift" >"$ART/windows.txt" 2>"$ART/winlist.err"; then
   WINDOWS_OK=false
 fi
-GOLIVE_WINDOWS="$(grep -c "^GoLive :: " "$ART/windows.txt" 2>/dev/null || true)"
+GOLIVE_WINDOWS="$(grep -c "^goDrinking :: " "$ART/windows.txt" 2>/dev/null || true)"
 
 if [ -z "$FIRST_MISSING" ]; then
   VERDICT="PASS"

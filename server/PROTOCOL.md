@@ -7,9 +7,9 @@ candidates.
 
 ## Transport
 
-- HTTP + WebSocket on a loopback address only (`BIND`, default `127.0.0.1`;
-  non-local binds are refused at startup). `PORT` env, default `18790`
-  (`PORT=0` picks an ephemeral port for tests).
+- HTTP + WebSocket. `BIND` default `127.0.0.1`; Docker sets `0.0.0.0` (or `::`)
+  behind a reverse proxy. Binding a specific public address is refused.
+  `PORT` env, default `18790` (`PORT=0` picks an ephemeral port for tests).
 - `GET /health` → `200 {"ok":true}`. No other GET routes exist.
 
 ## REST

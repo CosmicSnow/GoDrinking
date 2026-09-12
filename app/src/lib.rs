@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::mpsc;
 
-pub const DEFAULT_SERVER: &str = "http://127.0.0.1:18790";
+pub const DEFAULT_SERVER: &str = "https://together.jouymaker.com";
 
 /// Share source selector. Screen capture arrives via the platform bridge
 /// (`display:<id>` / `window:<id>`); synthetic + movie stay untouched.
@@ -270,7 +270,7 @@ pub struct AppState {
 pub struct E2ePlan {
     /// "host" or "viewer".
     pub role: String,
-    /// Rendezvous base, e.g. http://127.0.0.1:18790.
+    /// Rendezvous base, e.g. https://together.jouymaker.com.
     pub server: String,
     /// Room password for the run (local test only).
     pub password: String,

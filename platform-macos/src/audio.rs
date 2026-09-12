@@ -190,7 +190,7 @@ fn tap_description(process_objects: &[u32]) -> Result<*mut AnyObject, PlatformEr
     if description.is_null() {
         return Err(PlatformError::Internal("CATapDescription".into()));
     }
-    let name = NSString::from_str("GoLive System Audio Tap");
+    let name = NSString::from_str("goDrinking System Audio Tap");
     unsafe {
         let _: () = msg_send![description, setName: &*name];
         let _: () = msg_send![description, setPrivate: true];
@@ -214,7 +214,7 @@ fn tap_uuid(description: *mut AnyObject) -> Result<CFString, PlatformError> {
 }
 
 fn aggregate_description(tap_uid: &CFString) -> Result<CFDictionary<CFString, CFType>, PlatformError> {
-    let name = CFString::new("GoLive System Audio Tap");
+    let name = CFString::new("goDrinking System Audio Tap");
     let uid = CFString::new(&format!("golive-tap-{}", std::process::id()));
     let tap_entry = CFDictionary::from_CFType_pairs(&[
         (CFString::new("uid"), tap_uid.as_CFType()),

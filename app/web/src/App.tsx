@@ -71,7 +71,7 @@ import {
   type ResolutionSel,
 } from "./views";
 
-export const DEFAULT_SERVER = "http://127.0.0.1:18790";
+export const DEFAULT_SERVER = "https://together.jouymaker.com";
 
 const signalSummary = (event: SignalEvent): string => {
   switch (event.kind) {
@@ -193,7 +193,7 @@ export default function App() {
         void runE2ePlan(plan, (report) => {
           if (live) {
             setE2eReport(report);
-            document.title = `GoLive e2e ${report.role} ${report.phase}`;
+            document.title = `goDrinking e2e ${report.role} ${report.phase}`;
           }
         }).catch((failure: unknown) => {
           if (live) {
@@ -791,7 +791,7 @@ export default function App() {
       (e2eReport?.detail ? ` ${e2eReport.detail}` : "");
     return (
       <main data-testid="e2e-status">
-        <h1>GoLive e2e {e2ePlan.role}</h1>
+        <h1>goDrinking e2e {e2ePlan.role}</h1>
         <p>{summary}</p>
         {e2eReport?.watchedMember ? <StreamPlayer member={e2eReport.watchedMember} nickname="host-e2e" /> : null}
       </main>
@@ -803,6 +803,7 @@ export default function App() {
       <HomeScreen
         server={server}
         onServer={setServerBase}
+        defaultServer={DEFAULT_SERVER}
         tab={tab}
         onTab={setTab}
         nickname={nickname}

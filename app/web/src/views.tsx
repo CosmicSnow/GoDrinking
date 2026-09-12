@@ -632,9 +632,11 @@ function useToast(): { toast: string | null; show: (message: string) => void } {
 // ---------------------------------------------------------------------------
 
 export interface HomeProps {
-  /** Legado (mantido p/ compat): servidor rendezvous, hoje sempre DEFAULT_SERVER. */
+  /** Servidor de sinalização (default together.jouymaker.com). */
   server?: string;
   onServer?: (value: string) => void;
+  /** URL padrão; se o campo divergir, a home mostra Resetar. */
+  defaultServer?: string;
   /** Legado (mantido p/ compat): a home fiel não tem tabs. */
   tab?: "create" | "join";
   onTab?: (tab: "create" | "join") => void;
@@ -657,7 +659,7 @@ export interface HomeProps {
 
 export function HomeScreen(props: HomeProps) {
   const {
-    server = "", onServer,
+    server = "", onServer, defaultServer = "",
     nickname = "", onNickname,
     password, onPassword, code, onCode, busy, error, onCreate, onJoin,
     mock = false,
@@ -710,12 +712,22 @@ export function HomeScreen(props: HomeProps) {
                     type="text"
                     value={server}
                     onChange={(event) => onServer?.(event.target.value)}
-                    placeholder="http://127.0.0.1:18790"
+                    placeholder={defaultServer || "https://together.jouymaker.com"}
                     autoComplete="off"
                     spellCheck={false}
                     disabled={busy}
                   />
                 </label>
+                {defaultServer && server.trim() !== defaultServer ? (
+                  <button
+                    type="button"
+                    className="btn ghost small"
+                    onClick={() => onServer?.(defaultServer)}
+                    disabled={busy}
+                  >
+                    Resetar URL
+                  </button>
+                ) : null}
               </section>
 
               <section className="lobby-pane lobby-name" aria-label="Seu Nick (só pessoas na sala conseguem ver)">
@@ -1620,7 +1632,7 @@ export function RoomScreen(props: RoomProps) {
                     {sourcesError ?? "Sem permissão de Gravação de Tela."}
                     <span className="hint" style={{ display: "block", marginTop: 4 }}>
                       Caminho manual: Ajustes → Privacidade e Segurança →
-                      Gravação de Tela (ative o GoLive) e toque Listar telas
+                      Gravação de Tela (ative o goDrinking) e toque Listar telas
                       de novo.
                     </span>
                   </span>

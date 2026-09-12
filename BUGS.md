@@ -1,4 +1,4 @@
-# Bugs — GoLive (revisar)
+# Bugs — goDrinking (revisar)
 
 > Regra: bug 100% corrigido **e verificado** SAI desta lista (ver
 > AGENTS.md, seção Bugs). Nunca marcar como feito no lugar — remover a

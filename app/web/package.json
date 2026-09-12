@@ -2,7 +2,7 @@
   "name": "golive-web",
   "private": true,
   "version": "0.7.4",
-  "description": "GoLive Sala mínima (React+TS+Vite). Intents via comandos Tauri, snapshots sob demanda + eventos signal-event/media-event. Build gera dist/ (frontendDist da casca Tauri).",
+  "description": "goDrinking Sala mínima (React+TS+Vite). Intents via comandos Tauri, snapshots sob demanda + eventos signal-event/media-event. Build gera dist/ (frontendDist da casca Tauri).",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",

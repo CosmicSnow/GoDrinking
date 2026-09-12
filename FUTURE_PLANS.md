@@ -1,4 +1,4 @@
-# Future plans — GoLive
+# Future plans — goDrinking
 
 Planos grandes, ainda **não implementados**. Não são bugs (`BUGS.md`).
 Protocolos atuais (`server/PROTOCOL.md`, GLV1) continuam lei até uma
@@ -260,7 +260,7 @@ Pedido: interruptor “baixa latência” (hoje) vs “melhor qualidade”
 - Encode Mac: `AllowFrameReordering = true` + 1–2 B-frames no VT;
   decode tem de reordenar (fase 1.5 já deve permitir).
 - Default do produto **permanece** baixa latência (screen share).
-- SDP continua nosso (os dois peers são GoLive); não é mudança Sala.
+- SDP continua nosso (os dois peers são goDrinking); não é mudança Sala.
 - OpenH264 no Windows ganha pouco; não vender o modo como “OBS” lá
   até o plano 2.
 

@@ -125,7 +125,7 @@ export function mockCounters(
 export function mockSources(): SourceInfo[] {
   return [
     { kind: "display", id: "0", name: "Tela principal · 1920×1080", w: 1920, h: 1080 },
-    { kind: "window", id: "42", name: "VS Code · GoLive", w: 1280, h: 800 },
+    { kind: "window", id: "42", name: "VS Code · goDrinking", w: 1280, h: 800 },
   ];
 }
 

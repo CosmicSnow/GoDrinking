@@ -4,6 +4,7 @@
 // Protocol: server/PROTOCOL.md.
 //
 //   PORT=18790 BIND=127.0.0.1 node server.mjs   (PORT=0 picks an ephemeral port)
+//   Docker (behind a reverse proxy): BIND=0.0.0.0 PORT=8787 node server.mjs
 //
 // Signaling-only: this process routes JSON envelopes. It never opens UDP
 // sockets, never terminates media, never logs passwords, tokens, SDP or
@@ -16,8 +17,9 @@ import { WebSocketServer } from "ws";
 const PORT = Number(process.env.PORT || 18790);
 const BIND = process.env.BIND || "127.0.0.1";
 
-// Refuse non-local binds: this server only serves the local machine / LAN proxy.
-if (!/^(127\.\d+\.\d+\.\d+|::1|::ffff:127\.\d+\.\d+\.\d+|localhost)$/.test(BIND)) {
+// Default is loopback. Docker sets BIND=0.0.0.0 (or ::) behind a reverse proxy.
+// Binding a specific public address is still refused.
+if (!/^(127\.\d+\.\d+\.\d+|::1|::ffff:127\.\d+\.\d+\.\d+|localhost|0\.0\.0\.0|::)$/.test(BIND)) {
   console.error(`refusing non-local bind: ${BIND}`);
   process.exit(1);
 }

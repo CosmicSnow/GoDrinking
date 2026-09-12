@@ -1,4 +1,4 @@
-//! GoLive Sala core: serialized lifecycle, native WebRTC media, signaling.
+//! goDrinking Sala core: serialized lifecycle, native WebRTC media, signaling.
 //!
 //! No UI, no Tauri, no GStreamer. The [`owner`] serializes every command
 //! under one lock (immutable snapshots, fenced completions, idempotent

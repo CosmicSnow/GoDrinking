@@ -325,7 +325,7 @@ export async function runE2ePlan(
   onReport: (r: E2eReport) => void,
 ): Promise<void> {
   if (typeof document !== "undefined") {
-    document.title = `GoLive e2e ${plan.role}`;
+    document.title = `goDrinking e2e ${plan.role}`;
   }
   try {
     if (plan.role === "host") {

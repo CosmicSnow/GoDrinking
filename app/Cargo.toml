@@ -3,7 +3,7 @@ name = "golive-app"
 version = "0.7.4"
 edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
-description = "GoLive thin Tauri shell over golive-core. No product logic: commands drive the core, core events become Tauri events."
+description = "goDrinking thin Tauri shell over golive-core. No product logic: commands drive the core, core events become Tauri events."
 
 [lib]
 name = "golive_app"

@@ -1,4 +1,4 @@
-# GoLive — Agent Guide
+# goDrinking — Agent Guide
 
 Sala-first video rooms: native Rust core + Tauri shell + React frontend +
 Node rendezvous server. Read this before touching code. Protocols are law;
@@ -114,9 +114,10 @@ packaged exe points at `devUrl` instead of the bundled `frontendDist`.
 
 - Run: `node server.mjs` in `server/` (`PORT` default `18790`, `PORT=0` for an
   ephemeral test port; `BIND` default `127.0.0.1`).
-- `BIND` is loopback-ONLY by design: non-local binds are refused at startup.
-  To reach the room over the LAN, run a loopback forwarder on the host or put
-  both peers on the same ZeroTier network — never loosen the bind in code.
+- Local default is loopback. Docker (`BIND=0.0.0.0`) sits behind a reverse
+  proxy (`godrinking-rendezvous-prod` / `-dev` on `main-npm`). Binding a
+  specific public address is still refused. Production URL:
+  `https://together.jouymaker.com`.
 - Signaling-only: JSON/UTF-8, 64 KiB caps, scrypt password checks with
   timing-uniform denied responses. Never logs passwords, tokens, SDP, or candidates.
 

@@ -277,7 +277,8 @@ describe("HomeScreen", () => {
   it("card de servidor acima do nick, ligado às props legadas", () => {
     const html = renderToStaticMarkup(
       createElement(HomeScreen, {
-        server: "http://127.0.0.1:18790",
+        server: "https://together.jouymaker.com",
+        defaultServer: "https://together.jouymaker.com",
         onServer: noop,
         nickname: "",
         onNickname: noop,
@@ -292,9 +293,30 @@ describe("HomeScreen", () => {
       }),
     );
     expect(html).toContain('id="server"');
-    expect(html).toContain('value="http://127.0.0.1:18790"');
-    // Servidor renderiza antes do nick.
+    expect(html).toContain('value="https://together.jouymaker.com"');
+    expect(html).not.toContain("Resetar URL");
     expect(html.indexOf('id="server"')).toBeLessThan(html.indexOf('id="nickname"'));
+  });
+
+  it("mostra Resetar URL só quando o servidor diverge do padrão", () => {
+    const html = renderToStaticMarkup(
+      createElement(HomeScreen, {
+        server: "http://127.0.0.1:18790",
+        defaultServer: "https://together.jouymaker.com",
+        onServer: noop,
+        nickname: "",
+        onNickname: noop,
+        password: "",
+        onPassword: noop,
+        code: "",
+        onCode: noop,
+        busy: false,
+        error: null,
+        onCreate: noop,
+        onJoin: noop,
+      }),
+    );
+    expect(html).toContain("Resetar URL");
   });
 
   it("mostra o erro sem área muda", () => {    const html = renderToStaticMarkup(
