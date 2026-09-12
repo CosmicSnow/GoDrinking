@@ -21,6 +21,7 @@ import {
   shareLabel,
   sourceKindOf,
   watchingStillLive,
+  isSelf,
   roomTilesClassName,
   stageCellClassName,
   stageMembers,
@@ -370,6 +371,27 @@ describe("RoomScreen (snapshot → markup, sem inferência)", () => {
     );
     expect(alone).toContain("Sem transmissões");
     expect(alone).not.toContain("tile-view-m-1");
+  });
+
+  it("dois membros com o mesmo apelido: o palco usa o id, nunca o nick", () => {
+    const twins: RoomMember[] = [
+      { id: "m-host", nickname: "Ze", master: true, share: true },
+      { id: "m-peer", nickname: "Ze", master: false, share: false },
+    ];
+    expect(isSelf(twins[0], "m-peer", "Ze")).toBe(false);
+    expect(isSelf(twins[1], "m-peer", "Ze")).toBe(true);
+    expect(stageMembers(twins, "m-peer", "Ze").map((m) => m.id)).toEqual(["m-host"]);
+    expect(stageMembers(twins, "m-host", "Ze").map((m) => m.id)).toEqual([]);
+    expect(stageMembers(twins, null, "Ze").map((m) => m.id)).toEqual(["m-host"]);
+    const html = renderToStaticMarkup(
+      createElement(RoomScreen, roomProps({
+        selfId: "m-peer",
+        selfNickname: "Ze",
+        roster: twins,
+      })),
+    );
+    expect(html).toContain("tile-view-m-host");
+    expect(html).not.toContain("tile-view-m-peer");
   });
 
   it("share live lista apps para ignorar áudio", () => {

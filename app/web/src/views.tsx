@@ -856,15 +856,16 @@ export interface RoomProps {
   mock?: boolean;
 }
 
-const isSelf = (member: RoomMember, selfId: string | null, selfNickname: string): boolean =>
-  (selfId !== null && member.id === selfId) ||
-  (selfId === null && member.nickname === selfNickname);
+/** Identidade é o id opaco. Apelido nunca decide — dois Zés são pessoas distintas. */
+export function isSelf(member: RoomMember, selfId: string | null, _selfNickname?: string): boolean {
+  return selfId !== null && member.id === selfId;
+}
 
-/** Palco: só os outros que compartilham. O próprio share não ganha tile de Ver. */
+/** Palco: só os outros que compartilham. Sem id próprio, não esconde ninguém. */
 export function stageMembers(
   roster: RoomMember[],
   selfId: string | null,
-  selfNickname: string,
+  selfNickname?: string,
 ): RoomMember[] {
   return roster.filter((member) => member.share && !isSelf(member, selfId, selfNickname));
 }

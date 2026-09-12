@@ -254,6 +254,7 @@ export default function App() {
     try {
       const entries = await getRoster();
       setRoster(entries);
+      setSelfId((current) => current ?? entries.find((entry) => entry.master)?.id ?? null);
       setWatching((current) => {
         const next = watchingStillLive(current, entries);
         for (const id of current.filter((id) => !next.includes(id))) {
@@ -299,6 +300,7 @@ export default function App() {
       if (cancelled) return;
       if (event.kind === "roster") {
         setRoster(event.entries);
+        setSelfId((current) => current ?? event.entries.find((entry) => entry.master)?.id ?? null);
         setWatching((current) => {
           const next = watchingStillLive(current, event.entries);
           const dropped = current.filter((id) => !next.includes(id));
