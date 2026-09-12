@@ -92,9 +92,11 @@ else
   git -C "$ROOT" push origin "$TAG" || echo "release: note: git push origin $TAG failed (may already exist upstream), continuing"
   UPLOAD_FLAG=true
   if [ "$SKIP_UPLOAD" = true ]; then UPLOAD_FLAG=false; fi
-  (cd "$ROOT" && gh workflow run release-windows.yml --ref main -f tag="$TAG" -f upload="$UPLOAD_FLAG")
-  # Locate the run just triggered: snapshot existing ids, then wait for a new one.
+  # Snapshot existing run ids BEFORE triggering: the new run can appear
+  # within seconds, and snapshotting after would miss it entirely.
   BEFORE="$(cd "$ROOT" && gh run list --workflow release-windows.yml --limit 10 --json databaseId --jq '.[].databaseId' || true)"
+  (cd "$ROOT" && gh workflow run release-windows.yml --ref main -f tag="$TAG" -f upload="$UPLOAD_FLAG")
+  # Locate the run just triggered: wait for an id not in the snapshot.
   RUN_ID=""
   for _ in $(seq 1 18); do
     sleep 10
