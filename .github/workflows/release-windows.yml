@@ -1,0 +1,77 @@
+name: Release Windows exe
+
+# Native Windows build for goDrinking.exe (portable, no bundling).
+# Triggered by scripts/release.sh after it pushes the tag; the exe is
+# uploaded straight to the GitHub release, never downloaded locally.
+# Local `cargo xwin` cross is not used (it breaks on user-level RUSTFLAGS
+# containing spaces).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and upload (e.g. v0.7.5)"
+        required: true
+        type: string
+      upload:
+        description: "Upload the exe to the GitHub release"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build goDrinking.exe
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/web/package-lock.json
+
+      - name: Install web deps (npm ci, lockfile)
+        run: npm --prefix app/web ci
+
+      - name: Build web (same command as scripts/release.sh)
+        run: npm --prefix app/web run build
+
+      - name: Set up Rust stable
+        # windows-latest already ships stable MSVC Rust; this only pins it.
+        # No `rustup target add` needed: host == target (x86_64-pc-windows-msvc).
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+
+      - name: Build goDrinking.exe (portable, no bundling)
+        working-directory: app
+        run: cargo build --release --features tauri/custom-protocol --bin goDrinking
+
+      - name: Verify exe exists
+        run: |
+          EXE="app/target/release/goDrinking.exe"
+          if [ ! -f "$EXE" ]; then echo "goDrinking.exe not found at $EXE" >&2; exit 1; fi
+          ls -lh "$EXE"
+
+      - name: Ensure release and upload exe
+        if: ${{ inputs.upload }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --generate-notes
+          gh release upload "$TAG" app/target/release/goDrinking.exe --clobber
+          gh release view "$TAG" --json assets --jq '.assets[].name'

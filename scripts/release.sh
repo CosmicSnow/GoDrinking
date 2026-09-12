@@ -6,9 +6,9 @@
 #
 # Artifacts:
 #   - macOS: app/target/release/bundle/dmg/*.dmg  (via `cargo tauri build --bundles dmg` in app/)
-#   - Windows: app/target/x86_64-pc-windows-msvc/release/goDrinking.exe
-#     (via `cargo xwin build --target x86_64-pc-windows-msvc --release
-#      --features tauri/custom-protocol --bin goDrinking` in app/)
+#   - Windows: goDrinking.exe built natively on windows-latest via
+#     .github/workflows/release-windows.yml (triggered below) and uploaded
+#     straight to the GitHub release — never downloaded locally.
 #
 # Notes (AGENTS.md is law):
 #   - Web build ALWAYS FIRST (`npm run build` in app/web/ -> web/dist).
@@ -71,31 +71,53 @@ else
   ls -lh "$DMG"
 fi
 
-# --- Windows exe (cross from macOS host) ---
+# --- Windows exe (native build on GitHub Actions) ---
+# Local `cargo xwin` cross broke on user-level RUSTFLAGS containing spaces
+# (cargo-xwin rejects the separator), so the exe is built natively on
+# windows-latest via .github/workflows/release-windows.yml, which uploads
+# goDrinking.exe straight to the GitHub release. Nothing is downloaded back:
+# the publish step below uploads only what exists locally (the .dmg).
+# NOTE: the workflow file must already be on main for `gh workflow run --ref main`.
 EXE="$ROOT/app/target/x86_64-pc-windows-msvc/release/goDrinking.exe"
 if [ "$SKIP_WINDOWS" = true ]; then
   echo "release: skipping Windows build (--skip-windows)"
 else
-  echo "release: building Windows goDrinking.exe (xwin cross)..."
-  # cargo-xwin chokes on inherited RUSTFLAGS containing spaces
-  # ("flag in rustflags must not contain its separator"), so drop them
-  # for this invocation only; nothing is installed or changed globally.
-  # NOTE: `env -u` alone is not enough: a space-containing flag can also
-  # come from a user-level cargo config file (build.rustflags), which unset
-  # env cannot remove. Empty CARGO_BUILD_RUSTFLAGS / CARGO_TARGET_*_RUSTFLAGS
-  # shadow the config file (env wins over files); xwin still injects its
-  # own -C linker-flavor / -Lnative flags on top. Host (macOS-only) flags
-  # would break an msvc build anyway.
-  if ! (cd "$ROOT/app" && env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS="" CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="" cargo xwin build --target x86_64-pc-windows-msvc --release --features tauri/custom-protocol --bin goDrinking); then
-    echo "release: xwin build failed; requires cargo-xwin plus MSVC target deps (not installed automatically)" >&2
+  echo "release: building Windows goDrinking.exe via GitHub Actions..."
+  if git -C "$ROOT" rev-parse "$TAG" >/dev/null 2>&1; then
+    echo "release: tag $TAG already exists locally"
+  else
+    echo "release: creating tag $TAG from HEAD"
+    git -C "$ROOT" tag "$TAG"
+  fi
+  git -C "$ROOT" push origin "$TAG" || echo "release: note: git push origin $TAG failed (may already exist upstream), continuing"
+  UPLOAD_FLAG=true
+  if [ "$SKIP_UPLOAD" = true ]; then UPLOAD_FLAG=false; fi
+  (cd "$ROOT" && gh workflow run release-windows.yml --ref main -f tag="$TAG" -f upload="$UPLOAD_FLAG")
+  # Locate the run just triggered: snapshot existing ids, then wait for a new one.
+  BEFORE="$(cd "$ROOT" && gh run list --workflow release-windows.yml --limit 10 --json databaseId --jq '.[].databaseId' || true)"
+  RUN_ID=""
+  for _ in $(seq 1 18); do
+    sleep 10
+    AFTER="$(cd "$ROOT" && gh run list --workflow release-windows.yml --limit 10 --json databaseId --jq '.[].databaseId' || true)"
+    RUN_ID="$(comm -13 <(printf '%s\n' "$BEFORE" | sort -n) <(printf '%s\n' "$AFTER" | sort -n) | head -n 1 || true)"
+    if [ -n "$RUN_ID" ]; then break; fi
+  done
+  if [ -z "$RUN_ID" ]; then
+    echo "release: could not find the triggered release-windows.yml run" >&2
     exit 1
   fi
-  if [ ! -f "$EXE" ]; then
-    echo "release: Windows exe not found at app/target/x86_64-pc-windows-msvc/release/goDrinking.exe" >&2
-    exit 1
+  echo "release: watching run $RUN_ID..."
+  (cd "$ROOT" && gh run watch "$RUN_ID" --exit-status)
+  if [ "$SKIP_UPLOAD" = true ]; then
+    echo "release: skipping exe asset check (--skip-upload)"
+  else
+    ASSETS="$(cd "$ROOT" && gh release view "$TAG" --json assets --jq '.assets[].name' || true)"
+    if ! printf '%s\n' "$ASSETS" | grep -qxF 'goDrinking.exe'; then
+      echo "release: goDrinking.exe not found on release $TAG" >&2
+      exit 1
+    fi
+    echo "release: goDrinking.exe present on release $TAG"
   fi
-  echo "release: exe=$EXE"
-  ls -lh "$EXE"
 fi
 
 # --- publish ---
@@ -108,6 +130,11 @@ ARTIFACTS=()
 if [ -n "$DMG" ] && [ -f "$DMG" ]; then ARTIFACTS+=("$DMG"); fi
 if [ -f "$EXE" ]; then ARTIFACTS+=("$EXE"); fi
 if [ "${#ARTIFACTS[@]}" -eq 0 ]; then
+  # No local exe is produced anymore: the workflow uploads it directly.
+  if [ "$SKIP_MACOS" = true ] && [ "$SKIP_WINDOWS" = false ]; then
+    echo "release: nothing local to upload (exe was uploaded by the workflow)"
+    exit 0
+  fi
   echo "release: nothing to upload (both builds skipped?)" >&2
   exit 1
 fi
