@@ -3,20 +3,7 @@ networks:
     external: true
 
 services:
-  godrinking-rendezvous-dev:
-    profiles: [dev]
-    image: ${IMAGE_NAME}:dev
-    container_name: godrinking-rendezvous-dev
-    restart: unless-stopped
-    env_file:
-      - .env.dev
-    expose:
-      - "${PORT:-8787}"
-    networks:
-      - main-npm
-
   godrinking-rendezvous-prod:
-    profiles: [prod]
     image: ${IMAGE_NAME}:prod
     container_name: godrinking-rendezvous-prod
     restart: unless-stopped

@@ -115,7 +115,7 @@ packaged exe points at `devUrl` instead of the bundled `frontendDist`.
 - Run: `node server.mjs` in `server/` (`PORT` default `18790`, `PORT=0` for an
   ephemeral test port; `BIND` default `127.0.0.1`).
 - Local default is loopback. Docker (`BIND=0.0.0.0`) sits behind a reverse
-  proxy (`godrinking-rendezvous-prod` / `-dev` on `main-npm`). Binding a
+  proxy (`godrinking-rendezvous-prod` on `main-npm`). Binding a
   specific public address is still refused. Production URL:
   `https://together.jouymaker.com`.
 - Signaling-only: JSON/UTF-8, 64 KiB caps, scrypt password checks with
