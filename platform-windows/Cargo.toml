@@ -1,0 +1,33 @@
+[package]
+name = "golive-platform-windows"
+version = "0.7.5"
+edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0"
+description = "goDrinking Windows capture backend (DXGI displays + WGC windows) behind the golive-platform contract."
+
+[lib]
+name = "golive_platform_windows"
+crate-type = ["rlib"]
+
+[dependencies]
+golive-platform = { path = "../platform" }
+windows = { version = "0.62", features = [
+    "Graphics_Capture",
+    "Graphics_DirectX_Direct3D11",
+    "Foundation",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_WindowsAndMessaging",
+] }
+wasapi = "0.24.0"
+opus = "0.3"

@@ -46,7 +46,7 @@ jobs:
               --push \
               -t "${IMAGE_NAME}:dev" \
               -t "${IMAGE_NAME}:dev-${GITHUB_SHA}" \
-              ./rendezvous
+              ./server
 
   deploy:
     name: Deploy DEV
@@ -67,11 +67,11 @@ jobs:
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
       - name: Write .env.dev from secret
-        working-directory: rendezvous
+        working-directory: server
         run: printf '%s\n' "${{ secrets.ENV_RENDEZVOUS_DEV }}" > .env.dev
 
       - name: Pull and deploy
-        working-directory: rendezvous
+        working-directory: server
         run: |
           docker compose -f docker-compose.app.yml --profile dev pull
           docker compose -f docker-compose.app.yml --profile dev stop godrinking-rendezvous-dev || true

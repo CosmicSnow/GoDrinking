@@ -1,0 +1,70 @@
+[package]
+name = "golive-core"
+version = "0.7.5"
+edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0"
+description = "goDrinking Sala core: serialized lifecycle, native WebRTC media, signaling client. No UI, no Tauri."
+
+[lib]
+name = "golive_core"
+crate-type = ["rlib"]
+
+[dependencies]
+# Capture packet types shared with the backends (GpuPixelBuffer,
+# CapturePacket). TYPES ONLY: golive-platform is OS-free pure Rust (serde),
+# so this adds no OS bindings to the core — the old rule stands.
+golive-platform = { path = "../platform" }
+# Native WebRTC (tokio-based). Default TLS (no openssl needed on macOS).
+webrtc = "0.14"
+# H.264 software encode/decode (Constrained Baseline). Built from source.
+openh264 = "0.9"
+# Lean tokio: only what webrtc needs + our timers/channels.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net"] }
+# Sample/Bytes types shared with the webrtc crate (same versions it uses).
+webrtc-media = "0.11"
+bytes = "1"
+# Loss recovery (PLI): NACK/PLI interceptors + RTCP packet types. Pinned to
+# the versions webrtc 0.14 itself uses (the crate is literally `interceptor`).
+interceptor = "0.15"
+rtcp = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.8"
+opus = "0.3"
+# Sync signaling transport over std threads (no tokio in the signal path).
+tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
+ureq = { version = "3", features = ["json"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net"] }
+
+# VideoToolbox HW encode (macOS only, target-gated so other platforms and
+# docs builds never see ObjC). Pure framework bindings, no Swift toolchain.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSDictionary", "NSValue"] }
+objc2-core-foundation = "0.3"
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
+objc2-video-toolbox = "0.3"
+
+# NVENC / QSV / AMF via Media Foundation (Windows only). Driver MFT, no
+# NVIDIA Video Codec SDK to ship. Same probe-then-use contract as VT.
+# The decoder twin (mfdec.rs) additionally needs D3D11 for the DXVA device
+# manager the decoder MFT is handed.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+] }
+
+# RGBA conversion is on the live receive path; unoptimized OpenH264 misses
+# the 720p30 frame budget even when native decoding is fast.
+[profile.dev.package.openh264]
+opt-level = 3

@@ -1,33 +1,9 @@
 {
-  "name": "godrinking",
+  "name": "golive",
+  "version": "0.7.5",
   "private": true,
-  "version": "0.6.3",
-  "license": "PolyForm-Noncommercial-1.0.0",
-  "type": "module",
   "scripts": {
-    "dev": "vite",
-    "test": "vitest run",
-    "build": "tsc && vite build",
-    "preview": "vite preview",
-    "tauri": "tauri",
-    "macos:app": "src-tauri/build-debug-app.sh && open \"src-tauri/target/debug/bundle/macos/goDrinking.app\"",
-    "release:macos": "scripts/release-macos.sh",
-    "release:windows": "scripts/release-windows.sh"
-  },
-  "dependencies": {
-    "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-opener": "^2",
-    "react": "^19.1.0",
-    "react-dom": "^19.1.0"
-  },
-  "devDependencies": {
-    "@tauri-apps/cli": "^2",
-    "@types/react": "^19.1.8",
-    "@types/react-dom": "^19.1.6",
-    "@vitejs/plugin-react": "^4.6.0",
-    "happy-dom": "20.12.0",
-    "typescript": "~5.8.3",
-    "vite": "^7.0.4",
-    "vitest": "^5.0.0"
+    "build:windows": "npm --prefix app/web run build && cd app && cargo tauri build",
+    "build:release": "npm --prefix app/web run build && cd app && cargo tauri build --no-bundle -- --bin golive-app --bin golive-video"
   }
 }

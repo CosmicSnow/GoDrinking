@@ -1,54 +1,165 @@
-# goDrinking engineering guide
+# goDrinking — Agent Guide
 
-`GoLive` is the repository directory; the product is **goDrinking**. Read `CONTEXT.md` before changing product language or behavior. Its domain terms are normative.
+Sala-first video rooms: native Rust core + Tauri shell + React frontend +
+Node rendezvous server. Read this before touching code. Protocols are law;
+behavior changes need tests; platform code stays behind traits.
 
-## Product boundary
+## 1. Architecture and crate roles
 
-- goDrinking is P2P WebRTC screen sharing. Media never transits the Rendezvous.
-- Join modes are **LAN**, **Direct**, and **Stunar**. Preserve their meanings from `CONTEXT.md`.
-- Stunar is signaling-only and best-effort P2P. There is no TURN in this version, so symmetric-NAT failure is an expected, diagnosable limitation.
-- This reliability program supports packaged goDrinking Viewers only: WKWebView on macOS and WebView2 on Windows. External-browser compatibility is out of scope.
-- Broadcast is the migration contract for all join modes. Sala parity for LAN/Direct is deferred; do not accidentally imply it exists.
+```text
+app/                  golive-app: thin Tauri shell. Commands validate input,
+                      drive the core, return. Core events become Tauri events.
+                      NO product logic here. Two bins:
+                      - golive-app   (src/main.rs: Tauri app, owns main thread)
+                      - golive-video (src/bin/video.rs: one helper process per
+                        watched link, owns its winit event loop + softbuffer
+                        CPU blit; fed RGBA over IPC, acks 0x01 per present)
+app/src/video/        shared GLV1 IPC module (protocol, handshake, frame/ack,
+                      timeouts, feed loop) + per-OS transports selected ONLY
+                      here: transport_unix.rs (filesystem socket) /
+                      transport_windows.rs (TCP loopback). cfg(unix/windows)
+                      lives at this selection point, never scattered.
+app/src/screen.rs     glue the app owns: enumerate → open/start → bridge pump
+                      (BGRA→I420) → core channel. Delegates per OS to the
+                      platform crates below.
+app/src/pump.rs       signal↔media orchestration (offer/answer + bilateral
+                      trickle, fences, watch routing). Future core::runtime
+                      candidate — keep it orchestration-only.
+core/                 golive-core: room/owner state machine, SignalClient,
+                      media (WebRTC, H.264 OpenH264/VideoToolbox, quality
+                      profiles). Knows NO backend and NO Tauri.
+platform/             golive-platform: VideoSource trait, shared types
+                      (SourceInfo/Kind, BgraFrame, CaptureConfig,
+                      CapturePacket, GpuPixelBuffer), converters, CapabilitySet,
+                      MockSource. ZERO OS dependencies — builds everywhere.
+platform-macos/       golive-platform-macos: ScreenCaptureKit backend via pure
+                      objc2 (no Swift toolchain — undeployable here, see
+                      platform/README.md). enumerate/open/start + thumbnail.
+platform-windows/     golive-platform-windows: DXGI Desktop Duplication
+                      (displays) + Windows.Graphics.Capture (windows).
+                      Same VideoSource shape as macOS. Wired target-gated
+                      in app/Cargo.toml.
+server/               server.mjs: rendezvous signaling ONLY (routes envelopes,
+                      never carries media, never parses SDP/candidates).
+                      Contract: server/PROTOCOL.md (normative).
+app/web/              React+TS+Vite frontend. Intents via Tauri commands;
+                      snapshots on demand + signal-event/media-event. Builds
+                      to web/dist = Tauri frontendDist (git-ignored).
+```
 
-## Media compatibility contract
+## 2. Cross-platform requirement (Windows + macOS)
 
-- Product codec: **H.264 Constrained Baseline**, packetization mode 1, with an explicit SDP `profile-level-id` and exact emitted-bitstream validation.
-- One codec does not mean one encoder. Keep VideoToolbox, Media Foundation, and OpenH264 fallback only when each emits the same compatible H.264 contract.
-- Do not add or re-enable H.264 High, HEVC, AV1, or codec selection without an approved cross-platform compatibility plan.
-- The initial supported envelope ends at 60 fps. Validate permitted resolution/fps/profile/level combinations; reject unsupported combinations before a Session starts.
-- Preserve arbitrary aspect ratios. Dimensions delivered to encoders must be even and conform to the backend’s documented alignment requirements; never assume 16:9.
-- A live capture source/resolution/scale change restarts the local Share slot. The surrounding Session stays open. Do not attempt in-place encoder reconfiguration until it has dedicated design, tests, and cross-platform evidence.
-- Treat color as an API contract: record and validate pixel format, matrix, range, and transfer function. The canonical screen-media path is NV12 BT.709 limited range; the Host preview must not be used as proof of Viewer color correctness.
+- ALL OS code lives in its platform crate behind `golive_platform::VideoSource`
+  (`enumerate` / `open` / `start`). `golive-core` never imports OS bindings;
+  `app` only delegates (`screen.rs` per-OS arms).
+- Shared shapes live in `platform::types` (`SourceInfo`, `BgraFrame`,
+  `CaptureConfig`, `CapturePacket`). UI needs no changes for a new backend.
+- Capabilities are compile-time facts with honest reasons
+  (`platform/src/capability.rs`): unsupported disables UI options with the
+  explanation — never silent failure, never empty lists on a real desktop.
+- Protocols are the law: `server/PROTOCOL.md` (Sala wire v1) and the GLV1
+  helper IPC (`GLV1` + u32 w/h/title_len + title, then u32 len + RGBA per
+  frame, `0x01` ack; feeder BINDS, helper CONNECTS; EOF = clean shutdown).
+  Feeder + helper ship together — any wire change versions BOTH sides.
+- Denial is typed (`PlatformError::PermissionDenied` + Settings copy), never
+  silence. Titles/pixels/tokens/SDP never reach logs.
 
-## Architecture and lifecycle rules
+## 3. Windows screen capture
 
-- Keep platform capture and encoder adapters separate from signaling and WebRTC sender logic. The primary seam is normalized `EncodedAccessUnit` / encoded audio packets.
-- Use a serialized owner for mutable Session, Share slot, and link state. A snapshot is observational: it must never advance signaling or lifecycle work.
-- Fence asynchronous work by Session epoch, Share epoch, and link ID. Discard stale completions after Stop/restart.
-- Start transactionally: validate config/capabilities, acquire resources, then publish ready state. On any failure, roll back capture, audio, join service, Rendezvous state, and peers deterministically.
-- A stopped Share slot owns no capture or system-audio resources.
-- Remove peer handles under synchronization, but stop/join peer workers outside global state locks.
-- One Viewer failure must not stop other Viewers or the Host capture. Queue overflow/recovery must force a new keyframe for the affected link.
+Implemented in `platform-windows/`: DXGI outputs for displays, WGC
+(`CreateForWindow`) for windows, one-shot `thumbnail()`, typed denial.
+Keep the adapter small: frames out, errors typed. No RTP/WebRTC/lifecycle
+in the backend; pacing/encode belong to the core, lifecycle to the app.
 
-## Diagnosing reliability
+## 4. Commands per OS
 
-Every Session/Share/link must emit correlated, redacted milestones with IDs and platform/backend/codec/dimensions metadata. Never log Passwords, Tokens, or complete SDP.
+All Cargo commands run from `app/` (that is where `Cargo.toml` + `tauri.conf.json`
+live); web commands from `app/web/`; server commands from `server/`.
 
-Minimum milestones: join service ready; admission; offer/answer; ICE candidate and selected-pair state; peer connected; first capture frame; first encoder input/output; first valid IDR with parameters; first RTP sent; and Viewer packet, decode, and presentation milestones.
+| What        | Command |
+|-------------|---------|
+| Web dev     | `npm run dev` in `app/web/` (Vite `:1420`, strict — must match `devUrl`) |
+| Desktop dev | `cargo tauri dev -- --bin golive-app` in `app/` (picks the app bin; helpers spawn automatically) |
+| Web build   | `npm run build` in `app/web/` — **ALWAYS FIRST**: `tsc --noEmit && vite build` → `web/dist`. `beforeBuildCommand` is EMPTY, so Tauri never builds the frontend; a stale `dist/` means a stale UI. |
+| Tauri build | `cargo tauri build` in `app/` (after the web build; the `golive-video` helper must sit next to the binary — `scripts/e2e-packaged.sh` copies it into `Contents/MacOS` for the packaged app) |
+| Windows native | on a Windows machine: `cargo tauri build` (same order: web build first) |
+| Windows cross (macOS host) | `cargo xwin build --target x86_64-pc-windows-msvc` in `app/` (needs `cargo-xwin`; plain `cargo` cannot compile the C deps for msvc) |
 
-Classify failures from evidence rather than “connection failed”:
+`tauri/custom-protocol` flag: `tauri`'s default features do NOT include
+`custom-protocol` (verified against the registry manifest), and `app/Cargo.toml`
+adds no features. Building OUTSIDE the Tauri CLI (plain `cargo build`, xwin
+cross) therefore REQUIRES `--features tauri/custom-protocol` — without it the
+packaged exe points at `devUrl` instead of the bundled `frontendDist`.
 
-- no selected candidate pair → signaling/ICE/network;
-- capture but no encoded access unit → capture/encoder;
-- access unit but no accepted sample/RTP → sender/profile/queue;
-- RTP sent but not received → network path;
-- packets received but no decoded frames → codec/packetization/parameters;
-- decoded but not presented → Viewer playback.
+## 5. Tests
 
-## Required validation before merging media changes
+- `npm test` in `app/web/` — vitest (`api.test.ts`, `e2e.test.ts`; Tauri APIs mocked).
+- `cargo test` in `app/` — lib unit tests (video math/protocol, bridge pump,
+  trickle envelopes; all must pass unaltered) + `tests/smoke.rs` (shell commands
+  against a real local `server/`, needs `node`). The feeder→helper test needs a
+  window server and the built helper; it skips honestly without one.
+- `npm test` in `server/` — `node test_*.mjs` (rooms, auth, admit, signaling,
+  limits, kick, succession, heartbeat, ratelimit, nomedia).
+- Packaged end-to-end: `scripts/e2e-packaged.sh` (server + host + viewer, asserts
+  presented frames where windows exist).
+- Media trace analyzer: `python3 scripts/analyze-trace.py <trace-dir-or-*.jsonl...>`
+  (numeric-only JSONL, never prints raw lines). Per-stage rates (`rate=count*1e6/elapsed_us`)
+  + flags (STARVATION `decode.dropped`, REPLAY `present.repeats`, TIMEOUT-BURST
+  `capture.timeouts`, STALL `max_work_us`) + host+viewer overlay by `timestamp_ms`.
+  Self-test: `python3 scripts/analyze-trace.py --self-test`; fixture:
+  `scripts/fixtures/trace-sample.jsonl`. Capture via `bash scripts/debug-media.sh`
+  (see `MEDIA_DEBUG.md`); existing repro: `e2e-artifacts/slow-screen-share-repro/`.
 
-- Unit/integration tests for H.264 SDP/profile contract, SPS/PPS + IDR recovery, timestamps, color conversion, fitted/aligned ultrawide dimensions, queue recovery, and epoch fencing.
-- Packaged-app interoperability matrix: macOS Host/Viewer and Windows Host/Viewer in every pairing, with VideoToolbox, Media Foundation, and forced OpenH264 fallback where applicable.
-- Exercise LAN, Direct, and Stunar Broadcast; include late Viewer join, reconnect, capture restart, encoder failure, PLI/FIR, rejected video section, and repeated Start/Stop.
-- Test 16:9, 16:10, 21:9/32:9 including 5120×1440, static text, motion, saturated colors/gradients, and 720p30/1080p30/1080p60.
-- For macOS capture, use the packaged `.app`, not only `tauri dev`, so TCC Screen Recording behavior is representative.
+## 6. Server
+
+- Run: `node server.mjs` in `server/` (`PORT` default `18790`, `PORT=0` for an
+  ephemeral test port; `BIND` default `127.0.0.1`).
+- Local default is loopback. Docker (`BIND=0.0.0.0`) sits behind a reverse
+  proxy (`godrinking-rendezvous-prod` / `-dev` on `main-npm`). Binding a
+  specific public address is still refused. Production URL:
+  `https://together.jouymaker.com`.
+- Signaling-only: JSON/UTF-8, 64 KiB caps, scrypt password checks with
+  timing-uniform denied responses. Never logs passwords, tokens, SDP, or candidates.
+
+## 7. Conventions (do not break)
+
+- Event-driven UI: commands never poll. Snapshots are explicit pulls
+  (`get_snapshot`, `get_roster`, `get_media_counters`); live updates arrive via
+  `signal-event` / `media-event`. The one exception is the video helper's frozen
+  check, which is its own local clock — not UI polling.
+- Errors are redacted `String`s. Passwords, tokens, SDP/candidates never reach
+  logs or the frontend (envelopes carry kinds/counts only; session_log bans the
+  same keys — its tests enforce this).
+- Browser mock preserved: `app/web/src/mock.ts` drives the pure-browser path
+  (active when Tauri globals are absent). Keep it intact — change only on explicit
+  order. Same formats as `api.ts`.
+- Screen capture permission (macOS): first OS contact happens at
+  `enumerate()`/`start()` from explicit user gestures only. Denial codes `-3810`
+  (SCK user-declined) and `-3801` (TCC on macOS 26) map to `PermissionDenied`;
+  needs System Settings → Privacy → Screen Recording (new bundle id = new prompt).
+- Identity limits (server-enforced, `server/server.mjs`): nickname ASCII
+  `[A-Za-z0-9 _.-]`, 2–24 chars; password 4–64 chars.
+- `get_roster` is the roster pull (same `RoomMember` shape as the roster event);
+  call it to sync state on entry, never to poll.
+- Bilateral trickle ICE is mandatory: host candidates forward to the adopted
+  watcher AND viewer candidates forward to the watch target (`pump.rs`), plus
+  `ice-complete` both ways per `PROTOCOL.md`. No TURN (`typ relay` rejected).
+
+## 8. Bugs (BUGS.md)
+
+- Known bugs live in `BUGS.md` (repo root), each with a status — review
+  them before touching related code.
+- A bug that is 100% fixed AND verified is REMOVED from `BUGS.md`.
+  Never mark done-in-place; the list holds open bugs only.
+
+## 9. Commit style
+
+Short `type: subject` headers, lowercase, no trailing period. Usual types:
+`feat:`, `fix:`, `refactor:`, `release:`. `sala:` prefix for Sala-lane work,
+`fix(ci):` for CI. Examples from history:
+
+```text
+feat: forward host ICE candidates to viewer (fix stuck negotiating)
+refactor: simplify stage UI, restrict inputs to numeric values, ...
+sala: quality engine + set_quality camelCase fix + e2e quality gate + ...
+```
