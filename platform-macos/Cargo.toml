@@ -1,6 +1,6 @@
 [package]
 name = "golive-platform-macos"
-version = "0.7.4"
+version = "0.7.5"
 edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
 description = "goDrinking macOS capture backend (ScreenCaptureKit). macOS only; the pure contract lives in golive-platform."
