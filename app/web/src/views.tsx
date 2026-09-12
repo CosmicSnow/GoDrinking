@@ -274,6 +274,19 @@ export function shareIntentFromResolved(
   return { error: resolved.errors.join(" ") };
 }
 
+/** Intervalo mínimo entre refreshes completos vindos de frame-events. */
+export const FRAME_REFRESH_INTERVAL_MS = 1000;
+
+/**
+ * Portão de refresh para frame-events: cada frame decodificado (30–60/s
+ * por stream) gera um media-event `frame`, e um refresh completo custa 4
+ * round-trips IPC + enumeração de apps de áudio — sem portão a UI congela
+ * exatamente quando o stream flui bem. Sem timers: só carimbo de tempo.
+ */
+export function frameRefreshDue(lastRefreshMs: number, nowMs: number): boolean {
+  return nowMs - lastRefreshMs >= FRAME_REFRESH_INTERVAL_MS;
+}
+
 // ---------------------------------------------------------------------------
 // Formatação de contadores (pt-BR; "—" honesto quando ausente).
 // ---------------------------------------------------------------------------

@@ -530,6 +530,10 @@ pub struct VideoWindow {
     /// Presentation timestamps + byte sizes feeding fps/bitrate.
     stats: Arc<Mutex<PresentStats>>,
     healthy: Arc<AtomicBool>,
+    /// Raised by the feeder on reset-like IO failures: the helper exited
+    /// (user closed the window or it crashed). Stays clear on timeouts
+    /// (wedged helper) and on clean stops.
+    peer_gone: Arc<AtomicBool>,
     sock_path: PathBuf,
     title: String,
     w: u32,
@@ -561,6 +565,7 @@ impl VideoWindow {
         let (push, slot) = FrameSlot::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let healthy = Arc::new(AtomicBool::new(true));
+        let peer_gone = Arc::new(AtomicBool::new(false));
         let pushed = push.counter();
         let stats = Arc::new(Mutex::new(PresentStats::default()));
         let sock_path = std::env::temp_dir().join(format!(
@@ -573,6 +578,7 @@ impl VideoWindow {
         let feeder = {
             let stop = Arc::clone(&stop);
             let healthy = Arc::clone(&healthy);
+            let peer_gone = Arc::clone(&peer_gone);
             let presented = Arc::clone(&presented);
             let stats = Arc::clone(&stats);
             let sock_path = sock_path.clone();
@@ -580,7 +586,7 @@ impl VideoWindow {
             std::thread::Builder::new()
                 .name("golive-video-feed".into())
                 .spawn(move || {
-                    feed_loop(sock_path, helper, title, w, h, slot, &stop, &presented, &stats, &healthy);
+                    feed_loop(sock_path, helper, title, w, h, slot, &stop, &presented, &stats, &healthy, &peer_gone);
                 })
                 .ok()
         };
@@ -592,6 +598,7 @@ impl VideoWindow {
                 pushed,
                 stats,
                 healthy,
+                peer_gone,
                 sock_path,
                 title,
                 w: w as u32,
@@ -630,6 +637,25 @@ impl VideoWindow {
 
     pub fn healthy(&self) -> bool {
         self.healthy.load(Ordering::Relaxed)
+    }
+
+    /// True once the feeder has seen reset-like IO: the helper exited
+    /// (user closed the window or it crashed). False on clean stops and on
+    /// wedged-helper timeouts.
+    pub fn peer_gone(&self) -> bool {
+        self.peer_gone.load(Ordering::Acquire)
+    }
+
+    /// Test seam: simulate helper death paths without a window server.
+    #[cfg(test)]
+    pub fn mark_unhealthy(&self) {
+        self.healthy.store(false, Ordering::Release);
+    }
+
+    /// Test seam: simulate a clean helper exit (window closed / crash).
+    #[cfg(test)]
+    pub fn mark_peer_gone(&self) {
+        self.peer_gone.store(true, Ordering::Release);
     }
 
     pub fn title(&self) -> &str {
@@ -706,6 +732,9 @@ impl FramePush {
 /// Feeder: wait for frames, spawn the helper on the first one, stream
 /// length-prefixed RGBA, count acks as presented. Any error marks the
 /// window unhealthy and ends the thread (shell tears down).
+/// Reset-like IO failures additionally raise `peer_gone` (the helper exited:
+/// user closed the window or it crashed). Timeouts leave it clear (a
+/// wedged-but-present helper the shell may respawn around).
 fn feed_loop(
     sock_path: PathBuf,
     helper: PathBuf,
@@ -717,6 +746,7 @@ fn feed_loop(
     presented: &AtomicU64,
     present_stats: &Mutex<PresentStats>,
     healthy: &AtomicBool,
+    peer_gone: &AtomicBool,
 ) {
     // Phase 1: block for the first frame (window opens here, never before).
     let mut frame = loop {
@@ -809,15 +839,21 @@ fn feed_loop(
         }
         let bytes = frame.rgba.len() as u64;
         let started = trace.start();
-        if write_frame(&mut sock, &frame).is_err() {
+        if let Err(e) = write_frame(&mut sock, &frame) {
             trace.record(TraceSample { errors: 1, ..Default::default() }, started);
+            if peer_gone_error(&e) {
+                peer_gone.store(true, Ordering::Release);
+            }
             healthy.store(false, Ordering::Release);
             return;
         }
         let acked = match drain_present_acks(&mut sock) {
             Ok(n) => n,
-            Err(_) => {
+            Err(e) => {
                 trace.record(TraceSample { errors: 1, ..Default::default() }, started);
+                if peer_gone_error(&e) {
+                    peer_gone.store(true, Ordering::Release);
+                }
                 healthy.store(false, Ordering::Release);
                 return;
             }
@@ -855,6 +891,18 @@ fn feed_loop(
             }
         }
     }
+}
+
+/// True when an IO failure means the helper is GONE (clean window close or
+/// crash): reset-like errors. Timeouts mean a wedged-but-present helper
+/// instead — the shell respawns the window around it but keeps the watch.
+/// Pure; unit tested below.
+pub fn peer_gone_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        e.kind(),
+        ConnectionReset | ConnectionAborted | BrokenPipe | NotConnected | UnexpectedEof
+    )
 }
 
 /// Holds the helper child alive while streaming; kills on drop only if the
@@ -1002,6 +1050,26 @@ mod tests {
     fn initial_window_is_contain_frame_not_source_pixels() {
         for src in [(1920, 1080), (3440, 1440), (3840, 1600), (0, 720)] {
             assert_eq!(initial_window_size(src.0, src.1), (WINDOW_W, WINDOW_H));
+        }
+    }
+
+    #[test]
+    fn peer_gone_splits_helper_exit_from_wedged_helper() {
+        use std::io::ErrorKind::*;
+        // Reset-like failures: the helper is gone (window closed / crash).
+        for kind in [ConnectionReset, ConnectionAborted, BrokenPipe, NotConnected, UnexpectedEof] {
+            assert!(
+                peer_gone_error(&std::io::Error::new(kind, "gone")),
+                "peer gone: {kind:?}"
+            );
+        }
+        // Timeouts and junk: wedged-but-present helper, or bad data — the
+        // shell respawns the window but must NOT end the watch.
+        for kind in [TimedOut, WouldBlock, Interrupted, InvalidData, Other] {
+            assert!(
+                !peer_gone_error(&std::io::Error::new(kind, "wedged")),
+                "wedged, not gone: {kind:?}"
+            );
         }
     }
 

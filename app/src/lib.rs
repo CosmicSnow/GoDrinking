@@ -238,6 +238,18 @@ pub(crate) struct WatchSession {
     pub pending_remote: Vec<String>,
 }
 
+/// True when a watch session is already being torn down (window-close
+/// auto-unwatch flipped liveness; teardown queued or done). Fresh intents
+/// (`alive: None`, pre-adoption) and live sessions are NOT dying: only an
+/// explicit `Some(false)` counts, so a re-watch replaces exactly the
+/// sessions the death path abandoned — never a live viewer. Pure.
+pub(crate) fn watch_session_is_dying(session: &WatchSession) -> bool {
+    session
+        .alive
+        .as_ref()
+        .is_some_and(|flag| !flag.load(std::sync::atomic::Ordering::Acquire))
+}
+
 /// Shared shell state. Managed as `Arc<AppState>` so background tasks and
 /// tests can hold it without a Tauri app.
 pub struct AppState {
@@ -1189,8 +1201,8 @@ impl AppState {
         if member.trim().is_empty() {
             return Err("member must not be empty".into());
         }
-        let fence = {
-            let inner = self
+        let (fence, old) = {
+            let mut inner = self
                 .inner
                 .lock()
                 .map_err(|_| "state lock poisoned".to_string())?;
@@ -1200,10 +1212,33 @@ impl AppState {
             // Repeated UI/roster intent is idempotent. Replacing this entry
             // loses ownership of the live viewer and its callbacks.
             if let Some(session) = inner.viewers.get(member) {
-                return Ok(session.fence);
+                if !watch_session_is_dying(session) {
+                    return Ok(session.fence);
+                }
+                // A window-close auto-unwatch is still tearing this session
+                // down (or queued it): take the dying entry out for teardown
+                // below and start a fresh intent, instead of adopting a
+                // fence with no live viewer behind it. The queued teardown
+                // stands down on the fresh entry (see push_present_frame).
+                // Same attempt-advance semantics as a normal intent: the
+                // owner link is advanced, never re-rolled.
+                let old = inner.viewers.remove(member);
+                let fence = inner.owner.watch_remote(member).map_err(redact_owner)?;
+                (fence, old)
+            } else {
+                let fence = inner.owner.watch_remote(member).map_err(redact_owner)?;
+                (fence, None)
             }
-            inner.owner.watch_remote(member).map_err(redact_owner)?
         };
+        // Retire the dying session outside the lock: stop its viewer (core
+        // stop is idempotent) and forget its window/feed/track entries so
+        // no ghost pipeline survives. Playback dies with the session value.
+        if let Some(old) = old {
+            if let Some(viewer) = old.viewer {
+                viewer.lock().await.stop().await;
+            }
+            self.close_video_window(member);
+        }
         {
             let mut inner = self
                 .inner
@@ -2368,9 +2403,30 @@ mod operation_tests {
         }
     }
 
+    #[test]
+    fn watch_session_dying_only_counts_explicit_teardown() {
+        // The re-watch replace path must fire exactly for sessions the
+        // window-death path abandoned — never for fresh intents (alive None,
+        // pre-adoption) or live sessions.
+        fn session(alive: Option<bool>) -> WatchSession {
+            WatchSession {
+                playback: None,
+                fence: Fence::idle(),
+                viewer: None,
+                adopted: None,
+                alive: alive
+                    .map(|flag| Arc::new(std::sync::atomic::AtomicBool::new(flag))),
+                remote_ready: false,
+                pending_remote: Vec::new(),
+            }
+        }
+        assert!(!watch_session_is_dying(&session(None)), "fresh intent is not dying");
+        assert!(!watch_session_is_dying(&session(Some(true))), "live session is not dying");
+        assert!(watch_session_is_dying(&session(Some(false))), "torn-down session is dying");
+    }
+
     #[tokio::test]
-    async fn unwatch_one_host_does_not_wipe_the_other_session_or_counters() {
-        let state = Arc::new(AppState::new());
+    async fn unwatch_one_host_does_not_wipe_the_other_session_or_counters() {        let state = Arc::new(AppState::new());
         {
             let mut inner = state.inner.lock().unwrap();
             let join = inner.owner.begin_join().unwrap();

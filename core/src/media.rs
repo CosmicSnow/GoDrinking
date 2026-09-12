@@ -509,7 +509,7 @@ fn cpu_holdover_on_timeout(last: Option<&I420Frame>) -> Option<&I420Frame> {
 }
 
 /// Split Annex-B into NAL byte-ranges (start codes included).
-fn annexb_nals(data: &[u8]) -> Vec<std::ops::Range<usize>> {
+pub(crate) fn annexb_nals(data: &[u8]) -> Vec<std::ops::Range<usize>> {
     let mut starts = Vec::new();
     let mut i = 0;
     while i + 3 < data.len() {
@@ -538,7 +538,7 @@ fn annexb_nals(data: &[u8]) -> Vec<std::ops::Range<usize>> {
 }
 
 /// NAL unit type of an Annex-B NAL (byte after the start code).
-fn nal_type(nal: &[u8]) -> Option<u8> {
+pub(crate) fn nal_type(nal: &[u8]) -> Option<u8> {
     let mut i = 0;
     while i + 2 < nal.len() && nal[i] == 0 {
         i += 1;
@@ -919,8 +919,15 @@ impl FrameSlot {
 }
 
 /// Decoder feeding whole access units; returns luma stats per decoded frame.
-pub struct H264Decoder {
-    dec: Decoder,
+///
+/// Backend is an enum like the encoder side: software everywhere, hardware
+/// where probed (Windows MF DXVA — see `mfdec`). `new()` pins software
+/// (deterministic: tests, movie preload); `new_auto()` probes for hardware
+/// with transparent software fallback, and is what the live viewer uses.
+pub enum H264Decoder {
+    Software { dec: Decoder },
+    #[cfg(target_os = "windows")]
+    Hardware(crate::mfdec::MfDecoder),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -950,42 +957,104 @@ pub struct DecodedPicture {
 }
 
 impl H264Decoder {
+    /// Software decoder, always. Deterministic everywhere (tests, movie
+    /// preload, forced-fallback paths).
     pub fn new() -> Result<Self, MediaError> {
         let dec =
             Decoder::new().map_err(|e| MediaError::Codec(format!("decoder init: {e}")))?;
-        Ok(Self { dec })
+        Ok(Self::Software { dec })
+    }
+
+    /// Automatic engine selection: hardware DXVA where the probe passes
+    /// (Windows MF decoder MFT), explicit software fallback otherwise.
+    /// Never fails while software constructs; a mid-stream hardware fault
+    /// transparently degrades to software on the failing unit.
+    pub fn new_auto() -> Result<Self, MediaError> {
+        #[cfg(target_os = "windows")]
+        {
+            if std::env::var_os("GOLIVE_DISABLE_HW").is_none() {
+                if crate::mfdec::probe_hardware().is_ok() {
+                    match crate::mfdec::MfDecoder::new() {
+                        Ok(hw) => {
+                            eprintln!("golive: decode backend={}", hw.backend_name());
+                            return Ok(Self::Hardware(hw));
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+        Self::new()
+    }
+
+    /// Live decode backend (`openh264` or the hardware name). Diagnostics
+    /// only — same redaction rules as the encode side (names, never pixels).
+    pub fn backend_name(&self) -> &'static str {
+        match self {
+            Self::Software { .. } => "openh264",
+            #[cfg(target_os = "windows")]
+            Self::Hardware(hw) => hw.backend_name(),
+        }
     }
 
     pub fn decode(&mut self, annexb: &[u8]) -> Result<Option<DecodedPicture>, MediaError> {
         let is_keyframe = annexb_nals(annexb)
             .iter()
             .any(|range| nal_type(&annexb[range.clone()]) == Some(5));
-        match self
-            .dec
-            .decode(annexb)
-            .map_err(|e| MediaError::Codec(format!("decode: {e}")))?
-        {
-            Some(yuv) => {
-                let [slice] = yuv.split::<1>();
-                let y = slice.y();
-                let (w, h) = slice.dimensions();
-                if y.is_empty() {
-                    return Ok(None);
+        match self {
+            Self::Software { dec } => match dec
+                .decode(annexb)
+                .map_err(|e| MediaError::Codec(format!("decode: {e}")))?
+            {
+                Some(yuv) => {
+                    let [slice] = yuv.split::<1>();
+                    let y = slice.y();
+                    let (w, h) = slice.dimensions();
+                    if y.is_empty() {
+                        return Ok(None);
+                    }
+                    let sum: u64 = y.iter().map(|b| *b as u64).sum();
+                    let mut rgba = vec![0u8; w * h * 4];
+                    yuv.write_rgba8(&mut rgba);
+                    Ok(Some(DecodedPicture {
+                        stats: DecodedStats {
+                            w,
+                            h,
+                            luma_mean: sum as f64 / y.len() as f64,
+                            is_keyframe,
+                        },
+                        frame: PresentedFrame { w, h, rgba },
+                    }))
                 }
-                let sum: u64 = y.iter().map(|b| *b as u64).sum();
-                let mut rgba = vec![0u8; w * h * 4];
-                yuv.write_rgba8(&mut rgba);
-                Ok(Some(DecodedPicture {
-                    stats: DecodedStats {
-                        w,
-                        h,
-                        luma_mean: sum as f64 / y.len() as f64,
-                        is_keyframe,
-                    },
-                    frame: PresentedFrame { w, h, rgba },
-                }))
-            }
-            None => Ok(None),
+                None => Ok(None),
+            },
+            #[cfg(target_os = "windows")]
+            Self::Hardware(hw) => match hw.decode_annexb(annexb) {
+                Ok(None) => Ok(None),
+                Ok(Some(pic)) => {
+                    let sum: u64 =
+                        pic.nv12[..pic.w * pic.h].iter().map(|b| *b as u64).sum();
+                    let (w, h) = (pic.w, pic.h);
+                    let rgba = crate::mfdec::nv12_to_rgba(w, h, &pic.nv12)
+                        .ok_or_else(|| MediaError::Codec("hw decode dims invalid".into()))?;
+                    Ok(Some(DecodedPicture {
+                        stats: DecodedStats {
+                            w,
+                            h,
+                            luma_mean: sum as f64 / (w * h) as f64,
+                            is_keyframe,
+                        },
+                        frame: PresentedFrame { w, h, rgba },
+                    }))
+                }
+                Err(_) => {
+                    // Transparent permanent fallback: rebuild as software
+                    // and decode this same unit with it. One bad unit can
+                    // still fail loudly below — errors stay typed.
+                    *self = Self::new()?;
+                    self.decode(annexb)
+                }
+            },
         }
     }
 }
@@ -1963,15 +2032,16 @@ fn preload_movie(path: &PathBuf) -> Result<Vec<I420Frame>, MediaError> {
     if bytes.len() > 256 * 1024 * 1024 {
         return Err(MediaError::Source("movie over 256 MiB".into()));
     }
-    let mut decoder = H264Decoder::new()?;
+    let mut decoder =
+        Decoder::new().map_err(|e| MediaError::Codec(format!("movie decoder init: {e}")))?;
     let mut frames = Vec::new();
     let mut unit = Vec::<u8>::new();
     let mut unit_has_vcl = false;
-    let flush = |unit: &mut Vec<u8>, unit_has_vcl: &mut bool, decoder: &mut H264Decoder, frames: &mut Vec<I420Frame>| -> Result<(), MediaError> {
+    let flush = |unit: &mut Vec<u8>, unit_has_vcl: &mut bool, decoder: &mut Decoder, frames: &mut Vec<I420Frame>| -> Result<(), MediaError> {
         if unit.is_empty() {
             return Ok(());
         }
-        if let Some(yuv) = decoder.dec.decode(unit).map_err(|e| MediaError::Codec(format!("movie decode: {e}")))? {
+        if let Some(yuv) = decoder.decode(unit).map_err(|e| MediaError::Codec(format!("movie decode: {e}")))? {
             let [slice] = yuv.split::<1>();
             frames.push(contiguous_i420(&slice));
         }
@@ -2186,7 +2256,9 @@ async fn read_loop(
     census: &Arc<std::sync::Mutex<CandidateCensus>>,
 ) {
     let mut depacketizer = H264Packet::default();
-    let mut decoder = match H264Decoder::new() {
+    // Live viewer: hardware DXVA where probed, transparent software
+    // fallback otherwise (never black on probe failure).
+    let mut decoder = match H264Decoder::new_auto() {
         Ok(dec) => dec,
         Err(e) => {
             let _ = event_tx.send(MediaEvent::Error(e.to_string()));
@@ -3230,6 +3302,96 @@ mod tests {
     }
 
     static HW_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn hw_decode_auto_selects_hardware_where_probed() {
+        // Env mutation is process-global: serialize all HW-touching tests.
+        let _guard = HW_ENV_LOCK.lock().expect("hw lock");
+        let auto = H264Decoder::new_auto().expect("auto never fails while software builds");
+        #[cfg(target_os = "windows")]
+        if crate::mfdec::probe_hardware().is_ok() {
+            assert_ne!(auto.backend_name(), "openh264", "hardware must win where probed");
+            return;
+        }
+        assert_eq!(auto.backend_name(), "openh264");
+    }
+
+    #[test]
+    fn hw_decode_falls_back_to_software_on_hook() {
+        // Deterministic everywhere (non-Windows never probes): the hook
+        // forces software, removal restores auto.
+        let _guard = HW_ENV_LOCK.lock().expect("hw lock");
+        std::env::set_var("GOLIVE_DISABLE_HW", "1");
+        let hooked = H264Decoder::new_auto().expect("hooked auto still builds");
+        assert_eq!(hooked.backend_name(), "openh264");
+        std::env::remove_var("GOLIVE_DISABLE_HW");
+    }
+
+    #[test]
+    fn hw_decode_roundtrip_matches_encode_dims() {
+        // REAL path both ends: NVENC (or software where absent) encodes,
+        // new_auto decodes. Pictures arrive at encode dims, non-black.
+        let _guard = HW_ENV_LOCK.lock().expect("hw lock");
+        let profile = QualityProfile::custom(640, 360, 2000, 30).expect("profile");
+        let engine = if crate::mfdec::probe_hardware().is_ok() {
+            EngineKind::Hardware
+        } else {
+            EngineKind::Software
+        };
+        // Demanded hardware may still refuse odd sizes: fall back to
+        // software for the ENCODE side (the decode side under test is what
+        // matters here).
+        let mut enc = VideoEncoder::new(&profile, 640, 360, engine)
+            .or_else(|_| VideoEncoder::new(&profile, 640, 360, EngineKind::Software))
+            .expect("encoder");
+        let mut dec = H264Decoder::new_auto().expect("decoder");
+        let mut pictures = 0u32;
+        for n in 0..6u8 {
+            let frame = I420Frame {
+                w: 640,
+                h: 360,
+                data: {
+                    let mut data = vec![0u8; 640 * 360 * 3 / 2];
+                    data[..640 * 360].fill(16 + n * 10);
+                    data[640 * 360..].fill(128);
+                    data
+                },
+            };
+            let unit = match enc.encode_frame(&frame).expect("encode") {
+                Some(unit) => unit,
+                None => continue,
+            };
+            if let Some(picture) = dec.decode(&unit).expect("decode") {
+                assert_eq!((picture.frame.w, picture.frame.h), (640, 360));
+                pictures += 1;
+            }
+        }
+        assert!(pictures >= 2, "roundtrip yields pictures (saw {pictures})");
+        if crate::mfdec::probe_hardware().is_ok() {
+            assert_ne!(
+                dec.backend_name(),
+                "openh264",
+                "roundtrip must stay on hardware end to end"
+            );
+        }
+    }
+
+    #[test]
+    fn hw_decode_recovers_to_software_mid_stream() {
+        // A fatally failing unit degrades the decoder to software
+        // transparently: the NEXT valid unit still decodes, now in software.
+        let _guard = HW_ENV_LOCK.lock().expect("hw lock");
+        let mut dec = H264Decoder::new_auto().expect("decoder");
+        let garbage = [0u8, 0, 0, 1, 0x65, 0xFF, 0x00];
+        let _ = dec.decode(&garbage);
+        let profile = QualityProfile::custom(320, 240, 500, 15).expect("profile");
+        let mut enc = H264Encoder::new_with_profile(&profile, 320, 240).expect("encoder");
+        let frame = I420Frame { w: 320, h: 240, data: vec![128u8; 320 * 240 * 3 / 2] };
+        let unit = enc.encode(&frame).expect("encode");
+        let picture = dec.decode(&unit).expect("decode").expect("picture after fault");
+        assert_eq!((picture.frame.w, picture.frame.h), (320, 240));
+        assert_eq!(dec.backend_name(), "openh264", "faulted hardware stays software");
+    }
 
     #[test]
     fn hw_probe_falls_back_explicitly_and_demanded_hw_fails_high() {

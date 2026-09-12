@@ -58,6 +58,7 @@ import {
 import {
   HomeScreen,
   RoomScreen,
+  frameRefreshDue,
   resolveDesired,
   shareIntentFromResolved,
   watchingStillLive,
@@ -159,6 +160,10 @@ export default function App() {
   const [backendNote, setBackendNote] = useState<string | null>(null);
   const [applying, setApplying] = useState(false);
   const [applyError, setApplyError] = useState<string | null>(null);
+  // Último refresh completo disparado por frame-event (ver
+  // frameRefreshDue): frame-events chegam a 30–60/s por stream e um
+  // refresh custa 4 IPCs + enumeração de áudio — sem portão a UI congela.
+  const lastFrameRefresh = useRef(0);
 
   // Modo autodirigido test-only: só ativa com `--e2e-plan` (get_e2e_plan
   // devolve null no app normal e nada aqui executa). Guarda contra
@@ -324,7 +329,18 @@ export default function App() {
         setWatching([]);
       }
       setLastMedia(mediaSummary(event));
-      void refresh();
+      if (event.kind === "frame") {
+        // Frame-events chegam por frame decodificado: refresh completo aqui
+        // congela a UI (ver frameRefreshDue) — texto de liveness atualiza
+        // sempre, snapshot só no portão de 1/s (stats cobrem o resto).
+        const now = Date.now();
+        if (frameRefreshDue(lastFrameRefresh.current, now)) {
+          lastFrameRefresh.current = now;
+          void refresh();
+        }
+      } else {
+        void refresh();
+      }
     }).then((off) => {
       if (cancelled) off();
       else unlistens.push(off);

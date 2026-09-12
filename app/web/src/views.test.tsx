@@ -13,6 +13,7 @@ import {
   formatBps,
   formatDelayMs,
   formatFps,
+  frameRefreshDue,
   linkLabel,
   resolveDesired,
   salaLabel,
@@ -735,6 +736,14 @@ describe("qualidade (espelha QualityProfile; fio bloqueado)", () => {
     expect(valid).toEqual({ profile: { w: 5120, h: 1440, bitrate_kbps: 10000, fps: 60 } });
     const invalid = shareIntentFromResolved({ errors: ["sem upscale além da fonte (5120×1440)."] });
     expect("error" in invalid && invalid.error).toContain("sem upscale");
+  });
+
+  it("portão de refresh: frame-event só pede snapshot 1×/s", () => {
+    expect(frameRefreshDue(0, 999)).toBe(false);
+    expect(frameRefreshDue(0, 1000)).toBe(true);
+    expect(frameRefreshDue(1000, 1500)).toBe(false);
+    expect(frameRefreshDue(1000, 2000)).toBe(true);
+    expect(frameRefreshDue(1000, 2001)).toBe(true);
   });
 });
 

@@ -882,13 +882,23 @@ fn respawn_line(seq: u64, old: (u32, u32), new: (u32, u32)) -> String {
     format!("present window respawn #{seq} {}x{} -> {}x{}", old.0, old.1, new.0, new.1)
 }
 
+/// Window-death log line: truncated member id only (same redaction rule as
+/// the watch/unwatch milestones — never names, titles, or tokens).
+fn window_closed_line(member: &str) -> String {
+    format!("watch window closed member={}", crate::session_log::short_id(member))
+}
+
 /// Pushes one decoded frame to a watched member's present window. When the
 /// frame dims no longer fit the live window's spawn contract (the encoder
 /// rebuilt at new dims on quality-apply, which the helper rejects with
 /// "frame size != contracted" and then exits), the dead window is closed
 /// and a fresh one spawns through the same first-frame path — automatic
-/// recovery with no user action and no re-signaling. Dims only in
-/// diagnostics; never pixels, titles, or tokens.
+/// recovery with no user action and no re-signaling. When the window died
+/// at the SAME dims its helper is gone for good (user closed the window or
+/// it crashed): the watch ends right here — viewer, audio and signal —
+/// instead of decoding into the void forever. A wedged-but-present helper
+/// (timeouts, no peer-gone) takes the respawn path like a dims change.
+/// Dims only in diagnostics; never pixels, titles, or tokens.
 fn push_present_frame(
     state: &Arc<AppState>,
     watcher: &str,
@@ -906,6 +916,9 @@ fn push_present_frame(
     let (fw, fh) = (frame.w as u32, frame.h as u32);
     let mut dead: Option<crate::video::VideoWindow> = None;
     let mut push: Option<crate::video::FramePush> = None;
+    // Set when the helper is gone at unchanged dims: end the watch instead
+    // of feeding the void (or popping the window back open).
+    let mut window_closed = false;
     // Sequence reserved for the replacement window (also consumed by the
     // first-frame spawn, which logs nothing). 0 means "reusing".
     let mut spawn_seq: u64 = 0;
@@ -918,19 +931,70 @@ fn push_present_frame(
             return;
         }
         let contracted = inner.video_windows.get(watcher).map(|w| w.resolution());
+        // A dead window at unchanged dims means its helper exited (user
+        // closed it or it crashed) — anything else respawns around it.
+        let peer_gone = inner
+            .video_windows
+            .get(watcher)
+            .is_some_and(|w| !w.healthy() && w.peer_gone());
         if window_fits(contracted, fw, fh) {
-            push = inner.video_feeds.get(watcher).cloned();
+            if peer_gone {
+                window_closed = true;
+            } else {
+                push = inner.video_feeds.get(watcher).cloned();
+            }
         }
-        if push.is_none() {
-            // First frame, or the contract no longer fits: drop the stale
-            // entries here; the dead window stops outside the lock below
-            // (never join a feeder thread while holding state).
+        if window_closed {
+            // Forget the window entries now (a respawn here would pop the
+            // window back open against the user's close); flip liveness so
+            // in-flight frames drop instead of reopening. The spawned
+            // unwatch below finishes viewer/audio/signal teardown, unless a
+            // re-watch already replaced this session (then it stands down).
+            dead = inner.video_windows.remove(watcher);
+            inner.video_feeds.remove(watcher);
+            inner.video_seq.remove(watcher);
+            alive.store(false, std::sync::atomic::Ordering::Release);
+        }
+        if push.is_none() && !window_closed {
+            // First frame, wedged helper, or the contract no longer fits:
+            // drop the stale entries here; the dead window stops outside
+            // the lock below (never join a feeder thread while holding
+            // state).
             dead = inner.video_windows.remove(watcher);
             inner.video_feeds.remove(watcher);
             inner.video_seq.remove(watcher);
             spawn_seq = inner.next_video_seq;
             inner.next_video_seq += 1;
         }
+    }
+    if window_closed {
+        if let Some(mut dead) = dead {
+            dead.stop();
+        }
+        state.session_log(window_closed_line(watcher));
+        // The decode callback is sync: end the watch on a runtime task.
+        // No runtime in unit tests — entries are already forgotten and
+        // liveness flipped, which is all the routing asserts need.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let state = Arc::clone(state);
+            let watcher = watcher.to_owned();
+            handle.spawn(async move {
+                // Only the still-dying session belongs to us: absent
+                // (manual unwatch already tore everything down) or fresh
+                // (re-watch in between) must be left alone.
+                let dying = state.inner.lock().ok().map(|inner| {
+                    inner.viewers.get(&watcher).is_some_and(|session| {
+                        session.alive.as_ref().is_some_and(|flag| {
+                            !flag.load(std::sync::atomic::Ordering::Acquire)
+                        })
+                    })
+                });
+                if matches!(dying, Some(true)) {
+                    let _ = state.unwatch(&watcher).await;
+                }
+            });
+        }
+        return;
     }
     if let Some(mut dead) = dead {
         let (dw, dh) = dead.resolution();
@@ -1403,6 +1467,131 @@ mod present_respawn_tests {
             let inner = state.inner.lock().expect("state lock");
             assert!(!inner.video_seq.contains_key("watcher"), "close forgets the seq");
             assert!(!inner.video_seq.contains_key("other"), "close forgets the seq");
+        }
+    }
+
+    #[test]
+    fn closed_window_at_same_dims_ends_watch_without_respawn() {
+        // User closed the helper window (or it crashed) at unchanged dims:
+        // no respawn against the close, entries forgotten, liveness flipped
+        // so in-flight frames drop. Without a runtime the async unwatch
+        // teardown is skipped (covered by the async test below).
+        let state = Arc::new(AppState::new());
+        let presented = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let alive = std::sync::atomic::AtomicBool::new(true);
+        {
+            let mut inner = state.inner.lock().expect("state lock");
+            let (window, push) = crate::video::VideoWindow::spawn(
+                "watcher".to_owned(),
+                64,
+                36,
+                Arc::clone(&presented),
+            );
+            window.mark_unhealthy();
+            window.mark_peer_gone();
+            inner.video_windows.insert("watcher".to_owned(), window);
+            inner.video_feeds.insert("watcher".to_owned(), push);
+        }
+        push_present_frame(&state, "watcher", "watcher", &presented, frame(64, 36), &alive);
+        assert!(!alive.load(std::sync::atomic::Ordering::Acquire), "liveness flips");
+        {
+            let inner = state.inner.lock().expect("state lock");
+            assert!(!inner.video_windows.contains_key("watcher"), "window forgotten");
+            assert!(!inner.video_feeds.contains_key("watcher"), "feed forgotten");
+            assert!(!inner.video_seq.contains_key("watcher"), "seq forgotten");
+        }
+        // A racing in-flight frame must not pop the window back open.
+        push_present_frame(&state, "watcher", "watcher", &presented, frame(64, 36), &alive);
+        {
+            let inner = state.inner.lock().expect("state lock");
+            assert!(!inner.video_windows.contains_key("watcher"), "stays closed");
+        }
+    }
+
+    #[test]
+    fn wedged_window_at_same_dims_respawns_and_keeps_watch() {
+        // Helper wedged (timeouts, no peer-gone): same dims still respawn
+        // around it and the watch survives — only a confirmed exit ends it.
+        let state = Arc::new(AppState::new());
+        let presented = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let alive = std::sync::atomic::AtomicBool::new(true);
+        {
+            let mut inner = state.inner.lock().expect("state lock");
+            let (window, push) = crate::video::VideoWindow::spawn(
+                "watcher".to_owned(),
+                64,
+                36,
+                Arc::clone(&presented),
+            );
+            window.mark_unhealthy();
+            inner.video_windows.insert("watcher".to_owned(), window);
+            inner.video_feeds.insert("watcher".to_owned(), push);
+        }
+        push_present_frame(&state, "watcher", "watcher", &presented, frame(64, 36), &alive);
+        assert!(alive.load(std::sync::atomic::Ordering::Acquire), "watch survives");
+        {
+            let inner = state.inner.lock().expect("state lock");
+            let window = inner.video_windows.get("watcher").expect("respawned window");
+            assert_eq!(window.resolution(), (64, 36));
+            assert_eq!(window.pushed(), 1, "frame accepted by the fresh feed");
+        }
+        state.close_video_window("watcher");
+    }
+
+    #[test]
+    fn window_closed_line_carries_short_id_only() {
+        let line = window_closed_line("74e0d76a9f3c2d1b");
+        assert_eq!(line, "watch window closed member=74e0d76a");
+        for token in ["9f3c2d1b", "nick", "token", "sdp", "title"] {
+            assert!(!line.contains(token), "identity leak: {token}");
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_window_unwatches_the_member_end_to_end() {
+        // Full path on a runtime: dead window at same dims removes the
+        // watch session (viewer/audio/signal teardown via unwatch).
+        let state = Arc::new(AppState::new());
+        let presented = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        {
+            let mut inner = state.inner.lock().expect("state lock");
+            inner.viewers.insert(
+                "peer".into(),
+                crate::WatchSession {
+                    playback: None,
+                    fence: golive_core::owner::Fence::idle(),
+                    viewer: None,
+                    adopted: None,
+                    alive: Some(Arc::clone(&alive)),
+                    remote_ready: false,
+                    pending_remote: Vec::new(),
+                },
+            );
+            let (window, push) = crate::video::VideoWindow::spawn(
+                "peer".to_owned(),
+                64,
+                36,
+                Arc::clone(&presented),
+            );
+            window.mark_unhealthy();
+            window.mark_peer_gone();
+            inner.video_windows.insert("peer".to_owned(), window);
+            inner.video_feeds.insert("peer".to_owned(), push);
+        }
+        push_present_frame(&state, "peer", "peer", &presented, frame(64, 36), &alive);
+        // Let the spawned unwatch task run (operations mutex is free here).
+        for _ in 0..50 {
+            let gone = state.inner.lock().expect("state lock").viewers.is_empty();
+            if gone {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        {
+            let inner = state.inner.lock().expect("state lock");
+            assert!(!inner.viewers.contains_key("peer"), "watch session torn down");
+            assert!(!inner.video_windows.contains_key("peer"), "window forgotten");
         }
     }
 }
