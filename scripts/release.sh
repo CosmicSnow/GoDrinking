@@ -80,7 +80,7 @@ else
   # cargo-xwin chokes on inherited RUSTFLAGS containing spaces
   # ("flag in rustflags must not contain its separator"), so drop them
   # for this invocation only; nothing is installed or changed globally.
-  if ! (cd "$ROOT/app" && env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo xwin build --target x86_64-pc-windows-msvc --release --features tauri/custom-protocol --bin goDrinking); then
+  if ! (cd "$ROOT/app" && env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS -u CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS cargo xwin build --target x86_64-pc-windows-msvc --release --features tauri/custom-protocol --bin goDrinking); then
     echo "release: xwin build failed; requires cargo-xwin plus MSVC target deps (not installed automatically)" >&2
     exit 1
   fi
