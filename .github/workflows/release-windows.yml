@@ -57,6 +57,11 @@ jobs:
 
       - name: Build goDrinking.exe (portable, no bundling)
         working-directory: app
+        env:
+          # windows-latest ships CMake 4.x, which removed compatibility with
+          # cmake_minimum_required < 3.5 (see audiopus_sys's bundled opus).
+          # This is CMake's own documented workaround.
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: cargo build --release --features tauri/custom-protocol --bin goDrinking
 
       - name: Verify exe exists
