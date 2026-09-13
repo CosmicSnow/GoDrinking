@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { deliverPlayerFrame } from "./playerFrameDelivery";
 import { Channel, isTauri, playerAttach, playerDetach, playerAck, playerAudio, playerPopup, playerContext, onPlayerState, onPlayerEnded, type PlayerState } from "./api";
 
 export function parsePlayerFrame(buffer: ArrayBuffer) {
@@ -64,36 +65,32 @@ export function StreamPlayer({ member, nickname, pinned, popupWindow = false, on
   useEffect(() => {
     if (!isTauri()) return;
     let disposed = false;
-    let raf = 0;
     let frozenTimer: ReturnType<typeof setTimeout> | undefined;
     let unlisten: (() => void) | undefined;
     const token = crypto.randomUUID();
     const channel = new Channel<ArrayBuffer>();
     channel.onmessage = buffer => {
       if (disposed) return;
+      let frame: ReturnType<typeof parsePlayerFrame>;
+      try { frame = parsePlayerFrame(buffer); }
+      catch { setError("Frame de vídeo inválido. Reconecte o player."); return; }
       try {
-        const frame = parsePlayerFrame(buffer);
-        raf = requestAnimationFrame(() => {
-          if (disposed) return;
-          let drawn = false;
-          try {
-            const target = canvas.current;
-            const context = target?.getContext("2d");
-            if (target && context) {
-              if (target.width !== frame.width) target.width = frame.width;
-              if (target.height !== frame.height) target.height = frame.height;
-              context.putImageData(new ImageData(frame.pixels, frame.width, frame.height), 0, 0);
-              drawn = true;
-              setHasFrame(true);
-              setFrozen(false);
-              clearTimeout(frozenTimer);
-              frozenTimer = setTimeout(() => setFrozen(true), 1000);
-              setError(null);
-            }
-          } catch { setError("Não foi possível desenhar o vídeo."); }
+        deliverPlayerFrame(() => {
+          const target = canvas.current;
+          const context = target?.getContext("2d");
+          if (!target || !context) throw new Error("canvas unavailable");
+          if (target.width !== frame.width) target.width = frame.width;
+          if (target.height !== frame.height) target.height = frame.height;
+          context.putImageData(new ImageData(frame.pixels, frame.width, frame.height), 0, 0);
+          setHasFrame(true);
+          setFrozen(false);
+          clearTimeout(frozenTimer);
+          frozenTimer = setTimeout(() => setFrozen(true), 1000);
+          setError(null);
+        }, drawn => {
           void playerAck(member, token, frame.seq, drawn).catch(() => { if (!disposed) setError("Conexão com o player interrompida."); });
         });
-      } catch { setError("Frame de vídeo inválido. Reconecte o player."); }
+      } catch { setError("Não foi possível desenhar o vídeo."); }
     };
     void (async () => {
       try {
@@ -104,7 +101,7 @@ export function StreamPlayer({ member, nickname, pinned, popupWindow = false, on
         else await playerDetach(member, token);
       } catch (e) { if (!disposed) setError(String(e)); }
     })();
-    return () => { disposed = true; cancelAnimationFrame(raf); clearTimeout(frozenTimer); unlisten?.(); void playerDetach(member, token).catch(() => {}); };
+    return () => { disposed = true; clearTimeout(frozenTimer); unlisten?.(); void playerDetach(member, token).catch(() => {}); };
   }, [member, retry]);
   useEffect(() => {
     const el = viewport.current;

@@ -177,7 +177,7 @@ async function runHost(plan: E2ePlan, onReport: (r: E2eReport) => void): Promise
     // o MESMO intent da UI (api.setQuality) → geração efetiva bumpa e o
     // stream segue (o viewer prova continuidade do outro lado).
     // Diagnóstico temporário: registra as chaves exatas enviadas.
-    const qp = { w: 640, h: 360, bitrate_kbps: 1000, fps: 15 };
+    const qp = plan.quality ?? { w: 640, h: 360, bitrate_kbps: 1000, fps: 15 };
     report.detail = `sending set_quality keys: ${Object.keys(qp).join(",")}`;
     await emit();
     await setQuality(qp);

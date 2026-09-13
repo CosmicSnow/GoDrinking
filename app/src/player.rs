@@ -2,6 +2,7 @@
 //! player never replaces its WebRTC session. GLV1 remains the headless harness.
 use crate::AppState;
 use golive_core::media::PresentedFrame;
+use golive_core::trace::{Sample as TraceSample, Stage, Trace};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -41,6 +42,9 @@ pub(crate) struct Surface {
     seq: u32,
     pub presented: u64,
     pub stats: Mutex<crate::video::PresentStats>,
+    trace: Trace,
+    last_present: Option<Instant>,
+    replaced: u64,
 }
 impl Surface {
     fn new(member: &str, title: &str, mute_all: bool) -> Self {
@@ -60,9 +64,15 @@ impl Surface {
             seq: 0,
             presented: 0,
             stats: Mutex::new(crate::video::PresentStats::default()),
+            trace: Trace::new(Stage::Present),
+            last_present: None,
+            replaced: 0,
         }
     }
     fn offer(&mut self, frame: PresentedFrame) {
+        if self.dirty && self.latest.is_some() {
+            self.replaced += 1;
+        }
         self.latest = Some(Arc::new(frame));
         self.dirty = true;
     }
@@ -71,7 +81,18 @@ impl Surface {
         if sink.token != token || !sink.flight.is_some_and(|f| f.0 == seq) {
             return None;
         }
-        let (_, bytes, _) = sink.flight.take()?;
+        let (_, bytes, sent) = sink.flight.take()?;
+        let now = Instant::now();
+        let gap = if drawn {
+            self.last_present.replace(now).map(|last| now.duration_since(last).as_micros() as u64).unwrap_or(0)
+        } else { 0 };
+        self.trace.record(TraceSample {
+            frames: drawn as u64,
+            bytes: if drawn { bytes } else { 0 },
+            dropped: std::mem::take(&mut self.replaced) + (!drawn) as u64,
+            max_gap_us: gap,
+            ..Default::default()
+        }, Some(sent));
         if drawn {
             self.presented += 1;
             if let Ok(mut stats) = self.stats.lock() {

@@ -200,7 +200,7 @@ mod tests {
     fn normal_launch_marker_enables_trace_without_environment() {
         let dir = std::env::temp_dir().join(format!("golive-trace-marker-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let executable = dir.join("golive-app");
+        let executable = dir.join("goDrinking");
         assert_eq!(trace_directory(None, Some(&executable)), None);
         std::fs::write(dir.join(".golive-media-trace"), b"").unwrap();
         let output = trace_directory(None, Some(&executable)).expect("normal launch enabled");

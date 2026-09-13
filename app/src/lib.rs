@@ -285,6 +285,9 @@ pub struct E2ePlan {
     /// working unchanged (absent == synthetic). The viewer ignores it.
     #[serde(default)]
     pub share: Option<String>,
+    /// Optional quality for the mid-share E2E check; absent preserves 360p15.
+    #[serde(default)]
+    pub quality: Option<QualityProfile>,
 }
 
 impl E2ePlan {
@@ -322,6 +325,9 @@ impl E2ePlan {
             // so a typo here must fail at plan parse, not mid-run.
             ShareSource::parse(share)
                 .map_err(|e| format!("e2e plan field 'share': {e}"))?;
+        }
+        if let Some(quality) = plan.quality {
+            quality.validate().map_err(|e| format!("e2e quality: {e}"))?;
         }
         Ok(Some(plan))
     }
@@ -1881,7 +1887,7 @@ mod e2e_plan_tests {
     use super::*;
 
     fn args(extra: &[&str]) -> impl Iterator<Item = String> {
-        let mut v = vec!["golive-app".to_owned()];
+        let mut v = vec!["goDrinking".to_owned()];
         v.extend(extra.iter().map(|s| s.to_string()));
         v.into_iter()
     }
@@ -1905,6 +1911,17 @@ mod e2e_plan_tests {
             .unwrap()
             .unwrap();
         assert_eq!(plan.role, "viewer");
+    }
+
+    #[test]
+    fn e2e_quality_is_optional_and_validated() {
+        let mut raw: serde_json::Value = serde_json::from_str(PLAN).unwrap();
+        assert_eq!(E2ePlan::from_args(args(&["--e2e-plan", PLAN])).unwrap().unwrap().quality, None);
+        raw["quality"] = serde_json::json!({"w":1920,"h":1080,"bitrate_kbps":6000,"fps":60});
+        let encoded = raw.to_string();
+        assert_eq!(E2ePlan::from_args(args(&["--e2e-plan", &encoded])).unwrap().unwrap().quality.unwrap().fps, 60);
+        raw["quality"]["fps"] = serde_json::json!(0);
+        assert!(E2ePlan::from_args(args(&["--e2e-plan", &raw.to_string()])).is_err());
     }
 
     #[test]

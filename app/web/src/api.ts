@@ -365,6 +365,7 @@ export interface E2ePlan {
   status_file: string;
   /** Fonte do share ("synthetic" quando ausente; "movie:<path>" | "display:<id>"). */
   share?: string;
+  quality?: QualityProfile;
 }
 
 /** Devolve o plano ativo ou null (app normal). */

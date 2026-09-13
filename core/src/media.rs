@@ -2254,6 +2254,53 @@ async fn audio_read_loop(
     }
 }
 
+/// Timestamp fallback for peers without markers; marked units can be released
+/// without waiting for a future picture (RFC 6184 section 5.1).
+#[derive(Default)]
+struct VideoAssembly {
+    unit: Vec<u8>,
+    timestamp: Option<u32>,
+    released: bool,
+}
+
+impl VideoAssembly {
+    fn take(&mut self) -> Option<(u32, Vec<u8>)> {
+        if self.unit.is_empty() {
+            return None;
+        }
+        self.released = true;
+        Some((self.timestamp?, std::mem::take(&mut self.unit)))
+    }
+
+    fn begin(&mut self, timestamp: u32) -> Option<(u32, Vec<u8>)> {
+        let previous = if self.timestamp.is_some_and(|old| old != timestamp) {
+            self.take()
+        } else {
+            None
+        };
+        if self.timestamp != Some(timestamp) {
+            self.released = false;
+        }
+        self.timestamp = Some(timestamp);
+        previous
+    }
+
+    fn append(&mut self, bytes: &[u8], marker: bool) -> Option<(u32, Vec<u8>)> {
+        if self.released {
+            return None;
+        }
+        self.unit.extend_from_slice(bytes);
+        if marker { self.take() } else { None }
+    }
+
+    fn recycle(&mut self, mut bytes: Vec<u8>) {
+        if self.unit.is_empty() && bytes.capacity() > self.unit.capacity() {
+            bytes.clear();
+            self.unit = bytes;
+        }
+    }
+}
+
 /// Track read loop: depacketize, assemble access units per RTP timestamp,
 /// decode once, then validate + emit + present the same picture. On an
 /// irrecoverable AU gap (the depacketize error path) asks the publisher for
@@ -2277,8 +2324,7 @@ async fn read_loop(
     };
     let mut validator = FrameValidator::new();
     let mut stats = MediaStats::default();
-    let mut unit = Vec::<u8>::new();
-    let mut unit_ts: Option<u32> = None;
+    let mut assembly = VideoAssembly::default();
     let mut last_decoded_ts: Option<u32> = None;
     let mut last_pli: HashMap<u32, Instant> = HashMap::new();
     let mut rtp_trace = Trace::new(Stage::Rtp);
@@ -2290,9 +2336,20 @@ async fn read_loop(
         };
         let ts = packet.header.timestamp;
         rtp_trace.record(TraceSample { frames: 1, bytes: packet.payload.len() as u64, ..Default::default() }, None);
-        // Access-unit boundary: timestamp rollover flushes the previous unit.
-        if unit_ts.map(|t| t != ts).unwrap_or(false) && !unit.is_empty() {
-            let completed_ts = unit_ts.expect("guarded by the map above");
+        let previous = assembly.begin(ts);
+        let current = match depacketizer.depacketize(&packet.payload) {
+            Ok(bytes) => assembly.append(&bytes, packet.header.marker),
+            Err(_) => {
+                let sent = maybe_send_pli(pc, &mut last_pli, packet.header.ssrc).await;
+                decode_trace.record(TraceSample {
+                    pli_sent: sent as u64,
+                    pli_suppressed: (!sent) as u64,
+                    ..Default::default()
+                }, None);
+                None
+            }
+        };
+        for (completed_ts, unit) in [previous, current].into_iter().flatten() {
             if au_is_stale(last_decoded_ts, completed_ts) {
                 // Late pre-switch duplicate: decoding it would move
                 // presentation backwards in time. Count it in the existing
@@ -2303,7 +2360,6 @@ async fn read_loop(
                     bytes: unit.len() as u64,
                     ..Default::default()
                 }, None);
-                unit.clear();
             } else {
                 let started = decode_trace.start();
                 let decoded = decode_unit(&mut decoder, &unit, event_tx);
@@ -2344,25 +2400,8 @@ async fn read_loop(
                         ..Default::default()
                     }, None);
                 }
-                unit.clear();
             } // end non-stale branch
-        }
-        unit_ts = Some(ts);
-        match depacketizer.depacketize(&packet.payload) {
-            Ok(bytes) if !bytes.is_empty() => unit.extend_from_slice(&bytes),
-            Ok(_) => {}
-            Err(_) => {
-                // Irrecoverable AU gap: the unit being assembled can never
-                // decode cleanly — ask for an IDR (debounced inside). Trace
-                // sent vs suppressed so gap storms stay visible as numbers.
-                let sent = maybe_send_pli(pc, &mut last_pli, packet.header.ssrc).await;
-                decode_trace.record(TraceSample {
-                    pli_sent: sent as u64,
-                    pli_suppressed: (!sent) as u64,
-                    ..Default::default()
-                }, None);
-                continue;
-            }
+            assembly.recycle(unit);
         }
     }
 }
@@ -2762,6 +2801,44 @@ mod tests {
             }
         }
         assert!(saw_idr, "first access unit carries an IDR");
+    }
+
+    #[test]
+    fn viewer_releases_marked_picture_without_next_timestamp() {
+        use webrtc::rtp::codecs::h264::H264Payloader;
+        use webrtc::rtp::packetizer::Payloader;
+        let mut encoder = H264Encoder::new(Quality::P720).unwrap();
+        let encoded = encoder.encode(&synthetic_frame(1280, 720, 0)).unwrap();
+        let packets = H264Payloader::default().payload(500, &Bytes::from(encoded)).unwrap();
+        assert!(packets.len() > 2, "exercise fragmented IDR and parameter sets");
+        let mut depacketizer = H264Packet::default();
+        let mut assembly = VideoAssembly::default();
+        let mut picture = None;
+        for (i, payload) in packets.iter().enumerate() {
+            assert!(assembly.begin(9000).is_none());
+            let bytes = depacketizer.depacketize(payload).unwrap();
+            let completed = assembly.append(&bytes, i + 1 == packets.len());
+            if i + 1 < packets.len() { assert!(completed.is_none()); }
+            if completed.is_some() { picture = completed; }
+        }
+        let (timestamp, bytes) = picture.expect("last RTP packet must release the picture while the source is idle");
+        assert_eq!(timestamp, 9000);
+        assert!(assembly.begin(9000).is_none());
+        assert!(assembly.append(&bytes, true).is_none(), "duplicate marker cannot replay a picture");
+        let picture = H264Decoder::new().unwrap().decode(&bytes).unwrap().unwrap();
+        assert_eq!((picture.frame.w, picture.frame.h), (1280, 720));
+        assert!(assembly.begin(12000).is_none(), "marked picture cannot replay on rollover");
+    }
+
+    #[test]
+    fn viewer_keeps_timestamp_fallback_without_marker() {
+        let mut assembly = VideoAssembly::default();
+        assert!(assembly.begin(u32::MAX - 100).is_none());
+        assert!(assembly.append(&[1, 2, 3], false).is_none());
+        assert!(assembly.begin(u32::MAX - 100).is_none());
+        assert!(assembly.append(&[4, 5], false).is_none());
+        assert_eq!(assembly.begin(200), Some((u32::MAX - 100, vec![1, 2, 3, 4, 5])));
+        assert!(assembly.begin(300).is_none());
     }
 
     #[test]
@@ -3369,11 +3446,7 @@ mod tests {
         // new_auto decodes. Pictures arrive at encode dims, non-black.
         let _guard = HW_ENV_LOCK.lock().expect("hw lock");
         let profile = QualityProfile::custom(640, 360, 2000, 30).expect("profile");
-        let engine = if crate::mfdec::probe_hardware().is_ok() {
-            EngineKind::Hardware
-        } else {
-            EngineKind::Software
-        };
+        let engine = EngineKind::Auto;
         // Demanded hardware may still refuse odd sizes: fall back to
         // software for the ENCODE side (the decode side under test is what
         // matters here).
@@ -3403,6 +3476,7 @@ mod tests {
             }
         }
         assert!(pictures >= 2, "roundtrip yields pictures (saw {pictures})");
+        #[cfg(target_os = "windows")]
         if crate::mfdec::probe_hardware().is_ok() {
             assert_ne!(
                 dec.backend_name(),

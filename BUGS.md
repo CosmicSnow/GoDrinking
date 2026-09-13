@@ -61,3 +61,23 @@ como BUG-003 (linha da tabela). NOTA: todos os fixes citados nesta
 validação estão NÃO-COMMITADOS na árvore (~15 arquivos) — necessário
 commit antes de distribuir builds (o branch `fresh/native-core` do amigo
 não os contém).
+
+
+Validação viewer (2026-09-12): trace Windows controlado confirma envio ~59,4 FPS
+em 1080p60 e decode Mac ~59,1 FPS; não há teto fixo de 24/30 FPS nesse cenário.
+Viewer remoto ainda tem picos decode/conversão até 122,6 ms. Removida a espera
+extra de requestAnimationFrame antes do desenho/ack no player compartilhado;
+trace `present` agora cobre o canvas. E2E local release após alteração:
+60,006 FPS decoded/drawn, 0 descartes na janela, gap máximo 40,867 ms;
+96 testes web e 106 app-lib passaram. Correção completa NÃO verificada:
+faltam Windows viewer e nova sessão real, e o ajuste de agendamento não elimina
+por si só os picos de decode. Evidências em `DIAGNOSTICO-video-2026-09-12.md`
+e `e2e-artifacts/cadence-after/`.
+
+Revisão adicional (2026-09-12): viewer libera AU no marker RTP, preserva fallback
+por timestamp e recicla o buffer. Teste de IDR fragmentado sem próximo quadro
+falhou antes/passou depois; 88 testes core + E2E dois peers passaram. Bundle
+local: 60,011 FPS apresentados, gap máximo 28,215 ms. BUG-001 segue aberto:
+Windows/sessão remota não revalidados; CPU/IPC do viewer, FrameSlot substituindo
+H.264 sem contabilizar perdas, encode/captura por watcher e readback WGC antes
+do gate permanecem pendentes. Ver `REVISAO-performance-2026-09-12.md`.

@@ -10,10 +10,10 @@ described below. An explicitly empty `GOLIVE_TRACE_DIR` disables tracing.
 
 If launching through a shell produces a Screen Recording denial while
 opening the executable normally works, use the normal launch method:
-place an empty file named `.golive-media-trace` beside `golive-app` (or
-`golive-app.exe`), then reopen the apps normally. No environment variable
+place an empty file named `.golive-media-trace` beside `goDrinking` (or
+`goDrinking.exe`), then reopen the apps normally. No environment variable
 or bash launcher is needed. Each process writes its own JSONL file in the
-adjacent `media-trace/` directory. For `app/target/debug/golive-app`, that
+adjacent `media-trace/` directory. For `app/target/debug/goDrinking`, that
 is `app/target/debug/media-trace/`.
 
 Remove the marker and restart the apps to disable tracing. Use this method
@@ -38,7 +38,7 @@ Windows PowerShell, next to the newly built exes:
 
 ```powershell
 $env:GOLIVE_TRACE_DIR = Join-Path $PWD 'media-trace'
-& .\golive-app.exe
+& .\goDrinking.exe
 ```
 
 Launch normally without the variable to disable tracing again. Stop the
@@ -115,3 +115,36 @@ GOLIVE_MOVIE="$PWD/../e2e-artifacts/motion-repro.h264" cargo test --manifest-pat
 Requires FFmpeg and Node on PATH. The movie test asserts at least 125 fresh
 decoded frames over five seconds after startup, for a 30 FPS source. It does
 not verify native capture, helper rendering, 60 FPS, or a remote Windows peer.
+
+
+## Current WebView player cadence
+
+The desktop canvas now emits `present` records too. One valid player ack
+counts a completed canvas draw (not a measurement of physical scan-out).
+`work_us` spans dispatch to ack, including IPC and the draw; `max_gap_us`
+is the largest gap between successful draw acknowledgements. `dropped`
+counts pending decoded frames superseded before dispatch plus failed draw
+acks. `repeats` remains zero; a cached image transferred into a popup can
+still count as a draw. The helper and WebView use separate stage instances.
+
+The canvas updates when a decoded frame arrives and acks that draw directly.
+It does not wait for an extra requestAnimationFrame tick in the one-frame
+IPC round trip. The browser compositor still controls screen refresh.
+
+A local end-to-end cadence check exercises the real Tauri Channel and canvas,
+using `--e2e-plan` with optional `quality` (ordinary app behavior unaffected):
+
+```sh
+python3 scripts/check-viewer-cadence.py --artifact e2e-artifacts/cadence-check
+```
+
+Requires a release executable built after `npm run build` and the fixture
+`e2e-artifacts/live-20260912-viewer/motion-1080p60.h264` (or pass `--movie`).
+Generate a fixture with FFmpeg `testsrc2=size=1920x1080:rate=60`, one second,
+H.264 baseline, `slices=1`; the test loops its frames at the explicit profile.
+Pass `--binary` and optionally `--viewer-binary` for other executable locations.
+Keep the viewer visible. The check uses only a loopback test room, measures
+30 seconds after warmup, and stops its own processes. It requires >=54 FPS
+both decoded and drawn, and <=50 ms worst ack gap. This is a performance
+check sensitive to host load/display scheduling, not a deterministic unit test.
+It does not establish Windows native performance when executed on macOS.
