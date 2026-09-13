@@ -885,34 +885,63 @@ fn level_for(w: usize, h: usize) -> Level {
     }
 }
 
-/// Latest-only unit slot between the encode thread and the RTP pump: at
-/// most ONE access unit is ever queued. Publishing replaces stale; taking
-/// consumes. Under congestion the viewer gets the freshest decodable unit
-/// (gaps are packet-loss-shaped, which the decoder already survives) and
-/// the encoder never blocks on a slow peer — the anti-jank root fix.
+/// Bounded unit slot between the encode thread and the RTP pump: at most ONE
+/// access unit is queued. The producer waits for capacity before encoding, so
+/// an already encoded unit is never replaced and shutdown remains bounded.
 /// An empty unit is the poison pill (encoders never emit empty units).
 #[derive(Debug, Default)]
 struct FrameSlot {
-    slot: std::sync::Mutex<Option<(Vec<u8>, Duration)>>,
+    state: std::sync::Mutex<FrameSlotState>,
+    capacity: std::sync::Condvar,
     notify: tokio::sync::Notify,
 }
 
+#[derive(Debug, Default)]
+struct FrameSlotState {
+    item: Option<(Vec<u8>, Duration)>,
+    closed: bool,
+}
+
 impl FrameSlot {
-    fn publish(&self, unit: Vec<u8>, duration: Duration) {
-        *self.slot.lock().expect("frame slot poisoned") = Some((unit, duration));
+    fn wait_for_capacity(&self, stop: &AtomicBool) -> bool {
+        let mut state = self.state.lock().expect("frame slot poisoned");
+        while state.item.is_some() && !state.closed && !stop.load(Ordering::Acquire) {
+            state = self.capacity.wait_timeout(state, Duration::from_millis(50)).expect("frame slot poisoned").0;
+        }
+        !state.closed && !stop.load(Ordering::Acquire)
+    }
+
+    fn publish(&self, unit: Vec<u8>, duration: Duration) -> bool {
+        let mut state = self.state.lock().expect("frame slot poisoned");
+        if state.closed || state.item.is_some() {
+            return false;
+        }
+        state.item = Some((unit, duration));
         self.notify.notify_one();
+        true
     }
 
     fn poison(&self) {
-        *self.slot.lock().expect("frame slot poisoned") = Some((Vec::new(), Duration::ZERO));
+        let mut state = self.state.lock().expect("frame slot poisoned");
+        state.closed = true;
+        self.capacity.notify_all();
         self.notify.notify_one();
     }
 
     async fn take(&self) -> (Vec<u8>, Duration) {
         loop {
-            if let Some(item) = self.slot.lock().expect("frame slot poisoned").take() {
-                return item;
-            }
+            let result = {
+                let mut state = self.state.lock().expect("frame slot poisoned");
+                if let Some(item) = state.item.take() {
+                    self.capacity.notify_one();
+                    Some(item)
+                } else if state.closed {
+                    Some((Vec::new(), Duration::ZERO))
+                } else {
+                    None
+                }
+            };
+            if let Some(item) = result { return item; }
             self.notify.notified().await;
         }
     }
@@ -938,14 +967,21 @@ pub struct DecodedStats {
     pub is_keyframe: bool,
 }
 
-/// One decoded picture ready to present. RGBA, row-major, `w*h*4` bytes.
+/// Pixel layout carried to a presenter. YUV uses BT.601 limited range,
+/// matching the existing software conversion. Planes are tightly packed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum PixelFormat { Rgba = 0, I420 = 1, Nv12 = 2 }
+
+/// One decoded picture ready to present.
 /// Carried by value through the present callback (owned per frame; the shell
 /// drops stale ones instead of queuing).
 #[derive(Clone, Debug)]
 pub struct PresentedFrame {
     pub w: usize,
     pub h: usize,
-    pub rgba: Vec<u8>,
+    pub data: Vec<u8>,
+    pub format: PixelFormat,
 }
 
 /// Stats plus pixels from a single decode. One decode feeds validation,
@@ -998,65 +1034,86 @@ impl H264Decoder {
     }
 
     pub fn decode(&mut self, annexb: &[u8]) -> Result<Option<DecodedPicture>, MediaError> {
-        let is_keyframe = annexb_nals(annexb)
-            .iter()
-            .any(|range| nal_type(&annexb[range.clone()]) == Some(5));
+        self.decode_for_present(annexb, false)
+    }
+
+    pub fn decode_for_present(&mut self, annexb: &[u8], compact: bool) -> Result<Option<DecodedPicture>, MediaError> {
+        self.decode_measured(annexb, compact, None)
+    }
+
+    fn decode_measured(&mut self, annexb: &[u8], compact: bool, mut measurements: Option<&mut DecodeMeasurements>) -> Result<Option<DecodedPicture>, MediaError> {
+        let is_keyframe = contains_idr(annexb);
+        let started = measurements.as_ref().map(|_| Instant::now());
         match self {
-            Self::Software { dec } => match dec
-                .decode(annexb)
-                .map_err(|e| MediaError::Codec(format!("decode: {e}")))?
-            {
-                Some(yuv) => {
-                    let [slice] = yuv.split::<1>();
-                    let y = slice.y();
-                    let (w, h) = slice.dimensions();
-                    if y.is_empty() {
-                        return Ok(None);
+            Self::Software { dec } => {
+                let decoded = dec.decode(annexb).map_err(|e| MediaError::Codec(format!("decode: {e}")))?;
+                if let Some(m) = measurements.as_deref_mut() { m.codec_us = elapsed_us(started); }
+                let Some(yuv) = decoded else { return Ok(None) };
+                let started = measurements.as_ref().map(|_| Instant::now());
+                let (w, h) = yuv.dimensions();
+                let strides = yuv.strides();
+                if w == 0 || h == 0 { return Ok(None); }
+                // Ignore decoder row padding both in the pixels and the luma statistic.
+                let sum: u64 = yuv.y().chunks(strides.0).take(h)
+                    .flat_map(|row| row[..w].iter()).map(|b| *b as u64).sum();
+                let (data, format) = if compact && w % 2 == 0 && h % 2 == 0 {
+                    let mut data = Vec::with_capacity(w * h * 3 / 2);
+                    for (plane, stride, width, height) in [
+                        (yuv.y(), strides.0, w, h),
+                        (yuv.u(), strides.1, w / 2, h / 2),
+                        (yuv.v(), strides.2, w / 2, h / 2),
+                    ] {
+                        for row in plane.chunks(stride).take(height) { data.extend_from_slice(&row[..width]); }
                     }
-                    let sum: u64 = y.iter().map(|b| *b as u64).sum();
-                    let mut rgba = vec![0u8; w * h * 4];
-                    yuv.write_rgba8(&mut rgba);
-                    Ok(Some(DecodedPicture {
-                        stats: DecodedStats {
-                            w,
-                            h,
-                            luma_mean: sum as f64 / y.len() as f64,
-                            is_keyframe,
-                        },
-                        frame: PresentedFrame { w, h, rgba },
-                    }))
-                }
-                None => Ok(None),
-            },
+                    (data, PixelFormat::I420)
+                } else {
+                    let mut data = vec![0; w * h * 4];
+                    yuv.write_rgba8(&mut data);
+                    (data, PixelFormat::Rgba)
+                };
+                if let Some(m) = measurements { m.convert_us = elapsed_us(started); }
+                Ok(Some(DecodedPicture {
+                    stats: DecodedStats { w, h, luma_mean: sum as f64 / (w * h) as f64, is_keyframe },
+                    frame: PresentedFrame { w, h, data, format },
+                }))
+            }
             #[cfg(target_os = "windows")]
-            Self::Hardware(hw) => match hw.decode_annexb(annexb) {
-                Ok(None) => Ok(None),
-                Ok(Some(pic)) => {
-                    let sum: u64 =
-                        pic.nv12[..pic.w * pic.h].iter().map(|b| *b as u64).sum();
-                    let (w, h) = (pic.w, pic.h);
-                    let rgba = crate::mfdec::nv12_to_rgba(w, h, &pic.nv12)
-                        .ok_or_else(|| MediaError::Codec("hw decode dims invalid".into()))?;
-                    Ok(Some(DecodedPicture {
-                        stats: DecodedStats {
-                            w,
-                            h,
-                            luma_mean: sum as f64 / (w * h) as f64,
-                            is_keyframe,
-                        },
-                        frame: PresentedFrame { w, h, rgba },
-                    }))
+            Self::Hardware(hw) => {
+                let decoded = hw.decode_annexb(annexb);
+                if let Some(m) = measurements.as_deref_mut() { m.codec_us = elapsed_us(started); }
+                match decoded {
+                    Ok(None) => Ok(None),
+                    Ok(Some(pic)) => {
+                        let started = measurements.as_ref().map(|_| Instant::now());
+                        let (w, h) = (pic.w, pic.h);
+                        let sum: u64 = pic.nv12[..w * h].iter().map(|b| *b as u64).sum();
+                        let (data, format) = if compact {
+                            (pic.nv12, PixelFormat::Nv12)
+                        } else {
+                            (crate::mfdec::nv12_to_rgba(w, h, &pic.nv12)
+                                .ok_or_else(|| MediaError::Codec("hw decode dims invalid".into()))?, PixelFormat::Rgba)
+                        };
+                        if let Some(m) = measurements { m.convert_us = elapsed_us(started); }
+                        Ok(Some(DecodedPicture {
+                            stats: DecodedStats { w, h, luma_mean: sum as f64 / (w * h) as f64, is_keyframe },
+                            frame: PresentedFrame { w, h, data, format },
+                        }))
+                    }
+                    Err(_) => {
+                        *self = Self::new()?;
+                        self.decode_measured(annexb, compact, measurements)
+                    }
                 }
-                Err(_) => {
-                    // Transparent permanent fallback: rebuild as software
-                    // and decode this same unit with it. One bad unit can
-                    // still fail loudly below — errors stay typed.
-                    *self = Self::new()?;
-                    self.decode(annexb)
-                }
-            },
+            }
         }
     }
+
+}
+
+#[derive(Default)]
+struct DecodeMeasurements { codec_us: u64, convert_us: u64 }
+fn elapsed_us(started: Option<Instant>) -> u64 {
+    started.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0)
 }
 
 /// Luma validator: non-black + motion against the previous frame.
@@ -1242,24 +1299,25 @@ async fn maybe_send_pli(
 // crate to every watcher — encode once, fanout free)
 // ---------------------------------------------------------------------------
 
+struct SharedEncoder {
+    track: Arc<TrackLocalStaticSample>,
+    encode_stop: Arc<AtomicBool>,
+    encode_thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    reconfig_tx: std::sync::mpsc::Sender<QualityProfile>,
+    slot: Arc<FrameSlot>,
+    backend: Arc<std::sync::Mutex<Option<&'static str>>>,
+    intra_requested: Arc<AtomicBool>,
+    listeners: Arc<std::sync::Mutex<HashMap<u64, mpsc::UnboundedSender<MediaEvent>>>>,
+    next_listener: std::sync::atomic::AtomicU64,
+}
+
 pub struct Publisher {
     pc: Arc<RTCPeerConnection>,
     event_tx: mpsc::UnboundedSender<MediaEvent>,
-    encode_stop: Arc<AtomicBool>,
-    encode_thread: Option<std::thread::JoinHandle<()>>,
+    shared: Arc<SharedEncoder>,
+    listener: u64,
     stopped: Arc<AtomicBool>,
-    reconfig_tx: Option<std::sync::mpsc::Sender<QualityProfile>>,
-    slot: Arc<FrameSlot>,
-    /// Live encoder backend (`None` until the encode thread builds it).
-    /// Written on every build/rebuild; read for counters/diagnostics.
-    backend: Arc<std::sync::Mutex<Option<&'static str>>>,
-    /// PLI/FIR recovery task handle (aborted in `stop()`). The flag it sets
-    /// is owned by the encode thread + the task itself — this handle is the
-    /// only publisher-side state the recovery needs.
     rtcp_task: Option<tokio::task::JoinHandle<()>>,
-    /// Shared with the encode thread and the RTCP task. `request_keyframe`
-    /// arms it so a late watcher can recover the startup IDR it missed.
-    intra_requested: Arc<AtomicBool>,
 }
 
 impl Publisher {
@@ -1356,8 +1414,7 @@ impl Publisher {
         }
         wire_ice_events(&pc, &event_tx, &census);
 
-        // Encode on a blocking thread; latest-only slot into tokio (see
-        // FrameSlot: at most one unit queued, stale replaced, never block).
+        // Encode on a blocking thread; bounded slot into tokio (see FrameSlot).
         // `intra_requested` bridges the async RTCP task (PLI/FIR in) to the
         // encode thread (`force_intra()` out).
         let slot = Arc::new(FrameSlot::default());
@@ -1365,9 +1422,22 @@ impl Publisher {
         let intra_requested = Arc::new(AtomicBool::new(false));
         let (reconfig_tx, reconfig_rx) = std::sync::mpsc::channel::<QualityProfile>();
         let encode_stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let listeners = Arc::new(std::sync::Mutex::new(HashMap::from([(0, event_tx.clone())])));
+        let (encode_events, mut encode_event_rx) = mpsc::unbounded_channel::<MediaEvent>();
+        {
+            let listeners = Arc::clone(&listeners);
+            tokio::spawn(async move {
+                while let Some(event) = encode_event_rx.recv().await {
+                    if let Ok(listeners) = listeners.lock() {
+                        for tx in listeners.values() { let _ = tx.send(event.clone()); }
+                    }
+                }
+            });
+        }
         let encode_thread = {
             let stop = Arc::clone(&encode_stop);
-            let event_tx = event_tx.clone();
+            let event_tx = encode_events;
             let slot = Arc::clone(&slot);
             let backend = Arc::clone(&backend);
             let census = Arc::clone(&census);
@@ -1380,7 +1450,7 @@ impl Publisher {
                 .map_err(|e| MediaError::Codec(format!("encode thread: {e}")))?
         };
         if let Some((audio_track, audio_rx)) = audio_pair {
-            let stop = Arc::clone(&encode_stop);
+            let stop = Arc::clone(&stopped);
             let runtime = tokio::runtime::Handle::current();
             tokio::task::spawn_blocking(move || {
                 while !stop.load(Ordering::Acquire) {
@@ -1404,6 +1474,7 @@ impl Publisher {
         // the live profile (reconfig may change fps mid-share).
         {
             let slot = Arc::clone(&slot);
+            let track = Arc::clone(&track);
             tokio::spawn(async move {
                 let mut trace = Trace::new(Stage::Send);
                 loop {
@@ -1427,9 +1498,9 @@ impl Publisher {
                         errors: result.is_err() as u64,
                         ..Default::default()
                     }, started);
-                    if result.is_err() {
-                        break;
-                    }
+                    // A closing binding must not stop the other peers. WebRTC
+                    // writes all bindings before returning aggregate errors.
+                    // The producer's poison pill ends the source explicitly.
                 }
             });
         }
@@ -1460,29 +1531,71 @@ impl Publisher {
         };
 
         Ok(Self {
-            pc,
-            event_tx,
-            encode_stop,
-            encode_thread: Some(encode_thread),
-            stopped: Arc::new(AtomicBool::new(false)),
-            reconfig_tx: Some(reconfig_tx),
-            slot,
-            backend,
-            rtcp_task: Some(rtcp_task),
-            intra_requested,
+            pc, event_tx, stopped, listener: 0, rtcp_task: Some(rtcp_task),
+            shared: Arc::new(SharedEncoder {
+                track, encode_stop, encode_thread: std::sync::Mutex::new(Some(encode_thread)),
+                reconfig_tx, slot, backend, intra_requested, listeners,
+                next_listener: std::sync::atomic::AtomicU64::new(1),
+            }),
         })
     }
 
+    /// Independent WebRTC/ICE/audio connection using the same captured and
+    /// encoded video. No additional capture receiver or encoder is created.
+    pub async fn fork(
+        &self,
+        ice_servers: Option<Vec<String>>,
+        event_tx: mpsc::UnboundedSender<MediaEvent>,
+        audio_rx: Option<std::sync::mpsc::Receiver<EncodedAudioPacket>>,
+    ) -> Result<Self, MediaError> {
+        if self.stopped.load(Ordering::Acquire) || self.shared.encode_stop.load(Ordering::Acquire) {
+            return Err(MediaError::Closed);
+        }
+        let pc = Arc::new(build_api()?.new_peer_connection(rtc_config(ice_servers)).await
+            .map_err(|e| MediaError::Transport(format!("pc: {e}")))?);
+        let sender = pc.add_track(self.shared.track.clone()).await
+            .map_err(|e| MediaError::Transport(format!("add_track: {e}")))?;
+        let stopped = Arc::new(AtomicBool::new(false));
+        if let Some(audio_rx) = audio_rx {
+            let track = Arc::new(TrackLocalStaticSample::new(opus_codec(), "audio".into(), "golive".into()));
+            pc.add_track(track.clone()).await.map_err(|e| MediaError::Transport(format!("add_audio_track: {e}")))?;
+            let stop = stopped.clone();
+            let runtime = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let Ok(packet) = audio_rx.recv_timeout(Duration::from_millis(20)) else { continue };
+                    let sample = Sample { data: Bytes::from(packet.data), duration: packet.duration, ..Default::default() };
+                    let _ = runtime.block_on(track.write_sample(&sample));
+                }
+            });
+        }
+        for transceiver in pc.get_transceivers().await {
+            transceiver.set_direction(RTCRtpTransceiverDirection::Sendonly).await;
+        }
+        wire_ice_events(&pc, &event_tx, &Arc::new(std::sync::Mutex::new(CandidateCensus::default())));
+        let intra = self.shared.intra_requested.clone();
+        let rtcp_task = tokio::spawn(async move {
+            while let Ok((packets, _)) = sender.read_rtcp().await {
+                if packets.iter().any(|packet| packet.as_any().is::<PictureLossIndication>() || packet.as_any().is::<FullIntraRequest>()) {
+                    intra.store(true, Ordering::Release);
+                }
+            }
+        });
+        let listener = self.shared.next_listener.fetch_add(1, Ordering::Relaxed);
+        self.shared.listeners.lock().unwrap().insert(listener, event_tx.clone());
+        Ok(Self { pc, event_tx, stopped, listener, shared: self.shared.clone(), rtcp_task: Some(rtcp_task) })
+    }
+
     /// Next encoded unit starts with an IDR. Used when a watcher joins after
-    /// the startup keyframe has already left the latest-only slot.
+    /// the startup keyframe has already left the output slot.
     pub fn request_keyframe(&self) {
-        self.intra_requested.store(true, Ordering::Release);
+        self.shared.intra_requested.store(true, Ordering::Release);
     }
 
     /// Live encoder backend for counters/diagnostics (`None` until the
     /// encode thread finishes its first build). Non-blocking read.
     pub fn backend(&self) -> Option<&'static str> {
-        self.backend.lock().ok().and_then(|guard| *guard)
+        self.shared.backend.lock().ok().and_then(|guard| *guard)
     }
 
     /// Transactional reconfig without re-signaling: validates first (typed
@@ -1493,10 +1606,8 @@ impl Publisher {
         profile
             .validate()
             .map_err(|e| MediaError::Codec(format!("profile: {e}")))?;
-        self.reconfig_tx
-            .as_ref()
-            .ok_or(MediaError::Closed)?
-            .send(profile)
+        if self.stopped.load(Ordering::Acquire) { return Err(MediaError::Closed); }
+        self.shared.reconfig_tx.send(profile)
             .map_err(|_| MediaError::Closed)?;
         Ok(())
     }
@@ -1536,23 +1647,27 @@ impl Publisher {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
         }
-        self.encode_stop.store(true, Ordering::Release);
         let _ = tokio::time::timeout(Duration::from_secs(5), self.pc.close()).await;
-        if let Some(handle) = self.rtcp_task.take() {
-            handle.abort();
-        }
-        self.slot.poison();
-        if let Some(thread) = self.encode_thread.take() {
-            let _ = thread.join();
+        if let Some(handle) = self.rtcp_task.take() { handle.abort(); }
+        let last = {
+            let mut listeners = self.shared.listeners.lock().unwrap();
+            listeners.remove(&self.listener);
+            listeners.is_empty()
+        };
+        if last {
+            self.shared.encode_stop.store(true, Ordering::Release);
+            self.shared.slot.poison();
+            let thread = self.shared.encode_thread.lock().unwrap().take();
+            if let Some(thread) = thread { let _ = tokio::task::spawn_blocking(move || thread.join()).await; }
         }
         let _ = self.event_tx.send(MediaEvent::Stats(MediaStats::default()));
     }
 }
 
-/// Encode loop: profile-paced frames, transactional reconfig, latest-only
-/// output. Deterministic pacing from the profile fps (never wall-clock
-/// absolute near RTP): each tick targets start+n*interval; overruns skip
-/// sleep (catch-up, no burst). Reconfigs drain to latest and apply atomically
+/// Encode loop: profile-paced frames, transactional reconfig, bounded
+/// output. Wait for capacity before encode and drain stale raw capture frames.
+/// Monotonic deadlines are reanchored after overruns, without catch-up bursts.
+/// Reconfigs drain to latest and apply atomically
 /// (rebuild + forced IDR + new generation + fresh Stats) without touching
 /// signaling — WebRTC resolves it: same m-line, SPS in-band.
 fn encode_loop(
@@ -1599,7 +1714,7 @@ fn encode_loop(
     let mut consecutive_skips: u32 = 0;
     let mut encode_trace = Trace::new(Stage::Encode);
     let mut source_trace = Trace::new(Stage::Source);
-    let start = Instant::now();
+    let mut next_deadline = Instant::now();
     let mut n: u64 = 0;
     while !stop.load(Ordering::Acquire) {
         // 1. Drain reconfigs to latest; apply atomically.
@@ -1637,6 +1752,14 @@ fn encode_loop(
         if intra_applied == 1 {
             encoder.force_intra();
         }
+        // Wait before conversion/encode, preserving every compressed reference.
+        // Once capacity returns, take the newest raw capture frame.
+        if !slot.wait_for_capacity(stop) { break; }
+        let now = Instant::now();
+        if next_deadline > now { std::thread::sleep(next_deadline - now); }
+        let frame_time = Instant::now();
+        next_deadline += profile.frame_duration();
+        if next_deadline <= frame_time { next_deadline = frame_time + profile.frame_duration(); }
         // 2. Fetch one frame at the current target dims. CPU frames scale
         // here; GPU buffers stay retained until the encode step routes
         // them (zero-copy submit or one conversion — see below).
@@ -1652,9 +1775,17 @@ fn encode_loop(
             VideoSource::SyntheticBall => PendingFrame::Cpu(Cow::Owned(synthetic_frame(target.0, target.1, n))),
             VideoSource::External(ext) => match {
                 let started = source_trace.start();
-                let received = ext.rx.recv_timeout(EXT_TICK);
+                let mut received = ext.rx.recv_timeout(EXT_TICK);
+                let mut raw_dropped = 0;
+                if received.is_ok() {
+                    while let Ok(newest) = ext.rx.try_recv() {
+                        received = Ok(newest);
+                        raw_dropped += 1;
+                    }
+                }
                 source_trace.record(TraceSample {
                     frames: received.is_ok() as u64,
+                    dropped: raw_dropped,
                     gpu_frames: matches!(&received, Ok(ExternalFrame::Gpu(_))) as u64,
                     timeouts: matches!(&received, Err(std::sync::mpsc::RecvTimeoutError::Timeout)) as u64,
                     errors: matches!(&received, Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) as u64,
@@ -1689,7 +1820,9 @@ fn encode_loop(
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => match cpu_holdover_on_timeout(ext_last.as_ref()) {
                     Some(last) => PendingFrame::Cpu(Cow::Borrowed(scale_frame_reusing(last, target.0, target.1, &mut scaled))),
-                    None => continue,
+                    None => {
+                        continue;
+                    }
                 },
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     let _ = event_tx.send(MediaEvent::Error(format!(
@@ -1738,12 +1871,7 @@ fn encode_loop(
             }
         }
         n += 1;
-        // 4. Pace on the CURRENT profile (reconfig may have changed fps).
-        let next = start + profile.frame_duration() * (n as u32);
-        let now = Instant::now();
-        if next > now {
-            std::thread::sleep(next - now);
-        }
+
     }
 }
 
@@ -2135,6 +2263,16 @@ impl NativeViewer {
         on_frame: Arc<dyn Fn(PresentedFrame) + Send + Sync>,
         on_audio: Option<Arc<dyn Fn(&[f32]) + Send + Sync>>,
     ) -> Result<Self, MediaError> {
+        Self::start_with_audio_format(ice_servers, event_tx, on_frame, on_audio, false).await
+    }
+
+    pub async fn start_with_audio_format(
+        ice_servers: Option<Vec<String>>,
+        event_tx: mpsc::UnboundedSender<MediaEvent>,
+        on_frame: Arc<dyn Fn(PresentedFrame) + Send + Sync>,
+        on_audio: Option<Arc<dyn Fn(&[f32]) + Send + Sync>>,
+        compact: bool,
+    ) -> Result<Self, MediaError> {
         let api = build_api()?;
         let pc = Arc::new(
             api.new_peer_connection(rtc_config(ice_servers))
@@ -2166,7 +2304,7 @@ impl NativeViewer {
                             }
                             return;
                         }
-                        read_loop(track, &pc_pli, &event_tx, &on_frame, &census).await;
+                        read_loop(track, &pc_pli, &event_tx, &on_frame, &census, compact).await;
                     });
                 })
             }));
@@ -2311,6 +2449,7 @@ async fn read_loop(
     event_tx: &mpsc::UnboundedSender<MediaEvent>,
     on_frame: &Arc<dyn Fn(PresentedFrame) + Send + Sync>,
     census: &Arc<std::sync::Mutex<CandidateCensus>>,
+    compact: bool,
 ) {
     let mut depacketizer = H264Packet::default();
     // Live viewer: hardware DXVA where probed, transparent software
@@ -2329,6 +2468,9 @@ async fn read_loop(
     let mut last_pli: HashMap<u32, Instant> = HashMap::new();
     let mut rtp_trace = Trace::new(Stage::Rtp);
     let mut decode_trace = Trace::new(Stage::Decode);
+    let mut codec_trace = Trace::new(Stage::Codec);
+    let mut convert_trace = Trace::new(Stage::Convert);
+    let mut dispatch_trace = Trace::new(Stage::Dispatch);
     loop {
         let (packet, _) = match track.read_rtp().await {
             Ok(pair) => pair,
@@ -2362,7 +2504,16 @@ async fn read_loop(
                 }, None);
             } else {
                 let started = decode_trace.start();
-                let decoded = decode_unit(&mut decoder, &unit, event_tx);
+                let mut measurements = DecodeMeasurements::default();
+                let decoded = match decoder.decode_measured(&unit, compact, started.map(|_| &mut measurements)) {
+                    Ok(picture) => picture,
+                    Err(e) => { let _ = event_tx.send(MediaEvent::Error(e.to_string())); None }
+                };
+                if started.is_some() {
+                    codec_trace.record_cost(TraceSample { frames: decoded.is_some() as u64, ..Default::default() }, measurements.codec_us);
+                    convert_trace.record_cost(TraceSample { frames: decoded.is_some() as u64,
+                        bytes: decoded.as_ref().map(|p| p.frame.data.len() as u64).unwrap_or(0), ..Default::default() }, measurements.convert_us);
+                }
                 decode_trace.record(TraceSample {
                     frames: decoded.is_some() as u64, dropped: decoded.is_none() as u64,
                     bytes: unit.len() as u64,
@@ -2382,7 +2533,9 @@ async fn read_loop(
                     let non_black = FrameValidator::non_black(frame.luma_mean);
                     let motion = validator.motion(frame.luma_mean);
                     let _ = event_tx.send(MediaEvent::VideoFrame { non_black, motion });
+                    let started = dispatch_trace.start();
                     on_frame(picture.frame);
+                    dispatch_trace.record(TraceSample { frames: 1, ..Default::default() }, started);
                     if stats.frames_decoded % 30 == 0 {
                         let mut snapshot = stats.clone();
                         snapshot.census = census_snapshot(census);
@@ -2402,20 +2555,6 @@ async fn read_loop(
                 }
             } // end non-stale branch
             assembly.recycle(unit);
-        }
-    }
-}
-
-fn decode_unit(
-    decoder: &mut H264Decoder,
-    unit: &[u8],
-    event_tx: &mpsc::UnboundedSender<MediaEvent>,
-) -> Option<DecodedPicture> {
-    match decoder.decode(unit) {
-        Ok(frame) => frame,
-        Err(e) => {
-            let _ = event_tx.send(MediaEvent::Error(e.to_string()));
-            None
         }
     }
 }
@@ -2502,6 +2641,52 @@ fn wire_ice_events(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn frame_slot_reservation_never_replaces_queued_unit() {
+        let slot = FrameSlot::default();
+        let stop = AtomicBool::new(false);
+        assert!(slot.wait_for_capacity(&stop));
+        assert!(slot.publish(vec![1, 2, 3], Duration::from_millis(16)));
+        assert!(!slot.publish(vec![9], Duration::from_millis(16)));
+        let (unit, _) = slot.take().await;
+        assert_eq!(unit, vec![1, 2, 3]);
+        assert!(slot.wait_for_capacity(&stop));
+    }
+
+    #[tokio::test]
+    async fn congestion_preserves_the_encoded_prediction_chain() {
+        let profile = QualityProfile::custom(320, 180, 1000, 60).unwrap();
+        let slot = Arc::new(FrameSlot::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let (events, _rx) = mpsc::unbounded_channel();
+        let (_reconfig, configs) = std::sync::mpsc::channel();
+        let output = slot.clone();
+        let stopped = stop.clone();
+        let handle = std::thread::spawn(move || encode_loop(
+            VideoSource::SyntheticBall, profile, EngineKind::Software, &stopped, &output,
+            &Arc::new(std::sync::Mutex::new(None)), &Arc::new(std::sync::Mutex::new(CandidateCensus::default())),
+            &events, &configs, &AtomicBool::new(false),
+        ));
+        let mut reference = VideoEncoder::new(&profile, 320, 180, EngineKind::Software).unwrap();
+        let mut decoder = H264Decoder::new().unwrap();
+        let result = async {
+            for n in 0..12 {
+                if n == 3 { tokio::time::sleep(Duration::from_millis(150)).await; }
+                let (unit, _) = tokio::time::timeout(Duration::from_secs(2), slot.take()).await.map_err(|_| "sender stalled")?;
+                let expected = reference.encode_frame(&synthetic_frame(320, 180, n)).unwrap().unwrap();
+                if unit != expected { return Err("encoded reference was skipped while output stalled"); }
+                if decoder.decode(&unit).unwrap().is_none() { return Err("picture failed to decode"); }
+            }
+            Ok(())
+        }.await;
+        stop.store(true, Ordering::Release);
+        slot.poison();
+        handle.join().unwrap();
+        assert_eq!(result, Ok(()));
+        assert!(!slot.wait_for_capacity(&AtomicBool::new(false)), "closed source cannot restart");
+        assert!(!slot.publish(vec![1], Duration::ZERO), "closed source rejects late publish");
+    }
+
     #[test]
     fn matching_scale_and_encoder_view_borrow_pixels() {
         let frame = I420Frame { w: 4, h: 2, data: (0..12).collect() };
@@ -2582,17 +2767,13 @@ mod tests {
                 &intra_,
             );
         });
-        for n in 0..5 {
-            ext_tx.send(ExternalFrame::Cpu(gray(128, 96, 16 + n * 20))).unwrap();
-        }
-        drop(ext_tx); // source gone: loop must end by itself, bounded
-        // Drain latest-only units on a throwaway runtime (take is async).
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("test runtime");
         let mut units = 0;
-        for _ in 0..3 {
+        for n in 0..3 {
+            ext_tx.send(ExternalFrame::Cpu(gray(128, 96, 16 + n * 20))).unwrap();
             let got = rt.block_on(async {
                 tokio::time::timeout(Duration::from_secs(10), slot.take()).await
             });
@@ -2602,6 +2783,7 @@ mod tests {
             units += 1;
         }
         assert_eq!(units, 3);
+        drop(ext_tx); // source gone: loop must end by itself, bounded
         // Loop exits on disconnect (bounded by the pacing tick + timeout).
         handle.join().expect("encode loop thread");
         let mut saw_gone = false;
@@ -2659,15 +2841,6 @@ mod tests {
                 &intra_,
             );
         });
-        let feeder = std::thread::spawn(move || {
-            for n in 0..24u8 {
-                if ext_tx.send(ExternalFrame::Cpu(gray(2000, 1000, 16 + n))).is_err() {
-                    break;
-                }
-            }
-        });
-        // Drain units on a throwaway runtime; decode the first to prove the
-        // software fit still applies (output stays 1920x960, never native).
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2675,6 +2848,7 @@ mod tests {
         let mut decoded_dims = None;
         let mut decoder = H264Decoder::new().expect("decoder");
         for take in 0..10 {
+            ext_tx.send(ExternalFrame::Cpu(gray(2000, 1000, 16 + take as u8))).unwrap();
             let got = rt.block_on(async {
                 tokio::time::timeout(Duration::from_secs(15), slot.take()).await
             });
@@ -2686,7 +2860,7 @@ mod tests {
                 }
             }
         }
-        feeder.join().expect("feeder drains into the loop");
+        drop(ext_tx);
         stop.store(true, Ordering::Release);
         handle.join().expect("encode loop thread");
         assert_eq!(decoded_dims, Some((1920, 960)), "software fit still caps output");
@@ -2748,25 +2922,19 @@ mod tests {
                 &intra_,
             );
         });
-        let feeder = std::thread::spawn(move || {
-            for n in 0..16u8 {
-                if ext_tx.send(ExternalFrame::Cpu(gray(5120, 1440, 16 + n))).is_err() {
-                    break;
-                }
-            }
-        });
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("test runtime");
         for take in 0..8 {
+            ext_tx.send(ExternalFrame::Cpu(gray(5120, 1440, 16 + take as u8))).unwrap();
             let got = rt.block_on(async {
                 tokio::time::timeout(Duration::from_secs(20), slot.take()).await
             });
             let (unit, _) = got.unwrap_or_else(|_| panic!("unit {take} arrives"));
             assert!(!unit.is_empty(), "poison pill never counted");
         }
-        feeder.join().expect("feeder drains into the loop");
+        drop(ext_tx);
         stop.store(true, Ordering::Release);
         handle.join().expect("encode loop thread");
         let mut bumps = 0u32;
@@ -2839,6 +3007,15 @@ mod tests {
         assert!(assembly.append(&[4, 5], false).is_none());
         assert_eq!(assembly.begin(200), Some((u32::MAX - 100, vec![1, 2, 3, 4, 5])));
         assert!(assembly.begin(300).is_none());
+    }
+
+    #[test]
+    fn compact_viewer_does_not_expand_decoded_pixels_to_rgba() {
+        let mut encoder = H264Encoder::new(Quality::P720).unwrap();
+        let encoded = encoder.encode(&synthetic_frame(1280, 720, 0)).unwrap();
+        let picture = H264Decoder::new().unwrap().decode_for_present(&encoded, true).unwrap().unwrap();
+        assert_eq!(picture.frame.data.len(), 1280 * 720 * 3 / 2,
+            "compact presentation must transport YUV, not an RGBA expansion");
     }
 
     #[test]
@@ -3026,6 +3203,63 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn shared_encoder_survives_first_viewer_leaving_and_reconfigures() {
+        let (p1_tx, p1_rx) = mpsc::unbounded_channel();
+        let (p2_tx, p2_rx) = mpsc::unbounded_channel();
+        let p1 = Publisher::start_with_profile(VideoSource::SyntheticBall,
+            QualityProfile::custom(320, 180, 1000, 30).unwrap(), EngineKind::Software, Some(vec![]), p1_tx).await.unwrap();
+        let p2 = p1.fork(Some(vec![]), p2_tx, None).await.unwrap();
+        assert!(Arc::ptr_eq(&p1.shared, &p2.shared), "fork starts no second encoder");
+        let counts: Vec<_> = (0..2).map(|_| Arc::new(std::sync::atomic::AtomicU64::new(0))).collect();
+        let dims: Vec<_> = (0..2).map(|_| Arc::new(std::sync::atomic::AtomicU64::new(0))).collect();
+        let mut viewers = Vec::new();
+        let mut viewer_rx = Vec::new();
+        for i in 0..2 {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let count = counts[i].clone(); let dim = dims[i].clone();
+            viewers.push(NativeViewer::start(Some(vec![]), tx, Arc::new(move |frame| {
+                count.fetch_add(1, Ordering::Relaxed);
+                dim.store(((frame.w as u64) << 32) | frame.h as u64, Ordering::Relaxed);
+            })).await.unwrap());
+            viewer_rx.push(rx);
+        }
+        let mut publishers = [p1, p2];
+        let mut publisher_rx = [p1_rx, p2_rx];
+        for i in 0..2 {
+            let offer = publishers[i].create_offer().await.unwrap();
+            let answer = viewers[i].set_remote_offer(&offer).await.unwrap();
+            publishers[i].set_remote_answer(&answer).await.unwrap();
+        }
+        let mut stage = 0;
+        let mut after_close = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+        while tokio::time::Instant::now() < deadline {
+            for i in 0..2 {
+                while let Ok(event) = publisher_rx[i].try_recv() {
+                    if let MediaEvent::IceCandidate { candidate } = event { viewers[i].add_remote_candidate(&candidate).await.unwrap(); }
+                }
+                while let Ok(event) = viewer_rx[i].try_recv() {
+                    if let MediaEvent::IceCandidate { candidate } = event { publishers[i].add_remote_candidate(&candidate).await.unwrap(); }
+                }
+            }
+            if stage == 0 && counts.iter().all(|c| c.load(Ordering::Relaxed) >= 5) {
+                publishers[0].stop().await;
+                viewers[0].stop().await;
+                after_close = counts[1].load(Ordering::Relaxed);
+                publishers[1].reconfigure(QualityProfile::custom(640, 360, 1500, 30).unwrap()).unwrap();
+                stage = 1;
+            }
+            if stage == 1 && counts[1].load(Ordering::Relaxed) >= after_close + 5 && dims[1].load(Ordering::Relaxed) == (640u64 << 32) | 360 {
+                stage = 2; break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for i in 0..2 { publishers[i].stop().await; viewers[i].stop().await; }
+        assert_eq!(stage, 2, "both viewers must decode, then survivor must follow reconfiguration");
+        assert!(publishers[1].shared.encode_stop.load(Ordering::Acquire), "last viewer stops the shared encoder");
+    }
+
     async fn rtp_pair(
         audio: bool,
         audio_after_video: bool,
@@ -3165,7 +3399,7 @@ mod tests {
                 assert!(FrameValidator::non_black(stats.luma_mean), "non-black");
                 // Pixels ride along exactly once: dims match, RGBA sized.
                 assert_eq!((picture.frame.w, picture.frame.h), (1280, 720));
-                assert_eq!(picture.frame.rgba.len(), 1280 * 720 * 4);
+                assert_eq!(picture.frame.data.len(), 1280 * 720 * 4);
                 if validator.motion(stats.luma_mean) {
                     motions += 1;
                 }
@@ -3405,7 +3639,7 @@ mod tests {
         assert!(contains_idr(&first_b), "reconfig lands on an IDR");
         let picture = dec.decode(&first_b).expect("decode B").expect("picture B");
         assert_eq!((picture.frame.w, picture.frame.h), (480, 270));
-        assert_eq!(picture.frame.rgba.len(), 480 * 270 * 4);
+        assert_eq!(picture.frame.data.len(), 480 * 270 * 4);
         // Stream continues at the new size.
         for n in 1..5 {
             let unit = enc_b.encode(&synthetic_frame(480, 270, n)).expect("encode B");
@@ -3751,19 +3985,15 @@ mod tests {
         while !gen_seen || !saw_post_idr {
             let remaining = fence_line.saturating_duration_since(tokio::time::Instant::now());
             assert!(!remaining.is_zero(), "fence/IDR never observed");
-            match tokio::time::timeout(remaining, event_rx.recv()).await {
-                Ok(Some(MediaEvent::Keyframe)) => {
-                    if gen_seen {
-                        saw_post_idr = true;
-                    }
-                }
-                Ok(Some(MediaEvent::Stats(stats))) => {
-                    if stats.generation == 1 {
-                        gen_seen = true;
-                    }
-                }
-                Ok(_) => {}
-                Err(_) => panic!("event channel closed early"),
+            tokio::select! {
+                event = event_rx.recv() => match event {
+                    Some(MediaEvent::Keyframe) if gen_seen => saw_post_idr = true,
+                    Some(MediaEvent::Stats(stats)) if stats.generation == 1 => gen_seen = true,
+                    None => panic!("event channel closed early"),
+                    _ => {}
+                },
+                (unit, _) = slot.take() => { let _ = dec.decode(&unit).expect("decode during reconfig"); },
+                _ = tokio::time::sleep(remaining) => panic!("fence/IDR never observed"),
             }
         }
         // Phase 2: the SAME decoder now yields 360p (SPS-driven, no reset).
@@ -3783,7 +4013,7 @@ mod tests {
                     (picture.frame.w, picture.frame.h)
                 );
                 if (picture.frame.w, picture.frame.h) == (640, 360) {
-                    assert_eq!(picture.frame.rgba.len(), 640 * 360 * 4);
+                    assert_eq!(picture.frame.data.len(), 640 * 360 * 4);
                     saw_b = true;
                 }
             }

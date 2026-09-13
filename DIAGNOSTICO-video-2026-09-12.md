@@ -1,5 +1,7 @@
 # Diagnóstico da transmissão ao vivo — 2026-09-12
 
+**Implementação de 13/09:** viewer YUV/WebGL, proteção da sequência H.264, gate WGC antes do readback e encoder compartilhado. Resultados e pendências em [OTIMIZACOES-video-2026-09-13.md](OTIMIZACOES-video-2026-09-13.md).
+
 **Nova revisão:** ver [REVISAO-performance-2026-09-12.md](REVISAO-performance-2026-09-12.md). Liberação de H.264 pelo marker aplicada e testada; novo E2E local: 60,011 FPS apresentados, gap máximo 28,215 ms. Pendências estruturais de host/viewer documentadas.
 
 **Estado da correção anterior:** aplicada uma mudança no agendamento do canvas compartilhado por macOS e Windows: desenho/ack sem esperar um requestAnimationFrame extra. Validação local completa em release: 60,006 FPS decodificados e desenhados, zero descartes na janela medida, gap máximo de ack 40,867 ms. Isso elimina a dependência do ack em callbacks de animação, mas não demonstra correção dos picos remotos de decode de 123 ms. Windows nativo e nova sessão real ainda pendentes; BUG-001 permanece aberto.

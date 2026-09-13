@@ -6,9 +6,8 @@
 //! redacted Tauri events. All wire ids stay in memory; emitted payloads
 //! carry kinds and counts only — never SDP, candidates, or tokens.
 //!
-//! MVP scope: one publisher per watcher (each encodes independently).
-//! The planned core refactor is fanout-via-shared-track (one encode
-//! pipeline, one lightweight PC per watcher).
+//! One lightweight publisher/PC per watcher shares a single capture and
+//! encoder. The shared track fans out packets; ICE and audio stay per link.
 
 use super::{AppState, WireIds};
 use golive_core::media::{MediaEvent, NativeViewer};
@@ -766,7 +765,7 @@ async fn on_watch(state: &Arc<AppState>, app: &Option<AppHandle>, watcher: &str)
         }
     };
     let Some(ids) = wire_ids(&fence) else { return };
-    // Ensure a publisher for this watcher (MVP: one encode each).
+    // Ensure an independent transport for this watcher, sharing the encoder.
     let has_publisher = {
         let inner = match state.inner.lock() {
             Ok(inner) => inner,
@@ -851,7 +850,15 @@ async fn on_unwatch(state: &Arc<AppState>, watcher: &str) {
             Ok(inner) => inner,
             Err(_) => return,
         };
-        inner.publishers.remove(watcher)
+        let mut removed = inner.publishers.remove(watcher);
+        if let Some(session) = removed.as_mut() {
+            if session.bridge.is_some() {
+                if let Some(next) = inner.publishers.values_mut().next() {
+                    next.bridge = session.bridge.take();
+                }
+            }
+        }
+        removed
     };
     if let Some(mut session) = session {
         session.publisher.lock().await.stop().await;
@@ -1284,7 +1291,9 @@ async fn on_viewer_envelope(
         let on_audio = playback
             .as_ref()
             .map(crate::audio::ViewerPlayback::callback);
-        let viewer = match NativeViewer::start_with_audio(None, event_tx, on_frame, on_audio).await {
+        let compact = state.inner.lock().map(|inner| inner.desktop.is_some()).unwrap_or(false)
+            && std::env::var_os("GOLIVE_VIEWER_RGBA").is_none();
+        let viewer = match NativeViewer::start_with_audio_format(None, event_tx, on_frame, on_audio, compact).await {
             Ok(viewer) => Arc::new(tokio::sync::Mutex::new(viewer)),
             Err(_) => return,
         };
@@ -1381,7 +1390,7 @@ mod present_respawn_tests {
         golive_core::media::PresentedFrame {
             w,
             h,
-            rgba: vec![128u8; w * h * 4],
+            format: golive_core::media::PixelFormat::Rgba, data: vec![128u8; w * h * 4],
         }
     }
 

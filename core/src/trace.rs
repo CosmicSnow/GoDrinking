@@ -19,6 +19,10 @@ pub enum Stage {
     Send,
     Rtp,
     Decode,
+    Codec,
+    Convert,
+    Dispatch,
+    Draw,
     Present,
 }
 
@@ -129,11 +133,12 @@ impl Trace {
     }
 
     pub fn record(&mut self, sample: Sample, started: Option<Instant>) {
-        let Some(active) = self.0.as_mut() else {
-            return;
-        };
+        self.record_cost(sample, started.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0));
+    }
+
+    pub fn record_cost(&mut self, sample: Sample, us: u64) {
+        let Some(active) = self.0.as_mut() else { return; };
         let r = &mut active.record;
-        let us = started.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
         r.observations += 1;
         r.work_us += us;
         r.max_work_us = r.max_work_us.max(us);

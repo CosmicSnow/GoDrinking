@@ -13,7 +13,7 @@ given -- a host+viewer overlay keyed on ``timestamp_ms``.
 
 Schema mirror of ``core/src/trace.rs``: every value must be a number
 except ``stage``, which must be one of
-capture/source/encode/send/rtp/decode/present. Unknown *numeric* fields
+capture/source/encode/send/rtp/codec/convert/decode/dispatch/draw/present. Unknown *numeric* fields
 are accepted so older traces keep parsing; the pli-storm heuristic sums
 the ``pli_sent``/``pli_suppressed``/``intra_applied`` counters (plus legacy
 ``pli``/``nack``/``fir`` names) and the judder heuristic reads
@@ -32,7 +32,7 @@ import json
 import sys
 from pathlib import Path
 
-STAGES = ("capture", "source", "encode", "send", "rtp", "decode", "present")
+STAGES = ("capture", "source", "encode", "send", "rtp", "decode", "codec", "convert", "dispatch", "draw", "present")
 
 # Counters summed per stage for the summary. bytes/frames are informational;
 # the rest feed the finding flags.

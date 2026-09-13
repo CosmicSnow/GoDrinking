@@ -29,7 +29,9 @@ def main():
     parser.add_argument('--viewer-binary', type=Path)
     parser.add_argument('--movie', type=Path, default=ROOT / 'e2e-artifacts/live-20260912-viewer/motion-1080p60.h264')
     parser.add_argument('--seconds', type=int, default=30)
+    parser.add_argument('--viewers', type=int, choices=(1, 2, 3), default=1)
     args = parser.parse_args()
+    roles = ['host', 'viewer'] + [f'viewer{i}' for i in range(2, args.viewers + 1)]
     art = args.artifact.resolve()
     art.mkdir(parents=True, exist_ok=False)
     if not args.binary.is_file() or not args.movie.is_file():
@@ -55,17 +57,17 @@ def main():
                 if time.monotonic() > deadline:
                     raise RuntimeError('local server did not start')
                 time.sleep(.1)
-        for role in ('host', 'viewer'):
-            plan = dict(role=role, server=base, password='local-cadence-test', nickname=f'{role}-cadence',
+        for role in roles:
+            plan = dict(role='host' if role == 'host' else 'viewer', server=base, password='local-cadence-test', nickname=f'{role}-cadence',
                         code_file=str(art / 'code'), status_file=str(art / f'{role}.json'))
             if role == 'host':
                 plan.update(share=f'movie:{args.movie.resolve()}', quality=dict(w=1920, h=1080, bitrate_kbps=6000, fps=60))
-            binary = args.viewer_binary if role == 'viewer' and args.viewer_binary else args.binary
+            binary = args.viewer_binary if role != 'host' and args.viewer_binary else args.binary
             launch([str(binary.resolve()), '--e2e-plan', json.dumps(plan)], role, {'GOLIVE_TRACE_DIR': str(art / role)})
         deadline = time.monotonic() + 90
         while True:
             host, viewer = read_json(art / 'host.json'), read_json(art / 'viewer.json')
-            if host.get('qualityApplied') and viewer.get('presented', 0) > 0:
+            if host.get('qualityApplied') and all(read_json(art / f'{role}.json').get('presented', 0) > 0 for role in roles[1:]):
                 break
             if any(p.poll() is not None for p in children) or time.monotonic() > deadline:
                 raise RuntimeError('media startup failed; inspect local artifacts')
@@ -76,7 +78,7 @@ def main():
         time.sleep(args.seconds)
         end_ms = time.time() * 1000
         stages = {}
-        for role in ('host', 'viewer'):
+        for role in roles:
             rows = []
             for path in (art / role).glob('golive-trace-*.jsonl'):
                 for line in path.read_text().splitlines():
@@ -90,11 +92,16 @@ def main():
                 a = [r for r in rows if r['stage'] == stage]
                 elapsed = sum(r['elapsed_us'] for r in a) / 1e6
                 stages[f'{role}.{stage}'] = dict(seconds=round(elapsed, 3), fps=round(sum(r['frames'] for r in a) / elapsed, 3),
-                    dropped=sum(r['dropped'] for r in a), max_work_ms=max(r['max_work_us'] for r in a) / 1000,
+                    instances=len({r['instance'] for r in a}),
+                    mean_work_ms=round(sum(r['work_us'] for r in a) / max(1, sum(r['observations'] for r in a)) / 1000, 3),
+                    bytes_per_second=round(sum(r['bytes'] for r in a) / elapsed), gpu_frames=sum(r['gpu_frames'] for r in a),
+                    errors=sum(r['errors'] for r in a), dropped=sum(r['dropped'] for r in a), max_work_ms=max(r['max_work_us'] for r in a) / 1000,
                     max_gap_ms=max(r['max_gap_us'] for r in a) / 1000)
-        decode, present = stages.get('viewer.decode', {}), stages.get('viewer.present', {})
-        passed = decode.get('fps', 0) >= 54 and present.get('fps', 0) >= 54 and present.get('max_gap_ms', float('inf')) <= 50
-        report = dict(passed=passed, minimum_fps=54, maximum_present_gap_ms=50, stages=stages)
+        passed = stages.get('host.encode', {}).get('instances') == 1
+        for role in roles[1:]:
+            decode, present = stages.get(f'{role}.decode', {}), stages.get(f'{role}.present', {})
+            passed = passed and decode.get('fps', 0) >= 54 and present.get('fps', 0) >= 54 and present.get('max_gap_ms', float('inf')) <= 50
+        report = dict(passed=passed, viewers=args.viewers, minimum_fps=54, maximum_present_gap_ms=50, stages=stages)
         (art / 'verdict.json').write_text(json.dumps(report, indent=2) + '\n')
         print(json.dumps(report, indent=2))
         return 0 if passed else 1

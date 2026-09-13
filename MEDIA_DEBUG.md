@@ -148,3 +148,59 @@ Keep the viewer visible. The check uses only a loopback test room, measures
 both decoded and drawn, and <=50 ms worst ack gap. This is a performance
 check sensitive to host load/display scheduling, not a deterministic unit test.
 It does not establish Windows native performance when executed on macOS.
+
+
+## Viewer YUV / GLP2 and shared host encode (2026-09-13)
+
+The desktop player now receives tight I420 (OpenH264) or NV12 (MF/DXVA),
+then uploads reusable WebGL textures and converts BT.601 limited-range color
+in the fragment shader. Without WebGL, a reusable Canvas2D ImageData buffer
+provides the CPU fallback. This is not native GPU surface sharing: CPU YUV
+still crosses IPC. At 1080p60 the payload falls from 497,664,000 to
+186,624,000 bytes/second (62.5% less), excluding headers and additional copies.
+Mac decode is still OpenH264; this patch does not add VideoToolbox decode.
+
+Desktop IPC is versioned **GLP2**: four magic bytes, then LE u32 seq, width,
+height, format; pixels begin at offset 20. Format 0 = RGBA, 1 = I420, 2 = NV12.
+YUV dimensions are even and payload size is exactly w*h*3/2. Both endpoints
+ship together. The separate GLV1 helper protocol stays unchanged and RGBA.
+
+New numeric-only trace stages (opt-in with the existing trace mechanism):
+
+- `codec`: decoder call, including backend output/readback where applicable.
+- `convert`: luma validation plus compact plane packing or legacy RGBA conversion.
+- `dispatch`: synchronous shell callback, including packet copy and IPC submission.
+- `draw`: JavaScript draw/upload submission time reported with a valid ACK;
+  `gpu_frames` distinguishes WebGL from fallback. Browser timer precision applies.
+- `present` retains send-to-ACK time and ACK gaps. It does not measure scanout or
+  GPU completion. Dispatch, draw and present overlap; do not add their times as
+  if they were independent pipeline segments.
+
+`GOLIVE_VIEWER_RGBA=1` selects the legacy pixel layout for a diagnostic comparison
+using the same current WebGL renderer. It does not select the previous binary's
+Canvas2D path. Leave unset for compact YUV. On Windows the existing
+`GOLIVE_DISABLE_HW=1` hook can independently compare software decoding.
+
+Host FrameSlot now waits for capacity before encoding and never replaces an
+encoded reference frame. Stale raw capture inputs are drained before encode and
+counted in `source.dropped`. Deadlines reanchor after overruns. RTP still uses the
+nominal per-sample duration; capture-time/A-V synchronization is a separate
+remaining task. Multiple viewers share one capture/encoder/video track with
+independent peer connections and audio. `host.send.bytes` counts shared source
+payload once, not total wire upload across bindings. One transport write task
+fans out through webrtc-rs; a blocked local socket write can still delay the
+shared producer. No independent per-peer quality adaptation is introduced.
+
+Run `python3 scripts/check-viewer-cadence.py --artifact <new-directory> --viewers 2`
+with the built executable. The report requires one host encode instance and checks
+each viewer's FPS and largest ACK gap. A near-60 average does not override a
+failed maximum-gap check. WGC's gate is tested without Windows using
+`cargo test --manifest-path ../platform/Cargo.toml --test windows_readback` from app/;
+this tests skipped readback callbacks, not native driver performance.
+
+GPU conformance fixture: bundle `app/web/src/playerRenderer.ts` with esbuild into
+`playerRenderer.js`, copy `scripts/fixtures/player-gpu-check.html` beside it as
+`index.html`, and serve that directory locally. It checks real GL pixels against
+the CPU reference (orientation, colors, NV12/I420, resize, 1920-wide precision,
+context loss/restoration) plus the no-WebGL fallback. The artifact used here is
+`e2e-artifacts/viewer-gpu-check/`.

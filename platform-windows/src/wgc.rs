@@ -3,7 +3,7 @@
 use golive_platform::{
     BgraFrame, CaptureConfig, CapturePacket, PlatformError, SourceInfo, SourceKind,
 };
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 use windows::core::Interface;
@@ -29,7 +29,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOOLWINDOW,
 };
 
-use crate::copy::{gate_open, initial_last_ns, interval_ns, now_ns};
+use crate::copy::{initial_last_ns, interval_ns, now_ns, readback_if_due};
 use crate::d3d::{create_device, Readback};
 use crate::map::map_windows;
 
@@ -174,13 +174,26 @@ fn texture_from_frame(
     unsafe { access.GetInterface::<ID3D11Texture2D>() }.map_err(|e| map_windows(&e))
 }
 
-fn grab_wgc_frame(
-    readback: &mut Readback,
-    pool: &Direct3D11CaptureFramePool,
-) -> Option<BgraFrame> {
-    let frame = pool.TryGetNextFrame().ok()?;
-    let tex = texture_from_frame(&frame).ok()?;
+fn latest_wgc_frame(pool: &Direct3D11CaptureFramePool) -> Option<windows::Graphics::Capture::Direct3D11CaptureFrame> {
+    let mut frame = pool.TryGetNextFrame().ok()?;
+    // The pool has two buffers. Bound draining even if capture keeps producing.
+    if let Ok(newest) = pool.TryGetNextFrame() {
+        let _ = frame.Close();
+        frame = newest;
+    }
+    Some(frame)
+}
+
+fn readback_wgc_frame(readback: &mut Readback, frame: &windows::Graphics::Capture::Direct3D11CaptureFrame) -> Option<BgraFrame> {
+    let tex = texture_from_frame(frame).ok()?;
     readback.texture_to_bgra(&tex).ok()
+}
+
+fn grab_wgc_frame(readback: &mut Readback, pool: &Direct3D11CaptureFramePool) -> Option<BgraFrame> {
+    let frame = latest_wgc_frame(pool)?;
+    let result = readback_wgc_frame(readback, &frame);
+    let _ = frame.Close();
+    result
 }
 
 /// Captures a single still from any WGC item (window or monitor) with a
@@ -380,7 +393,7 @@ pub fn run_window(
         applied.width, applied.height, applied.fps
     );
     let interval = interval_ns(applied.fps);
-    let last_ns = AtomicU64::new(initial_last_ns(now_ns(), interval));
+    let mut last_ns = initial_last_ns(now_ns(), interval);
     let mut readback = Readback::new(device, context);
     let _ = ready_tx.send(Ok(()));
     while !stop_flag.load(Ordering::Acquire) {
@@ -400,19 +413,13 @@ pub fn run_window(
                 pool_size = now;
             }
         }
-        match grab_wgc_frame(&mut readback, &pool) {
-            Some(frame) => {
-                let now = now_ns();
-                if gate_open(last_ns.load(Ordering::Relaxed), now, interval) {
-                    let _ = frame_tx.try_send(CapturePacket::Cpu(frame));
-                    last_ns.store(
-                        golive_platform::cadence::advance_capture_clock(
-                            last_ns.load(Ordering::Relaxed), now, interval,
-                        ),
-                        Ordering::Relaxed,
-                    );
-                }
-            }
+        let frame = latest_wgc_frame(&pool);
+        let copied = frame.as_ref().and_then(|frame| {
+            readback_if_due(&mut last_ns, now_ns(), interval, || readback_wgc_frame(&mut readback, frame))
+        });
+        if let Some(frame) = frame { let _ = frame.Close(); }
+        match copied {
+            Some(frame) => { let _ = frame_tx.try_send(CapturePacket::Cpu(frame)); }
             None => std::thread::sleep(Duration::from_millis(10)),
         }
     }

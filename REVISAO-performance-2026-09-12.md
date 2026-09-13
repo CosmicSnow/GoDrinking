@@ -1,5 +1,7 @@
 # Revisão de eficiência do host e viewer — 12/09/2026
 
+**Atualização de 13/09:** as quatro melhorias estruturais abaixo foram implementadas; medições e limites atuais em [OTIMIZACOES-video-2026-09-13.md](OTIMIZACOES-video-2026-09-13.md). Este documento preserva os achados anteriores à implementação.
+
 Revisão local com apoio do Luna. O objetivo é cadência regular e baixa latência em 1080p60. Ainda não existe uma comparação controlada com Discord nas mesmas máquinas/rede; não há fundamento para prometer equivalência. Os traces Windows/Mac fornecidos mostram médias próximas de 60 FPS, mas picos de trabalho no viewer de até 122,6 ms.
 
 ## Correção aplicada nesta revisão
