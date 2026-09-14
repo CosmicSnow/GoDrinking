@@ -62,7 +62,10 @@ jobs:
           # cmake_minimum_required < 3.5 (see audiopus_sys's bundled opus).
           # This is CMake's own documented workaround.
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build --release --features tauri/custom-protocol --bin goDrinking
+        run: cargo build --release --features tauri/custom-protocol --bins
+
+      - name: Reject executables that open a console
+        run: python scripts/check-windows-gui.py app/target/release/goDrinking.exe app/target/release/golive-video.exe
 
       - name: Verify exe exists
         run: |

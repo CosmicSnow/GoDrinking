@@ -27,6 +27,7 @@ pub struct FrameStream {
     error: Arc<std::sync::Mutex<Option<PlatformError>>>,
     stop_flag: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    capture_probe: Option<Arc<crate::capture_probe::CaptureProbe>>,
 }
 
 impl FrameStream {
@@ -38,7 +39,16 @@ impl FrameStream {
         stop_flag: Arc<AtomicBool>,
         worker: JoinHandle<()>,
     ) -> Self {
-        Self { rx, error, stop_flag, worker: Some(worker) }
+        Self { rx, error, stop_flag, worker: Some(worker), capture_probe: None }
+    }
+
+    pub fn with_capture_probe(mut self, probe: Arc<crate::capture_probe::CaptureProbe>) -> Self {
+        self.capture_probe = Some(probe);
+        self
+    }
+
+    pub fn take_capture_counts(&self) -> Option<crate::capture_probe::CaptureCounts> {
+        self.capture_probe.as_ref().map(|probe| probe.take())
     }
 
     /// Next packet within `timeout`. Stale packets never queue upstream: the

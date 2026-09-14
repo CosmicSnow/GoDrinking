@@ -204,3 +204,61 @@ GPU conformance fixture: bundle `app/web/src/playerRenderer.ts` with esbuild int
 the CPU reference (orientation, colors, NV12/I420, resize, 1920-wide precision,
 context loss/restoration) plus the no-WebGL fallback. The artifact used here is
 `e2e-artifacts/viewer-gpu-check/`.
+
+
+### Acquisition and decoder isolation (2026-09-14)
+
+On macOS, fresh builds emit `capture_input` before the SCK callback throttle.
+`frames` counts screen callbacks, not necessarily valid/new video pictures.
+`gate_dropped`, `queue_dropped` and `invalid_frames` distinguish early throttle,
+full delivery channel and samples without usable pixels. `max_gap_us` is the
+largest callback arrival interval, not capture-to-display latency. Counts can
+straddle adjacent trace windows; aggregate several seconds. Windows does not
+provide these acquisition counters yet. Existing running processes must restart
+with the new binary to emit them; rebuilding does not update a running host.
+
+The decoder now owns a dedicated serial thread. `codec` and `convert` measure
+work inside that thread; `decode` also includes scheduling and reply overhead.
+The receive task still awaits each decoded access unit before reading the next;
+this isolates blocking codec work from Tokio but is not a separate RTP drain or
+a presentation jitter buffer. Compressed access units retain their order.
+
+A capture-only fixture is available from `app/`:
+
+```sh
+GOLIVE_CAPTURE_DISPLAY=3 cargo test --release --manifest-path ../platform-macos/Cargo.toml --test capture_probe -- --ignored --nocapture
+```
+
+It captures for 30 seconds without saving pixels or opening a viewer. The test
+binary needs its own screen recording permission. The local attempt was denied;
+it is intentionally ignored in the default suite and is not evidence of live
+capture passing. A standalone main-app CLI attempt timed out and was removed.
+For the ordinary app path, enable tracing as above, restart the fresh host and
+share the requested display normally. Keep the viewer off the captured display.
+
+
+### macOS hardware viewer decode
+
+The desktop app now installs the platform-macos VideoToolbox decoder through
+`platform::decode::VideoDecoder`. Core-only users retain software unless their
+shell installs a native factory. Windows MF selection remains unchanged.
+VideoToolbox requires hardware in the decoder specification; creation failure
+falls back to software. A redacted `decode backend=videotoolbox` line is emitted
+only after successful native session creation. `GOLIVE_DISABLE_HW=1` on the
+viewer process selects software for comparison (it also disables encoding
+hardware if used on a host process).
+
+Decompression uses neither asynchronous nor temporal-processing flags: the
+callback completes before the call returns. The callback copies visible NV12
+rows while the CVPixelBuffer is valid; no borrowed native pointer crosses into
+core/IPC. A native failure destroys the session, retains validated parameter
+sets and waits for IDR before resuming in software; it never starts a fresh
+software decoder with dependent frames from the old session.
+
+This is hardware decode plus CPU NV12 transfer and WebGL rendering, not native
+surface presentation. `codec` now includes the VideoToolbox call and NV12 copy;
+`convert` includes statistics and optional RGBA fallback. Do not compare the
+substage labels as if their work were identical to OpenH264's plane extraction.
+Real native regression tests cover separate SPS/PPS, delta frames, resolution
+changes to 1080p, padding and luma/chroma agreement with software. Core tests
+inject driver failure on a delta/IDR and IDR without in-band parameter sets.

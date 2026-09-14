@@ -356,6 +356,7 @@ fn pump_bridge(
 ) {
     let mut last_forwarded: Option<Instant> = None;
     let mut trace = Trace::new(Stage::Capture);
+    let mut input_trace = Trace::new(Stage::CaptureInput);
     loop {
         if stop.load(Ordering::Acquire) {
             break;
@@ -365,7 +366,19 @@ fn pump_bridge(
             Ok(profile) => (profile.frame_duration(), (profile.w, profile.h)),
             Err(_) => (BRIDGE_TICK, (1280, 720)),
         };
-        match stream.next_frame(BRIDGE_TICK) {
+        let packet = stream.next_frame(BRIDGE_TICK);
+        if input_trace.start().is_some() {
+            if let Some(counts) = stream.take_capture_counts() {
+                input_trace.record(TraceSample {
+                    frames: counts.received, gate_dropped: counts.gate_dropped,
+                    queue_dropped: counts.queue_dropped, invalid_frames: counts.invalid,
+                    max_gap_us: counts.max_gap_us,
+                    target_fps: (1.0 / interval.as_secs_f64()).round() as u32,
+                    ..Default::default()
+                }, None);
+            }
+        }
+        match packet {
             Ok(CapturePacket::Gpu(gpu)) => {
                 let started = trace.start();
                 let now = clock();
@@ -917,4 +930,11 @@ mod allocation_tests {
             }
         }
     }
+}
+
+
+/// Backend selection remains in the app's existing platform glue.
+pub(crate) fn install_decoder_backend() {
+    #[cfg(target_os = "macos")]
+    golive_core::media::install_decoder_factory(golive_platform_macos::decode::new_decoder);
 }

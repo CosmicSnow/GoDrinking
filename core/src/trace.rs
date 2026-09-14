@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
     Capture,
+    CaptureInput,
     Source,
     Encode,
     Send,
@@ -31,6 +32,9 @@ pub struct Sample {
     pub frames: u64,
     pub bytes: u64,
     pub dropped: u64,
+    pub gate_dropped: u64,
+    pub queue_dropped: u64,
+    pub invalid_frames: u64,
     pub timeouts: u64,
     pub errors: u64,
     pub keyframes: u64,
@@ -143,7 +147,7 @@ impl Trace {
         r.work_us += us;
         r.max_work_us = r.max_work_us.max(us);
         macro_rules! sum { ($($f:ident),*) => { $(r.sample.$f += sample.$f;)* }; }
-        sum!(frames, bytes, dropped, timeouts, errors, keyframes, repeats, gpu_frames,
+        sum!(frames, bytes, dropped, gate_dropped, queue_dropped, invalid_frames, timeouts, errors, keyframes, repeats, gpu_frames,
              pli_sent, pli_suppressed, intra_applied);
         // Pacing extremes never average away: keep the worst ack gap seen.
         r.sample.max_gap_us = r.sample.max_gap_us.max(sample.max_gap_us);

@@ -955,6 +955,8 @@ impl FrameSlot {
 /// with transparent software fallback, and is what the live viewer uses.
 pub enum H264Decoder {
     Software { dec: Decoder },
+    Native(Box<dyn golive_platform::decode::VideoDecoder>),
+    RecoveringSoftware { parameter_sets: Vec<u8> },
     #[cfg(target_os = "windows")]
     Hardware(crate::mfdec::MfDecoder),
 }
@@ -992,6 +994,14 @@ pub struct DecodedPicture {
     pub frame: PresentedFrame,
 }
 
+static NATIVE_DECODER_FACTORY: std::sync::OnceLock<golive_platform::decode::DecoderFactory> = std::sync::OnceLock::new();
+
+/// The app installs an OS backend before starting media. Core imports only
+/// the platform's pure contract. Creation happens on the serial codec worker.
+pub fn install_decoder_factory(factory: golive_platform::decode::DecoderFactory) {
+    let _ = NATIVE_DECODER_FACTORY.set(factory);
+}
+
 impl H264Decoder {
     /// Software decoder, always. Deterministic everywhere (tests, movie
     /// preload, forced-fallback paths).
@@ -1006,6 +1016,11 @@ impl H264Decoder {
     /// Never fails while software constructs; a mid-stream hardware fault
     /// transparently degrades to software on the failing unit.
     pub fn new_auto() -> Result<Self, MediaError> {
+        if std::env::var_os("GOLIVE_DISABLE_HW").is_none() {
+            if let Some(factory) = NATIVE_DECODER_FACTORY.get() {
+                if let Ok(decoder) = factory() { return Ok(Self::Native(decoder)); }
+            }
+        }
         #[cfg(target_os = "windows")]
         {
             if std::env::var_os("GOLIVE_DISABLE_HW").is_none() {
@@ -1027,7 +1042,8 @@ impl H264Decoder {
     /// only — same redaction rules as the encode side (names, never pixels).
     pub fn backend_name(&self) -> &'static str {
         match self {
-            Self::Software { .. } => "openh264",
+            Self::Software { .. } | Self::RecoveringSoftware { .. } => "openh264",
+            Self::Native(_) => "native",
             #[cfg(target_os = "windows")]
             Self::Hardware(hw) => hw.backend_name(),
         }
@@ -1045,6 +1061,43 @@ impl H264Decoder {
         let is_keyframe = contains_idr(annexb);
         let started = measurements.as_ref().map(|_| Instant::now());
         match self {
+            Self::RecoveringSoftware { parameter_sets } => {
+                // A fresh decoder has no reference pictures. Never feed it
+                // deltas from the failed hardware session or conceal garbage.
+                if !is_keyframe { return Ok(None); }
+                let mut recovered = std::mem::take(parameter_sets);
+                recovered.extend_from_slice(annexb);
+                *self = Self::new()?;
+                self.decode_measured(&recovered, compact, measurements)
+            }
+            Self::Native(hw) => {
+                let decoded = hw.decode(annexb);
+                if let Some(m) = measurements.as_deref_mut() { m.codec_us = elapsed_us(started); }
+                match decoded {
+                    Ok(None) => Ok(None),
+                    Ok(Some(pic)) => {
+                        let started = measurements.as_ref().map(|_| Instant::now());
+                        let (w, h) = (pic.width, pic.height);
+                        if w == 0 || h == 0 || w > 8192 || h > 8192 || w % 2 != 0 || h % 2 != 0 || pic.data.len() != w*h*3/2 {
+                            return Err(MediaError::Codec("native pixel layout invalid".into()));
+                        }
+                        let sum: u64 = pic.data[..w*h].iter().map(|b| *b as u64).sum();
+                        let (data, format) = if compact { (pic.data, PixelFormat::Nv12) }
+                            else { (crate::mfdec::nv12_to_rgba(w,h,&pic.data).ok_or_else(|| MediaError::Codec("native pixel conversion".into()))?, PixelFormat::Rgba) };
+                        if let Some(m) = measurements { m.convert_us = elapsed_us(started); }
+                        Ok(Some(DecodedPicture {
+                            stats: DecodedStats { w, h, luma_mean: sum as f64 / (w*h) as f64, is_keyframe },
+                            frame: PresentedFrame { w, h, data, format },
+                        }))
+                    }
+                    Err(_) => {
+                        let parameter_sets = hw.parameter_sets();
+                        *self = Self::RecoveringSoftware { parameter_sets };
+                        eprintln!("golive: decode backend=openh264 recovery=await-idr");
+                        self.decode_measured(annexb, compact, measurements)
+                    }
+                }
+            }
             Self::Software { dec } => {
                 let decoded = dec.decode(annexb).map_err(|e| MediaError::Codec(format!("decode: {e}")))?;
                 if let Some(m) = measurements.as_deref_mut() { m.codec_us = elapsed_us(started); }
@@ -2454,8 +2507,18 @@ async fn read_loop(
     let mut depacketizer = H264Packet::default();
     // Live viewer: hardware DXVA where probed, transparent software
     // fallback otherwise (never black on probe failure).
-    let mut decoder = match H264Decoder::new_auto() {
-        Ok(dec) => dec,
+    let mut decoder = match crate::worker::SerialWorker::start("golive-decode", move || {
+        let mut decoder = H264Decoder::new_auto();
+        move |(unit, measure): (Vec<u8>, bool)| {
+            let mut measurements = DecodeMeasurements::default();
+            let picture = match decoder.as_mut() {
+                Ok(decoder) => decoder.decode_measured(&unit, compact, measure.then_some(&mut measurements)),
+                Err(error) => Err(MediaError::Codec(error.to_string())),
+            };
+            (unit, picture, measurements)
+        }
+    }) {
+        Ok(worker) => worker,
         Err(e) => {
             let _ = event_tx.send(MediaEvent::Error(e.to_string()));
             return;
@@ -2491,7 +2554,7 @@ async fn read_loop(
                 None
             }
         };
-        for (completed_ts, unit) in [previous, current].into_iter().flatten() {
+        for (completed_ts, mut unit) in [previous, current].into_iter().flatten() {
             if au_is_stale(last_decoded_ts, completed_ts) {
                 // Late pre-switch duplicate: decoding it would move
                 // presentation backwards in time. Count it in the existing
@@ -2504,8 +2567,12 @@ async fn read_loop(
                 }, None);
             } else {
                 let started = decode_trace.start();
-                let mut measurements = DecodeMeasurements::default();
-                let decoded = match decoder.decode_measured(&unit, compact, started.map(|_| &mut measurements)) {
+                let (returned_unit, decoded, measurements) = match decoder.run((unit, started.is_some())).await {
+                    Ok(result) => result,
+                    Err(error) => { let _ = event_tx.send(MediaEvent::Error(error.into())); return; }
+                };
+                unit = returned_unit;
+                let decoded = match decoded {
                     Ok(picture) => picture,
                     Err(e) => { let _ = event_tx.send(MediaEvent::Error(e.to_string())); None }
                 };
@@ -4149,5 +4216,77 @@ mod tests {
         // Drop releases exactly once even on the error path above.
         drop(gpu);
         assert_eq!(TEST_RELEASES.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod native_decoder_recovery_tests {
+    use super::*;
+    use golive_platform::decode::{Nv12Picture, VideoDecoder};
+    struct FailingDecoder;
+    impl VideoDecoder for FailingDecoder {
+        fn decode(&mut self, _: &[u8]) -> Result<Option<Nv12Picture>, String> { Err("injected driver failure".into()) }
+        fn parameter_sets(&self) -> Vec<u8> { Vec::new() }
+    }
+    #[test]
+    fn hardware_failure_waits_for_idr_before_software_deltas() {
+        let profile = QualityProfile { w: 320, h: 180, fps: 60, bitrate_kbps: 600 };
+        let mut encoder = H264Encoder::new_with_profile(&profile, 320, 180).unwrap();
+        let frame = synthetic_frame(320,180,0);
+        let idr = encoder.encode(&frame).unwrap();
+        assert!(contains_idr(&idr));
+        let delta = encoder.encode(&synthetic_frame(320,180,1)).unwrap();
+        assert!(!contains_idr(&delta));
+        let mut decoder = H264Decoder::Native(Box::new(FailingDecoder));
+        assert!(decoder.decode_for_present(&delta,true).unwrap().is_none());
+        assert!(matches!(decoder, H264Decoder::RecoveringSoftware { .. }));
+        assert!(decoder.decode_for_present(&delta,true).unwrap().is_none());
+        let recovered = decoder.decode_for_present(&idr,true).unwrap().unwrap();
+        assert_eq!((recovered.frame.w,recovered.frame.h), (320,180));
+        assert_eq!(decoder.backend_name(), "openh264");
+        assert!(decoder.decode_for_present(&delta,true).unwrap().is_some());
+    }
+    #[test]
+    fn recovery_reuses_valid_parameter_sets_for_an_idr_without_headers() {
+        struct CachedFailure(Vec<u8>);
+        impl VideoDecoder for CachedFailure {
+            fn decode(&mut self, _: &[u8]) -> Result<Option<Nv12Picture>, String> { Err("injected".into()) }
+            fn parameter_sets(&self) -> Vec<u8> { self.0.clone() }
+        }
+        let mut encoder = H264Encoder::new(Quality::P720).unwrap();
+        let unit = encoder.encode(&synthetic_frame(1280,720,0)).unwrap();
+        let mut headers = Vec::new(); let mut idr = Vec::new();
+        for range in annexb_nals(&unit) {
+            let nal = &unit[range];
+            if matches!(nal_type(nal), Some(7 | 8)) { headers.extend_from_slice(nal); }
+            else { idr.extend_from_slice(nal); }
+        }
+        assert!(!headers.is_empty()); assert!(contains_idr(&idr));
+        let mut decoder = H264Decoder::Native(Box::new(CachedFailure(headers)));
+        assert!(decoder.decode_for_present(&idr,true).unwrap().is_some());
+        assert_eq!(decoder.backend_name(), "openh264");
+    }
+    #[test]
+    fn invalid_native_output_recovers_instead_of_retrying_broken_backend() {
+        struct InvalidOutput;
+        impl VideoDecoder for InvalidOutput {
+            fn decode(&mut self, _: &[u8]) -> Result<Option<Nv12Picture>, String> {
+                Ok(Some(Nv12Picture { width: 320, height: 180, data: vec![0] }))
+            }
+            fn parameter_sets(&self) -> Vec<u8> { Vec::new() }
+        }
+        let mut encoder = H264Encoder::new(Quality::P720).unwrap();
+        let idr = encoder.encode(&synthetic_frame(1280,720,0)).unwrap();
+        let mut decoder = H264Decoder::Native(Box::new(InvalidOutput));
+        assert!(decoder.decode_for_present(&idr,true).unwrap().is_some());
+        assert_eq!(decoder.backend_name(), "openh264");
+    }
+    #[test]
+    fn hardware_failure_on_idr_recovers_in_the_same_call() {
+        let mut encoder = H264Encoder::new(Quality::P720).unwrap();
+        let idr = encoder.encode(&synthetic_frame(1280,720,0)).unwrap();
+        let mut decoder = H264Decoder::Native(Box::new(FailingDecoder));
+        assert!(decoder.decode_for_present(&idr,true).unwrap().is_some());
+        assert_eq!(decoder.backend_name(), "openh264");
     }
 }

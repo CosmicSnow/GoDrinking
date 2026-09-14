@@ -20,3 +20,4 @@ pub mod trace;
 mod mfdec;
 mod nvenc;
 mod vt;
+mod worker;

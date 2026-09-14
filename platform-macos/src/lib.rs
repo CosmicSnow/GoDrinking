@@ -337,16 +337,18 @@ impl VideoSource for ScSource {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let error_ = Arc::clone(&error);
         let stop_ = Arc::clone(&stop_flag);
+        let probe = Arc::new(golive_platform::capture_probe::CaptureProbe::default());
+        let worker_probe = Arc::clone(&probe);
         // Every SCK object lives on this thread: no Send questions, prompt
         // teardown, deterministic startup rendezvous below.
         let worker = std::thread::Builder::new()
             .name("golive-sck".into())
             .spawn(move || {
-                run_capture(info, config, frame_tx, error_, stop_, ready_tx);
+                run_capture(info, config, frame_tx, error_, stop_, ready_tx, worker_probe);
             })
             .map_err(|e| PlatformError::Internal(format!("thread de captura: {e}")))?;
         match ready_rx.recv_timeout(START_DEADLINE) {
-            Ok(Ok(())) => Ok(FrameStream::new(frame_rx, error, stop_flag, worker)),
+            Ok(Ok(())) => Ok(FrameStream::new(frame_rx, error, stop_flag, worker).with_capture_probe(probe)),
             Ok(Err(error)) => {
                 stop_flag.store(true, Ordering::Release);
                 let _ = worker.join();
@@ -366,6 +368,7 @@ impl VideoSource for ScSource {
 // ---------------------------------------------------------------------------
 
 struct OutputIvars {
+    probe: Arc<golive_platform::capture_probe::CaptureProbe>,
     tx: Mutex<mpsc::SyncSender<CapturePacket>>,
     // Written here, read by golive-platform's FrameStream::next_frame
     // (cross-crate use the dead-code lint cannot see).
@@ -427,7 +430,9 @@ define_class!(
             // lock, no copy, no alloc.
             let ivars = self.ivars();
             let now = now_ns();
+            ivars.probe.arrival(now);
             if !gate_open(ivars.last_ns.load(Ordering::Relaxed), now, ivars.interval_ns) {
+                ivars.probe.gate_dropped.fetch_add(1, Ordering::Relaxed);
                 return;
             }
             let packet = match retain_gpu_packet(sample_buffer) {
@@ -444,12 +449,12 @@ define_class!(
                         log_fallback_once();
                         CapturePacket::Cpu(frame)
                     }
-                    None => return,
+                    None => { ivars.probe.invalid.fetch_add(1, Ordering::Relaxed); return; }
                 },
             };
             if let Ok(tx) = ivars.tx.lock() {
                 // Latest-only: drop newest (not oldest) when full.
-                let _ = tx.try_send(packet);
+                if tx.try_send(packet).is_err() { ivars.probe.queue_dropped.fetch_add(1, Ordering::Relaxed); }
             }
             // Cadence accounts accepted frames even when the channel was
             // full: copies/retains stay capped at profile fps while the
@@ -637,6 +642,7 @@ fn run_capture(
     error_slot: Arc<Mutex<Option<PlatformError>>>,
     stop_flag: Arc<AtomicBool>,
     ready_tx: mpsc::Sender<Result<(), PlatformError>>,
+    probe: Arc<golive_platform::capture_probe::CaptureProbe>,
 ) {
     let fail = |error: PlatformError| {
         if let Ok(mut guard) = error_slot.lock() {
@@ -743,6 +749,7 @@ fn run_capture(
         );
         let interval_ns = 1_000_000_000u64 / applied.fps.max(1) as u64;
         let output = CaptureOutput::alloc().set_ivars(OutputIvars {
+            probe,
             tx: Mutex::new(frame_tx),
             error_slot: Arc::clone(&error_slot),
             last_ns: AtomicU64::new(initial_last_ns(now_ns(), interval_ns)),
@@ -1030,3 +1037,5 @@ mod tests {
         assert!(dropped > 100, "{dropped} died pre-copy");
     }
 }
+
+pub mod decode;

@@ -128,7 +128,7 @@ async fn shell_create_share_snapshot() {
 
     // create → share → snapshot(Live with a share id).
     // With a plan installed, the room code is also published to code_file.
-    let dir = std::env::temp_dir().join("golive-smoke-e2e");
+    let dir = std::env::temp_dir().join(format!("golive-smoke-e2e-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     state
         .set_e2e_plan(golive_app::E2ePlan {
@@ -139,6 +139,7 @@ async fn shell_create_share_snapshot() {
             code_file: dir.join("code").to_string_lossy().into_owned(),
             status_file: dir.join("status.json").to_string_lossy().into_owned(),
             share: None,
+            quality: None,
         })
         .expect("set_e2e_plan");
     let code = state
@@ -293,6 +294,66 @@ async fn run_mutual_watch(room_creator_shares_first: bool) {
         reverse >= 3 && forward >= 3,
         "both directions must deliver video: A -> B fresh={forward}, B -> A={reverse}"
     );
+}
+
+async fn wait_for_frames(state: &Arc<AppState>, minimum: u64) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let frames = state.get_media_counters().unwrap().frames;
+        if frames >= minimum { return; }
+        assert!(Instant::now() < deadline, "fresh video stalled: {frames} < {minimum}");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+}
+
+/// Real signaling + shell orchestration, including ownership transfer and
+/// re-watch. Core-only fanout tests cannot catch shell lifecycle regressions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_host_survives_viewer_departure_quality_change_and_rewatch() {
+    let server = ServerGuard::spawn().unwrap();
+    let host = Arc::new(AppState::new());
+    let first = Arc::new(AppState::new());
+    let second = Arc::new(AppState::new());
+    for state in [&host, &first, &second] { state.set_server(&server.base).unwrap(); }
+    let code = host.create_room(None, "shared-host", "local-fanout-test").await.unwrap();
+    first.join_room(None, &code, "first", "local-fanout-test").await.unwrap();
+    second.join_room(None, &code, "second", "local-fanout-test").await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let host_id = loop {
+        if let Some(member) = second.get_roster().into_iter().find(|m| m.nickname == "shared-host") {
+            break member.id;
+        }
+        assert!(Instant::now() < deadline, "host missing from roster");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    };
+    host.start_share(None, "synthetic", Some(golive_core::media::QualityProfile {
+        w: 320, h: 180, fps: 30, bitrate_kbps: 600,
+    })).await.unwrap();
+    first.watch(&host_id).await.unwrap();
+    wait_for_frames(&first, 5).await;
+    second.watch(&host_id).await.unwrap();
+    wait_for_frames(&second, 5).await;
+
+    first.leave().await.unwrap();
+    let before = second.get_media_counters().unwrap().frames;
+    host.set_quality(None, golive_app::SetQualityArgs {
+        w: 640, h: 360, fps: 30, bitrate_kbps: 1200, preset: None,
+    }).await.unwrap();
+    wait_for_frames(&second, before + 15).await;
+
+    // Last viewer out, then in: the encoder must be recreated and decode again.
+    second.unwatch(&host_id).await.unwrap();
+    assert_eq!(second.get_media_counters().unwrap().frames, 0);
+    second.watch(&host_id).await.unwrap();
+    wait_for_frames(&second, 5).await;
+    second.leave().await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !host.get_snapshot().unwrap().links.is_empty() {
+        assert!(Instant::now() < deadline, "departed viewers left orphan links");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    host.stop_share().await.unwrap();
+    host.leave().await.unwrap();
 }
 
 /// Native UI fixture: three real, independent senders in one local room.

@@ -1823,6 +1823,7 @@ fn e2e_read_code(state: State<'_, Arc<AppState>>) -> Result<String, String> {
 
 /// Tauri entry point with an explicit state (tests inject their own).
 pub fn run_with(state: Arc<AppState>) {
+    screen::install_decoder_backend();
     let log_state = Arc::clone(&state);
     tauri::Builder::default()
         .manage(state)

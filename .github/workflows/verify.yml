@@ -1,0 +1,52 @@
+name: Application regression tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            app/web/package-lock.json
+            server/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Rust stable
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Select Rust
+        run: rustup default stable
+      - name: Install dependencies
+        run: |
+          npm --prefix server ci
+          npm --prefix app/web ci
+      - name: Install browser
+        working-directory: app/web
+        run: npx playwright install chromium
+      - name: Run reusable suite
+        run: python scripts/verify.py --artifact e2e-artifacts/ci
+      - name: Preserve reports, including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-${{ matrix.os }}
+          path: e2e-artifacts/

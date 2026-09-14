@@ -12,6 +12,9 @@
 | BUG-002 | Windows lento + GPU ~40% de RTX 3090 só assistindo             | open (windows) | build Windows pós-DXGI   | Lado Windows (LLM Windows): checar decode por software, present loop sem vsync, upload de textura por frame. Evidência nova: viewer inocente (28fps local saudável, 0 repeats, path sem perdas); pipeline sem GPU em nenhum estágio (sem NVENC — 3090 não ajuda em nada hoje); host Windows emite ~13fps num alvo 60fps (ver BUG-001). |
 | BUG-003 | Viewer repete `ice connected` a cada ~0,5–2 s a sessão toda    | open | log viewer do amigo (~150 linhas, sessão com watch+share) | `wire_ice_events` (media.rs) emite sem dedupe a cada transição Connected/Completed — connects succeeding = flap/retry loop, não causa do kick. Apurar gatilho (roster re-watch? ICE flap). |
 | BUG-004 | Checagem cross Windows bloqueada na compilação de Opus | open — ambiente macOS→Windows | 2026-09-11 | `cargo xwin check` rejeita inicialmente espaços no rustflag do manifesto. Com `RUSTFLAGS=''` (somente para check), CMake 4 exige `CMAKE_POLICY_VERSION_MINIMUM=3.5`; após esse ajuste, `audiopus_sys 0.2.2` falha em intrínsecos SSE4.1/SSSE3 compilados sem a feature. Nenhuma dependência/flag permanente foi alterada. Testes nativos macOS passam; checagem e execução Windows pendentes. |
+| BUG-005 | Janela de terminal abre junto com o app no Windows | correção no código, validação nativa pendente | 2026-09-13 | App e helper sem atributo de subsystem; os dois PEs antigos disponíveis foram reprovados como console=3. Ambos agora declaram GUI. `check-windows-gui.py` inspeciona os executáveis gerados e bloqueia release com console. Falta compilar/executar a versão corrigida no Windows; não considerar verificado apenas pelo patch. |
+
+Auditoria automatizada de 13/09: `verify.py --desktop` aprovou as suítes funcionais, build e cadência com um viewer (gap 43,746 ms), mas reprovou dois viewers (57,507 / 58,456 ms, limite 50 ms). BUG-001 continua aberto. Evidências e cobertura em [VALIDACAO-app-2026-09-13.md](VALIDACAO-app-2026-09-13.md); execução reutilizável em [TESTING.md](TESTING.md).
 
 Validação BUG-001 (2026-09-09): checks/testes de app, core, platform e
 platform-macos passaram; web typecheck/test/build, testes do server e
@@ -83,3 +86,12 @@ local: 60,011 FPS apresentados, gap máximo 28,215 ms. BUG-001 segue aberto:
 Windows/sessão remota não revalidados; CPU/IPC do viewer, FrameSlot substituindo
 H.264 sem contabilizar perdas, encode/captura por watcher e readback WGC antes
 do gate permanecem pendentes. Ver `REVISAO-performance-2026-09-12.md`.
+
+
+Reprodução adicional (2026-09-14): vídeo YouTube 60 FPS no Display 3 a 120 Hz,
+com viewer medido na sala indicada pelo usuário. Baseline teve gap de apresentação
+até 122,343 ms; reteste com decoder em thread dedicada ainda chegou a 100,172 ms.
+O host entregou cerca de 50 e 40 FPS, respectivamente; não é comparação A/B
+controlada e não comprova ganho percentual. BUG-001 continua aberto. Contadores
+`capture_input` adicionados antes do gate SCK precisam de host reiniciado na
+build nova. Captura isolada bloqueada por permissão/timeout, sem resultado de FPS.

@@ -32,11 +32,11 @@ import json
 import sys
 from pathlib import Path
 
-STAGES = ("capture", "source", "encode", "send", "rtp", "decode", "codec", "convert", "dispatch", "draw", "present")
+STAGES = ("capture_input", "capture", "source", "encode", "send", "rtp", "decode", "codec", "convert", "dispatch", "draw", "present")
 
 # Counters summed per stage for the summary. bytes/frames are informational;
 # the rest feed the finding flags.
-TOTALS = ("frames", "bytes", "dropped", "timeouts", "errors", "keyframes",
+TOTALS = ("frames", "bytes", "dropped", "gate_dropped", "queue_dropped", "invalid_frames", "timeouts", "errors", "keyframes",
           "repeats", "gpu_frames")
 
 # Optional future counters for the pli-storm heuristic. Absent from current
@@ -199,6 +199,9 @@ def report_file(path, records, summary, timeout_burst, stall_us):
                 s["pli_sent"], s["pli_suppressed"])
         if stage == "encode" and s.get("intra_applied", 0):
             extra = " intra_applied=%d" % s["intra_applied"]
+        if stage == "capture_input":
+            extra = " gate_dropped=%d queue_dropped=%d invalid_frames=%d max_gap=%dus" % (
+                s["gate_dropped"], s["queue_dropped"], s["invalid_frames"], s["max_gap_us"])
         if stage == "rtp":
             extra = " (frames=packets)"
         lines.append(
@@ -297,6 +300,15 @@ def run_self_test():
     check(any(f.startswith("JITTER") for f in flags),
           "present judder flagged (max_gap_us >= 2x interval)")
 
+    acquisition = summarize([dict(stage="capture_input", frames=60, elapsed_us=1000000,
+                                  gate_dropped=4, queue_dropped=2, invalid_frames=1,
+                                  max_gap_us=33000)])
+    rendered = "\n".join(report_file("numeric-fixture", [], acquisition,
+                                    TIMEOUT_BURST_DEFAULT, STALL_US_DEFAULT))
+    check(all(value in rendered for value in ("gate_dropped=4", "queue_dropped=2",
+                                               "invalid_frames=1", "max_gap=33000us")),
+          "acquisition report exposes each loss reason and callback gap")
+
     bad = {"stage": "decode", "frames": "many"}
     ok = True
     for key, value in bad.items():
@@ -306,7 +318,7 @@ def run_self_test():
     check(not ok, "non-numeric value rejected by schema rule")
     check("nope" not in STAGES, "unknown stage rejected by schema rule")
 
-    checks = 14  # number of check() calls above
+    checks = 16  # number of check() calls above
     if failures:
         print("self-test: %d failure(s)" % len(failures))
         return 1
