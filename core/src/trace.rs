@@ -17,6 +17,8 @@ pub enum Stage {
     CaptureInput,
     Source,
     Encode,
+    EncodePrepare,
+    EncodePool,
     EncodeSubmit,
     EncodeCompletion,
     EncodeResume,
@@ -25,6 +27,7 @@ pub enum Stage {
     Decode,
     Codec,
     Convert,
+    PacerHold,
     Dispatch,
     Draw,
     Present,
@@ -57,6 +60,14 @@ pub struct Sample {
     /// Presenter pacing: max gap between consecutive successful acks within
     /// the record (microseconds, 0 when fewer than 2 acks). Max-merged, not summed.
     pub max_gap_us: u64,
+    /// Presenter ack-gap histogram: per-record counts of inter-ack gaps above
+    /// 20/25/34/50 ms. Nested — one 60 ms stall counts in all four bands —
+    /// so subtract adjacent bands for exclusive histograms. Summed, 0 in old
+    /// records that predate the fields.
+    pub gap_gt_20ms: u64,
+    pub gap_gt_25ms: u64,
+    pub gap_gt_34ms: u64,
+    pub gap_gt_50ms: u64,
     pub width: u32,
     pub height: u32,
     pub target_fps: u32,
@@ -156,7 +167,7 @@ impl Trace {
         r.max_work_us = r.max_work_us.max(us);
         macro_rules! sum { ($($f:ident),*) => { $(r.sample.$f += sample.$f;)* }; }
         sum!(frames, bytes, dropped, gate_dropped, queue_dropped, invalid_frames, idle_frames, blank_frames, cpu_work_us, cpu_samples, timeouts, errors, keyframes, repeats, gpu_frames,
-             pli_sent, pli_suppressed, intra_applied);
+             pli_sent, pli_suppressed, intra_applied, gap_gt_20ms, gap_gt_25ms, gap_gt_34ms, gap_gt_50ms);
         // Pacing extremes never average away: keep the worst ack gap seen.
         r.sample.max_gap_us = r.sample.max_gap_us.max(sample.max_gap_us);
         r.sample.max_cpu_work_us = r.sample.max_cpu_work_us.max(sample.max_cpu_work_us);
@@ -213,6 +224,49 @@ impl Drop for Trace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encode_sub_stages_serialize_to_snake_case() {
+        // Analyzer contract (scripts/analyze-trace.py STAGES): pool is the
+        // create+lock sub-interval split out of prepare.
+        let prepare = serde_json::to_value(Stage::EncodePrepare).unwrap();
+        let pool = serde_json::to_value(Stage::EncodePool).unwrap();
+        assert_eq!(prepare, "encode_prepare");
+        assert_eq!(pool, "encode_pool");
+    }
+
+    #[test]
+    fn gap_bands_sum_and_pacer_hold_serializes() {
+        // Present-stage histogram: nested per-ack band counts sum across the
+        // record window; old records simply omit the fields (= 0).
+        let dir = std::env::temp_dir().join(format!("golive-trace-gaps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut trace = Trace::open(Stage::Present, &dir);
+        for gap in [10_000u64, 30_000, 60_000] {
+            trace.record(
+                Sample {
+                    frames: 1,
+                    gap_gt_20ms: (gap > 20_000) as u64,
+                    gap_gt_25ms: (gap > 25_000) as u64,
+                    gap_gt_34ms: (gap > 34_000) as u64,
+                    gap_gt_50ms: (gap > 50_000) as u64,
+                    ..Default::default()
+                },
+                None,
+            );
+        }
+        drop(trace);
+        let file = dir.join(format!("golive-trace-{}.jsonl", std::process::id()));
+        let content = std::fs::read_to_string(&file).unwrap();
+        let r: serde_json::Value = serde_json::from_str(content.lines().last().unwrap()).unwrap();
+        assert_eq!(r["gap_gt_20ms"], 2, "30ms + 60ms gaps");
+        assert_eq!(r["gap_gt_25ms"], 2, "30ms + 60ms gaps");
+        assert_eq!(r["gap_gt_34ms"], 1, "60ms gap only");
+        assert_eq!(r["gap_gt_50ms"], 1, "60ms gap only");
+        let hold = serde_json::to_value(Stage::PacerHold).unwrap();
+        assert_eq!(hold, "pacer_hold");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn normal_launch_marker_enables_trace_without_environment() {

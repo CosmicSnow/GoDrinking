@@ -286,3 +286,41 @@ opt-in e não escreve arquivos na thread do driver. Os intervalos se sobrepõem:
 **não somar** submit/completion. Completion inclui agendamento do callback e
 extração H.264, não apenas execução na GPU. Resume também pode incluir trabalho
 síncrono que o worker ainda precisava concluir antes de consumir a fila.
+
+`encode_prepare` mede no worker a conversão I420→NV12 para o staging reutilizável
+(`i420_to_nv12_into`, sem alloc por frame) mais o memcpy para o pixel buffer do pool
+(bulk por plano quando o stride é tight). `encode_pool` mede só `create_pixel_buffer` +
+lock dentro do mesmo bloco — é sub-intervalo do prepare antigo (`prepare + pool ≈
+prepare` anterior). No próximo cadence: pool dominante = backpressure do VT; prepare
+dominante = memcpy/conversão. **Não somar** nenhum deles com completion/submit.
+
+O viewer apresenta com micro jitter buffer de no máximo 2 quadros entre decode e
+`on_frame`, num relógio suavizado dos deltas RTP: EWMA com alpha 0.125 (primeira
+amostra real vence a semente; deltas 0 e >1s ignorados; clamp 1ms..1s) e phase-lock
+com slew de no máximo 2ms por quadro — erro de fase pequeno é absorvido aos poucos,
+só buraco maior que 2 intervalos reancora de uma vez. Quadro sozinho apresenta na
+hora (~0ms extra com rede boa), rajada espaça 1 intervalo, cheio adiciona no máximo
+2 intervalos (~33ms a 60fps). Na leitura, `pacer_hold` médio deve cair para perto do
+intervalo nominal (wobble absorvido) em vez de copiar o ritmo de chegada; gaps
+>50ms de buracos reais da fonte permanecem. Estouro pós-decode só descarta e conta
+`decode.dropped` — o decoder já avançou as referências, então sem PLI e sem espera de
+IDR (forçar recovery aqui virava cascata: IDR grande/lento → mais gaps → mais PLIs).
+PLI + espera de IDR ficam só para perda pré-decode (gap de AU, erro de depacketize ou
+decode), onde a referência realmente se perdeu. Chegada (`decode`/`codec`) e
+apresentação (`dispatch`/`present`) seguem separadas: `dropped > 0` sem `pli_sent`
+junto = estouros absorvidos; `dropped` com `pli_sent` = perda real reassincronizando;
+`present.max_gap` pequeno com chegadas espaçadas = suavização ativa.
+
+O host segue sem rajada pós-overrun: após estouro o `encode_loop` reancora o deadline
+para `frame_time + frame_duration` (pula slots, nunca publica 2 unidades para
+compensar) e o `FrameSlot` comporta 1 unidade — no máximo 1 publicada por intervalo,
+latest-only. Nenhuma mudança foi necessária; latência base intacta.
+
+Micro-travadas do viewer separam-se em duas medidas: `present` conta por janela
+quantos gaps de ack passaram de 20/25/34/50ms (`gap_gt_*`, aninhados — um stall de
+60ms conta nas quatro faixas; subtrair faixas adjacentes para histograma exclusivo) e
+`pacer_hold` mede por quadro apresentado só a retenção agendada (`due − ready`, ≥0).
+`pacer_hold` exclui espera de decode, IPC, draw e ack; `present` contém
+dispatch+draw+ack — **não somar** hold+dispatch+present. Leitura: `pacer_hold`
+alto com `present` alto = jitter do pacer (rede/ritmo); hold ~0 com gaps altos =
+downstream (IPC/draw/ack). Registros antigos sem os campos leem como 0.

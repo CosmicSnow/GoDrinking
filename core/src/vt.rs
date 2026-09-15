@@ -44,18 +44,36 @@ pub fn data_rate_limit_bytes(bitrate_bps: u32, window_secs: f64, overshoot: f64)
 /// Convert planar I420 (tight, even dims) to NV12 (Y + interleaved UV).
 /// Pure; the contract dims reaching here are always even (see normalize).
 pub fn i420_to_nv12(w: usize, h: usize, y: &[u8], u: &[u8], v: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    i420_to_nv12_into(w, h, y, u, v, &mut out);
+    out
+}
+
+/// Staging variant: writes NV12 into a caller-owned buffer, growing it to
+/// `w*h*3/2` only when dims change. Steady-state frames reuse the
+/// allocation (no 3 MB alloc at 60 fps). Byte-exact with `i420_to_nv12`.
+pub fn i420_to_nv12_into(
+    w: usize,
+    h: usize,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    out: &mut Vec<u8>,
+) {
     debug_assert!(w % 2 == 0 && h % 2 == 0);
     debug_assert_eq!(y.len(), w * h);
     debug_assert_eq!(u.len(), w * h / 4);
     debug_assert_eq!(v.len(), w * h / 4);
-    let mut out = vec![0u8; w * h * 3 / 2];
+    let expect = w * h * 3 / 2;
+    if out.len() != expect {
+        out.resize(expect, 0);
+    }
     out[..w * h].copy_from_slice(y);
     let uv = &mut out[w * h..];
     for i in 0..w * h / 4 {
         uv[2 * i] = u[i];
         uv[2 * i + 1] = v[i];
     }
-    out
 }
 
 /// Convert an AVCC sample (u32-BE length-prefixed NALs) to Annex-B.
@@ -207,6 +225,14 @@ mod backend {
         consecutive_skips: u32,
         force_next: bool,
         closed: bool,
+        /// Reusable NV12 staging (`w*h*3/2` bytes). Grown only when dims
+        /// change; steady-state frames overwrite it in place instead of
+        /// allocating a ~3 MB Vec per frame at 60 fps.
+        staging: Vec<u8>,
+        /// Pool-acquire timer (`create_pixel_buffer` + lock only). Sub-interval
+        /// of the old prepare block: `prepare + pool ≈ old prepare`.
+        pool_trace: Trace,
+        prepare_trace: Trace,
         submit_trace: Trace,
         completion_trace: Trace,
         resume_trace: Trace,
@@ -266,6 +292,9 @@ mod backend {
                 consecutive_skips: 0,
                 force_next: false,
                 closed: false,
+                staging: Vec::new(),
+                pool_trace: Trace::new(Stage::EncodePool),
+                prepare_trace: Trace::new(Stage::EncodePrepare),
                 submit_trace,
                 completion_trace: Trace::new(Stage::EncodeCompletion),
                 resume_trace: Trace::new(Stage::EncodeResume),
@@ -506,9 +535,66 @@ mod backend {
             }
         }
 
+        /// Encode one I420 frame: planar → reusable NV12 staging
+        /// (`i420_to_nv12_into`, grown only on dims change) plus pool copy
+        /// (`copy_to_pool`, bulk plane copy when strides are tight), then the
+        /// shared submit/wait path. Timers: `encode_pool` covers pool create +
+        /// lock, `encode_prepare` covers conversion + memcpy (pool window
+        /// subtracted, saturating, so `prepare + pool ≈ old prepare`).
+        /// Opt-in: when no trace is active `start` returns `None` and the
+        /// records no-op. No trace I/O happens on the VT callback thread.
+        pub fn encode_i420(
+            &mut self,
+            w: usize,
+            h: usize,
+            y: &[u8],
+            u: &[u8],
+            v: &[u8],
+        ) -> Result<Option<Vec<u8>>, MediaError> {
+            if self.closed {
+                return Err(MediaError::Codec("encoder closed".into()));
+            }
+            if (w, h) != (self.w, self.h) {
+                return Err(MediaError::Codec(format!(
+                    "hw frame {w}x{h} != session {}x{}",
+                    self.w, self.h
+                )));
+            }
+            if y.len() != w * h || u.len() != w * h / 4 || v.len() != w * h / 4 {
+                return Err(MediaError::Codec("i420 plane size mismatch".into()));
+            }
+            let started = self.prepare_trace.start();
+            super::i420_to_nv12_into(w, h, y, u, v, &mut self.staging);
+            let pixel = match Self::copy_to_pool(
+                &self.pool,
+                self.w,
+                self.h,
+                &self.staging,
+                &mut self.pool_trace,
+            ) {
+                Ok((pixel, pool_us)) => {
+                    let total_us = started.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
+                    self.prepare_trace.record_cost(
+                        Sample { frames: 1, ..Default::default() },
+                        total_us.saturating_sub(pool_us),
+                    );
+                    pixel
+                }
+                Err(e) => {
+                    self.prepare_trace.record(
+                        Sample { frames: 1, errors: 1, ..Default::default() },
+                        started,
+                    );
+                    return Err(e);
+                }
+            };
+            self.submit_owned(pixel)
+        }
+
         /// Encode one NV12 frame (w*h + w*h/2 bytes). Returns the Annex-B
         /// unit, or `None` on a transient encoder drop (capped upstream).
         /// Fatal errors (timeouts included) are `Err` — fail-high mid-share.
+        /// Same pool/prepare split as `encode_i420` (here prepare is memcpy).
         pub fn encode_nv12(&mut self, nv12: &[u8]) -> Result<Option<Vec<u8>>, MediaError> {
             if self.closed {
                 return Err(MediaError::Codec("encoder closed".into()));
@@ -522,7 +608,30 @@ mod backend {
                     self.h
                 )));
             }
-            let pixel = self.copy_to_pool(nv12)?;
+            let started = self.prepare_trace.start();
+            let pixel = match Self::copy_to_pool(
+                &self.pool,
+                self.w,
+                self.h,
+                nv12,
+                &mut self.pool_trace,
+            ) {
+                Ok((pixel, pool_us)) => {
+                    let total_us = started.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
+                    self.prepare_trace.record_cost(
+                        Sample { frames: 1, ..Default::default() },
+                        total_us.saturating_sub(pool_us),
+                    );
+                    pixel
+                }
+                Err(e) => {
+                    self.prepare_trace.record(
+                        Sample { frames: 1, errors: 1, ..Default::default() },
+                        started,
+                    );
+                    return Err(e);
+                }
+            };
             let done = self.submit_owned(pixel);
             return done;
         }
@@ -651,20 +760,40 @@ mod backend {
             }
         }
 
+        /// Pool copy of one NV12 staging buffer. Associated function (not a
+        /// `&self` method) so callers can hold their reusable `staging`
+        /// borrow across the call. Fast path: when a plane stride equals the
+        /// width the whole plane copies at once; row-by-row only when the
+        /// pool pads strides. Same bytes either way.
+        ///
+        /// Timing split (diagnostic only): pool create + lock + base/stride
+        /// lookup is recorded on `pool_trace` as `encode_pool`; the returned
+        /// `u64` is that window in microseconds so the caller can exclude it
+        /// from `encode_prepare` (conversion + memcpy). Unlock + memcpy cost
+        /// stays in prepare. On create/lock failure the pool record carries
+        /// `errors: 1` and no duration is returned.
         fn copy_to_pool(
-            &self,
+            pool: &CFRetained<CVPixelBufferPool>,
+            w: usize,
+            h: usize,
             nv12: &[u8],
-        ) -> Result<objc2_core_foundation::CFRetained<CVPixelBuffer>, MediaError> {
+            pool_trace: &mut Trace,
+        ) -> Result<(objc2_core_foundation::CFRetained<CVPixelBuffer>, u64), MediaError> {
             use objc2_core_video::*;
+            let pool_started = pool_trace.start();
             let mut raw: *mut CVPixelBuffer = null_mut();
             let status = unsafe {
                 CVPixelBufferPool::create_pixel_buffer(
                     None,
-                    &self.pool,
+                    pool,
                     NonNull::new(&mut raw).unwrap(),
                 )
             };
             if status != 0 || raw.is_null() {
+                pool_trace.record(
+                    Sample { frames: 1, errors: 1, ..Default::default() },
+                    pool_started,
+                );
                 return Err(MediaError::Codec(format!("pixel pool status {status}")));
             }
             // SAFETY: Create rule (+1) adopted exactly once here.
@@ -673,26 +802,44 @@ mod backend {
             let status =
                 unsafe { CVPixelBufferLockBaseAddress(&pixel, CVPixelBufferLockFlags::empty()) };
             if status != 0 {
+                pool_trace.record(
+                    Sample { frames: 1, errors: 1, ..Default::default() },
+                    pool_started,
+                );
                 return Err(MediaError::Codec(format!("pixel lock status {status}")));
             }
+            let (y_base, uv_base, y_stride, uv_stride) = unsafe {
+                (
+                    CVPixelBufferGetBaseAddressOfPlane(&pixel, 0) as *mut u8,
+                    CVPixelBufferGetBaseAddressOfPlane(&pixel, 1) as *mut u8,
+                    CVPixelBufferGetBytesPerRowOfPlane(&pixel, 0),
+                    CVPixelBufferGetBytesPerRowOfPlane(&pixel, 1),
+                )
+            };
+            let pool_us = pool_started.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
+            pool_trace.record_cost(Sample { frames: 1, ..Default::default() }, pool_us);
             let copied = unsafe {
-                let y_base = CVPixelBufferGetBaseAddressOfPlane(&pixel, 0) as *mut u8;
-                let uv_base = CVPixelBufferGetBaseAddressOfPlane(&pixel, 1) as *mut u8;
                 if y_base.is_null() || uv_base.is_null() {
                     false
                 } else {
-                    let y_stride = CVPixelBufferGetBytesPerRowOfPlane(&pixel, 0);
-                    let uv_stride = CVPixelBufferGetBytesPerRowOfPlane(&pixel, 1);
-                    let (w, h) = (self.w, self.h);
-                    for row in 0..h {
-                        let dst = y_base.add(row * y_stride);
-                        let src = &nv12[row * w..row * w + w];
-                        std::ptr::copy_nonoverlapping(src.as_ptr(), dst, w);
+                    let (y_src, uv_src) = nv12.split_at(w * h);
+                    if y_stride == w {
+                        std::ptr::copy_nonoverlapping(y_src.as_ptr(), y_base, w * h);
+                    } else {
+                        for row in 0..h {
+                            let dst = y_base.add(row * y_stride);
+                            let src = &y_src[row * w..row * w + w];
+                            std::ptr::copy_nonoverlapping(src.as_ptr(), dst, w);
+                        }
                     }
-                    for row in 0..h / 2 {
-                        let dst = uv_base.add(row * uv_stride);
-                        let src = &nv12[w * h + row * w..w * h + row * w + w];
-                        std::ptr::copy_nonoverlapping(src.as_ptr(), dst, w);
+                    if uv_stride == w {
+                        std::ptr::copy_nonoverlapping(uv_src.as_ptr(), uv_base, w * h / 2);
+                    } else {
+                        for row in 0..h / 2 {
+                            let dst = uv_base.add(row * uv_stride);
+                            let src = &uv_src[row * w..row * w + w];
+                            std::ptr::copy_nonoverlapping(src.as_ptr(), dst, w);
+                        }
                     }
                     true
                 }
@@ -701,7 +848,7 @@ mod backend {
             if !copied {
                 return Err(MediaError::Codec("pixel copy failed".into()));
             }
-            Ok(pixel)
+            Ok((pixel, pool_us))
         }
 
         /// Graceful close: drain completions, invalidate. Re-entrant safe
@@ -853,6 +1000,17 @@ mod backend {
             Err(MediaError::HwUnavailable("VideoToolbox is macOS-only".into()))
         }
 
+        pub fn encode_i420(
+            &mut self,
+            _w: usize,
+            _h: usize,
+            _y: &[u8],
+            _u: &[u8],
+            _v: &[u8],
+        ) -> Result<Option<Vec<u8>>, MediaError> {
+            Err(MediaError::HwUnavailable("VideoToolbox is macOS-only".into()))
+        }
+
         pub fn close(&mut self) {}
 
         pub fn dims(&self) -> (usize, usize) {
@@ -884,6 +1042,33 @@ mod tests {
         assert_eq!(nv12.len(), 4 * 2 * 3 / 2);
         assert_eq!(&nv12[..8], &y[..]);
         assert_eq!(&nv12[8..], &[10, 20, 10, 20]);
+    }
+
+    #[test]
+    fn nv12_into_matches_alloc_and_reuses_staging() {
+        // Byte-exact with the allocating variant, then reuse without growth.
+        let y: Vec<u8> = (0..8).collect();
+        let u = vec![10u8; 2];
+        let v = vec![20u8; 2];
+        let expect = i420_to_nv12(4, 2, &y, &u, &v);
+        let mut staging = Vec::new();
+        i420_to_nv12_into(4, 2, &y, &u, &v, &mut staging);
+        assert_eq!(staging, expect);
+        let cap = staging.capacity();
+        assert!(cap >= 4 * 2 * 3 / 2);
+        // Second frame, same dims: overwrite in place, no realloc.
+        let y2: Vec<u8> = (8..16).collect();
+        i420_to_nv12_into(4, 2, &y2, &u, &v, &mut staging);
+        assert_eq!(staging.len(), 4 * 2 * 3 / 2);
+        assert_eq!(staging.capacity(), cap);
+        assert_eq!(&staging[..8], &y2[..]);
+        assert_eq!(&staging[8..], &[10, 20, 10, 20]);
+        // Dims change: buffer grows to the new frame size.
+        let big_y = vec![1u8; 8 * 4];
+        let big_u = vec![2u8; 8 * 4 / 4];
+        let big_v = vec![3u8; 8 * 4 / 4];
+        i420_to_nv12_into(8, 4, &big_y, &big_u, &big_v, &mut staging);
+        assert_eq!(staging, i420_to_nv12(8, 4, &big_y, &big_u, &big_v));
     }
 
     #[test]

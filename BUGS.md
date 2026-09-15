@@ -12,6 +12,13 @@ a fonte ao vivo foi corrigida de 30 para 60 FPS, mas ainda houve gaps de
 cadência (um viewer: 75,83 ms; dois: 65,32/65,05 ms). BUG-001 permanece aberto;
 ver [MELHORIA-viewer-2026-09-15.md](MELHORIA-viewer-2026-09-15.md).
 
+Atualização 15/09 (noite): pacer de apresentação + relógio EWMA sanaram a
+cascata PLI/IDR no viewer Mac. Ao vivo D5LC1C: primeiro PASS no gate (present
+57,9 FPS, gap máx 45,2ms, 0 drops/PLI; histograma >50ms 16→0) e confirmação
+visual do usuário ("melhorou muito"). Resíduo: micro-gaps 58–81ms isolados por
+agendamento sob carga. Falta build Windows para a espectadora no Windows 10
+sentir o efeito + confirmação visual final; BUG-001 segue aberto.
+
 | ID      | Sintoma                                                        | Status         | Desde                    | Suspeita / notas |
 |---------|----------------------------------------------------------------|----------------|--------------------------|------------------|
 | BUG-001 | Compartilhamento de tela lento com hosts e viewers macOS/Windows | open — Mac validado ao vivo, falta Windows + CPU/GPU | relatado após mudança PLI | Confirmado: gates de captura/ponte reiniciavam o intervalo a cada chegada, perdendo FPS com jitter. Regressão de 300 chegadas a 30 FPS com jitter de 1 ms: 151 encaminhadas antes, 300 após correção de cadência. Validado ao vivo no Mac (viewer fresh ~28,6/s, Display-3 PASS 23 s). Aberto: host Windows 1080p60 emite ~13fps/~2,5 Mbps (medido no viewer LHYSYV, path sem perdas — teto no emissor, trace do host pendente) + CPU/GPU sustentados. `link_stats.bitrate_bps` mede RGBA apresentado, não bitrate H.264; não prova storm de IDR. |

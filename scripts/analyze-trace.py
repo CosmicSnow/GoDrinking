@@ -32,12 +32,12 @@ import json
 import sys
 from pathlib import Path
 
-STAGES = ("capture_input", "capture", "source", "encode", "encode_submit", "encode_completion", "encode_resume", "send", "rtp", "decode", "codec", "convert", "dispatch", "draw", "present")
+STAGES = ("capture_input", "capture", "source", "encode", "encode_prepare", "encode_pool", "encode_submit", "encode_completion", "encode_resume", "send", "rtp", "decode", "codec", "convert", "pacer_hold", "dispatch", "draw", "present")
 
 # Counters summed per stage for the summary. bytes/frames are informational;
 # the rest feed the finding flags.
 TOTALS = ("frames", "bytes", "dropped", "gate_dropped", "queue_dropped", "invalid_frames", "idle_frames", "blank_frames", "cpu_work_us", "cpu_samples", "timeouts", "errors", "keyframes",
-          "repeats", "gpu_frames")
+          "repeats", "gpu_frames", "gap_gt_20ms", "gap_gt_25ms", "gap_gt_34ms", "gap_gt_50ms")
 
 # Optional future counters for the pli-storm heuristic. Absent from current
 # traces; only consulted when present as numeric fields.
@@ -193,8 +193,10 @@ def report_file(path, records, summary, timeout_burst, stall_us):
         extra = ""
         if stage == "present":
             fresh = s["frames"] - s.get("repeats", 0)
-            extra = " fresh=%d fresh_fps=%.1f max_gap=%dus" % (
-                fresh, rate(fresh, s["elapsed_us"]), s.get("max_gap_us", 0))
+            extra = " fresh=%d fresh_fps=%.1f max_gap=%dus gap>20ms=%d gap>25ms=%d gap>34ms=%d gap>50ms=%d" % (
+                fresh, rate(fresh, s["elapsed_us"]), s.get("max_gap_us", 0),
+                s.get("gap_gt_20ms", 0), s.get("gap_gt_25ms", 0),
+                s.get("gap_gt_34ms", 0), s.get("gap_gt_50ms", 0))
         if stage == "decode" and (s.get("pli_sent", 0) or s.get("pli_suppressed", 0)):
             extra = " pli_sent=%d pli_suppressed=%d" % (
                 s["pli_sent"], s["pli_suppressed"])
@@ -208,6 +210,8 @@ def report_file(path, records, summary, timeout_burst, stall_us):
                 s["cpu_work_us"] / s["cpu_samples"], s["max_cpu_work_us"])
         if stage == "rtp":
             extra = " (frames=packets)"
+        if stage == "pacer_hold":
+            extra = " (hold=due-ready per presented frame; disjoint from dispatch/present)"
         lines.append(
             "  %-8s rec=%-4d rate=%7.1f/s mean_work=%9.1fus max_work=%8dus "
             "drop=%d timeouts=%d err=%d repeats=%d keyframes=%d%s"
@@ -318,6 +322,17 @@ def run_self_test():
     check(cpu["decode"]["cpu_work_us"] == 400 and cpu["decode"]["cpu_samples"] == 2
           and cpu["decode"]["max_cpu_work_us"] == 300, "worker CPU totals and maximum preserved")
 
+    gaps = summarize([dict(stage="present", frames=60, elapsed_us=1000000,
+                             gap_gt_20ms=5, gap_gt_25ms=3, gap_gt_34ms=2, gap_gt_50ms=1,
+                             max_gap_us=60000)])
+    rendered = "\n".join(report_file("gap-fixture", [], gaps,
+                                     TIMEOUT_BURST_DEFAULT, STALL_US_DEFAULT))
+    check(all(value in rendered for value in ("gap>20ms=5", "gap>25ms=3",
+                                               "gap>34ms=2", "gap>50ms=1",
+                                               "max_gap=60000us")),
+          "present report exposes nested ack-gap histogram bands")
+    check("pacer_hold" in STAGES, "pacer_hold stage accepted by schema rule")
+
     bad = {"stage": "decode", "frames": "many"}
     ok = True
     for key, value in bad.items():
@@ -327,7 +342,7 @@ def run_self_test():
     check(not ok, "non-numeric value rejected by schema rule")
     check("nope" not in STAGES, "unknown stage rejected by schema rule")
 
-    checks = 17  # number of check() calls above
+    checks = 19  # number of check() calls above
     if failures:
         print("self-test: %d failure(s)" % len(failures))
         return 1

@@ -21,6 +21,12 @@ pub struct PlayerState {
 }
 const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Ack-gap histogram bands for the present stage (>20/>25/>34/>50 ms).
+/// Nested: one 60 ms stall counts in all four. Pure so tests own time.
+fn gap_bands(gap_us: u64) -> [u64; 4] {
+    [20_000, 25_000, 34_000, 50_000].map(|t| (gap_us > t) as u64)
+}
+
 struct Sink {
     token: String,
     channel: Channel,
@@ -97,11 +103,16 @@ impl Surface {
         let gap = if drawn {
             self.last_present.replace(now).map(|last| now.duration_since(last).as_micros() as u64).unwrap_or(0)
         } else { 0 };
+        let bands = gap_bands(gap);
         self.trace.record(TraceSample {
             frames: drawn as u64,
             bytes: if drawn { bytes } else { 0 },
             dropped: std::mem::take(&mut self.replaced) + (!drawn) as u64,
             max_gap_us: gap,
+            gap_gt_20ms: bands[0],
+            gap_gt_25ms: bands[1],
+            gap_gt_34ms: bands[2],
+            gap_gt_50ms: bands[3],
             ..Default::default()
         }, Some(sent));
         if drawn {
@@ -505,6 +516,15 @@ mod tests {
             h: 1,
             format: golive_core::media::PixelFormat::Rgba, data: vec![value; w * 4],
         }
+    }
+    #[test]
+    fn ack_gap_histogram_bands_are_nested() {
+        assert_eq!(gap_bands(0), [0, 0, 0, 0], "first ack has no gap");
+        assert_eq!(gap_bands(20_000), [0, 0, 0, 0], "bands are strict >");
+        assert_eq!(gap_bands(20_001), [1, 0, 0, 0]);
+        assert_eq!(gap_bands(30_000), [1, 1, 0, 0]);
+        assert_eq!(gap_bands(40_000), [1, 1, 1, 0]);
+        assert_eq!(gap_bands(60_000), [1, 1, 1, 1], "worst stall in every band");
     }
     #[test]
     fn stalled_surface_keeps_only_latest_frame_and_rejects_stale_acks() {
