@@ -372,6 +372,7 @@ fn pump_bridge(
                 input_trace.record(TraceSample {
                     frames: counts.received, gate_dropped: counts.gate_dropped,
                     queue_dropped: counts.queue_dropped, invalid_frames: counts.invalid,
+                    idle_frames: counts.idle, blank_frames: counts.blank,
                     max_gap_us: counts.max_gap_us,
                     target_fps: (1.0 / interval.as_secs_f64()).round() as u32,
                     ..Default::default()
@@ -936,5 +937,8 @@ mod allocation_tests {
 /// Backend selection remains in the app's existing platform glue.
 pub(crate) fn install_decoder_backend() {
     #[cfg(target_os = "macos")]
-    golive_core::media::install_decoder_factory(golive_platform_macos::decode::new_decoder);
+    {
+        golive_core::media::install_decoder_factory(golive_platform_macos::decode::new_decoder);
+        golive_core::media::install_media_cpu_clock(golive_platform_macos::decode::thread_cpu_us);
+    }
 }

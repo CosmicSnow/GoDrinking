@@ -52,6 +52,7 @@ dispatch2 = { version = "0.3", features = ["objc2"] }
 
 objc2-core-foundation = "0.3"
 objc2-video-toolbox = "0.3"
+libc = "0.2"
 
 [dev-dependencies]
 openh264 = "0.9"

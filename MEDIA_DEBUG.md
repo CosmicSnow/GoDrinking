@@ -262,3 +262,27 @@ substage labels as if their work were identical to OpenH264's plane extraction.
 Real native regression tests cover separate SPS/PPS, delta frames, resolution
 changes to 1080p, padding and luma/chroma agreement with software. Core tests
 inject driver failure on a delta/IDR and IDR without in-band parameter sets.
+
+
+For missing-image SCK callbacks, `idle_frames` and `blank_frames` are subsets
+of `invalid_frames` (the historical name for callbacks without usable pixels).
+Do not add them to that total or treat idle as corruption. They reflect Apple's
+numeric status metadata, read only when neither GPU nor CPU pixels are available.
+Older host builds omit these two fields and cannot establish the reason.
+
+
+O trace opt-in também mede `cpu_work_us`, `cpu_samples` e `max_cpu_work_us`
+nos estágios encode/decode quando o backend fornece relógio de CPU da thread
+(macOS). Esse relógio exclui espera, trabalho da GPU e de outras threads;
+`max_work_us` continua sendo tempo de parede. Os máximos por janela podem
+pertencer a quadros diferentes. Campo sem amostras não significa CPU zero.
+
+
+No encoder VideoToolbox, `encode_submit` mede a chamada de submissão ao VT;
+`encode_completion` mede da submissão até o callback terminar de preparar a
+unidade H.264 e enfileirá-la; `encode_resume` mede desse ponto até o worker
+retomar após consumir a conclusão. A captura do timestamp no callback é
+opt-in e não escreve arquivos na thread do driver. Os intervalos se sobrepõem:
+**não somar** submit/completion. Completion inclui agendamento do callback e
+extração H.264, não apenas execução na GPU. Resume também pode incluir trabalho
+síncrono que o worker ainda precisava concluir antes de consumir a fila.

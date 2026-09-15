@@ -67,3 +67,25 @@ Ele reprova se faltar um arquivo, o PE for inválido ou o subsystem for console=
 `.github/workflows/verify.yml` executa a mesma suíte em macOS e Windows em PRs, pushes para main e por acionamento manual. Preserva os relatórios mesmo em falha. A release Windows também recusa executáveis de console antes do upload. Configurar o workflow no repositório não significa que ele já executou: a execução remota depende do push/CI.
 
 Nenhuma suíte garante ausência de todos os bugs. Para aceitar a correção original de fluidez ainda é necessário testar Windows↔macOS nas máquinas reais, com captura de tela, áudio, conteúdo 60 FPS e rede remota. O teste de cadência mede ACK de desenho, não o scanout físico. Não declarar equivalência ao Discord a partir de um PASS local.
+
+
+## Decoder nativo do macOS
+
+A suíte do backend macOS agora executa VideoToolbox de verdade, sem captura de
+tela: compara saída NV12 com OpenH264, inclui quadros dependentes, SPS/PPS
+separados, mudanças de resolução e 1080p. Ela exige hardware H.264 disponível;
+falha explicitamente se a sessão de hardware não puder ser criada. O core
+injeta falhas de driver e saída inválida para verificar recuperação em software
+somente a partir de IDR, incluindo reaproveitamento de SPS/PPS validados.
+
+Comandos focados, a partir de `app/`:
+
+```sh
+cargo test --release --manifest-path ../platform-macos/Cargo.toml --lib decode::
+cargo test --release --manifest-path ../core/Cargo.toml --lib native_decoder_recovery_tests
+```
+
+Esses testes não precisam de permissão de Gravação de Tela. O backend nativo é
+instalado pelo shell na inicialização normal; core isolado mantém seu padrão
+software. Para comparar o viewer em software, inicie somente esse processo com
+`GOLIVE_DISABLE_HW=1`; não aplique a variável ao host durante a mesma comparação.

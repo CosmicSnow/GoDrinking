@@ -994,6 +994,11 @@ pub struct DecodedPicture {
     pub frame: PresentedFrame,
 }
 
+static THREAD_CPU_CLOCK: std::sync::OnceLock<fn() -> Option<u64>> = std::sync::OnceLock::new();
+
+/// Installs a clock measuring only the calling media worker, for opt-in traces.
+pub fn install_media_cpu_clock(clock: fn() -> Option<u64>) { let _ = THREAD_CPU_CLOCK.set(clock); }
+
 static NATIVE_DECODER_FACTORY: std::sync::OnceLock<golive_platform::decode::DecoderFactory> = std::sync::OnceLock::new();
 
 /// The app installs an OS backend before starting media. Core imports only
@@ -1049,6 +1054,8 @@ impl H264Decoder {
         }
     }
 
+    fn waiting_for_keyframe(&self) -> bool { matches!(self, Self::RecoveringSoftware { .. }) }
+
     pub fn decode(&mut self, annexb: &[u8]) -> Result<Option<DecodedPicture>, MediaError> {
         self.decode_for_present(annexb, false)
     }
@@ -1079,7 +1086,10 @@ impl H264Decoder {
                         let started = measurements.as_ref().map(|_| Instant::now());
                         let (w, h) = (pic.width, pic.height);
                         if w == 0 || h == 0 || w > 8192 || h > 8192 || w % 2 != 0 || h % 2 != 0 || pic.data.len() != w*h*3/2 {
-                            return Err(MediaError::Codec("native pixel layout invalid".into()));
+                            let parameter_sets = hw.parameter_sets();
+                            *self = Self::RecoveringSoftware { parameter_sets };
+                            eprintln!("golive: decode backend=openh264 recovery=invalid-native-output");
+                            return self.decode_measured(annexb, compact, measurements);
                         }
                         let sum: u64 = pic.data[..w*h].iter().map(|b| *b as u64).sum();
                         let (data, format) = if compact { (pic.data, PixelFormat::Nv12) }
@@ -1164,7 +1174,7 @@ impl H264Decoder {
 }
 
 #[derive(Default)]
-struct DecodeMeasurements { codec_us: u64, convert_us: u64 }
+struct DecodeMeasurements { codec_us: u64, convert_us: u64, cpu_work_us: u64, cpu_samples: u64, request_keyframe: bool }
 fn elapsed_us(started: Option<Instant>) -> u64 {
     started.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0)
 }
@@ -1888,11 +1898,16 @@ fn encode_loop(
         };
         // 3. Encode; transient skips are capped, anything else is fatal+loud.
         let started = encode_trace.start();
+        let cpu_start = started.and_then(|_| THREAD_CPU_CLOCK.get().and_then(|clock| clock()));
         let encoded = match frame {
             PendingFrame::Cpu(frame) => encoder.encode_frame(&frame),
             PendingFrame::Gpu(gpu) => encode_gpu_frame(&mut encoder, gpu, target),
         };
+        let cpu_elapsed = cpu_start.zip(cpu_start.and_then(|_| THREAD_CPU_CLOCK.get().and_then(|clock| clock())))
+            .map(|(start, end)| end.saturating_sub(start));
         if started.is_some() { encode_trace.record(TraceSample {
+            cpu_work_us: cpu_elapsed.unwrap_or(0), cpu_samples: cpu_elapsed.is_some() as u64,
+            max_cpu_work_us: cpu_elapsed.unwrap_or(0),
             frames: matches!(&encoded, Ok(Some(_))) as u64,
             bytes: encoded.as_ref().ok().and_then(|u| u.as_ref()).map(|u| u.len() as u64).unwrap_or(0),
             keyframes: encoded.as_ref().ok().and_then(|u| u.as_ref()).map(|u| contains_idr(u) as u64).unwrap_or(0),
@@ -2511,10 +2526,16 @@ async fn read_loop(
         let mut decoder = H264Decoder::new_auto();
         move |(unit, measure): (Vec<u8>, bool)| {
             let mut measurements = DecodeMeasurements::default();
+            let cpu_start = measure.then(|| THREAD_CPU_CLOCK.get().and_then(|clock| clock())).flatten();
             let picture = match decoder.as_mut() {
                 Ok(decoder) => decoder.decode_measured(&unit, compact, measure.then_some(&mut measurements)),
                 Err(error) => Err(MediaError::Codec(error.to_string())),
             };
+            if let (Some(start), Some(end)) = (cpu_start, cpu_start.and_then(|_| THREAD_CPU_CLOCK.get().and_then(|clock| clock()))) {
+                measurements.cpu_work_us = end.saturating_sub(start);
+                measurements.cpu_samples = 1;
+            }
+            measurements.request_keyframe = decoder.as_ref().map(|decoder| decoder.waiting_for_keyframe()).unwrap_or(false);
             (unit, picture, measurements)
         }
     }) {
@@ -2583,6 +2604,8 @@ async fn read_loop(
                 }
                 decode_trace.record(TraceSample {
                     frames: decoded.is_some() as u64, dropped: decoded.is_none() as u64,
+                    cpu_work_us: measurements.cpu_work_us, cpu_samples: measurements.cpu_samples,
+                    max_cpu_work_us: measurements.cpu_work_us,
                     bytes: unit.len() as u64,
                     width: decoded.as_ref().map(|p| p.frame.w as u32).unwrap_or(0),
                     height: decoded.as_ref().map(|p| p.frame.h as u32).unwrap_or(0),
@@ -2608,8 +2631,8 @@ async fn read_loop(
                         snapshot.census = census_snapshot(census);
                         let _ = event_tx.send(MediaEvent::Stats(snapshot));
                     }
-                } else if stats.frames_decoded == 0 {
-                    // Pre-IDR deltas: decoder returns None and nothing is
+                } else if stats.frames_decoded == 0 || measurements.request_keyframe {
+                    // Initial join or hardware recovery: None means nothing is
                     // presented. Ask once per debounce window — same path as
                     // an AU gap — so a late join does not stay black until
                     // the host happens to reconfigure.
@@ -4240,6 +4263,7 @@ mod native_decoder_recovery_tests {
         let mut decoder = H264Decoder::Native(Box::new(FailingDecoder));
         assert!(decoder.decode_for_present(&delta,true).unwrap().is_none());
         assert!(matches!(decoder, H264Decoder::RecoveringSoftware { .. }));
+        assert!(decoder.waiting_for_keyframe(), "mid-stream recovery must request a fresh IDR");
         assert!(decoder.decode_for_present(&delta,true).unwrap().is_none());
         let recovered = decoder.decode_for_present(&idr,true).unwrap().unwrap();
         assert_eq!((recovered.frame.w,recovered.frame.h), (320,180));

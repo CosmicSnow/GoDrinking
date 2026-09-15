@@ -17,6 +17,9 @@ pub enum Stage {
     CaptureInput,
     Source,
     Encode,
+    EncodeSubmit,
+    EncodeCompletion,
+    EncodeResume,
     Send,
     Rtp,
     Decode,
@@ -35,6 +38,11 @@ pub struct Sample {
     pub gate_dropped: u64,
     pub queue_dropped: u64,
     pub invalid_frames: u64,
+    pub idle_frames: u64,
+    pub blank_frames: u64,
+    pub cpu_work_us: u64,
+    pub cpu_samples: u64,
+    pub max_cpu_work_us: u64,
     pub timeouts: u64,
     pub errors: u64,
     pub keyframes: u64,
@@ -147,10 +155,11 @@ impl Trace {
         r.work_us += us;
         r.max_work_us = r.max_work_us.max(us);
         macro_rules! sum { ($($f:ident),*) => { $(r.sample.$f += sample.$f;)* }; }
-        sum!(frames, bytes, dropped, gate_dropped, queue_dropped, invalid_frames, timeouts, errors, keyframes, repeats, gpu_frames,
+        sum!(frames, bytes, dropped, gate_dropped, queue_dropped, invalid_frames, idle_frames, blank_frames, cpu_work_us, cpu_samples, timeouts, errors, keyframes, repeats, gpu_frames,
              pli_sent, pli_suppressed, intra_applied);
         // Pacing extremes never average away: keep the worst ack gap seen.
         r.sample.max_gap_us = r.sample.max_gap_us.max(sample.max_gap_us);
+        r.sample.max_cpu_work_us = r.sample.max_cpu_work_us.max(sample.max_cpu_work_us);
         if sample.width != 0 {
             r.sample.width = sample.width;
         }
@@ -239,6 +248,24 @@ mod tests {
         std::fs::remove_file(dir.join(".golive-media-trace")).unwrap();
         assert_eq!(trace_directory(None, Some(&executable)), None);
         assert_eq!(trace_directory(None, None), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cpu_cost_is_separate_from_wall_time_and_keeps_its_maximum() {
+        let dir = std::env::temp_dir().join(format!("golive-trace-cpu-{}", std::process::id()));
+        let mut trace = Trace::open(Stage::Decode, &dir);
+        for (wall, cpu) in [(20_000, 300), (60_000, 100)] {
+            trace.record_cost(Sample { frames: 1, cpu_samples: 1, cpu_work_us: cpu,
+                max_cpu_work_us: cpu, ..Default::default() }, wall);
+        }
+        drop(trace);
+        let file = dir.join(format!("golive-trace-{}.jsonl", std::process::id()));
+        let record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+        assert_eq!(record["work_us"], 80_000);
+        assert_eq!(record["cpu_work_us"], 400);
+        assert_eq!(record["cpu_samples"], 2);
+        assert_eq!(record["max_cpu_work_us"], 300);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -449,7 +449,15 @@ define_class!(
                         log_fallback_once();
                         CapturePacket::Cpu(frame)
                     }
-                    None => { ivars.probe.invalid.fetch_add(1, Ordering::Relaxed); return; }
+                    None => {
+                        ivars.probe.invalid.fetch_add(1, Ordering::Relaxed);
+                        match frame_status::sample_status(sample_buffer) {
+                            Some(1) => { ivars.probe.idle.fetch_add(1, Ordering::Relaxed); },
+                            Some(2) => { ivars.probe.blank.fetch_add(1, Ordering::Relaxed); },
+                            _ => (),
+                        }
+                        return;
+                    }
                 },
             };
             if let Ok(tx) = ivars.tx.lock() {
@@ -1039,3 +1047,5 @@ mod tests {
 }
 
 pub mod decode;
+
+mod frame_status;

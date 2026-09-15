@@ -97,6 +97,7 @@ pub use backend::{probe_hardware, VtEncoder};
 mod backend {
     use super::{avcc_to_annexb, OSStatus};
     use crate::media::MediaError;
+    use crate::trace::{Trace, Stage, Sample};
     use objc2_core_foundation::{
         CFArray, CFBoolean, CFDictionary, CFNumber, CFRetained, kCFBooleanFalse, kCFBooleanTrue,
         kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks,
@@ -141,17 +142,18 @@ mod backend {
     /// Shared callback state. Only refcounted, lock-guarded data crosses
     /// threads here — never raw session pointers.
     struct CbState {
-        queue: Mutex<VecDeque<Completed>>,
+        queue: Mutex<VecDeque<(Completed, Option<Instant>)>>,
+        measure: bool,
         notify: Condvar,
     }
 
     impl CbState {
         fn push(&self, item: Completed) {
-            self.queue.lock().expect("cb queue poisoned").push_back(item);
+            self.queue.lock().expect("cb queue poisoned").push_back((item, self.measure.then(Instant::now)));
             self.notify.notify_one();
         }
 
-        fn wait_pop(&self, deadline: Instant) -> Option<Completed> {
+        fn wait_pop(&self, deadline: Instant) -> Option<(Completed, Option<Instant>)> {
             let mut queue = self.queue.lock().expect("cb queue poisoned");
             loop {
                 if let Some(item) = queue.pop_front() {
@@ -205,6 +207,9 @@ mod backend {
         consecutive_skips: u32,
         force_next: bool,
         closed: bool,
+        submit_trace: Trace,
+        completion_trace: Trace,
+        resume_trace: Trace,
     }
 
     unsafe impl Send for VtEncoder {}
@@ -232,7 +237,9 @@ mod backend {
                     crate::media::MAX_DIM
                 )));
             }
+            let submit_trace = Trace::new(Stage::EncodeSubmit);
             let state = Arc::new(CbState {
+                measure: submit_trace.start().is_some(),
                 queue: Mutex::new(VecDeque::new()),
                 notify: Condvar::new(),
             });
@@ -259,6 +266,9 @@ mod backend {
                 consecutive_skips: 0,
                 force_next: false,
                 closed: false,
+                submit_trace,
+                completion_trace: Trace::new(Stage::EncodeCompletion),
+                resume_trace: Trace::new(Stage::EncodeResume),
             };
             if let Err(e) = enc.setup() {
                 enc.teardown();
@@ -570,6 +580,7 @@ mod backend {
             } else {
                 None
             };
+            let submitted_at = self.submit_trace.start();
             let status = unsafe {
                 self.session_ref().encode_frame(
                     image,
@@ -580,11 +591,12 @@ mod backend {
                     &mut info_flags,
                 )
             };
+            self.submit_trace.record(Sample { frames: 1, errors: (status != 0) as u64, ..Default::default() }, submitted_at);
             drop(pixel);
             if status != 0 {
                 return Err(MediaError::Codec(format!("hw encode status {status}")));
             }
-            match self.wait_completed() {
+            match self.wait_completed(submitted_at) {
                 result => result,
             }
         }
@@ -593,10 +605,25 @@ mod backend {
         /// 200ms. Timeout is fatal (a realtime encoder stuck longer is
         /// wedged — fail-high, never wedge the loop). IDR units leave with
         /// fresh SPS/PPS prepended (cache refreshed from the sample).
-        fn wait_completed(&mut self) -> Result<Option<Vec<u8>>, MediaError> {
+        fn wait_completed(&mut self, submitted_at: Option<Instant>) -> Result<Option<Vec<u8>>, MediaError> {
             let wait = Duration::from_millis((4000 / self.fps.max(1) as u64).max(200));
             let deadline = Instant::now() + wait;
-            match self.state.wait_pop(deadline) {
+            let completed = self.state.wait_pop(deadline);
+            // Callback timestamp is captured before notifying this worker. No
+            // trace I/O occurs on the VT callback thread. Single in-flight
+            // submission makes the timestamp unambiguous.
+            let resumed_at = self.resume_trace.start();
+            if let Some((_, Some(callback_at))) = completed.as_ref() {
+                if let Some(submitted_at) = submitted_at {
+                    self.completion_trace.record_cost(Sample { frames: 1, ..Default::default() },
+                        callback_at.saturating_duration_since(submitted_at).as_micros() as u64);
+                }
+                if let Some(resumed_at) = resumed_at {
+                    self.resume_trace.record_cost(Sample { frames: 1, ..Default::default() },
+                        resumed_at.saturating_duration_since(*callback_at).as_micros() as u64);
+                }
+            }
+            match completed.map(|(item, _)| item) {
                 Some(Completed::Unit { annexb, is_idr, sps_pps }) => {
                     self.consecutive_skips = 0;
                     if !is_idr {

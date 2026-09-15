@@ -6,6 +6,12 @@
 
 **Estado em 13/09/2026:** BUG-001/002 continuam abertos para validação remota e Windows. Viewer YUV/WebGL reduz o payload de pixels em 62,5%; último controle local atingiu 60 FPS e gap máximo de 26,538 ms. Outros ensaios falharam no gate de cadência, incluindo dois viewers com pausas de ~98 ms. Proteção de H.264, encoder/captura compartilhados e gate WGC antes do readback foram implementados e testados nos limites descritos em [OTIMIZACOES-video-2026-09-13.md](OTIMIZACOES-video-2026-09-13.md). As notas de ~13 FPS e ausência de GPU na tabela são observações históricas, superadas pelos traces posteriores; não descrevem todo o pipeline atual. BUG-004 reproduzido novamente na dependência Opus (SSE4.1/SSSE3), sem alteração permanente de flags.
 
+Atualização 15/09: decoder macOS VideoToolbox e fallback para software testados;
+a fonte ao vivo foi corrigida de 30 para 60 FPS, mas ainda houve gaps de
+~94–98 ms. A suíte completa passou nos testes funcionais e falhou nos gates de
+cadência (um viewer: 75,83 ms; dois: 65,32/65,05 ms). BUG-001 permanece aberto;
+ver [MELHORIA-viewer-2026-09-15.md](MELHORIA-viewer-2026-09-15.md).
+
 | ID      | Sintoma                                                        | Status         | Desde                    | Suspeita / notas |
 |---------|----------------------------------------------------------------|----------------|--------------------------|------------------|
 | BUG-001 | Compartilhamento de tela lento com hosts e viewers macOS/Windows | open — Mac validado ao vivo, falta Windows + CPU/GPU | relatado após mudança PLI | Confirmado: gates de captura/ponte reiniciavam o intervalo a cada chegada, perdendo FPS com jitter. Regressão de 300 chegadas a 30 FPS com jitter de 1 ms: 151 encaminhadas antes, 300 após correção de cadência. Validado ao vivo no Mac (viewer fresh ~28,6/s, Display-3 PASS 23 s). Aberto: host Windows 1080p60 emite ~13fps/~2,5 Mbps (medido no viewer LHYSYV, path sem perdas — teto no emissor, trace do host pendente) + CPU/GPU sustentados. `link_stats.bitrate_bps` mede RGBA apresentado, não bitrate H.264; não prova storm de IDR. |

@@ -465,3 +465,29 @@ mod native_tests {
         }
     }
 }
+
+/// Diagnostic clock for the calling worker only; excludes GPU/other threads.
+pub fn thread_cpu_us() -> Option<u64> {
+    unsafe {
+        let mut value: libc::timespec = std::mem::zeroed();
+        if libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut value) != 0 {
+            return None;
+        }
+        Some((value.tv_sec as u64).checked_mul(1_000_000)? + value.tv_nsec as u64 / 1000)
+    }
+}
+
+#[cfg(test)]
+mod cpu_clock_tests {
+    #[test]
+    fn thread_cpu_clock_excludes_sleep() {
+        let before = super::thread_cpu_us().expect("thread CPU clock available");
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        let after = super::thread_cpu_us().unwrap();
+        assert!(after >= before);
+        assert!(
+            after - before < 20_000,
+            "sleep must not look like busy codec CPU"
+        );
+    }
+}

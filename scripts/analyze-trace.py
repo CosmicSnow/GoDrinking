@@ -32,11 +32,11 @@ import json
 import sys
 from pathlib import Path
 
-STAGES = ("capture_input", "capture", "source", "encode", "send", "rtp", "decode", "codec", "convert", "dispatch", "draw", "present")
+STAGES = ("capture_input", "capture", "source", "encode", "encode_submit", "encode_completion", "encode_resume", "send", "rtp", "decode", "codec", "convert", "dispatch", "draw", "present")
 
 # Counters summed per stage for the summary. bytes/frames are informational;
 # the rest feed the finding flags.
-TOTALS = ("frames", "bytes", "dropped", "gate_dropped", "queue_dropped", "invalid_frames", "timeouts", "errors", "keyframes",
+TOTALS = ("frames", "bytes", "dropped", "gate_dropped", "queue_dropped", "invalid_frames", "idle_frames", "blank_frames", "cpu_work_us", "cpu_samples", "timeouts", "errors", "keyframes",
           "repeats", "gpu_frames")
 
 # Optional future counters for the pli-storm heuristic. Absent from current
@@ -124,13 +124,14 @@ def summarize(records):
             "t_min": rec.get("timestamp_ms", 0),
             "t_max": rec.get("timestamp_ms", 0),
             "pli": 0, "pli_sent": 0, "pli_suppressed": 0,
-            "intra_applied": 0, "max_gap_us": 0,
+            "intra_applied": 0, "max_gap_us": 0, "max_cpu_work_us": 0,
         })
         for key in TOTALS:
             s[key] = s.get(key, 0) + num(rec, key)
         for key in ("pli_sent", "pli_suppressed", "intra_applied"):
             s[key] += num(rec, key)
         s["max_gap_us"] = max(s["max_gap_us"], num(rec, "max_gap_us"))
+        s["max_cpu_work_us"] = max(s["max_cpu_work_us"], num(rec, "max_cpu_work_us"))
         s["records"] += 1
         s["elapsed_us"] += num(rec, "elapsed_us")
         s["work_us"] += num(rec, "work_us")
@@ -200,8 +201,11 @@ def report_file(path, records, summary, timeout_burst, stall_us):
         if stage == "encode" and s.get("intra_applied", 0):
             extra = " intra_applied=%d" % s["intra_applied"]
         if stage == "capture_input":
-            extra = " gate_dropped=%d queue_dropped=%d invalid_frames=%d max_gap=%dus" % (
-                s["gate_dropped"], s["queue_dropped"], s["invalid_frames"], s["max_gap_us"])
+            extra = " gate_dropped=%d queue_dropped=%d invalid_frames=%d idle_frames=%d blank_frames=%d max_gap=%dus" % (
+                s["gate_dropped"], s["queue_dropped"], s["invalid_frames"], s["idle_frames"], s["blank_frames"], s["max_gap_us"])
+        if s.get("cpu_samples", 0):
+            extra += " worker_cpu_mean=%.1fus worker_cpu_max=%dus" % (
+                s["cpu_work_us"] / s["cpu_samples"], s["max_cpu_work_us"])
         if stage == "rtp":
             extra = " (frames=packets)"
         lines.append(
@@ -301,13 +305,18 @@ def run_self_test():
           "present judder flagged (max_gap_us >= 2x interval)")
 
     acquisition = summarize([dict(stage="capture_input", frames=60, elapsed_us=1000000,
-                                  gate_dropped=4, queue_dropped=2, invalid_frames=1,
+                                  gate_dropped=4, queue_dropped=2, invalid_frames=5, idle_frames=3, blank_frames=1,
                                   max_gap_us=33000)])
     rendered = "\n".join(report_file("numeric-fixture", [], acquisition,
                                     TIMEOUT_BURST_DEFAULT, STALL_US_DEFAULT))
     check(all(value in rendered for value in ("gate_dropped=4", "queue_dropped=2",
-                                               "invalid_frames=1", "max_gap=33000us")),
+                                               "invalid_frames=5", "idle_frames=3", "blank_frames=1", "max_gap=33000us")),
           "acquisition report exposes each loss reason and callback gap")
+
+    cpu = summarize([dict(stage="decode", cpu_work_us=300, cpu_samples=1, max_cpu_work_us=300),
+                     dict(stage="decode", cpu_work_us=100, cpu_samples=1, max_cpu_work_us=100)])
+    check(cpu["decode"]["cpu_work_us"] == 400 and cpu["decode"]["cpu_samples"] == 2
+          and cpu["decode"]["max_cpu_work_us"] == 300, "worker CPU totals and maximum preserved")
 
     bad = {"stage": "decode", "frames": "many"}
     ok = True
@@ -318,7 +327,7 @@ def run_self_test():
     check(not ok, "non-numeric value rejected by schema rule")
     check("nope" not in STAGES, "unknown stage rejected by schema rule")
 
-    checks = 16  # number of check() calls above
+    checks = 17  # number of check() calls above
     if failures:
         print("self-test: %d failure(s)" % len(failures))
         return 1
