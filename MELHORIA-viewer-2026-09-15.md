@@ -187,3 +187,44 @@ Leitura honesta: o host também estava mais calmo neste ensaio (send 96→26ms,
 capture gap 109→37ms), então a queda mistura relógio melhor + fonte melhor;
 não dá para atribuir percentual a cada um com uma execução por configuração.
 111 testes core passed. BUG-001 segue aberto até confirmação visual.
+
+
+## Revisão de baixa latência após auditoria (15/09)
+
+`core/src/media.rs`: deadlines atendidos durante leitura RTP e espera pelo
+worker serial; o mesmo future é preservado entre deadlines. Primeiro quadro
+imediato e capacidade 2 mantidos. Ao retomar tarde, só o quadro vencido mais
+recente é liberado; descartes pós-decode continuam sem PLI. Deltas isolados
+maiores que 2 intervalos + 1ms não alteram a EWMA; três amostras semelhantes
+confirmam uma mudança sustentada. A tolerância evita classificar 33333µs
+como pausa quando a estimativa era 16666µs.
+
+A decisão `deliver_decoded` é compartilhada pelo loop e pelos testes: erro
+software após o primeiro quadro pede PLI; overflow não pede. Fallback Windows
+agora usa RecoveringSoftware e espera IDR com os headers enviados pelo host;
+a execução nativa Windows continua pendente. Não foi adicionada detecção de
+perda/reordenação por sequência RTP nesta revisão.
+
+Validação em `e2e-artifacts/verify-20260915-054958-509128/`:
+
+- Dois testes novos reproduziram antes do fix: pausa de 500ms contaminando
+  a EWMA e liberação de dois quadros vencidos após pausa de 100ms.
+- Core corrigido: 116 unitários + 3 integração passaram (`core-corrected.log`).
+  O relatório original conserva duas falhas intermediárias de arredondamento
+  na troca 60→30 FPS, corrigidas e cobertas pelo reteste completo do core.
+- Teste com decoder bloqueado exige apresentação antes de liberar o worker.
+  Teste de 300 quadros regulares a 60 FPS exige retenção agendada zero.
+- Harness, analyzer, servidor, web unit/build/browser, platform, platform-macos
+  e app passaram; app inclui 107 unitários e 4 smoke, com 1 interativo ignorado.
+  Frontend e binários release macOS recompilados.
+- Cadência 1 viewer: 57,650 FPS, gap 164,105ms, zero drops; FAIL. Hold médio
+  13,485ms, máximo 27,127ms. Host encode máximo 158,482ms.
+- Cadência 2 viewers: ambos 57,123 FPS, gaps 934,935/917,096ms; FAIL. Hold
+  médio 10,880/10,971ms, máximo 28,288/22,661ms. Zero drops. Na janela dos
+  gaps, host encode 905,229ms (prepare 897,916ms), sem PLI no viewer.
+
+Os gates de 54 FPS/50ms foram preservados e continuam reprovados por gaps.
+A correlação temporal com o host não identifica a causa da pausa do emissor.
+Não há comparação A/B controlada nem nova confirmação visual remota. O limite
+de dois quadros é orçamento de retenção agendada em regime estável, não
+garantia de latência real ou proteção contra pausas longas. BUG-001 fica aberto.

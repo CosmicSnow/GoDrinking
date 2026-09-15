@@ -1174,7 +1174,7 @@ impl H264Decoder {
                         }))
                     }
                     Err(_) => {
-                        *self = Self::new()?;
+                        *self = Self::RecoveringSoftware { parameter_sets: Vec::new() };
                         self.decode_measured(annexb, compact, measurements)
                     }
                 }
@@ -2481,18 +2481,19 @@ fn rtp_frame_interval(prev_ts: u32, cur_ts: u32) -> Option<Duration> {
 /// between decode and `on_frame`, presented on a smoothed clock (EWMA of the
 /// RTP timestamp deltas), not the raw arrival rhythm.
 ///
-/// Low-watermark: a lone picture presents immediately (due now), so a healthy
-/// stream gains ~0 added latency; only the second held picture waits, at most
-/// one more interval. A full buffer adds at most 2 intervals (~33ms @60fps).
+/// The first picture presents immediately, without pre-roll. At a steady
+/// rate the two slots schedule at most two intervals ahead (~33ms @60fps).
+/// OS/IPC stalls are not bounded by this scheduling budget.
 /// Arrivals past 2 held slots are refused (caller drops + counts, decoder
 /// untouched — the drop is post-decode so the chain stays intact, no IDR
 /// needed) — order never changes. Small phase errors are slewed out at
 /// [`MAX_SLEW_PER_FRAME`] per frame; only holes bigger than the buffer can
-/// absorb (2 smoothed intervals) reanchor at once, so no catch-up burst ever
-/// forms. Pure: the clock is the caller's (`now`), so tests own time.
+/// absorb reanchor at once. Late wakeups keep only the newest due picture.
+/// Scheduling is pure: the caller supplies `now` for deterministic tests.
 struct PresentPacer {
     interval: Duration,
     observed: bool,
+    slow_candidate: Option<(Duration, u8)>,
     queue: VecDeque<(DecodedPicture, Instant, Instant)>,
     last_due: Option<Instant>,
     dropped: u64,
@@ -2506,6 +2507,7 @@ impl PresentPacer {
         Self {
             interval: interval.max(Duration::from_micros(1)),
             observed: false,
+            slow_candidate: None,
             queue: VecDeque::new(),
             last_due: None,
             dropped: 0,
@@ -2518,17 +2520,37 @@ impl PresentPacer {
         self.interval = interval.max(Duration::from_millis(1)).min(Duration::from_secs(1));
     }
 
-    /// Fold one arrival-delta sample into the smoothed clock. The first real
-    /// sample wins outright (the seed is only a guess); later ones move the
-    /// EWMA by [`INTERVAL_SMOOTHING_ALPHA`]. Callers pre-filter deltas
+    /// Fold one arrival-delta sample into the smoothed clock. The first
+    /// plausible sample replaces the seed; isolated long gaps are ignored.
+    /// Later samples move the EWMA by [`INTERVAL_SMOOTHING_ALPHA`]. Callers pre-filter deltas
     /// (see `rtp_frame_interval`: 0 and >1s never reach here).
     fn observe_interval(&mut self, sample: Duration) {
         let sample = sample.max(Duration::from_millis(1)).min(Duration::from_secs(1));
-        if !self.observed {
+        // RTP's 90kHz clock and microsecond rounding must not classify a
+        // normal 60->30fps switch (33333 vs 2*16666us) as a gap.
+        let gap_threshold = 2 * self.interval + Duration::from_millis(1);
+        if !self.observed && sample <= gap_threshold {
             self.interval = sample;
             self.observed = true;
+            self.slow_candidate = None;
             return;
         }
+        // A single missing stretch is not a new frame rate. Accept a much
+        // slower clock only after three similar deltas; normal 30<->60 fps
+        // changes still use the EWMA. This adds no picture buffering.
+        if sample > gap_threshold {
+            let count = match self.slow_candidate {
+                Some((previous, count)) if sample.abs_diff(previous) <= previous / 4 => count + 1,
+                _ => 1,
+            };
+            self.slow_candidate = Some((sample, count));
+            if count < 3 { return; }
+            self.interval = sample;
+            self.observed = true;
+            self.slow_candidate = None;
+            return;
+        }
+        self.slow_candidate = None;
         let current = self.interval.as_micros() as f64;
         let next = current + INTERVAL_SMOOTHING_ALPHA * (sample.as_micros() as f64 - current);
         self.interval = Duration::from_micros(next.round() as u64)
@@ -2589,12 +2611,69 @@ impl PresentPacer {
     /// Pop the front picture when its time has come, with the time it spent
     /// retained (`due - ready`, saturating, always >= 0). Call in a loop.
     fn pop_due(&mut self, now: Instant) -> Option<(DecodedPicture, u64)> {
+        // After a scheduler stall, replaying every expired slot just replaces
+        // pictures at the shell. Keep the freshest due picture instead.
+        while self.queue.get(1).is_some_and(|(_, due, _)| *due <= now) {
+            self.queue.pop_front();
+            self.dropped += 1;
+        }
         match self.queue.front() {
             Some((_, due, _)) if *due <= now => self.queue.pop_front().map(|(picture, due, ready)| {
+                if self.queue.is_empty() && now.saturating_duration_since(due) >= self.interval {
+                    self.last_due = Some(now);
+                }
                 (picture, due.saturating_duration_since(ready).as_micros() as u64)
             }),
             _ => None,
         }
+    }
+
+    fn drain_due(&mut self, emit: &mut impl FnMut(DecodedPicture, u64)) {
+        while let Some((picture, hold_us)) = self.pop_due(Instant::now()) {
+            emit(picture, hold_us);
+        }
+    }
+
+    /// Keep the same future alive across deadlines: no cancelled RTP reads
+    /// and no duplicate codec submissions. The codec remains serial.
+    async fn wait<F: std::future::Future>(
+        &mut self,
+        future: F,
+        emit: &mut impl FnMut(DecodedPicture, u64),
+    ) -> F::Output {
+        tokio::pin!(future);
+        loop {
+            self.drain_due(emit);
+            let Some(due) = self.next_due() else { return future.await; };
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(due.into()) => {},
+                result = &mut future => return result,
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DecodeDelivery { Queued, PresentationDrop, Pending, RequestKeyframe }
+
+/// Only a failure before presentation can request an IDR. Keeping the whole
+/// decision here lets regression tests exercise the same policy as read_loop.
+fn deliver_decoded(
+    pacer: &mut PresentPacer,
+    decoded: Result<Option<DecodedPicture>, MediaError>,
+    waiting_for_keyframe: bool,
+    has_decoded: bool,
+    now: Instant,
+) -> DecodeDelivery {
+    match decoded {
+        Ok(Some(picture)) => {
+            if pacer.push(picture, now) { DecodeDelivery::Queued }
+            else { DecodeDelivery::PresentationDrop }
+        }
+        Err(_) => DecodeDelivery::RequestKeyframe,
+        Ok(None) if waiting_for_keyframe || !has_decoded => DecodeDelivery::RequestKeyframe,
+        Ok(None) => DecodeDelivery::Pending,
     }
 }
 
@@ -2719,25 +2798,35 @@ async fn read_loop(
     let mut convert_trace = Trace::new(Stage::Convert);
     let mut pacer_hold_trace = Trace::new(Stage::PacerHold);
     let mut dispatch_trace = Trace::new(Stage::Dispatch);
+    let mut emit = |picture: DecodedPicture, hold_us: u64| {
+        // Scheduled retention only (due - ready): excludes decode wait,
+        // IPC, draw and ack. Disjoint from dispatch/present work below.
+        pacer_hold_trace.record_cost(TraceSample { frames: 1, ..Default::default() }, hold_us);
+        let frame = picture.stats;
+        stats.frames_decoded += 1;
+        if frame.is_keyframe {
+            stats.keyframes_decoded += 1;
+            let _ = event_tx.send(MediaEvent::Keyframe);
+        }
+        let non_black = FrameValidator::non_black(frame.luma_mean);
+        let motion = validator.motion(frame.luma_mean);
+        let _ = event_tx.send(MediaEvent::VideoFrame { non_black, motion });
+        let started = dispatch_trace.start();
+        on_frame(picture.frame);
+        dispatch_trace.record(TraceSample { frames: 1, ..Default::default() }, started);
+        if stats.frames_decoded % 30 == 0 {
+            let mut snapshot = stats.clone();
+            snapshot.census = census_snapshot(census);
+            let _ = event_tx.send(MediaEvent::Stats(snapshot));
+        }
+    };
+    let mut reported_pacer_drops = 0;
     loop {
-        // Wait for the next RTP packet, but only until the next paced
-        // present: held pictures must surface on rhythm even when the
-        // network gaps. Nothing held → block on the network as before.
-        let incoming = match pacer.next_due() {
-            Some(due) => {
-                let wait = due.saturating_duration_since(Instant::now());
-                match tokio::time::timeout(wait, track.read_rtp()).await {
-                    Ok(Ok(pair)) => Some(pair),
-                    Ok(Err(_)) => break,
-                    Err(_) => None,
-                }
-            }
-            None => match track.read_rtp().await {
-                Ok(pair) => Some(pair),
-                Err(_) => break,
-            },
+        let (packet, _) = match pacer.wait(track.read_rtp(), &mut emit).await {
+            Ok(pair) => pair,
+            Err(_) => break,
         };
-        if let Some((packet, _)) = incoming {
+        {
             let ts = packet.header.timestamp;
             rtp_trace.record(TraceSample { frames: 1, bytes: packet.payload.len() as u64, ..Default::default() }, None);
             let previous = assembly.begin(ts);
@@ -2775,53 +2864,35 @@ async fn read_loop(
                     }
                     last_au_ts = Some(completed_ts);
                     let started = decode_trace.start();
-                    let (returned_unit, decoded, measurements) = match decoder.run((unit, started.is_some())).await {
+                    let (returned_unit, decoded, measurements) = match pacer.wait(decoder.run((unit, started.is_some())), &mut emit).await {
                         Ok(result) => result,
                         Err(error) => { let _ = event_tx.send(MediaEvent::Error(error.into())); return; }
                     };
                     unit = returned_unit;
-                    let decoded = match decoded {
-                        Ok(picture) => picture,
-                        Err(e) => { let _ = event_tx.send(MediaEvent::Error(e.to_string())); None }
-                    };
+                    if let Err(error) = &decoded {
+                        let _ = event_tx.send(MediaEvent::Error(error.to_string()));
+                    }
+                    let picture = decoded.as_ref().ok().and_then(|p| p.as_ref());
                     if started.is_some() {
-                        codec_trace.record_cost(TraceSample { frames: decoded.is_some() as u64, ..Default::default() }, measurements.codec_us);
-                        convert_trace.record_cost(TraceSample { frames: decoded.is_some() as u64,
-                            bytes: decoded.as_ref().map(|p| p.frame.data.len() as u64).unwrap_or(0), ..Default::default() }, measurements.convert_us);
+                        codec_trace.record_cost(TraceSample { frames: picture.is_some() as u64, ..Default::default() }, measurements.codec_us);
+                        convert_trace.record_cost(TraceSample { frames: picture.is_some() as u64,
+                            bytes: picture.map(|p| p.frame.data.len() as u64).unwrap_or(0), ..Default::default() }, measurements.convert_us);
                     }
                     decode_trace.record(TraceSample {
-                        frames: decoded.is_some() as u64, dropped: decoded.is_none() as u64,
+                        frames: picture.is_some() as u64, dropped: picture.is_none() as u64,
                         cpu_work_us: measurements.cpu_work_us, cpu_samples: measurements.cpu_samples,
                         max_cpu_work_us: measurements.cpu_work_us,
                         bytes: unit.len() as u64,
-                        width: decoded.as_ref().map(|p| p.frame.w as u32).unwrap_or(0),
-                        height: decoded.as_ref().map(|p| p.frame.h as u32).unwrap_or(0),
-                        keyframes: decoded.as_ref().map(|p| p.stats.is_keyframe as u64).unwrap_or(0),
+                        width: picture.map(|p| p.frame.w as u32).unwrap_or(0),
+                        height: picture.map(|p| p.frame.h as u32).unwrap_or(0),
+                        keyframes: picture.map(|p| p.stats.is_keyframe as u64).unwrap_or(0),
                         ..Default::default()
                     }, started);
-                    if let Some(picture) = decoded {
-                        last_decoded_ts = Some(completed_ts);
-                        if !pacer.push(picture, Instant::now()) {
-                            // Overflow past 2 held slots: refuse the arrival
-                            // (order kept) and count it in the existing decode
-                            // `dropped` sample — nothing more. The drop is
-                            // post-decode, so the decoder already advanced its
-                            // references and the prediction chain is intact:
-                            // no recovery, no PLI. PLI + IDR wait stay on the
-                            // pre-decode loss paths (AU gap, depacketize or
-                            // decode failure), where a reference was really
-                            // lost.
-                            decode_trace.record(TraceSample {
-                                dropped: 1,
-                                bytes: unit.len() as u64,
-                                ..Default::default()
-                            }, None);
-                        }
-                    } else if stats.frames_decoded == 0 || measurements.request_keyframe {
-                        // Initial join or hardware recovery: None means nothing is
-                        // presented. Ask once per debounce window — same path as
-                        // an AU gap — so a late join does not stay black until
-                        // the host happens to reconfigure.
+                    let produced_picture = picture.is_some();
+                    let delivery = deliver_decoded(&mut pacer, decoded, measurements.request_keyframe,
+                        last_decoded_ts.is_some(), Instant::now());
+                    if produced_picture { last_decoded_ts = Some(completed_ts); }
+                    if delivery == DecodeDelivery::RequestKeyframe {
                         let sent = maybe_send_pli(pc, &mut last_pli, packet.header.ssrc).await;
                         decode_trace.record(TraceSample {
                             pli_sent: sent as u64,
@@ -2833,30 +2904,11 @@ async fn read_loop(
                 assembly.recycle(unit);
             }
         }
-        // Paced presentation: whatever is due surfaces now, in arrival order.
-        // Burst arrivals and gap timeouts converge here — arrival (decode),
-        // pacer hold and presentation (dispatch) stay separately traced.
-        while let Some((picture, hold_us)) = pacer.pop_due(Instant::now()) {
-            // Scheduled retention only (due - ready): excludes decode wait,
-            // IPC, draw and ack. Disjoint from dispatch/present work below.
-            pacer_hold_trace.record_cost(TraceSample { frames: 1, ..Default::default() }, hold_us);
-            let frame = picture.stats;
-            stats.frames_decoded += 1;
-            if frame.is_keyframe {
-                stats.keyframes_decoded += 1;
-                let _ = event_tx.send(MediaEvent::Keyframe);
-            }
-            let non_black = FrameValidator::non_black(frame.luma_mean);
-            let motion = validator.motion(frame.luma_mean);
-            let _ = event_tx.send(MediaEvent::VideoFrame { non_black, motion });
-            let started = dispatch_trace.start();
-            on_frame(picture.frame);
-            dispatch_trace.record(TraceSample { frames: 1, ..Default::default() }, started);
-            if stats.frames_decoded % 30 == 0 {
-                let mut snapshot = stats.clone();
-                snapshot.census = census_snapshot(census);
-                let _ = event_tx.send(MediaEvent::Stats(snapshot));
-            }
+        pacer.drain_due(&mut emit);
+        let dropped = pacer.dropped() - reported_pacer_drops;
+        if dropped != 0 {
+            decode_trace.record(TraceSample { dropped, ..Default::default() }, None);
+            reported_pacer_drops = pacer.dropped();
         }
     }
 }
@@ -3448,6 +3500,12 @@ mod tests {
         assert!(pacer.is_empty());
         assert_eq!(pacer.dropped(), 0);
         assert_eq!(pacer.next_due(), None, "empty buffer blocks on network");
+        for n in 1..=300 {
+            let now = t0 + Duration::from_micros(n * 16_666);
+            pacer.push(pacer_picture(n as u8), now);
+            let (_, hold_us) = pacer.pop_due(now).expect("steady 60fps must never wait");
+            assert_eq!(hold_us, 0);
+        }
     }
 
     #[test]
@@ -3507,6 +3565,46 @@ mod tests {
     }
 
     #[test]
+    fn present_pacer_pause_does_not_slow_resumed_stream() {
+        let interval = Duration::from_micros(16_667);
+        let mut pacer = PresentPacer::new(interval);
+        let t = Instant::now();
+        pacer.observe_interval(interval);
+        pacer.push(pacer_picture(0), t);
+        pacer.pop_due(t);
+        let resumed = t + Duration::from_millis(500);
+        pacer.observe_interval(Duration::from_millis(500));
+        pacer.push(pacer_picture(1), resumed);
+        assert!(pacer.pop_due(resumed).is_some());
+        pacer.observe_interval(interval);
+        pacer.push(pacer_picture(2), resumed + interval);
+        assert!(pacer.pop_due(resumed + interval).is_some(), "pause must not add delay after resuming");
+        let mut fresh = PresentPacer::new(DEFAULT_PRESENT_INTERVAL);
+        fresh.observe_interval(Duration::from_millis(500));
+        assert_eq!(fresh.interval, DEFAULT_PRESENT_INTERVAL, "even the first delta can be a join pause");
+        fresh.observe_interval(interval);
+        assert_eq!(fresh.interval, interval);
+    }
+
+    #[test]
+    fn present_pacer_late_wakeup_keeps_only_latest_due_picture() {
+        let interval = Duration::from_micros(16_667);
+        let mut pacer = PresentPacer::new(interval);
+        let t = Instant::now();
+        pacer.push(pacer_picture(0), t);
+        pacer.pop_due(t);
+        pacer.push(pacer_picture(1), t);
+        pacer.push(pacer_picture(2), t);
+        let resumed = t + Duration::from_millis(100);
+        let (picture, _) = pacer.pop_due(resumed).unwrap();
+        assert_eq!(picture.frame.data[0], 2, "do not replay stale pictures after a stall");
+        assert!(pacer.pop_due(resumed).is_none());
+        assert_eq!(pacer.dropped(), 1);
+        pacer.push(pacer_picture(3), resumed);
+        assert_eq!(pacer.next_due(), Some(resumed + interval));
+    }
+
+    #[test]
     fn pacer_overflow_drop_leaves_decoder_chain_intact() {
         // Post-decode presentation drop is not a loss: the decoder already
         // advanced its references, so refusing a pacer arrival must neither
@@ -3527,7 +3625,8 @@ mod tests {
         assert!(pacer.push(picture, t0));
         let unit = enc.encode(&synthetic_frame(1280, 720, 2)).expect("delta");
         let picture = dec.decode(&unit).expect("decode").expect("delta pictures");
-        assert!(!pacer.push(picture, t0), "past 2 held slots drops");
+        assert_eq!(deliver_decoded(&mut pacer, Ok(Some(picture)), false, true, t0),
+            DecodeDelivery::PresentationDrop, "production overflow policy never requests PLI");
         assert_eq!(pacer.dropped(), 1);
         assert!(!dec.waiting_for_keyframe(), "post-decode drop arms no recovery");
         assert_eq!(dec.backend_name(), "openh264", "no backend switch");
@@ -3538,6 +3637,48 @@ mod tests {
             let picture = dec.decode(&unit).expect("decode").expect("chain intact");
             assert!(!dec.waiting_for_keyframe());
             let _ = picture;
+        }
+    }
+
+    #[test]
+    fn decoder_error_after_first_picture_requests_keyframe() {
+        let mut pacer = PresentPacer::new(DEFAULT_PRESENT_INTERVAL);
+        let now = Instant::now();
+        assert_eq!(deliver_decoded(&mut pacer, Err(MediaError::Codec("injected".into())), false, true, now),
+            DecodeDelivery::RequestKeyframe);
+        assert_eq!(deliver_decoded(&mut pacer, Ok(None), false, true, now), DecodeDelivery::Pending);
+        assert_eq!(deliver_decoded(&mut pacer, Ok(None), true, true, now), DecodeDelivery::RequestKeyframe);
+        assert_eq!(deliver_decoded(&mut pacer, Ok(None), false, false, now), DecodeDelivery::RequestKeyframe);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn present_pacer_releases_while_serial_decoder_is_blocked() {
+        let (release, wait) = std::sync::mpsc::channel();
+        let mut worker = crate::worker::SerialWorker::start("pacer-test-decode", move || move |()| {
+            wait.recv_timeout(Duration::from_secs(2)).expect("presentation must run before decode finishes")
+        }).unwrap();
+        let mut pacer = PresentPacer::new(Duration::from_millis(16));
+        let now = Instant::now();
+        pacer.push(pacer_picture(0), now);
+        pacer.pop_due(now);
+        pacer.push(pacer_picture(1), now);
+        let mut presented = 0;
+        let result = tokio::time::timeout(Duration::from_secs(1), pacer.wait(worker.run(()), &mut |picture, _| {
+            assert_eq!(picture.frame.data[0], 1);
+            presented += 1;
+            release.send(42).unwrap();
+        })).await.expect("no dependency on decoder completion").unwrap();
+        assert_eq!(result, 42);
+        assert_eq!(presented, 1);
+    }
+
+    #[test]
+    fn present_pacer_tracks_sustained_rate_changes() {
+        let mut pacer = PresentPacer::new(Duration::from_micros(16_667));
+        pacer.observe_interval(Duration::from_micros(16_667));
+        for sample in [33_333, 16_667, 100_000, 16_667] {
+            for _ in 0..80 { pacer.observe_interval(Duration::from_micros(sample)); }
+            assert!(pacer.interval.abs_diff(Duration::from_micros(sample)) < Duration::from_micros(10));
         }
     }
 

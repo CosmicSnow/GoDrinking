@@ -294,22 +294,21 @@ lock dentro do mesmo bloco — é sub-intervalo do prepare antigo (`prepare + po
 prepare` anterior). No próximo cadence: pool dominante = backpressure do VT; prepare
 dominante = memcpy/conversão. **Não somar** nenhum deles com completion/submit.
 
-O viewer apresenta com micro jitter buffer de no máximo 2 quadros entre decode e
-`on_frame`, num relógio suavizado dos deltas RTP: EWMA com alpha 0.125 (primeira
-amostra real vence a semente; deltas 0 e >1s ignorados; clamp 1ms..1s) e phase-lock
-com slew de no máximo 2ms por quadro — erro de fase pequeno é absorvido aos poucos,
-só buraco maior que 2 intervalos reancora de uma vez. Quadro sozinho apresenta na
-hora (~0ms extra com rede boa), rajada espaça 1 intervalo, cheio adiciona no máximo
-2 intervalos (~33ms a 60fps). Na leitura, `pacer_hold` médio deve cair para perto do
-intervalo nominal (wobble absorvido) em vez de copiar o ritmo de chegada; gaps
->50ms de buracos reais da fonte permanecem. Estouro pós-decode só descarta e conta
-`decode.dropped` — o decoder já avançou as referências, então sem PLI e sem espera de
-IDR (forçar recovery aqui virava cascata: IDR grande/lento → mais gaps → mais PLIs).
-PLI + espera de IDR ficam só para perda pré-decode (gap de AU, erro de depacketize ou
-decode), onde a referência realmente se perdeu. Chegada (`decode`/`codec`) e
-apresentação (`dispatch`/`present`) seguem separadas: `dropped > 0` sem `pli_sent`
-junto = estouros absorvidos; `dropped` com `pli_sent` = perda real reassincronizando;
-`present.max_gap` pequeno com chegadas espaçadas = suavização ativa.
+O viewer mantém no máximo 2 quadros entre decode e `on_frame`, num relógio
+suavizado dos deltas RTP: EWMA com alpha 0.125, clamp 1ms..1s e slew de no
+máximo 2ms por quadro. A primeira amostra plausível substitui a semente;
+deltas 0 e >1s são ignorados. Pausas isoladas não alteram o ritmo estimado
+(ver revisão abaixo). O primeiro quadro apresenta imediatamente. Em regime
+estável, a fila agenda até 2 intervalos (~33ms a 60fps) de retenção; isso não
+limita atrasos do SO/IPC. Após uma pausa, quadros vencidos obsoletos são
+descartados, sem apresentar uma rajada para compensar.
+
+Estouro e descarte de quadros vencidos são pós-decode: contam em
+`decode.dropped`, sem PLI nem espera por IDR. O decoder já avançou suas
+referências. Erros de decode e estados de recuperação solicitam PLI com
+debounce. `dropped` sozinho não identifica a causa: também pode representar
+AU obsoleta ou decode sem saída. `pacer_hold` mede somente retenção agendada;
+gaps de ACK e máximos agregados não provam causalidade por quadro.
 
 O host segue sem rajada pós-overrun: após estouro o `encode_loop` reancora o deadline
 para `frame_time + frame_duration` (pula slots, nunca publica 2 unidades para
@@ -322,5 +321,29 @@ quantos gaps de ack passaram de 20/25/34/50ms (`gap_gt_*`, aninhados — um stal
 `pacer_hold` mede por quadro apresentado só a retenção agendada (`due − ready`, ≥0).
 `pacer_hold` exclui espera de decode, IPC, draw e ack; `present` contém
 dispatch+draw+ack — **não somar** hold+dispatch+present. Leitura: `pacer_hold`
-alto com `present` alto = jitter do pacer (rede/ritmo); hold ~0 com gaps altos =
-downstream (IPC/draw/ack). Registros antigos sem os campos leem como 0.
+alto indica retenção agendada. Hold ~0 com gaps altos não localiza a causa:
+pode faltar quadro upstream, o processo pode retomar tarde ou haver atraso de
+IPC/draw/ack. `due − ready` não mede `release − due` nem latência total.
+Registros antigos sem os campos leem como 0.
+
+
+### Revisão do pacer: deadlines durante decode (15/09/2026)
+
+O mesmo future de leitura/decode fica ativo enquanto deadlines liberam quadros
+já prontos. O decoder continua serial; não há fila adicional nem pre-roll.
+Após desescalonamento, somente o quadro vencido mais recente é liberado; os
+obsoletos contam em `decode.dropped`, sem PLI. Overflow também é pós-decode.
+Erros de decode, inclusive software após o primeiro quadro, solicitam PLI com
+o debounce existente. O fallback Windows aguarda IDR antes de alimentar o
+decoder software novo. Detecção completa de perdas/reordenação RTP continua
+fora desta alteração.
+
+Deltas maiores que duas vezes o intervalo estimado precisam de três amostras
+semelhantes para mudar o ritmo; uma pausa isolada não desacelera a retomada.
+Isso filtra timestamps, sem guardar quadros adicionais. A capacidade permanece
+2: em regime estável, retenção agendada até dois intervalos (~33ms a 60fps);
+não é limite de latência real sob pausa do SO, IPC ou mudança de FPS.
+
+`decode.work_us` cobre submissão até retorno observado do worker. Agora pode
+sobrepor também o dispatch de um quadro anterior enquanto aguarda o decoder.
+Não somar esse tempo com dispatch, hold ou present para obter latência.

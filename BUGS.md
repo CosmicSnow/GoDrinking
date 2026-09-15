@@ -19,6 +19,14 @@ visual do usuário ("melhorou muito"). Resíduo: micro-gaps 58–81ms isolados p
 agendamento sob carga. Falta build Windows para a espectadora no Windows 10
 sentir o efeito + confirmação visual final; BUG-001 segue aberto.
 
+Atualização 15/09 (revisão de baixa latência): pacer atende deadlines durante
+decode serial, filtra pausas isoladas na EWMA e descarta apresentações vencidas
+sem PLI. 116 testes core + 3 integração passaram após ajuste de arredondamento.
+Build macOS atualizado; cadência ainda FAIL: 1 viewer 164ms, 2 viewers
+935/917ms, com host encode 905ms na janela dos dois viewers. Retenção agendada
+média 11–13,5ms, capacidade 2 preservada. Detalhes e logs em
+[MELHORIA-viewer-2026-09-15.md](MELHORIA-viewer-2026-09-15.md).
+
 | ID      | Sintoma                                                        | Status         | Desde                    | Suspeita / notas |
 |---------|----------------------------------------------------------------|----------------|--------------------------|------------------|
 | BUG-001 | Compartilhamento de tela lento com hosts e viewers macOS/Windows | open — Mac validado ao vivo, falta Windows + CPU/GPU | relatado após mudança PLI | Confirmado: gates de captura/ponte reiniciavam o intervalo a cada chegada, perdendo FPS com jitter. Regressão de 300 chegadas a 30 FPS com jitter de 1 ms: 151 encaminhadas antes, 300 após correção de cadência. Validado ao vivo no Mac (viewer fresh ~28,6/s, Display-3 PASS 23 s). Aberto: host Windows 1080p60 emite ~13fps/~2,5 Mbps (medido no viewer LHYSYV, path sem perdas — teto no emissor, trace do host pendente) + CPU/GPU sustentados. `link_stats.bitrate_bps` mede RGBA apresentado, não bitrate H.264; não prova storm de IDR. |
