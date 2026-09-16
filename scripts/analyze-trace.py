@@ -32,7 +32,7 @@ import json
 import sys
 from pathlib import Path
 
-STAGES = ("capture_input", "capture", "source", "encode", "encode_prepare", "encode_pool", "encode_submit", "encode_completion", "encode_resume", "send", "rtp", "decode", "codec", "convert", "pacer_hold", "dispatch", "draw", "present")
+STAGES = ("capture_input", "capture", "source", "encode", "encode_prepare", "encode_pool", "encode_convert", "encode_copy", "encode_unlock", "encode_submit", "encode_completion", "encode_resume", "send", "rtp", "decode", "codec", "convert", "pacer_hold", "dispatch", "draw", "present")
 
 # Counters summed per stage for the summary. bytes/frames are informational;
 # the rest feed the finding flags.

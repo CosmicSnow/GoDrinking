@@ -347,3 +347,36 @@ não é limite de latência real sob pausa do SO, IPC ou mudança de FPS.
 `decode.work_us` cobre submissão até retorno observado do worker. Agora pode
 sobrepor também o dispatch de um quadro anterior enquanto aguarda o decoder.
 Não somar esse tempo com dispatch, hold ou present para obter latência.
+
+
+### Diagnóstico detalhado do preparo VT (15/09/2026)
+
+Novos subestágios opt-in: `encode_convert` (I420→NV12), `encode_copy` (pixels
+para o buffer VT) e `encode_unlock`. Parede e CPU da thread são medidos na
+mesma operação. Eles sobrepõem `encode_prepare`, que também inclui bookkeeping
+e I/O dos traces internos; não somar com prepare/encode.
+
+`cpu_at_max_work_us` é a CPU da observação que estabeleceu `max_work_us`, válida
+quando `cpu_at_max_work_available=1`. Diferente de `max_cpu_work_us`, que pode
+vir de outra observação. Empates não apagam um pareamento disponível.
+
+`previous_write_us`, `previous_write_cpu_us` e
+`previous_write_cpu_available` descrevem a serialização/escrita do flush
+anterior do mesmo estágio, carregadas no registro seguinte. A última escrita
+pode não ter sucessor. Não atribuir esse custo à emissão do registro atual.
+
+O cadence salva `start_ms`/`end_ms`, snapshots de memória no macOS e aceita
+`--sample-host` e `--no-host-trace` (controle que não aprova o gate completo).
+O exemplo `encode_probe` isola o encoder de WebRTC/WebView. Experimentos e
+limitações em [DIAGNOSTICO-host-2026-09-15.md](DIAGNOSTICO-host-2026-09-15.md).
+
+
+`max_work_end_ms` / `max_gap_end_ms` registram o término do pico selecionado,
+não o flush. Callback completion/resume preservam o instante de término mesmo
+quando reportados depois; precisão de ms, sem identidade de frame.
+`--observe-host` acrescenta snapshots numéricos de libproc da thread encoder
+(~10 ms) e memória do processo (~100 ms), apenas para o host criado pelo teste.
+`python3 scripts/correlate-host-stalls.py <artifact>` cruza picos contínuos do
+encoder com esses snapshots. RUNNING inclui runnable; WAITING não revela o
+recurso; page-ins são do processo inteiro. Buracos do observador são reportados.
+Não soma estágios nem correlaciona send/prepare líquido como trabalho contínuo.

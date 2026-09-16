@@ -1009,6 +1009,7 @@ static THREAD_CPU_CLOCK: std::sync::OnceLock<fn() -> Option<u64>> = std::sync::O
 
 /// Installs a clock measuring only the calling media worker, for opt-in traces.
 pub fn install_media_cpu_clock(clock: fn() -> Option<u64>) { let _ = THREAD_CPU_CLOCK.set(clock); }
+pub(crate) fn media_cpu_us() -> Option<u64> { THREAD_CPU_CLOCK.get().and_then(|clock| clock()) }
 
 static NATIVE_DECODER_FACTORY: std::sync::OnceLock<golive_platform::decode::DecoderFactory> = std::sync::OnceLock::new();
 

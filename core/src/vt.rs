@@ -115,7 +115,7 @@ pub use backend::{probe_hardware, VtEncoder};
 mod backend {
     use super::{avcc_to_annexb, OSStatus};
     use crate::media::MediaError;
-    use crate::trace::{Trace, Stage, Sample};
+    use crate::trace::{Trace, Stage, Sample, WorkTimer};
     use objc2_core_foundation::{
         CFArray, CFBoolean, CFDictionary, CFNumber, CFRetained, kCFBooleanFalse, kCFBooleanTrue,
         kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks,
@@ -233,6 +233,9 @@ mod backend {
         /// of the old prepare block: `prepare + pool ≈ old prepare`.
         pool_trace: Trace,
         prepare_trace: Trace,
+        convert_trace: Trace,
+        copy_trace: Trace,
+        unlock_trace: Trace,
         submit_trace: Trace,
         completion_trace: Trace,
         resume_trace: Trace,
@@ -295,6 +298,9 @@ mod backend {
                 staging: Vec::new(),
                 pool_trace: Trace::new(Stage::EncodePool),
                 prepare_trace: Trace::new(Stage::EncodePrepare),
+                convert_trace: Trace::new(Stage::EncodeConvert),
+                copy_trace: Trace::new(Stage::EncodeCopy),
+                unlock_trace: Trace::new(Stage::EncodeUnlock),
                 submit_trace,
                 completion_trace: Trace::new(Stage::EncodeCompletion),
                 resume_trace: Trace::new(Stage::EncodeResume),
@@ -564,13 +570,20 @@ mod backend {
                 return Err(MediaError::Codec("i420 plane size mismatch".into()));
             }
             let started = self.prepare_trace.start();
+            let convert_started = WorkTimer::start(&self.convert_trace);
             super::i420_to_nv12_into(w, h, y, u, v, &mut self.staging);
+            if let Some(timer) = convert_started {
+                let (us, sample) = timer.finish();
+                self.convert_trace.record_cost(sample, us);
+            }
             let pixel = match Self::copy_to_pool(
                 &self.pool,
                 self.w,
                 self.h,
                 &self.staging,
                 &mut self.pool_trace,
+                &mut self.copy_trace,
+                &mut self.unlock_trace,
             ) {
                 Ok((pixel, pool_us)) => {
                     let total_us = started.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
@@ -615,6 +628,8 @@ mod backend {
                 self.h,
                 nv12,
                 &mut self.pool_trace,
+                &mut self.copy_trace,
+                &mut self.unlock_trace,
             ) {
                 Ok((pixel, pool_us)) => {
                     let total_us = started.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
@@ -724,11 +739,11 @@ mod backend {
             let resumed_at = self.resume_trace.start();
             if let Some((_, Some(callback_at))) = completed.as_ref() {
                 if let Some(submitted_at) = submitted_at {
-                    self.completion_trace.record_cost(Sample { frames: 1, ..Default::default() },
+                    self.completion_trace.record_cost(Sample { frames: 1, ..Default::default() }.ending_at(*callback_at),
                         callback_at.saturating_duration_since(submitted_at).as_micros() as u64);
                 }
                 if let Some(resumed_at) = resumed_at {
-                    self.resume_trace.record_cost(Sample { frames: 1, ..Default::default() },
+                    self.resume_trace.record_cost(Sample { frames: 1, ..Default::default() }.ending_at(resumed_at),
                         resumed_at.saturating_duration_since(*callback_at).as_micros() as u64);
                 }
             }
@@ -778,6 +793,8 @@ mod backend {
             h: usize,
             nv12: &[u8],
             pool_trace: &mut Trace,
+            copy_trace: &mut Trace,
+            unlock_trace: &mut Trace,
         ) -> Result<(objc2_core_foundation::CFRetained<CVPixelBuffer>, u64), MediaError> {
             use objc2_core_video::*;
             let pool_started = pool_trace.start();
@@ -818,6 +835,7 @@ mod backend {
             };
             let pool_us = pool_started.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
             pool_trace.record_cost(Sample { frames: 1, ..Default::default() }, pool_us);
+            let copy_started = WorkTimer::start(copy_trace);
             let copied = unsafe {
                 if y_base.is_null() || uv_base.is_null() {
                     false
@@ -844,7 +862,13 @@ mod backend {
                     true
                 }
             };
+            let copy_cost = copy_started.map(WorkTimer::finish);
+            let unlock_started = WorkTimer::start(unlock_trace);
             unsafe { CVPixelBufferUnlockBaseAddress(&pixel, CVPixelBufferLockFlags::empty()) };
+            let unlock_cost = unlock_started.map(WorkTimer::finish);
+            // Keep diagnostic I/O outside the measured copy/unlock operations.
+            if let Some((us, sample)) = copy_cost { copy_trace.record_cost(sample, us); }
+            if let Some((us, sample)) = unlock_cost { unlock_trace.record_cost(sample, us); }
             if !copied {
                 return Err(MediaError::Codec("pixel copy failed".into()));
             }

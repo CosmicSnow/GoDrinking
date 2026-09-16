@@ -49,7 +49,7 @@
               </div>
               <h1 class="hero-title font-display">
                 Divide a tela.<br />
-                Não os dados<span class="cursor" aria-hidden="true"></span>
+                Não os dados!<span class="cursor" aria-hidden="true"></span>
               </h1>
               <p class="hero-sub">
                 Host captura. Viewer assiste. O vídeo vai direto de um PC para o outro. Sem nuvem, sem login, sem a tela passando por um datacenter.

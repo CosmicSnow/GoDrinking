@@ -1,4 +1,6 @@
 import copy
+import os
+import sys
 import importlib.util
 from pathlib import Path
 import unittest
@@ -14,6 +16,13 @@ class CadenceVerdictTests(unittest.TestCase):
             dropped=0, max_gap_ms=25, gpu_frames=1680) for name in (
                 'host.encode', 'host.send', 'viewer.decode', 'viewer.draw', 'viewer.present',
                 'viewer2.decode', 'viewer2.draw', 'viewer2.present')}
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'macOS libproc diagnostic')
+    def test_host_memory_reads_owned_process_and_reports_missing_pid(self):
+        own = cadence.host_memory(os.getpid())
+        self.assertTrue(own['available'])
+        self.assertGreater(own['resident_bytes'], 0)
+        self.assertFalse(cadence.host_memory(2147483647)['available'])
 
     def test_complete_two_viewer_run_passes(self):
         self.assertEqual(cadence.verdict_failures(self.stages, 2, 30), [])
