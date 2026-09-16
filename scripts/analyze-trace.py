@@ -13,7 +13,7 @@ given -- a host+viewer overlay keyed on ``timestamp_ms``.
 
 Schema mirror of ``core/src/trace.rs``: every value must be a number
 except ``stage``, which must be one of
-capture/source/encode/send/rtp/decode/present. Unknown *numeric* fields
+capture/source/encode/send/rtp/codec/convert/decode/dispatch/draw/present. Unknown *numeric* fields
 are accepted so older traces keep parsing; the pli-storm heuristic sums
 the ``pli_sent``/``pli_suppressed``/``intra_applied`` counters (plus legacy
 ``pli``/``nack``/``fir`` names) and the judder heuristic reads
@@ -32,12 +32,12 @@ import json
 import sys
 from pathlib import Path
 
-STAGES = ("capture", "source", "encode", "send", "rtp", "decode", "present")
+STAGES = ("capture_input", "capture", "source", "encode", "encode_prepare", "encode_pool", "encode_convert", "encode_copy", "encode_unlock", "encode_submit", "encode_completion", "encode_resume", "send", "rtp", "decode", "codec", "convert", "pacer_hold", "dispatch", "draw", "present")
 
 # Counters summed per stage for the summary. bytes/frames are informational;
 # the rest feed the finding flags.
-TOTALS = ("frames", "bytes", "dropped", "timeouts", "errors", "keyframes",
-          "repeats", "gpu_frames")
+TOTALS = ("frames", "bytes", "dropped", "gate_dropped", "queue_dropped", "invalid_frames", "idle_frames", "blank_frames", "cpu_work_us", "cpu_samples", "timeouts", "errors", "keyframes",
+          "repeats", "gpu_frames", "gap_gt_20ms", "gap_gt_25ms", "gap_gt_34ms", "gap_gt_50ms")
 
 # Optional future counters for the pli-storm heuristic. Absent from current
 # traces; only consulted when present as numeric fields.
@@ -124,13 +124,14 @@ def summarize(records):
             "t_min": rec.get("timestamp_ms", 0),
             "t_max": rec.get("timestamp_ms", 0),
             "pli": 0, "pli_sent": 0, "pli_suppressed": 0,
-            "intra_applied": 0, "max_gap_us": 0,
+            "intra_applied": 0, "max_gap_us": 0, "max_cpu_work_us": 0,
         })
         for key in TOTALS:
             s[key] = s.get(key, 0) + num(rec, key)
         for key in ("pli_sent", "pli_suppressed", "intra_applied"):
             s[key] += num(rec, key)
         s["max_gap_us"] = max(s["max_gap_us"], num(rec, "max_gap_us"))
+        s["max_cpu_work_us"] = max(s["max_cpu_work_us"], num(rec, "max_cpu_work_us"))
         s["records"] += 1
         s["elapsed_us"] += num(rec, "elapsed_us")
         s["work_us"] += num(rec, "work_us")
@@ -192,15 +193,25 @@ def report_file(path, records, summary, timeout_burst, stall_us):
         extra = ""
         if stage == "present":
             fresh = s["frames"] - s.get("repeats", 0)
-            extra = " fresh=%d fresh_fps=%.1f max_gap=%dus" % (
-                fresh, rate(fresh, s["elapsed_us"]), s.get("max_gap_us", 0))
+            extra = " fresh=%d fresh_fps=%.1f max_gap=%dus gap>20ms=%d gap>25ms=%d gap>34ms=%d gap>50ms=%d" % (
+                fresh, rate(fresh, s["elapsed_us"]), s.get("max_gap_us", 0),
+                s.get("gap_gt_20ms", 0), s.get("gap_gt_25ms", 0),
+                s.get("gap_gt_34ms", 0), s.get("gap_gt_50ms", 0))
         if stage == "decode" and (s.get("pli_sent", 0) or s.get("pli_suppressed", 0)):
             extra = " pli_sent=%d pli_suppressed=%d" % (
                 s["pli_sent"], s["pli_suppressed"])
         if stage == "encode" and s.get("intra_applied", 0):
             extra = " intra_applied=%d" % s["intra_applied"]
+        if stage == "capture_input":
+            extra = " gate_dropped=%d queue_dropped=%d invalid_frames=%d idle_frames=%d blank_frames=%d max_gap=%dus" % (
+                s["gate_dropped"], s["queue_dropped"], s["invalid_frames"], s["idle_frames"], s["blank_frames"], s["max_gap_us"])
+        if s.get("cpu_samples", 0):
+            extra += " worker_cpu_mean=%.1fus worker_cpu_max=%dus" % (
+                s["cpu_work_us"] / s["cpu_samples"], s["max_cpu_work_us"])
         if stage == "rtp":
             extra = " (frames=packets)"
+        if stage == "pacer_hold":
+            extra = " (hold=due-ready per presented frame; disjoint from dispatch/present)"
         lines.append(
             "  %-8s rec=%-4d rate=%7.1f/s mean_work=%9.1fus max_work=%8dus "
             "drop=%d timeouts=%d err=%d repeats=%d keyframes=%d%s"
@@ -297,6 +308,31 @@ def run_self_test():
     check(any(f.startswith("JITTER") for f in flags),
           "present judder flagged (max_gap_us >= 2x interval)")
 
+    acquisition = summarize([dict(stage="capture_input", frames=60, elapsed_us=1000000,
+                                  gate_dropped=4, queue_dropped=2, invalid_frames=5, idle_frames=3, blank_frames=1,
+                                  max_gap_us=33000)])
+    rendered = "\n".join(report_file("numeric-fixture", [], acquisition,
+                                    TIMEOUT_BURST_DEFAULT, STALL_US_DEFAULT))
+    check(all(value in rendered for value in ("gate_dropped=4", "queue_dropped=2",
+                                               "invalid_frames=5", "idle_frames=3", "blank_frames=1", "max_gap=33000us")),
+          "acquisition report exposes each loss reason and callback gap")
+
+    cpu = summarize([dict(stage="decode", cpu_work_us=300, cpu_samples=1, max_cpu_work_us=300),
+                     dict(stage="decode", cpu_work_us=100, cpu_samples=1, max_cpu_work_us=100)])
+    check(cpu["decode"]["cpu_work_us"] == 400 and cpu["decode"]["cpu_samples"] == 2
+          and cpu["decode"]["max_cpu_work_us"] == 300, "worker CPU totals and maximum preserved")
+
+    gaps = summarize([dict(stage="present", frames=60, elapsed_us=1000000,
+                             gap_gt_20ms=5, gap_gt_25ms=3, gap_gt_34ms=2, gap_gt_50ms=1,
+                             max_gap_us=60000)])
+    rendered = "\n".join(report_file("gap-fixture", [], gaps,
+                                     TIMEOUT_BURST_DEFAULT, STALL_US_DEFAULT))
+    check(all(value in rendered for value in ("gap>20ms=5", "gap>25ms=3",
+                                               "gap>34ms=2", "gap>50ms=1",
+                                               "max_gap=60000us")),
+          "present report exposes nested ack-gap histogram bands")
+    check("pacer_hold" in STAGES, "pacer_hold stage accepted by schema rule")
+
     bad = {"stage": "decode", "frames": "many"}
     ok = True
     for key, value in bad.items():
@@ -306,7 +342,7 @@ def run_self_test():
     check(not ok, "non-numeric value rejected by schema rule")
     check("nope" not in STAGES, "unknown stage rejected by schema rule")
 
-    checks = 14  # number of check() calls above
+    checks = 19  # number of check() calls above
     if failures:
         print("self-test: %d failure(s)" % len(failures))
         return 1

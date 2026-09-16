@@ -6,6 +6,15 @@ pub fn gate_open(last_ns: u64, now_ns: u64, interval_ns: u64) -> bool {
     now_ns.wrapping_sub(last_ns) >= interval_ns
 }
 
+/// Gate the expensive GPU readback itself, not the already-copied pixels.
+/// Failed readbacks leave the clock unchanged so the next frame can retry.
+pub fn readback_if_due<T>(last: &mut u64, now: u64, interval: u64, readback: impl FnOnce() -> Option<T>) -> Option<T> {
+    if !gate_open(*last, now, interval) { return None; }
+    let frame = readback()?;
+    *last = golive_platform::cadence::advance_capture_clock(*last, now, interval);
+    Some(frame)
+}
+
 pub fn initial_last_ns(now: u64, interval_ns: u64) -> u64 {
     now.wrapping_sub(interval_ns)
 }

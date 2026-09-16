@@ -365,6 +365,7 @@ export interface E2ePlan {
   status_file: string;
   /** Fonte do share ("synthetic" quando ausente; "movie:<path>" | "display:<id>"). */
   share?: string;
+  quality?: QualityProfile;
 }
 
 /** Devolve o plano ativo ou null (app normal). */
@@ -407,7 +408,7 @@ export { Channel, isTauri } from "@tauri-apps/api/core";
 export const playerAttach = (member: string, token: string, channel: import("@tauri-apps/api/core").Channel<ArrayBuffer>) =>
   invoke<PlayerState>("player_attach", { member, token, channel });
 export const playerDetach = (member: string, token: string) => invoke<void>("player_detach", { member, token });
-export const playerAck = (member: string, token: string, seq: number, drawn: boolean) => invoke<void>("player_ack", { member, token, seq, drawn });
+export const playerAck = (member: string, token: string, seq: number, drawn: boolean, drawUs?: number, gpu?: boolean) => invoke<void>("player_ack", { member, token, seq, drawn, drawUs, gpu });
 export const playerContext = () => invoke<PlayerState>("player_context");
 export const playerPopup = (member: string, popup: boolean) => invoke<void>("player_popup", { member, popup });
 export const playerAudio = (member: string, volume: number, muted: boolean) => invoke<void>("player_audio", { member, volume, muted });

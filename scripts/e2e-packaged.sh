@@ -23,13 +23,9 @@ E2E_SHARE="${E2E_SHARE:-synthetic}"
 TRACE_ROOT="${E2E_TRACE_ROOT:-$ART/traces}"
 HOST_TRACE="$TRACE_ROOT/host-trace"
 VIEWER_TRACE="$TRACE_ROOT/viewer-trace"
-# The Mach-O inside is named after the cargo binary (golive-app), not the
-# product name — resolve it by name (never first-executable: the staged
-# video helper lives in the same dir).
-# Override to drive a consented identity directly (e.g. the unbundled
-# target/release/golive-app that already holds the Screen Recording grant —
-# a bundle copy at another path is a different TCC identity).
-BIN="${E2E_BIN:-$APP/Contents/MacOS/golive-app}"
+# The Mach-O inside is named after the cargo binary (goDrinking).
+# Never pick the first executable: the staged video helper lives in the same dir.
+BIN="${E2E_BIN:-$APP/Contents/MacOS/goDrinking}"
 SERVER="$ROOT/server/server.mjs"
 TIMEOUT_S="${E2E_TIMEOUT_S:-120}"
 PASSWORD="e2e-packaged-local"

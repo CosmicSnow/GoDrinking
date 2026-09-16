@@ -837,7 +837,7 @@ fn feed_loop(
         if stop.load(Ordering::Acquire) {
             return;
         }
-        let bytes = frame.rgba.len() as u64;
+        let bytes = frame.data.len() as u64;
         let started = trace.start();
         if let Err(e) = write_frame(&mut sock, &frame) {
             trace.record(TraceSample { errors: 1, ..Default::default() }, started);
@@ -959,14 +959,14 @@ fn write_handshake(sock: &mut impl Write, title: &str, w: usize, h: usize) -> st
 
 fn write_frame(sock: &mut impl Write, frame: &PresentedFrame) -> std::io::Result<()> {
     let expected = frame.w.checked_mul(frame.h).and_then(|n| n.checked_mul(4));
-    if expected != Some(frame.rgba.len()) {
+    if frame.format != golive_core::media::PixelFormat::Rgba || expected != Some(frame.data.len()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "rgba size mismatch",
         ));
     }
-    sock.write_all(&(frame.rgba.len() as u32).to_le_bytes())?;
-    sock.write_all(&frame.rgba)?;
+    sock.write_all(&(frame.data.len() as u32).to_le_bytes())?;
+    sock.write_all(&frame.data)?;
     sock.flush()
 }
 
@@ -1181,14 +1181,14 @@ mod tests {
         let mk = |v: u8| PresentedFrame {
             w: 1,
             h: 1,
-            rgba: vec![v, v, v, 255],
+            format: golive_core::media::PixelFormat::Rgba, data: vec![v, v, v, 255],
         };
         push.push(mk(1));
         push.push(mk(2));
         push.push(mk(3));
         // Exactly the newest frame waits, no matter how many were pushed.
         match slot.wait(Duration::from_secs(1)) {
-            SlotWait::Frame(got) => assert_eq!(got.rgba[0], 3),
+            SlotWait::Frame(got) => assert_eq!(got.data[0], 3),
             _ => panic!("expected the latest frame"),
         }
         // Slot drained: next wait times out instead of replaying old data.
@@ -1247,7 +1247,7 @@ mod tests {
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         while presented.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
-            push.push(PresentedFrame { w: 320, h: 180, rgba: rgba.clone() });
+            push.push(PresentedFrame { w: 320, h: 180, format: golive_core::media::PixelFormat::Rgba, data: rgba.clone() });
             std::thread::sleep(Duration::from_millis(200));
         }
         let shown = presented.load(Ordering::Relaxed);
@@ -1272,7 +1272,7 @@ mod tests {
         let (mut window, push) = VideoWindow::spawn_with(
             "idle-test".into(), 32, 32, Arc::clone(&presented), helper,
         );
-        let frame = || PresentedFrame { w: 32, h: 32, rgba: vec![128; 32 * 32 * 4] };
+        let frame = || PresentedFrame { w: 32, h: 32, format: golive_core::media::PixelFormat::Rgba, data: vec![128; 32 * 32 * 4] };
         push.push(frame());
         let deadline = Instant::now() + Duration::from_secs(15);
         while presented.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
@@ -1447,7 +1447,7 @@ mod tests {
     fn push_counter_feeds_dropped_estimate() {
         let (push, _slot) = FrameSlot::channel();
         assert_eq!(push.counter().load(Ordering::Relaxed), 0);
-        let mk = || PresentedFrame { w: 1, h: 1, rgba: vec![0, 0, 0, 255] };
+        let mk = || PresentedFrame { w: 1, h: 1, format: golive_core::media::PixelFormat::Rgba, data: vec![0, 0, 0, 255] };
         push.push(mk());
         push.push(mk());
         assert_eq!(push.counter().load(Ordering::Relaxed), 2);
@@ -1484,13 +1484,13 @@ mod tests {
     #[test]
     fn frame_roundtrip_and_ack_shape() {
         let (mut a, mut b) = connected_pair();
-        let frame = PresentedFrame { w: 2, h: 1, rgba: vec![9u8; 8] };
+        let frame = PresentedFrame { w: 2, h: 1, format: golive_core::media::PixelFormat::Rgba, data: vec![9u8; 8] };
         write_frame(&mut a, &frame).unwrap();
         let mut len = [0u8; 4];
         b.read_exact(&mut len).unwrap();
         assert_eq!(u32::from_le_bytes(len) as usize, 8);
         // Size mismatch never hits the wire.
-        let bad = PresentedFrame { w: 2, h: 1, rgba: vec![0u8; 4] };
+        let bad = PresentedFrame { w: 2, h: 1, format: golive_core::media::PixelFormat::Rgba, data: vec![0u8; 4] };
         assert!(write_frame(&mut a, &bad).is_err());
         // Ack shape: exactly 0x01 accepted.
         b.write_all(&[0x01]).unwrap();

@@ -5,10 +5,11 @@ import { StreamPlayer, parsePlayerFrame, clampZoom, applyWheelZoom } from "./Str
 
 describe("stream presentation", () => {
   it("reads binary sequence, dynamic dimensions and exact RGBA bytes", () => {
-    const buffer = new ArrayBuffer(20);
+    const buffer = new ArrayBuffer(28);
     const header = new DataView(buffer);
-    header.setUint32(0, 17, true); header.setUint32(4, 2, true); header.setUint32(8, 1, true);
-    new Uint8Array(buffer, 12).set([255, 0, 0, 255, 0, 255, 0, 255]);
+    new Uint8Array(buffer, 0, 4).set([71, 76, 80, 50]);
+    header.setUint32(4, 17, true); header.setUint32(8, 2, true); header.setUint32(12, 1, true);
+    new Uint8Array(buffer, 20).set([255, 0, 0, 255, 0, 255, 0, 255]);
     const frame = parsePlayerFrame(buffer);
     expect([frame.seq, frame.width, frame.height]).toEqual([17, 2, 1]);
     expect([...frame.pixels]).toEqual([255, 0, 0, 255, 0, 255, 0, 255]);

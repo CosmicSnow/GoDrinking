@@ -17,6 +17,7 @@
 pub mod audio;
 pub mod capability;
 pub mod cadence;
+pub mod capture_probe;
 pub mod convert;
 pub mod error;
 pub mod mock;
@@ -31,3 +32,5 @@ pub use convert::{bgra_to_i420, convert_error, ConvertError};
 pub use error::{PlatformError, PERMISSION_HINT};
 pub use traits::{FrameStream, NextError, RestartOrder, VideoSource};
 pub use types::{capture_config_for, BgraFrame, CaptureConfig, CapturePacket, GpuPixelBuffer, PixelFormat, PlanarYuv, SourceInfo, SourceKind};
+
+pub mod decode;

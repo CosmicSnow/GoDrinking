@@ -2,6 +2,7 @@
 //! player never replaces its WebRTC session. GLV1 remains the headless harness.
 use crate::AppState;
 use golive_core::media::PresentedFrame;
+use golive_core::trace::{Sample as TraceSample, Stage, Trace};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -19,6 +20,12 @@ pub struct PlayerState {
     pub mute_all: bool,
 }
 const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Ack-gap histogram bands for the present stage (>20/>25/>34/>50 ms).
+/// Nested: one 60 ms stall counts in all four. Pure so tests own time.
+fn gap_bands(gap_us: u64) -> [u64; 4] {
+    [20_000, 25_000, 34_000, 50_000].map(|t| (gap_us > t) as u64)
+}
 
 struct Sink {
     token: String,
@@ -41,6 +48,10 @@ pub(crate) struct Surface {
     seq: u32,
     pub presented: u64,
     pub stats: Mutex<crate::video::PresentStats>,
+    trace: Trace,
+    draw_trace: Trace,
+    last_present: Option<Instant>,
+    replaced: u64,
 }
 impl Surface {
     fn new(member: &str, title: &str, mute_all: bool) -> Self {
@@ -60,18 +71,50 @@ impl Surface {
             seq: 0,
             presented: 0,
             stats: Mutex::new(crate::video::PresentStats::default()),
+            trace: Trace::new(Stage::Present),
+            draw_trace: Trace::new(Stage::Draw),
+            last_present: None,
+            replaced: 0,
         }
     }
     fn offer(&mut self, frame: PresentedFrame) {
+        if self.dirty && self.latest.is_some() {
+            self.replaced += 1;
+        }
         self.latest = Some(Arc::new(frame));
         self.dirty = true;
     }
     fn ack(&mut self, label: &str, token: &str, seq: u32, drawn: bool) -> Option<Packet> {
+        self.ack_timed(label, token, seq, drawn, None, false)
+    }
+    fn ack_timed(&mut self, label: &str, token: &str, seq: u32, drawn: bool, draw_us: Option<u64>, gpu: bool) -> Option<Packet> {
         let sink = self.sinks.get_mut(label)?;
         if sink.token != token || !sink.flight.is_some_and(|f| f.0 == seq) {
             return None;
         }
-        let (_, bytes, _) = sink.flight.take()?;
+        let (_, bytes, sent) = sink.flight.take()?;
+        if let Some(draw_us) = draw_us {
+            self.draw_trace.record_cost(TraceSample {
+                frames: drawn as u64, errors: (!drawn) as u64, gpu_frames: (drawn && gpu) as u64,
+                ..Default::default()
+            }, draw_us.min(60_000_000));
+        }
+        let now = Instant::now();
+        let gap = if drawn {
+            self.last_present.replace(now).map(|last| now.duration_since(last).as_micros() as u64).unwrap_or(0)
+        } else { 0 };
+        let bands = gap_bands(gap);
+        self.trace.record(TraceSample {
+            frames: drawn as u64,
+            bytes: if drawn { bytes } else { 0 },
+            dropped: std::mem::take(&mut self.replaced) + (!drawn) as u64,
+            max_gap_us: gap,
+            gap_gt_20ms: bands[0],
+            gap_gt_25ms: bands[1],
+            gap_gt_34ms: bands[2],
+            gap_gt_50ms: bands[3],
+            ..Default::default()
+        }, Some(sent));
         if drawn {
             self.presented += 1;
             if let Ok(mut stats) = self.stats.lock() {
@@ -96,13 +139,16 @@ impl Surface {
         let frame = self.latest.as_ref()?;
         self.dirty = false;
         self.seq = self.seq.wrapping_add(1);
-        // LE u32 sequence / width / height, then tightly packed RGBA.
-        let mut bytes = Vec::with_capacity(12 + frame.rgba.len());
+        // GLP2 WebView channel: magic + LE sequence/width/height/format + pixels.
+        // Both endpoints ship together. The separate GLV1 helper remains RGBA.
+        let mut bytes = Vec::with_capacity(20 + frame.data.len());
+        bytes.extend_from_slice(b"GLP2");
         bytes.extend_from_slice(&self.seq.to_le_bytes());
         bytes.extend_from_slice(&(frame.w as u32).to_le_bytes());
         bytes.extend_from_slice(&(frame.h as u32).to_le_bytes());
-        bytes.extend_from_slice(&frame.rgba);
-        sink.flight = Some((self.seq, frame.rgba.len() as u64, Instant::now()));
+        bytes.extend_from_slice(&(frame.format as u32).to_le_bytes());
+        bytes.extend_from_slice(&frame.data);
+        sink.flight = Some((self.seq, frame.data.len() as u64, Instant::now()));
         Some(Packet {
             channel: sink.channel.clone(),
             bytes,
@@ -260,12 +306,14 @@ pub fn player_ack(
     token: String,
     seq: u32,
     drawn: bool,
+    draw_us: Option<u64>,
+    gpu: Option<bool>,
 ) {
     let packet = state.inner.lock().ok().and_then(|mut inner| {
         inner
             .players
             .get_mut(&member)?
-            .ack(window.label(), &token, seq, drawn)
+            .ack_timed(window.label(), &token, seq, drawn, draw_us, gpu.unwrap_or(false))
     });
     send_packet(&state, &member, packet);
 }
@@ -466,8 +514,17 @@ mod tests {
         PresentedFrame {
             w,
             h: 1,
-            rgba: vec![value; w * 4],
+            format: golive_core::media::PixelFormat::Rgba, data: vec![value; w * 4],
         }
+    }
+    #[test]
+    fn ack_gap_histogram_bands_are_nested() {
+        assert_eq!(gap_bands(0), [0, 0, 0, 0], "first ack has no gap");
+        assert_eq!(gap_bands(20_000), [0, 0, 0, 0], "bands are strict >");
+        assert_eq!(gap_bands(20_001), [1, 0, 0, 0]);
+        assert_eq!(gap_bands(30_000), [1, 1, 0, 0]);
+        assert_eq!(gap_bands(40_000), [1, 1, 1, 0]);
+        assert_eq!(gap_bands(60_000), [1, 1, 1, 1], "worst stall in every band");
     }
     #[test]
     fn stalled_surface_keeps_only_latest_frame_and_rejects_stale_acks() {
@@ -482,8 +539,8 @@ mod tests {
         assert!(s.ack("main", "main", first.seq + 1, true).is_none());
         assert_eq!(s.presented, 0);
         let next = s.ack("main", "main", first.seq, true).unwrap();
-        assert_eq!(u32::from_le_bytes(next.bytes[4..8].try_into().unwrap()), 4);
-        assert_eq!(&next.bytes[12..], &[99; 16]);
+        assert_eq!(u32::from_le_bytes(next.bytes[8..12].try_into().unwrap()), 4);
+        assert_eq!(&next.bytes[20..], &[99; 16]);
         assert_eq!(s.presented, 1);
         assert!(s.ack("main", "main", first.seq, true).is_none());
         assert_eq!(s.presented, 1);
@@ -514,7 +571,7 @@ mod tests {
         s.popup_label = Some("player-1".into());
         s.dirty = true;
         let moved = s.dispatch().unwrap();
-        assert_eq!(&moved.bytes[12..], &[7; 8]);
+        assert_eq!(&moved.bytes[20..], &[7; 8]);
         assert_eq!(moved.label, "player-1");
     }
     #[test]
@@ -540,6 +597,6 @@ mod tests {
         ));
         let next = s.dispatch().unwrap();
         assert_ne!(next.seq, first.seq);
-        assert_eq!(&next.bytes[12..], &[9; 8]);
+        assert_eq!(&next.bytes[20..], &[9; 8]);
     }
 }

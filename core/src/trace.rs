@@ -14,11 +14,25 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
     Capture,
+    CaptureInput,
     Source,
     Encode,
+    EncodePrepare,
+    EncodePool,
+    EncodeConvert,
+    EncodeCopy,
+    EncodeUnlock,
+    EncodeSubmit,
+    EncodeCompletion,
+    EncodeResume,
     Send,
     Rtp,
     Decode,
+    Codec,
+    Convert,
+    PacerHold,
+    Dispatch,
+    Draw,
     Present,
 }
 
@@ -27,6 +41,25 @@ pub struct Sample {
     pub frames: u64,
     pub bytes: u64,
     pub dropped: u64,
+    pub gate_dropped: u64,
+    pub queue_dropped: u64,
+    pub invalid_frames: u64,
+    pub idle_frames: u64,
+    pub blank_frames: u64,
+    pub cpu_work_us: u64,
+    pub cpu_samples: u64,
+    pub max_cpu_work_us: u64,
+    /// CPU cost of the same observation that set max_work_us, not another peak.
+    pub cpu_at_max_work_us: u64,
+    pub cpu_at_max_work_available: u64,
+    /// Wall-clock end of the selected work observation (millisecond precision).
+    pub max_work_end_ms: u64,
+    /// Wall-clock end of the selected ACK gap, separate from work latency.
+    pub max_gap_end_ms: u64,
+    /// Previous flush's serialization + write cost, carried into this record.
+    pub previous_write_us: u64,
+    pub previous_write_cpu_us: u64,
+    pub previous_write_cpu_available: u64,
     pub timeouts: u64,
     pub errors: u64,
     pub keyframes: u64,
@@ -41,6 +74,14 @@ pub struct Sample {
     /// Presenter pacing: max gap between consecutive successful acks within
     /// the record (microseconds, 0 when fewer than 2 acks). Max-merged, not summed.
     pub max_gap_us: u64,
+    /// Presenter ack-gap histogram: per-record counts of inter-ack gaps above
+    /// 20/25/34/50 ms. Nested — one 60 ms stall counts in all four bands —
+    /// so subtract adjacent bands for exclusive histograms. Summed, 0 in old
+    /// records that predate the fields.
+    pub gap_gt_20ms: u64,
+    pub gap_gt_25ms: u64,
+    pub gap_gt_34ms: u64,
+    pub gap_gt_50ms: u64,
     pub width: u32,
     pub height: u32,
     pub target_fps: u32,
@@ -59,6 +100,39 @@ struct Record {
     observations: u64,
     #[serde(flatten)]
     sample: Sample,
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+
+impl Sample {
+    /// Map a deferred observation's actual end to wall time, rather than
+    /// attributing callback work to the later worker wakeup/trace write.
+    pub(crate) fn ending_at(mut self, end: Instant) -> Self {
+        self.max_work_end_ms = unix_ms().saturating_sub(end.elapsed().as_millis() as u64);
+        self
+    }
+}
+
+pub(crate) struct WorkTimer {
+    wall: Instant,
+    cpu: Option<u64>,
+}
+impl WorkTimer {
+    pub(crate) fn start(trace: &Trace) -> Option<Self> {
+        trace.start().map(|wall| Self { wall, cpu: crate::media::media_cpu_us() })
+    }
+    pub(crate) fn finish(self) -> (u64, Sample) {
+        let cpu = self.cpu.zip(crate::media::media_cpu_us()).map(|(a, b)| b.saturating_sub(a));
+        let us = self.wall.elapsed().as_micros() as u64;
+        (us, Sample {
+            max_work_end_ms: unix_ms(),
+            frames: 1, cpu_samples: cpu.is_some() as u64,
+            cpu_work_us: cpu.unwrap_or(0), max_cpu_work_us: cpu.unwrap_or(0),
+            ..Default::default()
+        })
+    }
 }
 
 pub struct Trace(Option<Active>);
@@ -129,19 +203,29 @@ impl Trace {
     }
 
     pub fn record(&mut self, sample: Sample, started: Option<Instant>) {
-        let Some(active) = self.0.as_mut() else {
-            return;
-        };
+        self.record_cost(sample, started.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0));
+    }
+
+    pub fn record_cost(&mut self, sample: Sample, us: u64) {
+        let Some(active) = self.0.as_mut() else { return; };
         let r = &mut active.record;
-        let us = started.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
         r.observations += 1;
         r.work_us += us;
+        if us > r.max_work_us || (us == r.max_work_us && sample.cpu_samples == 1 && r.sample.cpu_at_max_work_available == 0) {
+            r.sample.max_work_end_ms = if sample.max_work_end_ms != 0 { sample.max_work_end_ms } else { unix_ms() };
+            r.sample.cpu_at_max_work_us = sample.cpu_work_us;
+            r.sample.cpu_at_max_work_available = (sample.cpu_samples == 1) as u64;
+        }
         r.max_work_us = r.max_work_us.max(us);
         macro_rules! sum { ($($f:ident),*) => { $(r.sample.$f += sample.$f;)* }; }
-        sum!(frames, bytes, dropped, timeouts, errors, keyframes, repeats, gpu_frames,
-             pli_sent, pli_suppressed, intra_applied);
+        sum!(frames, bytes, dropped, gate_dropped, queue_dropped, invalid_frames, idle_frames, blank_frames, cpu_work_us, cpu_samples, timeouts, errors, keyframes, repeats, gpu_frames,
+             pli_sent, pli_suppressed, intra_applied, gap_gt_20ms, gap_gt_25ms, gap_gt_34ms, gap_gt_50ms);
         // Pacing extremes never average away: keep the worst ack gap seen.
-        r.sample.max_gap_us = r.sample.max_gap_us.max(sample.max_gap_us);
+        if sample.max_gap_us > r.sample.max_gap_us {
+            r.sample.max_gap_us = sample.max_gap_us;
+            r.sample.max_gap_end_ms = if sample.max_gap_end_ms != 0 { sample.max_gap_end_ms } else { unix_ms() };
+        }
+        r.sample.max_cpu_work_us = r.sample.max_cpu_work_us.max(sample.max_cpu_work_us);
         if sample.width != 0 {
             r.sample.width = sample.width;
         }
@@ -168,18 +252,27 @@ impl Trace {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+        let write_started = Instant::now();
+        let write_cpu = crate::media::media_cpu_us();
         let result = serde_json::to_vec(&active.record)
             .ok()
             .and_then(|mut bytes| {
                 bytes.push(b'\n');
                 active.file.write_all(&bytes).ok()
             });
+        let write_us = write_started.elapsed().as_micros() as u64;
+        let write_cpu_us = write_cpu.zip(crate::media::media_cpu_us()).map(|(a, b)| b.saturating_sub(a));
         if result.is_none() {
             self.0 = None;
             return;
         }
         active.since = Instant::now();
-        active.record.sample = Sample::default();
+        active.record.sample = Sample {
+            previous_write_us: write_us,
+            previous_write_cpu_us: write_cpu_us.unwrap_or(0),
+            previous_write_cpu_available: write_cpu_us.is_some() as u64,
+            ..Default::default()
+        };
         active.record.work_us = 0;
         active.record.max_work_us = 0;
         active.record.observations = 0;
@@ -197,10 +290,93 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deferred_work_keeps_its_end_before_the_recording_time() {
+        let before = unix_ms();
+        let end = Instant::now() - Duration::from_secs(1);
+        let sample = Sample::default().ending_at(end);
+        let after = unix_ms();
+        assert!(sample.max_work_end_ms >= before.saturating_sub(1001));
+        assert!(sample.max_work_end_ms <= after.saturating_sub(999));
+    }
+
+    #[test]
+    fn encode_sub_stages_serialize_to_snake_case() {
+        // Analyzer contract (scripts/analyze-trace.py STAGES): pool is the
+        // create+lock sub-interval split out of prepare.
+        let prepare = serde_json::to_value(Stage::EncodePrepare).unwrap();
+        let pool = serde_json::to_value(Stage::EncodePool).unwrap();
+        assert_eq!(prepare, "encode_prepare");
+        assert_eq!(pool, "encode_pool");
+    }
+
+    #[test]
+    fn cpu_peak_is_paired_with_the_wall_peak_and_previous_write_is_separate() {
+        let dir = std::env::temp_dir().join(format!("golive-trace-paired-{}", std::process::id()));
+        let mut trace = Trace::open(Stage::EncodeCopy, &dir);
+        trace.record_cost(Sample { frames: 1, cpu_samples: 1, cpu_work_us: 300,
+            max_cpu_work_us: 300, max_work_end_ms: 123456, max_gap_us: 70_000,
+            max_gap_end_ms: 123450, ..Default::default() }, 50_000);
+        trace.record_cost(Sample { frames: 1, cpu_samples: 1, cpu_work_us: 900,
+            max_cpu_work_us: 900, ..Default::default() }, 1_000);
+        trace.record_cost(Sample { frames: 1, ..Default::default() }, 50_000);
+        trace.flush();
+        trace.record_cost(Sample { frames: 1, ..Default::default() }, 3);
+        drop(trace);
+        let file = dir.join(format!("golive-trace-{}.jsonl", std::process::id()));
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(file).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(records[0]["max_work_us"], 50_000);
+        assert_eq!(records[0]["max_work_end_ms"], 123456);
+        assert_eq!(records[0]["max_gap_end_ms"], 123450);
+        assert_eq!(records[0]["cpu_at_max_work_us"], 300);
+        assert_eq!(records[0]["max_cpu_work_us"], 900);
+        assert_eq!(records[0]["cpu_at_max_work_available"], 1);
+        assert_eq!(records[1]["cpu_at_max_work_available"], 0);
+        assert!(records[1]["previous_write_us"].is_u64());
+        for (stage, name) in [(Stage::EncodeConvert, "encode_convert"), (Stage::EncodeCopy, "encode_copy"), (Stage::EncodeUnlock, "encode_unlock")] {
+            assert_eq!(serde_json::to_value(stage).unwrap(), name);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn gap_bands_sum_and_pacer_hold_serializes() {
+        // Present-stage histogram: nested per-ack band counts sum across the
+        // record window; old records simply omit the fields (= 0).
+        let dir = std::env::temp_dir().join(format!("golive-trace-gaps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut trace = Trace::open(Stage::Present, &dir);
+        for gap in [10_000u64, 30_000, 60_000] {
+            trace.record(
+                Sample {
+                    frames: 1,
+                    gap_gt_20ms: (gap > 20_000) as u64,
+                    gap_gt_25ms: (gap > 25_000) as u64,
+                    gap_gt_34ms: (gap > 34_000) as u64,
+                    gap_gt_50ms: (gap > 50_000) as u64,
+                    ..Default::default()
+                },
+                None,
+            );
+        }
+        drop(trace);
+        let file = dir.join(format!("golive-trace-{}.jsonl", std::process::id()));
+        let content = std::fs::read_to_string(&file).unwrap();
+        let r: serde_json::Value = serde_json::from_str(content.lines().last().unwrap()).unwrap();
+        assert_eq!(r["gap_gt_20ms"], 2, "30ms + 60ms gaps");
+        assert_eq!(r["gap_gt_25ms"], 2, "30ms + 60ms gaps");
+        assert_eq!(r["gap_gt_34ms"], 1, "60ms gap only");
+        assert_eq!(r["gap_gt_50ms"], 1, "60ms gap only");
+        let hold = serde_json::to_value(Stage::PacerHold).unwrap();
+        assert_eq!(hold, "pacer_hold");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn normal_launch_marker_enables_trace_without_environment() {
         let dir = std::env::temp_dir().join(format!("golive-trace-marker-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let executable = dir.join("golive-app");
+        let executable = dir.join("goDrinking");
         assert_eq!(trace_directory(None, Some(&executable)), None);
         std::fs::write(dir.join(".golive-media-trace"), b"").unwrap();
         let output = trace_directory(None, Some(&executable)).expect("normal launch enabled");
@@ -230,6 +406,24 @@ mod tests {
         std::fs::remove_file(dir.join(".golive-media-trace")).unwrap();
         assert_eq!(trace_directory(None, Some(&executable)), None);
         assert_eq!(trace_directory(None, None), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cpu_cost_is_separate_from_wall_time_and_keeps_its_maximum() {
+        let dir = std::env::temp_dir().join(format!("golive-trace-cpu-{}", std::process::id()));
+        let mut trace = Trace::open(Stage::Decode, &dir);
+        for (wall, cpu) in [(20_000, 300), (60_000, 100)] {
+            trace.record_cost(Sample { frames: 1, cpu_samples: 1, cpu_work_us: cpu,
+                max_cpu_work_us: cpu, ..Default::default() }, wall);
+        }
+        drop(trace);
+        let file = dir.join(format!("golive-trace-{}.jsonl", std::process::id()));
+        let record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+        assert_eq!(record["work_us"], 80_000);
+        assert_eq!(record["cpu_work_us"], 400);
+        assert_eq!(record["cpu_samples"], 2);
+        assert_eq!(record["max_cpu_work_us"], 300);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

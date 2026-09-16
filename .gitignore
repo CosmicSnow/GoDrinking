@@ -19,6 +19,7 @@ e2e-artifacts/
 dist
 dist-ssr
 *.local
+__pycache__/
 
 # Portable builds (gerados localmente / no CI, nunca commitados)
 goDrinking-*-portable*.exe

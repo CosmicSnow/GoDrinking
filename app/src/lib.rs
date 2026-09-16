@@ -221,10 +221,9 @@ pub struct PublishSession {
     pub wire: WireIds,
     pub remote_ready: bool,
     pub pending_remote: Vec<String>,
-    /// Capture bridge feeding THIS session (Display/Window only; None for
-    /// synthetic/movie). Per-session so a re-watch builds a fresh OS stream
-    /// instead of inheriting a dead one; stopped with the publisher on
-    /// unwatch/stop/leave.
+    /// Sole capture bridge for this shared encoder (Display/Window only).
+    /// One live session holds it; unwatch transfers ownership to a survivor.
+    /// The last session stops it; a later watch starts a fresh source.
     pub bridge: Option<screen::BridgeHandle>,
 }
 
@@ -285,6 +284,9 @@ pub struct E2ePlan {
     /// working unchanged (absent == synthetic). The viewer ignores it.
     #[serde(default)]
     pub share: Option<String>,
+    /// Optional quality for the mid-share E2E check; absent preserves 360p15.
+    #[serde(default)]
+    pub quality: Option<QualityProfile>,
 }
 
 impl E2ePlan {
@@ -322,6 +324,9 @@ impl E2ePlan {
             // so a typo here must fail at plan parse, not mid-run.
             ShareSource::parse(share)
                 .map_err(|e| format!("e2e plan field 'share': {e}"))?;
+        }
+        if let Some(quality) = plan.quality {
+            quality.validate().map_err(|e| format!("e2e quality: {e}"))?;
         }
         Ok(Some(plan))
     }
@@ -844,14 +849,11 @@ impl AppState {
         }
     }
 
-    /// Builds + adopts a FRESH publisher session for a late watcher from the
-    /// stored share source (re-watch after unwatch, or a second concurrent
-    /// peer): the idle template is single-shot, so once adopted there is
-    /// nothing left to reuse. Runs at the CURRENT effective profile and, for
-    /// Display/Window, opens a fresh bridge on the shared live profile (so
-    /// `set_quality` keeps clamping every live bridge). Also spawns the
-    /// session's Share forward task. Returns false to keep the silent-refuse
-    /// (share not live, or the build failed) — no protocol change.
+    /// Adopts an independent peer connection for a late watcher. Concurrent
+    /// watchers share the existing capture and encoder; after the last one
+    /// leaves, a re-watch opens a fresh source at the current profile. Also
+    /// spawns the session's Share forward task. Returns false when sharing
+    /// is no longer live or construction fails; the wire protocol is unchanged.
     pub(crate) async fn adopt_fresh_session(
         self: &Arc<Self>,
         app: Option<AppHandle>,
@@ -894,11 +896,21 @@ impl AppState {
             let audio_rx = inner.audio.as_ref().map(|session| session.subscribe());
             (source, live, profile, audio_rx)
         };
-        let (publisher, mut bridge, event_rx) =
+        // Existing viewers already own a capture/encoder for this share.
+        // Fork only transport; the single bridge remains with one live session.
+        let existing = self.inner.lock().ok().and_then(|inner| inner.publishers.values().next().map(|s| s.publisher.clone()));
+        let (publisher, mut bridge, event_rx) = if let Some(existing) = existing {
+            let (tx, rx) = mpsc::unbounded_channel();
+            match existing.lock().await.fork(None, tx, audio_rx).await {
+                Ok(publisher) => (publisher, None, rx),
+                Err(_) => return false,
+            }
+        } else {
             match Self::build_source_session(&source, profile, &live, audio_rx).await {
                 Ok(built) => built,
                 Err(_) => return false,
-            };
+            }
+        };
         let publisher = Arc::new(tokio::sync::Mutex::new(publisher));
         // Decide + insert under one short lock with NO await inside (a std
         // guard must never cross an await — it would poison Send for every
@@ -1108,9 +1120,8 @@ impl AppState {
             return Err(error);
         }
         // Restart the capture streams at the new profile (if bridged).
-        // EVERY live session owns its bridge (re-watch/second-peer fanout),
-        // so reconfigure ALL of them — otherwise late watchers' bridges
-        // diverge after a quality apply. Transactional per stream (the new
+        // One live session owns the shared bridge. Visiting all sessions
+        // finds that owner even after the original watcher has left. Transactional per stream (the new
         // OS stream starts first; a failure leaves the old one running)
         // with best-effort rollback of the streams that already moved plus
         // the publishers that already applied. Handles leave Inner for the
@@ -1812,6 +1823,7 @@ fn e2e_read_code(state: State<'_, Arc<AppState>>) -> Result<String, String> {
 
 /// Tauri entry point with an explicit state (tests inject their own).
 pub fn run_with(state: Arc<AppState>) {
+    screen::install_decoder_backend();
     let log_state = Arc::clone(&state);
     tauri::Builder::default()
         .manage(state)
@@ -1881,7 +1893,7 @@ mod e2e_plan_tests {
     use super::*;
 
     fn args(extra: &[&str]) -> impl Iterator<Item = String> {
-        let mut v = vec!["golive-app".to_owned()];
+        let mut v = vec!["goDrinking".to_owned()];
         v.extend(extra.iter().map(|s| s.to_string()));
         v.into_iter()
     }
@@ -1905,6 +1917,17 @@ mod e2e_plan_tests {
             .unwrap()
             .unwrap();
         assert_eq!(plan.role, "viewer");
+    }
+
+    #[test]
+    fn e2e_quality_is_optional_and_validated() {
+        let mut raw: serde_json::Value = serde_json::from_str(PLAN).unwrap();
+        assert_eq!(E2ePlan::from_args(args(&["--e2e-plan", PLAN])).unwrap().unwrap().quality, None);
+        raw["quality"] = serde_json::json!({"w":1920,"h":1080,"bitrate_kbps":6000,"fps":60});
+        let encoded = raw.to_string();
+        assert_eq!(E2ePlan::from_args(args(&["--e2e-plan", &encoded])).unwrap().unwrap().quality.unwrap().fps, 60);
+        raw["quality"]["fps"] = serde_json::json!(0);
+        assert!(E2ePlan::from_args(args(&["--e2e-plan", &raw.to_string()])).is_err());
     }
 
     #[test]

@@ -92,7 +92,7 @@ shortcuts, settings persistence, Windows capture UX.
 - Building OUTSIDE the Tauri CLI (plain `cargo`, xwin cross) REQUIRES
   `--features tauri/custom-protocol` — without it the exe points at
   `devUrl` instead of the bundled UI (proven by reading tauri 2.11.5).
-- Dev needs `-- --bin golive-app` (two bins confuse `cargo run`).
+- Dev needs `-- --bin goDrinking` (two bins confuse `cargo run`).
 - `cargo tauri dev` watches `app/` only — Rust changes in `core/` do
   NOT trigger rebuild; relaunch manually.
 - Server binds loopback-ONLY by design (non-local refused at startup).

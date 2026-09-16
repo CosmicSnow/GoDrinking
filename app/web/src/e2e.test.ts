@@ -66,7 +66,7 @@ describe("helpers puros", () => {
 });
 
 describe("runE2ePlan host", () => {
-  it("create → publica code → share → connected+keyframe", async () => {
+  it.each([undefined, { w: 1920, h: 1080, bitrate_kbps: 6000, fps: 60 }])("create → publica code → share → connected+keyframe (quality %j)", async (quality) => {
     const hooks: { media: ((e: never) => void) | null } = { media: null };
     mockListen.mockImplementation((event: string, cb: (e: never) => void) => {
       if (event === "media-event") hooks.media = cb;
@@ -106,7 +106,7 @@ describe("runE2ePlan host", () => {
       }
     });
     const reports: E2eReport[] = [];
-    const done = runE2ePlan(PLAN, (r) => {
+    const done = runE2ePlan({ ...PLAN, quality }, (r) => {
       reports.push(r);
     });
     // Eventos dirigem até connected.
@@ -123,10 +123,10 @@ describe("runE2ePlan host", () => {
     // Caminho real do aplicar-qualidade: intent exato (Tauri converte o
     // snake_case Rust para camelCase no IPC — ver api.setQuality), geração bumpada.
     expect(mockInvoke).toHaveBeenCalledWith("set_quality", {
-      w: 640,
-      h: 360,
-      bitrateKbps: 1000,
-      fps: 15,
+      w: quality?.w ?? 640,
+      h: quality?.h ?? 360,
+      bitrateKbps: quality?.bitrate_kbps ?? 1000,
+      fps: quality?.fps ?? 15,
     });
     // Code publicado no status (sem segredos além do code, que é local).
     const room = mockInvoke.mock.calls.find((c) => c[0] === "e2e_status");

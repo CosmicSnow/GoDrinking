@@ -4,12 +4,54 @@
 > AGENTS.md, seção Bugs). Nunca marcar como feito no lugar — remover a
 > linha. A lista contém só bugs abertos.
 
+Atualização 15/09 (host observado por 180 s): reproduzida pausa de encode
+354,771 ms (CPU 3,602 ms), alinhada com gaps 303,756/304,870 ms dos dois viewers.
+Conclusão VT levou 275,043 ms; thread observada em espera, sem novos page-ins
+do host no intervalo. Conversão também teve pausa 152,133 ms com pouca CPU.
+O recurso que bloqueou ainda não foi identificado; não basta aumentar o pacer.
+BUG-001 continua aberto. Evidências e limites em
+[DIAGNOSTICO-host-2026-09-15.md](DIAGNOSTICO-host-2026-09-15.md).
+
+**Estado em 13/09/2026:** BUG-001/002 continuam abertos para validação remota e Windows. Viewer YUV/WebGL reduz o payload de pixels em 62,5%; último controle local atingiu 60 FPS e gap máximo de 26,538 ms. Outros ensaios falharam no gate de cadência, incluindo dois viewers com pausas de ~98 ms. Proteção de H.264, encoder/captura compartilhados e gate WGC antes do readback foram implementados e testados nos limites descritos em [OTIMIZACOES-video-2026-09-13.md](OTIMIZACOES-video-2026-09-13.md). As notas de ~13 FPS e ausência de GPU na tabela são observações históricas, superadas pelos traces posteriores; não descrevem todo o pipeline atual. BUG-004 reproduzido novamente na dependência Opus (SSE4.1/SSSE3), sem alteração permanente de flags.
+
+Atualização 15/09: decoder macOS VideoToolbox e fallback para software testados;
+a fonte ao vivo foi corrigida de 30 para 60 FPS, mas ainda houve gaps de
+~94–98 ms. A suíte completa passou nos testes funcionais e falhou nos gates de
+cadência (um viewer: 75,83 ms; dois: 65,32/65,05 ms). BUG-001 permanece aberto;
+ver [MELHORIA-viewer-2026-09-15.md](MELHORIA-viewer-2026-09-15.md).
+
+Atualização 15/09 (noite): pacer de apresentação + relógio EWMA sanaram a
+cascata PLI/IDR no viewer Mac. Ao vivo D5LC1C: primeiro PASS no gate (present
+57,9 FPS, gap máx 45,2ms, 0 drops/PLI; histograma >50ms 16→0) e confirmação
+visual do usuário ("melhorou muito"). Resíduo: micro-gaps 58–81ms isolados por
+agendamento sob carga. Falta build Windows para a espectadora no Windows 10
+sentir o efeito + confirmação visual final; BUG-001 segue aberto.
+
+Atualização 15/09 (revisão de baixa latência): pacer atende deadlines durante
+decode serial, filtra pausas isoladas na EWMA e descarta apresentações vencidas
+sem PLI. 116 testes core + 3 integração passaram após ajuste de arredondamento.
+Build macOS atualizado; cadência ainda FAIL: 1 viewer 164ms, 2 viewers
+935/917ms, com host encode 905ms na janela dos dois viewers. Retenção agendada
+média 11–13,5ms, capacidade 2 preservada. Detalhes e logs em
+[MELHORIA-viewer-2026-09-15.md](MELHORIA-viewer-2026-09-15.md).
+
+Investigação adicional do host em 15/09: baseline reproduziu encode 785ms;
+subestágios instrumentados mostraram pausas com pouca CPU. Controles com/sem
+trace variaram; escrita de trace não é causa necessária. Filme de 12 frames
+e repetição do original passaram com dois viewers, mas ensaios anteriores
+reprovaram. Pressão de memória/agendamento seguem hipóteses, sem atribuição
+de kernel. Sem mudança de buffer ou codec. Ver
+[DIAGNOSTICO-host-2026-09-15.md](DIAGNOSTICO-host-2026-09-15.md).
+
 | ID      | Sintoma                                                        | Status         | Desde                    | Suspeita / notas |
 |---------|----------------------------------------------------------------|----------------|--------------------------|------------------|
 | BUG-001 | Compartilhamento de tela lento com hosts e viewers macOS/Windows | open — Mac validado ao vivo, falta Windows + CPU/GPU | relatado após mudança PLI | Confirmado: gates de captura/ponte reiniciavam o intervalo a cada chegada, perdendo FPS com jitter. Regressão de 300 chegadas a 30 FPS com jitter de 1 ms: 151 encaminhadas antes, 300 após correção de cadência. Validado ao vivo no Mac (viewer fresh ~28,6/s, Display-3 PASS 23 s). Aberto: host Windows 1080p60 emite ~13fps/~2,5 Mbps (medido no viewer LHYSYV, path sem perdas — teto no emissor, trace do host pendente) + CPU/GPU sustentados. `link_stats.bitrate_bps` mede RGBA apresentado, não bitrate H.264; não prova storm de IDR. |
 | BUG-002 | Windows lento + GPU ~40% de RTX 3090 só assistindo             | open (windows) | build Windows pós-DXGI   | Lado Windows (LLM Windows): checar decode por software, present loop sem vsync, upload de textura por frame. Evidência nova: viewer inocente (28fps local saudável, 0 repeats, path sem perdas); pipeline sem GPU em nenhum estágio (sem NVENC — 3090 não ajuda em nada hoje); host Windows emite ~13fps num alvo 60fps (ver BUG-001). |
 | BUG-003 | Viewer repete `ice connected` a cada ~0,5–2 s a sessão toda    | open | log viewer do amigo (~150 linhas, sessão com watch+share) | `wire_ice_events` (media.rs) emite sem dedupe a cada transição Connected/Completed — connects succeeding = flap/retry loop, não causa do kick. Apurar gatilho (roster re-watch? ICE flap). |
 | BUG-004 | Checagem cross Windows bloqueada na compilação de Opus | open — ambiente macOS→Windows | 2026-09-11 | `cargo xwin check` rejeita inicialmente espaços no rustflag do manifesto. Com `RUSTFLAGS=''` (somente para check), CMake 4 exige `CMAKE_POLICY_VERSION_MINIMUM=3.5`; após esse ajuste, `audiopus_sys 0.2.2` falha em intrínsecos SSE4.1/SSSE3 compilados sem a feature. Nenhuma dependência/flag permanente foi alterada. Testes nativos macOS passam; checagem e execução Windows pendentes. |
+| BUG-005 | Janela de terminal abre junto com o app no Windows | correção no código, validação nativa pendente | 2026-09-13 | App e helper sem atributo de subsystem; os dois PEs antigos disponíveis foram reprovados como console=3. Ambos agora declaram GUI. `check-windows-gui.py` inspeciona os executáveis gerados e bloqueia release com console. Falta compilar/executar a versão corrigida no Windows; não considerar verificado apenas pelo patch. |
+
+Auditoria automatizada de 13/09: `verify.py --desktop` aprovou as suítes funcionais, build e cadência com um viewer (gap 43,746 ms), mas reprovou dois viewers (57,507 / 58,456 ms, limite 50 ms). BUG-001 continua aberto. Evidências e cobertura em [VALIDACAO-app-2026-09-13.md](VALIDACAO-app-2026-09-13.md); execução reutilizável em [TESTING.md](TESTING.md).
 
 Validação BUG-001 (2026-09-09): checks/testes de app, core, platform e
 platform-macos passaram; web typecheck/test/build, testes do server e
@@ -61,3 +103,32 @@ como BUG-003 (linha da tabela). NOTA: todos os fixes citados nesta
 validação estão NÃO-COMMITADOS na árvore (~15 arquivos) — necessário
 commit antes de distribuir builds (o branch `fresh/native-core` do amigo
 não os contém).
+
+
+Validação viewer (2026-09-12): trace Windows controlado confirma envio ~59,4 FPS
+em 1080p60 e decode Mac ~59,1 FPS; não há teto fixo de 24/30 FPS nesse cenário.
+Viewer remoto ainda tem picos decode/conversão até 122,6 ms. Removida a espera
+extra de requestAnimationFrame antes do desenho/ack no player compartilhado;
+trace `present` agora cobre o canvas. E2E local release após alteração:
+60,006 FPS decoded/drawn, 0 descartes na janela, gap máximo 40,867 ms;
+96 testes web e 106 app-lib passaram. Correção completa NÃO verificada:
+faltam Windows viewer e nova sessão real, e o ajuste de agendamento não elimina
+por si só os picos de decode. Evidências em `DIAGNOSTICO-video-2026-09-12.md`
+e `e2e-artifacts/cadence-after/`.
+
+Revisão adicional (2026-09-12): viewer libera AU no marker RTP, preserva fallback
+por timestamp e recicla o buffer. Teste de IDR fragmentado sem próximo quadro
+falhou antes/passou depois; 88 testes core + E2E dois peers passaram. Bundle
+local: 60,011 FPS apresentados, gap máximo 28,215 ms. BUG-001 segue aberto:
+Windows/sessão remota não revalidados; CPU/IPC do viewer, FrameSlot substituindo
+H.264 sem contabilizar perdas, encode/captura por watcher e readback WGC antes
+do gate permanecem pendentes. Ver `REVISAO-performance-2026-09-12.md`.
+
+
+Reprodução adicional (2026-09-14): vídeo YouTube 60 FPS no Display 3 a 120 Hz,
+com viewer medido na sala indicada pelo usuário. Baseline teve gap de apresentação
+até 122,343 ms; reteste com decoder em thread dedicada ainda chegou a 100,172 ms.
+O host entregou cerca de 50 e 40 FPS, respectivamente; não é comparação A/B
+controlada e não comprova ganho percentual. BUG-001 continua aberto. Contadores
+`capture_input` adicionados antes do gate SCK precisam de host reiniciado na
+build nova. Captura isolada bloqueada por permissão/timeout, sem resultado de FPS.

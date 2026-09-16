@@ -23,7 +23,7 @@
 
 use golive_platform::{EncodedAudioPacket, GpuPixelBuffer};
 use crate::trace::{Trace, Stage, Sample as TraceSample};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -765,7 +765,18 @@ impl VideoEncoder {
     pub fn encode_frame(&mut self, frame: &I420Frame) -> Result<Option<Vec<u8>>, MediaError> {
         match self {
             Self::Software(enc) => enc.encode(frame).map(Some),
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(target_os = "macos")]
+            Self::Hardware(enc) => {
+                let pixels = frame.w * frame.h;
+                enc.encode_i420(
+                    frame.w,
+                    frame.h,
+                    &frame.data[..pixels],
+                    &frame.data[pixels..pixels + pixels / 4],
+                    &frame.data[pixels + pixels / 4..],
+                )
+            }
+            #[cfg(target_os = "windows")]
             Self::Hardware(enc) => {
                 let nv12 = crate::vt::i420_to_nv12(
                     frame.w,
@@ -885,34 +896,63 @@ fn level_for(w: usize, h: usize) -> Level {
     }
 }
 
-/// Latest-only unit slot between the encode thread and the RTP pump: at
-/// most ONE access unit is ever queued. Publishing replaces stale; taking
-/// consumes. Under congestion the viewer gets the freshest decodable unit
-/// (gaps are packet-loss-shaped, which the decoder already survives) and
-/// the encoder never blocks on a slow peer — the anti-jank root fix.
+/// Bounded unit slot between the encode thread and the RTP pump: at most ONE
+/// access unit is queued. The producer waits for capacity before encoding, so
+/// an already encoded unit is never replaced and shutdown remains bounded.
 /// An empty unit is the poison pill (encoders never emit empty units).
 #[derive(Debug, Default)]
 struct FrameSlot {
-    slot: std::sync::Mutex<Option<(Vec<u8>, Duration)>>,
+    state: std::sync::Mutex<FrameSlotState>,
+    capacity: std::sync::Condvar,
     notify: tokio::sync::Notify,
 }
 
+#[derive(Debug, Default)]
+struct FrameSlotState {
+    item: Option<(Vec<u8>, Duration)>,
+    closed: bool,
+}
+
 impl FrameSlot {
-    fn publish(&self, unit: Vec<u8>, duration: Duration) {
-        *self.slot.lock().expect("frame slot poisoned") = Some((unit, duration));
+    fn wait_for_capacity(&self, stop: &AtomicBool) -> bool {
+        let mut state = self.state.lock().expect("frame slot poisoned");
+        while state.item.is_some() && !state.closed && !stop.load(Ordering::Acquire) {
+            state = self.capacity.wait_timeout(state, Duration::from_millis(50)).expect("frame slot poisoned").0;
+        }
+        !state.closed && !stop.load(Ordering::Acquire)
+    }
+
+    fn publish(&self, unit: Vec<u8>, duration: Duration) -> bool {
+        let mut state = self.state.lock().expect("frame slot poisoned");
+        if state.closed || state.item.is_some() {
+            return false;
+        }
+        state.item = Some((unit, duration));
         self.notify.notify_one();
+        true
     }
 
     fn poison(&self) {
-        *self.slot.lock().expect("frame slot poisoned") = Some((Vec::new(), Duration::ZERO));
+        let mut state = self.state.lock().expect("frame slot poisoned");
+        state.closed = true;
+        self.capacity.notify_all();
         self.notify.notify_one();
     }
 
     async fn take(&self) -> (Vec<u8>, Duration) {
         loop {
-            if let Some(item) = self.slot.lock().expect("frame slot poisoned").take() {
-                return item;
-            }
+            let result = {
+                let mut state = self.state.lock().expect("frame slot poisoned");
+                if let Some(item) = state.item.take() {
+                    self.capacity.notify_one();
+                    Some(item)
+                } else if state.closed {
+                    Some((Vec::new(), Duration::ZERO))
+                } else {
+                    None
+                }
+            };
+            if let Some(item) = result { return item; }
             self.notify.notified().await;
         }
     }
@@ -926,6 +966,8 @@ impl FrameSlot {
 /// with transparent software fallback, and is what the live viewer uses.
 pub enum H264Decoder {
     Software { dec: Decoder },
+    Native(Box<dyn golive_platform::decode::VideoDecoder>),
+    RecoveringSoftware { parameter_sets: Vec<u8> },
     #[cfg(target_os = "windows")]
     Hardware(crate::mfdec::MfDecoder),
 }
@@ -938,14 +980,21 @@ pub struct DecodedStats {
     pub is_keyframe: bool,
 }
 
-/// One decoded picture ready to present. RGBA, row-major, `w*h*4` bytes.
+/// Pixel layout carried to a presenter. YUV uses BT.601 limited range,
+/// matching the existing software conversion. Planes are tightly packed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum PixelFormat { Rgba = 0, I420 = 1, Nv12 = 2 }
+
+/// One decoded picture ready to present.
 /// Carried by value through the present callback (owned per frame; the shell
 /// drops stale ones instead of queuing).
 #[derive(Clone, Debug)]
 pub struct PresentedFrame {
     pub w: usize,
     pub h: usize,
-    pub rgba: Vec<u8>,
+    pub data: Vec<u8>,
+    pub format: PixelFormat,
 }
 
 /// Stats plus pixels from a single decode. One decode feeds validation,
@@ -954,6 +1003,20 @@ pub struct PresentedFrame {
 pub struct DecodedPicture {
     pub stats: DecodedStats,
     pub frame: PresentedFrame,
+}
+
+static THREAD_CPU_CLOCK: std::sync::OnceLock<fn() -> Option<u64>> = std::sync::OnceLock::new();
+
+/// Installs a clock measuring only the calling media worker, for opt-in traces.
+pub fn install_media_cpu_clock(clock: fn() -> Option<u64>) { let _ = THREAD_CPU_CLOCK.set(clock); }
+pub(crate) fn media_cpu_us() -> Option<u64> { THREAD_CPU_CLOCK.get().and_then(|clock| clock()) }
+
+static NATIVE_DECODER_FACTORY: std::sync::OnceLock<golive_platform::decode::DecoderFactory> = std::sync::OnceLock::new();
+
+/// The app installs an OS backend before starting media. Core imports only
+/// the platform's pure contract. Creation happens on the serial codec worker.
+pub fn install_decoder_factory(factory: golive_platform::decode::DecoderFactory) {
+    let _ = NATIVE_DECODER_FACTORY.set(factory);
 }
 
 impl H264Decoder {
@@ -970,6 +1033,11 @@ impl H264Decoder {
     /// Never fails while software constructs; a mid-stream hardware fault
     /// transparently degrades to software on the failing unit.
     pub fn new_auto() -> Result<Self, MediaError> {
+        if std::env::var_os("GOLIVE_DISABLE_HW").is_none() {
+            if let Some(factory) = NATIVE_DECODER_FACTORY.get() {
+                if let Ok(decoder) = factory() { return Ok(Self::Native(decoder)); }
+            }
+        }
         #[cfg(target_os = "windows")]
         {
             if std::env::var_os("GOLIVE_DISABLE_HW").is_none() {
@@ -991,72 +1059,136 @@ impl H264Decoder {
     /// only — same redaction rules as the encode side (names, never pixels).
     pub fn backend_name(&self) -> &'static str {
         match self {
-            Self::Software { .. } => "openh264",
+            Self::Software { .. } | Self::RecoveringSoftware { .. } => "openh264",
+            Self::Native(_) => "native",
             #[cfg(target_os = "windows")]
             Self::Hardware(hw) => hw.backend_name(),
         }
     }
 
+    fn waiting_for_keyframe(&self) -> bool { matches!(self, Self::RecoveringSoftware { .. }) }
+
     pub fn decode(&mut self, annexb: &[u8]) -> Result<Option<DecodedPicture>, MediaError> {
-        let is_keyframe = annexb_nals(annexb)
-            .iter()
-            .any(|range| nal_type(&annexb[range.clone()]) == Some(5));
+        self.decode_for_present(annexb, false)
+    }
+
+    pub fn decode_for_present(&mut self, annexb: &[u8], compact: bool) -> Result<Option<DecodedPicture>, MediaError> {
+        self.decode_measured(annexb, compact, None)
+    }
+
+    fn decode_measured(&mut self, annexb: &[u8], compact: bool, mut measurements: Option<&mut DecodeMeasurements>) -> Result<Option<DecodedPicture>, MediaError> {
+        let is_keyframe = contains_idr(annexb);
+        let started = measurements.as_ref().map(|_| Instant::now());
         match self {
-            Self::Software { dec } => match dec
-                .decode(annexb)
-                .map_err(|e| MediaError::Codec(format!("decode: {e}")))?
-            {
-                Some(yuv) => {
-                    let [slice] = yuv.split::<1>();
-                    let y = slice.y();
-                    let (w, h) = slice.dimensions();
-                    if y.is_empty() {
-                        return Ok(None);
+            Self::RecoveringSoftware { parameter_sets } => {
+                // A fresh decoder has no reference pictures. Never feed it
+                // deltas from the failed hardware session or conceal garbage.
+                if !is_keyframe { return Ok(None); }
+                let mut recovered = std::mem::take(parameter_sets);
+                recovered.extend_from_slice(annexb);
+                *self = Self::new()?;
+                self.decode_measured(&recovered, compact, measurements)
+            }
+            Self::Native(hw) => {
+                let decoded = hw.decode(annexb);
+                if let Some(m) = measurements.as_deref_mut() { m.codec_us = elapsed_us(started); }
+                match decoded {
+                    Ok(None) => Ok(None),
+                    Ok(Some(pic)) => {
+                        let started = measurements.as_ref().map(|_| Instant::now());
+                        let (w, h) = (pic.width, pic.height);
+                        if w == 0 || h == 0 || w > 8192 || h > 8192 || w % 2 != 0 || h % 2 != 0 || pic.data.len() != w*h*3/2 {
+                            let parameter_sets = hw.parameter_sets();
+                            *self = Self::RecoveringSoftware { parameter_sets };
+                            eprintln!("golive: decode backend=openh264 recovery=invalid-native-output");
+                            return self.decode_measured(annexb, compact, measurements);
+                        }
+                        let sum: u64 = pic.data[..w*h].iter().map(|b| *b as u64).sum();
+                        let (data, format) = if compact { (pic.data, PixelFormat::Nv12) }
+                            else { (crate::mfdec::nv12_to_rgba(w,h,&pic.data).ok_or_else(|| MediaError::Codec("native pixel conversion".into()))?, PixelFormat::Rgba) };
+                        if let Some(m) = measurements { m.convert_us = elapsed_us(started); }
+                        Ok(Some(DecodedPicture {
+                            stats: DecodedStats { w, h, luma_mean: sum as f64 / (w*h) as f64, is_keyframe },
+                            frame: PresentedFrame { w, h, data, format },
+                        }))
                     }
-                    let sum: u64 = y.iter().map(|b| *b as u64).sum();
-                    let mut rgba = vec![0u8; w * h * 4];
-                    yuv.write_rgba8(&mut rgba);
-                    Ok(Some(DecodedPicture {
-                        stats: DecodedStats {
-                            w,
-                            h,
-                            luma_mean: sum as f64 / y.len() as f64,
-                            is_keyframe,
-                        },
-                        frame: PresentedFrame { w, h, rgba },
-                    }))
+                    Err(_) => {
+                        let parameter_sets = hw.parameter_sets();
+                        *self = Self::RecoveringSoftware { parameter_sets };
+                        eprintln!("golive: decode backend=openh264 recovery=await-idr");
+                        self.decode_measured(annexb, compact, measurements)
+                    }
                 }
-                None => Ok(None),
-            },
+            }
+            Self::Software { dec } => {
+                let decoded = dec.decode(annexb).map_err(|e| MediaError::Codec(format!("decode: {e}")))?;
+                if let Some(m) = measurements.as_deref_mut() { m.codec_us = elapsed_us(started); }
+                let Some(yuv) = decoded else { return Ok(None) };
+                let started = measurements.as_ref().map(|_| Instant::now());
+                let (w, h) = yuv.dimensions();
+                let strides = yuv.strides();
+                if w == 0 || h == 0 { return Ok(None); }
+                // Ignore decoder row padding both in the pixels and the luma statistic.
+                let sum: u64 = yuv.y().chunks(strides.0).take(h)
+                    .flat_map(|row| row[..w].iter()).map(|b| *b as u64).sum();
+                let (data, format) = if compact && w % 2 == 0 && h % 2 == 0 {
+                    let mut data = Vec::with_capacity(w * h * 3 / 2);
+                    for (plane, stride, width, height) in [
+                        (yuv.y(), strides.0, w, h),
+                        (yuv.u(), strides.1, w / 2, h / 2),
+                        (yuv.v(), strides.2, w / 2, h / 2),
+                    ] {
+                        for row in plane.chunks(stride).take(height) { data.extend_from_slice(&row[..width]); }
+                    }
+                    (data, PixelFormat::I420)
+                } else {
+                    let mut data = vec![0; w * h * 4];
+                    yuv.write_rgba8(&mut data);
+                    (data, PixelFormat::Rgba)
+                };
+                if let Some(m) = measurements { m.convert_us = elapsed_us(started); }
+                Ok(Some(DecodedPicture {
+                    stats: DecodedStats { w, h, luma_mean: sum as f64 / (w * h) as f64, is_keyframe },
+                    frame: PresentedFrame { w, h, data, format },
+                }))
+            }
             #[cfg(target_os = "windows")]
-            Self::Hardware(hw) => match hw.decode_annexb(annexb) {
-                Ok(None) => Ok(None),
-                Ok(Some(pic)) => {
-                    let sum: u64 =
-                        pic.nv12[..pic.w * pic.h].iter().map(|b| *b as u64).sum();
-                    let (w, h) = (pic.w, pic.h);
-                    let rgba = crate::mfdec::nv12_to_rgba(w, h, &pic.nv12)
-                        .ok_or_else(|| MediaError::Codec("hw decode dims invalid".into()))?;
-                    Ok(Some(DecodedPicture {
-                        stats: DecodedStats {
-                            w,
-                            h,
-                            luma_mean: sum as f64 / (w * h) as f64,
-                            is_keyframe,
-                        },
-                        frame: PresentedFrame { w, h, rgba },
-                    }))
+            Self::Hardware(hw) => {
+                let decoded = hw.decode_annexb(annexb);
+                if let Some(m) = measurements.as_deref_mut() { m.codec_us = elapsed_us(started); }
+                match decoded {
+                    Ok(None) => Ok(None),
+                    Ok(Some(pic)) => {
+                        let started = measurements.as_ref().map(|_| Instant::now());
+                        let (w, h) = (pic.w, pic.h);
+                        let sum: u64 = pic.nv12[..w * h].iter().map(|b| *b as u64).sum();
+                        let (data, format) = if compact {
+                            (pic.nv12, PixelFormat::Nv12)
+                        } else {
+                            (crate::mfdec::nv12_to_rgba(w, h, &pic.nv12)
+                                .ok_or_else(|| MediaError::Codec("hw decode dims invalid".into()))?, PixelFormat::Rgba)
+                        };
+                        if let Some(m) = measurements { m.convert_us = elapsed_us(started); }
+                        Ok(Some(DecodedPicture {
+                            stats: DecodedStats { w, h, luma_mean: sum as f64 / (w * h) as f64, is_keyframe },
+                            frame: PresentedFrame { w, h, data, format },
+                        }))
+                    }
+                    Err(_) => {
+                        *self = Self::RecoveringSoftware { parameter_sets: Vec::new() };
+                        self.decode_measured(annexb, compact, measurements)
+                    }
                 }
-                Err(_) => {
-                    // Transparent permanent fallback: rebuild as software
-                    // and decode this same unit with it. One bad unit can
-                    // still fail loudly below — errors stay typed.
-                    *self = Self::new()?;
-                    self.decode(annexb)
-                }
-            },
+            }
         }
     }
+
+}
+
+#[derive(Default)]
+struct DecodeMeasurements { codec_us: u64, convert_us: u64, cpu_work_us: u64, cpu_samples: u64, request_keyframe: bool }
+fn elapsed_us(started: Option<Instant>) -> u64 {
+    started.map(|s| s.elapsed().as_micros() as u64).unwrap_or(0)
 }
 
 /// Luma validator: non-black + motion against the previous frame.
@@ -1242,24 +1374,25 @@ async fn maybe_send_pli(
 // crate to every watcher — encode once, fanout free)
 // ---------------------------------------------------------------------------
 
+struct SharedEncoder {
+    track: Arc<TrackLocalStaticSample>,
+    encode_stop: Arc<AtomicBool>,
+    encode_thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    reconfig_tx: std::sync::mpsc::Sender<QualityProfile>,
+    slot: Arc<FrameSlot>,
+    backend: Arc<std::sync::Mutex<Option<&'static str>>>,
+    intra_requested: Arc<AtomicBool>,
+    listeners: Arc<std::sync::Mutex<HashMap<u64, mpsc::UnboundedSender<MediaEvent>>>>,
+    next_listener: std::sync::atomic::AtomicU64,
+}
+
 pub struct Publisher {
     pc: Arc<RTCPeerConnection>,
     event_tx: mpsc::UnboundedSender<MediaEvent>,
-    encode_stop: Arc<AtomicBool>,
-    encode_thread: Option<std::thread::JoinHandle<()>>,
+    shared: Arc<SharedEncoder>,
+    listener: u64,
     stopped: Arc<AtomicBool>,
-    reconfig_tx: Option<std::sync::mpsc::Sender<QualityProfile>>,
-    slot: Arc<FrameSlot>,
-    /// Live encoder backend (`None` until the encode thread builds it).
-    /// Written on every build/rebuild; read for counters/diagnostics.
-    backend: Arc<std::sync::Mutex<Option<&'static str>>>,
-    /// PLI/FIR recovery task handle (aborted in `stop()`). The flag it sets
-    /// is owned by the encode thread + the task itself — this handle is the
-    /// only publisher-side state the recovery needs.
     rtcp_task: Option<tokio::task::JoinHandle<()>>,
-    /// Shared with the encode thread and the RTCP task. `request_keyframe`
-    /// arms it so a late watcher can recover the startup IDR it missed.
-    intra_requested: Arc<AtomicBool>,
 }
 
 impl Publisher {
@@ -1356,8 +1489,7 @@ impl Publisher {
         }
         wire_ice_events(&pc, &event_tx, &census);
 
-        // Encode on a blocking thread; latest-only slot into tokio (see
-        // FrameSlot: at most one unit queued, stale replaced, never block).
+        // Encode on a blocking thread; bounded slot into tokio (see FrameSlot).
         // `intra_requested` bridges the async RTCP task (PLI/FIR in) to the
         // encode thread (`force_intra()` out).
         let slot = Arc::new(FrameSlot::default());
@@ -1365,9 +1497,22 @@ impl Publisher {
         let intra_requested = Arc::new(AtomicBool::new(false));
         let (reconfig_tx, reconfig_rx) = std::sync::mpsc::channel::<QualityProfile>();
         let encode_stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let listeners = Arc::new(std::sync::Mutex::new(HashMap::from([(0, event_tx.clone())])));
+        let (encode_events, mut encode_event_rx) = mpsc::unbounded_channel::<MediaEvent>();
+        {
+            let listeners = Arc::clone(&listeners);
+            tokio::spawn(async move {
+                while let Some(event) = encode_event_rx.recv().await {
+                    if let Ok(listeners) = listeners.lock() {
+                        for tx in listeners.values() { let _ = tx.send(event.clone()); }
+                    }
+                }
+            });
+        }
         let encode_thread = {
             let stop = Arc::clone(&encode_stop);
-            let event_tx = event_tx.clone();
+            let event_tx = encode_events;
             let slot = Arc::clone(&slot);
             let backend = Arc::clone(&backend);
             let census = Arc::clone(&census);
@@ -1380,7 +1525,7 @@ impl Publisher {
                 .map_err(|e| MediaError::Codec(format!("encode thread: {e}")))?
         };
         if let Some((audio_track, audio_rx)) = audio_pair {
-            let stop = Arc::clone(&encode_stop);
+            let stop = Arc::clone(&stopped);
             let runtime = tokio::runtime::Handle::current();
             tokio::task::spawn_blocking(move || {
                 while !stop.load(Ordering::Acquire) {
@@ -1404,6 +1549,7 @@ impl Publisher {
         // the live profile (reconfig may change fps mid-share).
         {
             let slot = Arc::clone(&slot);
+            let track = Arc::clone(&track);
             tokio::spawn(async move {
                 let mut trace = Trace::new(Stage::Send);
                 loop {
@@ -1427,9 +1573,9 @@ impl Publisher {
                         errors: result.is_err() as u64,
                         ..Default::default()
                     }, started);
-                    if result.is_err() {
-                        break;
-                    }
+                    // A closing binding must not stop the other peers. WebRTC
+                    // writes all bindings before returning aggregate errors.
+                    // The producer's poison pill ends the source explicitly.
                 }
             });
         }
@@ -1460,29 +1606,71 @@ impl Publisher {
         };
 
         Ok(Self {
-            pc,
-            event_tx,
-            encode_stop,
-            encode_thread: Some(encode_thread),
-            stopped: Arc::new(AtomicBool::new(false)),
-            reconfig_tx: Some(reconfig_tx),
-            slot,
-            backend,
-            rtcp_task: Some(rtcp_task),
-            intra_requested,
+            pc, event_tx, stopped, listener: 0, rtcp_task: Some(rtcp_task),
+            shared: Arc::new(SharedEncoder {
+                track, encode_stop, encode_thread: std::sync::Mutex::new(Some(encode_thread)),
+                reconfig_tx, slot, backend, intra_requested, listeners,
+                next_listener: std::sync::atomic::AtomicU64::new(1),
+            }),
         })
     }
 
+    /// Independent WebRTC/ICE/audio connection using the same captured and
+    /// encoded video. No additional capture receiver or encoder is created.
+    pub async fn fork(
+        &self,
+        ice_servers: Option<Vec<String>>,
+        event_tx: mpsc::UnboundedSender<MediaEvent>,
+        audio_rx: Option<std::sync::mpsc::Receiver<EncodedAudioPacket>>,
+    ) -> Result<Self, MediaError> {
+        if self.stopped.load(Ordering::Acquire) || self.shared.encode_stop.load(Ordering::Acquire) {
+            return Err(MediaError::Closed);
+        }
+        let pc = Arc::new(build_api()?.new_peer_connection(rtc_config(ice_servers)).await
+            .map_err(|e| MediaError::Transport(format!("pc: {e}")))?);
+        let sender = pc.add_track(self.shared.track.clone()).await
+            .map_err(|e| MediaError::Transport(format!("add_track: {e}")))?;
+        let stopped = Arc::new(AtomicBool::new(false));
+        if let Some(audio_rx) = audio_rx {
+            let track = Arc::new(TrackLocalStaticSample::new(opus_codec(), "audio".into(), "golive".into()));
+            pc.add_track(track.clone()).await.map_err(|e| MediaError::Transport(format!("add_audio_track: {e}")))?;
+            let stop = stopped.clone();
+            let runtime = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let Ok(packet) = audio_rx.recv_timeout(Duration::from_millis(20)) else { continue };
+                    let sample = Sample { data: Bytes::from(packet.data), duration: packet.duration, ..Default::default() };
+                    let _ = runtime.block_on(track.write_sample(&sample));
+                }
+            });
+        }
+        for transceiver in pc.get_transceivers().await {
+            transceiver.set_direction(RTCRtpTransceiverDirection::Sendonly).await;
+        }
+        wire_ice_events(&pc, &event_tx, &Arc::new(std::sync::Mutex::new(CandidateCensus::default())));
+        let intra = self.shared.intra_requested.clone();
+        let rtcp_task = tokio::spawn(async move {
+            while let Ok((packets, _)) = sender.read_rtcp().await {
+                if packets.iter().any(|packet| packet.as_any().is::<PictureLossIndication>() || packet.as_any().is::<FullIntraRequest>()) {
+                    intra.store(true, Ordering::Release);
+                }
+            }
+        });
+        let listener = self.shared.next_listener.fetch_add(1, Ordering::Relaxed);
+        self.shared.listeners.lock().unwrap().insert(listener, event_tx.clone());
+        Ok(Self { pc, event_tx, stopped, listener, shared: self.shared.clone(), rtcp_task: Some(rtcp_task) })
+    }
+
     /// Next encoded unit starts with an IDR. Used when a watcher joins after
-    /// the startup keyframe has already left the latest-only slot.
+    /// the startup keyframe has already left the output slot.
     pub fn request_keyframe(&self) {
-        self.intra_requested.store(true, Ordering::Release);
+        self.shared.intra_requested.store(true, Ordering::Release);
     }
 
     /// Live encoder backend for counters/diagnostics (`None` until the
     /// encode thread finishes its first build). Non-blocking read.
     pub fn backend(&self) -> Option<&'static str> {
-        self.backend.lock().ok().and_then(|guard| *guard)
+        self.shared.backend.lock().ok().and_then(|guard| *guard)
     }
 
     /// Transactional reconfig without re-signaling: validates first (typed
@@ -1493,10 +1681,8 @@ impl Publisher {
         profile
             .validate()
             .map_err(|e| MediaError::Codec(format!("profile: {e}")))?;
-        self.reconfig_tx
-            .as_ref()
-            .ok_or(MediaError::Closed)?
-            .send(profile)
+        if self.stopped.load(Ordering::Acquire) { return Err(MediaError::Closed); }
+        self.shared.reconfig_tx.send(profile)
             .map_err(|_| MediaError::Closed)?;
         Ok(())
     }
@@ -1536,23 +1722,27 @@ impl Publisher {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
         }
-        self.encode_stop.store(true, Ordering::Release);
         let _ = tokio::time::timeout(Duration::from_secs(5), self.pc.close()).await;
-        if let Some(handle) = self.rtcp_task.take() {
-            handle.abort();
-        }
-        self.slot.poison();
-        if let Some(thread) = self.encode_thread.take() {
-            let _ = thread.join();
+        if let Some(handle) = self.rtcp_task.take() { handle.abort(); }
+        let last = {
+            let mut listeners = self.shared.listeners.lock().unwrap();
+            listeners.remove(&self.listener);
+            listeners.is_empty()
+        };
+        if last {
+            self.shared.encode_stop.store(true, Ordering::Release);
+            self.shared.slot.poison();
+            let thread = self.shared.encode_thread.lock().unwrap().take();
+            if let Some(thread) = thread { let _ = tokio::task::spawn_blocking(move || thread.join()).await; }
         }
         let _ = self.event_tx.send(MediaEvent::Stats(MediaStats::default()));
     }
 }
 
-/// Encode loop: profile-paced frames, transactional reconfig, latest-only
-/// output. Deterministic pacing from the profile fps (never wall-clock
-/// absolute near RTP): each tick targets start+n*interval; overruns skip
-/// sleep (catch-up, no burst). Reconfigs drain to latest and apply atomically
+/// Encode loop: profile-paced frames, transactional reconfig, bounded
+/// output. Wait for capacity before encode and drain stale raw capture frames.
+/// Monotonic deadlines are reanchored after overruns, without catch-up bursts.
+/// Reconfigs drain to latest and apply atomically
 /// (rebuild + forced IDR + new generation + fresh Stats) without touching
 /// signaling — WebRTC resolves it: same m-line, SPS in-band.
 fn encode_loop(
@@ -1599,7 +1789,7 @@ fn encode_loop(
     let mut consecutive_skips: u32 = 0;
     let mut encode_trace = Trace::new(Stage::Encode);
     let mut source_trace = Trace::new(Stage::Source);
-    let start = Instant::now();
+    let mut next_deadline = Instant::now();
     let mut n: u64 = 0;
     while !stop.load(Ordering::Acquire) {
         // 1. Drain reconfigs to latest; apply atomically.
@@ -1637,6 +1827,14 @@ fn encode_loop(
         if intra_applied == 1 {
             encoder.force_intra();
         }
+        // Wait before conversion/encode, preserving every compressed reference.
+        // Once capacity returns, take the newest raw capture frame.
+        if !slot.wait_for_capacity(stop) { break; }
+        let now = Instant::now();
+        if next_deadline > now { std::thread::sleep(next_deadline - now); }
+        let frame_time = Instant::now();
+        next_deadline += profile.frame_duration();
+        if next_deadline <= frame_time { next_deadline = frame_time + profile.frame_duration(); }
         // 2. Fetch one frame at the current target dims. CPU frames scale
         // here; GPU buffers stay retained until the encode step routes
         // them (zero-copy submit or one conversion — see below).
@@ -1652,9 +1850,17 @@ fn encode_loop(
             VideoSource::SyntheticBall => PendingFrame::Cpu(Cow::Owned(synthetic_frame(target.0, target.1, n))),
             VideoSource::External(ext) => match {
                 let started = source_trace.start();
-                let received = ext.rx.recv_timeout(EXT_TICK);
+                let mut received = ext.rx.recv_timeout(EXT_TICK);
+                let mut raw_dropped = 0;
+                if received.is_ok() {
+                    while let Ok(newest) = ext.rx.try_recv() {
+                        received = Ok(newest);
+                        raw_dropped += 1;
+                    }
+                }
                 source_trace.record(TraceSample {
                     frames: received.is_ok() as u64,
+                    dropped: raw_dropped,
                     gpu_frames: matches!(&received, Ok(ExternalFrame::Gpu(_))) as u64,
                     timeouts: matches!(&received, Err(std::sync::mpsc::RecvTimeoutError::Timeout)) as u64,
                     errors: matches!(&received, Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) as u64,
@@ -1689,7 +1895,9 @@ fn encode_loop(
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => match cpu_holdover_on_timeout(ext_last.as_ref()) {
                     Some(last) => PendingFrame::Cpu(Cow::Borrowed(scale_frame_reusing(last, target.0, target.1, &mut scaled))),
-                    None => continue,
+                    None => {
+                        continue;
+                    }
                 },
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     let _ = event_tx.send(MediaEvent::Error(format!(
@@ -1702,11 +1910,16 @@ fn encode_loop(
         };
         // 3. Encode; transient skips are capped, anything else is fatal+loud.
         let started = encode_trace.start();
+        let cpu_start = started.and_then(|_| THREAD_CPU_CLOCK.get().and_then(|clock| clock()));
         let encoded = match frame {
             PendingFrame::Cpu(frame) => encoder.encode_frame(&frame),
             PendingFrame::Gpu(gpu) => encode_gpu_frame(&mut encoder, gpu, target),
         };
+        let cpu_elapsed = cpu_start.zip(cpu_start.and_then(|_| THREAD_CPU_CLOCK.get().and_then(|clock| clock())))
+            .map(|(start, end)| end.saturating_sub(start));
         if started.is_some() { encode_trace.record(TraceSample {
+            cpu_work_us: cpu_elapsed.unwrap_or(0), cpu_samples: cpu_elapsed.is_some() as u64,
+            max_cpu_work_us: cpu_elapsed.unwrap_or(0),
             frames: matches!(&encoded, Ok(Some(_))) as u64,
             bytes: encoded.as_ref().ok().and_then(|u| u.as_ref()).map(|u| u.len() as u64).unwrap_or(0),
             keyframes: encoded.as_ref().ok().and_then(|u| u.as_ref()).map(|u| contains_idr(u) as u64).unwrap_or(0),
@@ -1738,12 +1951,7 @@ fn encode_loop(
             }
         }
         n += 1;
-        // 4. Pace on the CURRENT profile (reconfig may have changed fps).
-        let next = start + profile.frame_duration() * (n as u32);
-        let now = Instant::now();
-        if next > now {
-            std::thread::sleep(next - now);
-        }
+
     }
 }
 
@@ -2135,6 +2343,16 @@ impl NativeViewer {
         on_frame: Arc<dyn Fn(PresentedFrame) + Send + Sync>,
         on_audio: Option<Arc<dyn Fn(&[f32]) + Send + Sync>>,
     ) -> Result<Self, MediaError> {
+        Self::start_with_audio_format(ice_servers, event_tx, on_frame, on_audio, false).await
+    }
+
+    pub async fn start_with_audio_format(
+        ice_servers: Option<Vec<String>>,
+        event_tx: mpsc::UnboundedSender<MediaEvent>,
+        on_frame: Arc<dyn Fn(PresentedFrame) + Send + Sync>,
+        on_audio: Option<Arc<dyn Fn(&[f32]) + Send + Sync>>,
+        compact: bool,
+    ) -> Result<Self, MediaError> {
         let api = build_api()?;
         let pc = Arc::new(
             api.new_peer_connection(rtc_config(ice_servers))
@@ -2166,7 +2384,7 @@ impl NativeViewer {
                             }
                             return;
                         }
-                        read_loop(track, &pc_pli, &event_tx, &on_frame, &census).await;
+                        read_loop(track, &pc_pli, &event_tx, &on_frame, &census, compact).await;
                     });
                 })
             }));
@@ -2231,6 +2449,235 @@ fn au_is_stale(last_decoded_ts: Option<u32>, completed_ts: u32) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Viewer micro jitter buffer (paced presentation, bounded extra latency)
+// ---------------------------------------------------------------------------
+
+/// Decoded pictures held between decode and `on_frame`. Arrival bursts and
+/// single network gaps no longer hit the screen directly.
+const PRESENT_BUFFER_MAX: usize = 2;
+/// Nominal rhythm before the first RTP timestamp delta is observed. Only the
+/// second picture of a stream can ever use it (the first presents at once,
+/// the second already carries a delta); 30 fps is the safe middle.
+const DEFAULT_PRESENT_INTERVAL: Duration = Duration::from_micros(1_000_000 / 30);
+/// EWMA weight per observed arrival delta: ~8 frames to adapt, slow enough
+/// to iron out source wobble, fast enough to follow a real rate change.
+const INTERVAL_SMOOTHING_ALPHA: f64 = 0.125;
+/// Phase correction per frame: chase drift gradually instead of jumping the
+/// schedule at once. Well under one 60 fps interval, over timer slop.
+const MAX_SLEW_PER_FRAME: Duration = Duration::from_micros(2_000);
+
+/// Nominal frame interval from consecutive RTP timestamps (90 kHz clock).
+/// `None` on same-timestamp repeats or gaps over a second — the caller keeps
+/// its previous rhythm instead of scheduling nonsense.
+fn rtp_frame_interval(prev_ts: u32, cur_ts: u32) -> Option<Duration> {
+    let delta = cur_ts.wrapping_sub(prev_ts);
+    if delta == 0 || delta > 90_000 {
+        return None;
+    }
+    Some(Duration::from_micros(delta as u64 * 1_000_000 / 90_000))
+}
+
+/// Micro jitter buffer: at most [`PRESENT_BUFFER_MAX`] decoded pictures held
+/// between decode and `on_frame`, presented on a smoothed clock (EWMA of the
+/// RTP timestamp deltas), not the raw arrival rhythm.
+///
+/// The first picture presents immediately, without pre-roll. At a steady
+/// rate the two slots schedule at most two intervals ahead (~33ms @60fps).
+/// OS/IPC stalls are not bounded by this scheduling budget.
+/// Arrivals past 2 held slots are refused (caller drops + counts, decoder
+/// untouched — the drop is post-decode so the chain stays intact, no IDR
+/// needed) — order never changes. Small phase errors are slewed out at
+/// [`MAX_SLEW_PER_FRAME`] per frame; only holes bigger than the buffer can
+/// absorb reanchor at once. Late wakeups keep only the newest due picture.
+/// Scheduling is pure: the caller supplies `now` for deterministic tests.
+struct PresentPacer {
+    interval: Duration,
+    observed: bool,
+    slow_candidate: Option<(Duration, u8)>,
+    queue: VecDeque<(DecodedPicture, Instant, Instant)>,
+    last_due: Option<Instant>,
+    dropped: u64,
+}
+
+// Test + diagnostics accessors below (len/is_empty/dropped) have no
+// production caller yet: the loop drives off next_due/pop_due/push.
+#[allow(dead_code)]
+impl PresentPacer {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval: interval.max(Duration::from_micros(1)),
+            observed: false,
+            slow_candidate: None,
+            queue: VecDeque::new(),
+            last_due: None,
+            dropped: 0,
+        }
+    }
+
+    fn set_interval(&mut self, interval: Duration) {
+        // Sane presenter range (1 fps..1000 fps): garbage ts deltas must
+        // never schedule a picture minutes out.
+        self.interval = interval.max(Duration::from_millis(1)).min(Duration::from_secs(1));
+    }
+
+    /// Fold one arrival-delta sample into the smoothed clock. The first
+    /// plausible sample replaces the seed; isolated long gaps are ignored.
+    /// Later samples move the EWMA by [`INTERVAL_SMOOTHING_ALPHA`]. Callers pre-filter deltas
+    /// (see `rtp_frame_interval`: 0 and >1s never reach here).
+    fn observe_interval(&mut self, sample: Duration) {
+        let sample = sample.max(Duration::from_millis(1)).min(Duration::from_secs(1));
+        // RTP's 90kHz clock and microsecond rounding must not classify a
+        // normal 60->30fps switch (33333 vs 2*16666us) as a gap.
+        let gap_threshold = 2 * self.interval + Duration::from_millis(1);
+        if !self.observed && sample <= gap_threshold {
+            self.interval = sample;
+            self.observed = true;
+            self.slow_candidate = None;
+            return;
+        }
+        // A single missing stretch is not a new frame rate. Accept a much
+        // slower clock only after three similar deltas; normal 30<->60 fps
+        // changes still use the EWMA. This adds no picture buffering.
+        if sample > gap_threshold {
+            let count = match self.slow_candidate {
+                Some((previous, count)) if sample.abs_diff(previous) <= previous / 4 => count + 1,
+                _ => 1,
+            };
+            self.slow_candidate = Some((sample, count));
+            if count < 3 { return; }
+            self.interval = sample;
+            self.observed = true;
+            self.slow_candidate = None;
+            return;
+        }
+        self.slow_candidate = None;
+        let current = self.interval.as_micros() as f64;
+        let next = current + INTERVAL_SMOOTHING_ALPHA * (sample.as_micros() as f64 - current);
+        self.interval = Duration::from_micros(next.round() as u64)
+            .max(Duration::from_millis(1))
+            .min(Duration::from_secs(1));
+    }
+
+    fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    /// Hold one decoded picture for paced presentation. `false` = buffer was
+    /// full: the arrival is refused (caller counts `dropped`; decoder and
+    /// publisher need nothing — post-decode drop, chain intact).
+    fn push(&mut self, picture: DecodedPicture, now: Instant) -> bool {
+        if self.queue.len() >= PRESENT_BUFFER_MAX {
+            self.dropped += 1;
+            return false;
+        }
+        let due = match self.last_due {
+            // First picture ever: present at once (no pre-roll).
+            None => now,
+            Some(last) => {
+                let nominal = last.checked_add(self.interval).unwrap_or(now);
+                if nominal >= now {
+                    // Early/on-time arrival: hold the slot, wobble stops here.
+                    nominal
+                } else if now.duration_since(nominal) > 2 * self.interval {
+                    // Hole bigger than the buffer can absorb: skip the debt,
+                    // reanchor at once (same as the old full reanchor).
+                    now
+                } else {
+                    // Small phase lag: chase at most one slew step per frame
+                    // instead of jumping the whole schedule at once.
+                    nominal + now.duration_since(nominal).min(MAX_SLEW_PER_FRAME)
+                }
+            }
+        };
+        self.last_due = Some(due);
+        self.queue.push_back((picture, due, now));
+        true
+    }
+
+    /// Next scheduled present (for the RTP read timeout). `None` when nothing
+    /// is held — the reader blocks on the network instead.
+    fn next_due(&self) -> Option<Instant> {
+        self.queue.front().map(|(_, due, _)| *due)
+    }
+
+    /// Pop the front picture when its time has come, with the time it spent
+    /// retained (`due - ready`, saturating, always >= 0). Call in a loop.
+    fn pop_due(&mut self, now: Instant) -> Option<(DecodedPicture, u64)> {
+        // After a scheduler stall, replaying every expired slot just replaces
+        // pictures at the shell. Keep the freshest due picture instead.
+        while self.queue.get(1).is_some_and(|(_, due, _)| *due <= now) {
+            self.queue.pop_front();
+            self.dropped += 1;
+        }
+        match self.queue.front() {
+            Some((_, due, _)) if *due <= now => self.queue.pop_front().map(|(picture, due, ready)| {
+                if self.queue.is_empty() && now.saturating_duration_since(due) >= self.interval {
+                    self.last_due = Some(now);
+                }
+                (picture, due.saturating_duration_since(ready).as_micros() as u64)
+            }),
+            _ => None,
+        }
+    }
+
+    fn drain_due(&mut self, emit: &mut impl FnMut(DecodedPicture, u64)) {
+        while let Some((picture, hold_us)) = self.pop_due(Instant::now()) {
+            emit(picture, hold_us);
+        }
+    }
+
+    /// Keep the same future alive across deadlines: no cancelled RTP reads
+    /// and no duplicate codec submissions. The codec remains serial.
+    async fn wait<F: std::future::Future>(
+        &mut self,
+        future: F,
+        emit: &mut impl FnMut(DecodedPicture, u64),
+    ) -> F::Output {
+        tokio::pin!(future);
+        loop {
+            self.drain_due(emit);
+            let Some(due) = self.next_due() else { return future.await; };
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(due.into()) => {},
+                result = &mut future => return result,
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DecodeDelivery { Queued, PresentationDrop, Pending, RequestKeyframe }
+
+/// Only a failure before presentation can request an IDR. Keeping the whole
+/// decision here lets regression tests exercise the same policy as read_loop.
+fn deliver_decoded(
+    pacer: &mut PresentPacer,
+    decoded: Result<Option<DecodedPicture>, MediaError>,
+    waiting_for_keyframe: bool,
+    has_decoded: bool,
+    now: Instant,
+) -> DecodeDelivery {
+    match decoded {
+        Ok(Some(picture)) => {
+            if pacer.push(picture, now) { DecodeDelivery::Queued }
+            else { DecodeDelivery::PresentationDrop }
+        }
+        Err(_) => DecodeDelivery::RequestKeyframe,
+        Ok(None) if waiting_for_keyframe || !has_decoded => DecodeDelivery::RequestKeyframe,
+        Ok(None) => DecodeDelivery::Pending,
+    }
+}
+
 async fn audio_read_loop(
     track: Arc<TrackRemote>,
     on_audio: Arc<dyn Fn(&[f32]) + Send + Sync>,
@@ -2254,6 +2701,53 @@ async fn audio_read_loop(
     }
 }
 
+/// Timestamp fallback for peers without markers; marked units can be released
+/// without waiting for a future picture (RFC 6184 section 5.1).
+#[derive(Default)]
+struct VideoAssembly {
+    unit: Vec<u8>,
+    timestamp: Option<u32>,
+    released: bool,
+}
+
+impl VideoAssembly {
+    fn take(&mut self) -> Option<(u32, Vec<u8>)> {
+        if self.unit.is_empty() {
+            return None;
+        }
+        self.released = true;
+        Some((self.timestamp?, std::mem::take(&mut self.unit)))
+    }
+
+    fn begin(&mut self, timestamp: u32) -> Option<(u32, Vec<u8>)> {
+        let previous = if self.timestamp.is_some_and(|old| old != timestamp) {
+            self.take()
+        } else {
+            None
+        };
+        if self.timestamp != Some(timestamp) {
+            self.released = false;
+        }
+        self.timestamp = Some(timestamp);
+        previous
+    }
+
+    fn append(&mut self, bytes: &[u8], marker: bool) -> Option<(u32, Vec<u8>)> {
+        if self.released {
+            return None;
+        }
+        self.unit.extend_from_slice(bytes);
+        if marker { self.take() } else { None }
+    }
+
+    fn recycle(&mut self, mut bytes: Vec<u8>) {
+        if self.unit.is_empty() && bytes.capacity() > self.unit.capacity() {
+            bytes.clear();
+            self.unit = bytes;
+        }
+    }
+}
+
 /// Track read loop: depacketize, assemble access units per RTP timestamp,
 /// decode once, then validate + emit + present the same picture. On an
 /// irrecoverable AU gap (the depacketize error path) asks the publisher for
@@ -2264,12 +2758,29 @@ async fn read_loop(
     event_tx: &mpsc::UnboundedSender<MediaEvent>,
     on_frame: &Arc<dyn Fn(PresentedFrame) + Send + Sync>,
     census: &Arc<std::sync::Mutex<CandidateCensus>>,
+    compact: bool,
 ) {
     let mut depacketizer = H264Packet::default();
     // Live viewer: hardware DXVA where probed, transparent software
     // fallback otherwise (never black on probe failure).
-    let mut decoder = match H264Decoder::new_auto() {
-        Ok(dec) => dec,
+    let mut decoder = match crate::worker::SerialWorker::start("golive-decode", move || {
+        let mut decoder = H264Decoder::new_auto();
+        move |(unit, measure): (Vec<u8>, bool)| {
+            let mut measurements = DecodeMeasurements::default();
+            let cpu_start = measure.then(|| THREAD_CPU_CLOCK.get().and_then(|clock| clock())).flatten();
+            let picture = match decoder.as_mut() {
+                Ok(decoder) => decoder.decode_measured(&unit, compact, measure.then_some(&mut measurements)),
+                Err(error) => Err(MediaError::Codec(error.to_string())),
+            };
+            if let (Some(start), Some(end)) = (cpu_start, cpu_start.and_then(|_| THREAD_CPU_CLOCK.get().and_then(|clock| clock()))) {
+                measurements.cpu_work_us = end.saturating_sub(start);
+                measurements.cpu_samples = 1;
+            }
+            measurements.request_keyframe = decoder.as_ref().map(|decoder| decoder.waiting_for_keyframe()).unwrap_or(false);
+            (unit, picture, measurements)
+        }
+    }) {
+        Ok(worker) => worker,
         Err(e) => {
             let _ = event_tx.send(MediaEvent::Error(e.to_string()));
             return;
@@ -2277,106 +2788,128 @@ async fn read_loop(
     };
     let mut validator = FrameValidator::new();
     let mut stats = MediaStats::default();
-    let mut unit = Vec::<u8>::new();
-    let mut unit_ts: Option<u32> = None;
+    let mut assembly = VideoAssembly::default();
     let mut last_decoded_ts: Option<u32> = None;
+    let mut last_au_ts: Option<u32> = None;
     let mut last_pli: HashMap<u32, Instant> = HashMap::new();
+    let mut pacer = PresentPacer::new(DEFAULT_PRESENT_INTERVAL);
     let mut rtp_trace = Trace::new(Stage::Rtp);
     let mut decode_trace = Trace::new(Stage::Decode);
+    let mut codec_trace = Trace::new(Stage::Codec);
+    let mut convert_trace = Trace::new(Stage::Convert);
+    let mut pacer_hold_trace = Trace::new(Stage::PacerHold);
+    let mut dispatch_trace = Trace::new(Stage::Dispatch);
+    let mut emit = |picture: DecodedPicture, hold_us: u64| {
+        // Scheduled retention only (due - ready): excludes decode wait,
+        // IPC, draw and ack. Disjoint from dispatch/present work below.
+        pacer_hold_trace.record_cost(TraceSample { frames: 1, ..Default::default() }, hold_us);
+        let frame = picture.stats;
+        stats.frames_decoded += 1;
+        if frame.is_keyframe {
+            stats.keyframes_decoded += 1;
+            let _ = event_tx.send(MediaEvent::Keyframe);
+        }
+        let non_black = FrameValidator::non_black(frame.luma_mean);
+        let motion = validator.motion(frame.luma_mean);
+        let _ = event_tx.send(MediaEvent::VideoFrame { non_black, motion });
+        let started = dispatch_trace.start();
+        on_frame(picture.frame);
+        dispatch_trace.record(TraceSample { frames: 1, ..Default::default() }, started);
+        if stats.frames_decoded % 30 == 0 {
+            let mut snapshot = stats.clone();
+            snapshot.census = census_snapshot(census);
+            let _ = event_tx.send(MediaEvent::Stats(snapshot));
+        }
+    };
+    let mut reported_pacer_drops = 0;
     loop {
-        let (packet, _) = match track.read_rtp().await {
+        let (packet, _) = match pacer.wait(track.read_rtp(), &mut emit).await {
             Ok(pair) => pair,
             Err(_) => break,
         };
-        let ts = packet.header.timestamp;
-        rtp_trace.record(TraceSample { frames: 1, bytes: packet.payload.len() as u64, ..Default::default() }, None);
-        // Access-unit boundary: timestamp rollover flushes the previous unit.
-        if unit_ts.map(|t| t != ts).unwrap_or(false) && !unit.is_empty() {
-            let completed_ts = unit_ts.expect("guarded by the map above");
-            if au_is_stale(last_decoded_ts, completed_ts) {
-                // Late pre-switch duplicate: decoding it would move
-                // presentation backwards in time. Count it in the existing
-                // decode `dropped` sample; the PLI path already asked for
-                // (or will ask for) the IDR that replaces it.
-                decode_trace.record(TraceSample {
-                    dropped: 1,
-                    bytes: unit.len() as u64,
-                    ..Default::default()
-                }, None);
-                unit.clear();
-            } else {
-                let started = decode_trace.start();
-                let decoded = decode_unit(&mut decoder, &unit, event_tx);
-                decode_trace.record(TraceSample {
-                    frames: decoded.is_some() as u64, dropped: decoded.is_none() as u64,
-                    bytes: unit.len() as u64,
-                    width: decoded.as_ref().map(|p| p.frame.w as u32).unwrap_or(0),
-                    height: decoded.as_ref().map(|p| p.frame.h as u32).unwrap_or(0),
-                    keyframes: decoded.as_ref().map(|p| p.stats.is_keyframe as u64).unwrap_or(0),
-                    ..Default::default()
-                }, started);
-                if let Some(picture) = decoded {
-                    last_decoded_ts = Some(completed_ts);
-                    let frame = picture.stats;
-                    stats.frames_decoded += 1;
-                    if frame.is_keyframe {
-                        stats.keyframes_decoded += 1;
-                        let _ = event_tx.send(MediaEvent::Keyframe);
-                    }
-                    let non_black = FrameValidator::non_black(frame.luma_mean);
-                    let motion = validator.motion(frame.luma_mean);
-                    let _ = event_tx.send(MediaEvent::VideoFrame { non_black, motion });
-                    on_frame(picture.frame);
-                    if stats.frames_decoded % 30 == 0 {
-                        let mut snapshot = stats.clone();
-                        snapshot.census = census_snapshot(census);
-                        let _ = event_tx.send(MediaEvent::Stats(snapshot));
-                    }
-                } else if stats.frames_decoded == 0 {
-                    // Pre-IDR deltas: decoder returns None and nothing is
-                    // presented. Ask once per debounce window — same path as
-                    // an AU gap — so a late join does not stay black until
-                    // the host happens to reconfigure.
+        {
+            let ts = packet.header.timestamp;
+            rtp_trace.record(TraceSample { frames: 1, bytes: packet.payload.len() as u64, ..Default::default() }, None);
+            let previous = assembly.begin(ts);
+            let current = match depacketizer.depacketize(&packet.payload) {
+                Ok(bytes) => assembly.append(&bytes, packet.header.marker),
+                Err(_) => {
                     let sent = maybe_send_pli(pc, &mut last_pli, packet.header.ssrc).await;
                     decode_trace.record(TraceSample {
                         pli_sent: sent as u64,
                         pli_suppressed: (!sent) as u64,
                         ..Default::default()
                     }, None);
+                    None
                 }
-                unit.clear();
-            } // end non-stale branch
-        }
-        unit_ts = Some(ts);
-        match depacketizer.depacketize(&packet.payload) {
-            Ok(bytes) if !bytes.is_empty() => unit.extend_from_slice(&bytes),
-            Ok(_) => {}
-            Err(_) => {
-                // Irrecoverable AU gap: the unit being assembled can never
-                // decode cleanly — ask for an IDR (debounced inside). Trace
-                // sent vs suppressed so gap storms stay visible as numbers.
-                let sent = maybe_send_pli(pc, &mut last_pli, packet.header.ssrc).await;
-                decode_trace.record(TraceSample {
-                    pli_sent: sent as u64,
-                    pli_suppressed: (!sent) as u64,
-                    ..Default::default()
-                }, None);
-                continue;
+            };
+            for (completed_ts, mut unit) in [previous, current].into_iter().flatten() {
+                if au_is_stale(last_decoded_ts, completed_ts) {
+                    // Late pre-switch duplicate: decoding it would move
+                    // presentation backwards in time. Count it in the existing
+                    // decode `dropped` sample; the PLI path already asked for
+                    // (or will ask for) the IDR that replaces it.
+                    decode_trace.record(TraceSample {
+                        dropped: 1,
+                        bytes: unit.len() as u64,
+                        ..Default::default()
+                    }, None);
+                } else {
+                    // Presenter rhythm follows a smoothed sender clock, not the
+                    // raw arrival jitter: consecutive AU timestamps feed the
+                    // pacer EWMA (0 and >1s deltas never reach it).
+                    if let Some(prev) = last_au_ts {
+                        if let Some(rhythm) = rtp_frame_interval(prev, completed_ts) {
+                            pacer.observe_interval(rhythm);
+                        }
+                    }
+                    last_au_ts = Some(completed_ts);
+                    let started = decode_trace.start();
+                    let (returned_unit, decoded, measurements) = match pacer.wait(decoder.run((unit, started.is_some())), &mut emit).await {
+                        Ok(result) => result,
+                        Err(error) => { let _ = event_tx.send(MediaEvent::Error(error.into())); return; }
+                    };
+                    unit = returned_unit;
+                    if let Err(error) = &decoded {
+                        let _ = event_tx.send(MediaEvent::Error(error.to_string()));
+                    }
+                    let picture = decoded.as_ref().ok().and_then(|p| p.as_ref());
+                    if started.is_some() {
+                        codec_trace.record_cost(TraceSample { frames: picture.is_some() as u64, ..Default::default() }, measurements.codec_us);
+                        convert_trace.record_cost(TraceSample { frames: picture.is_some() as u64,
+                            bytes: picture.map(|p| p.frame.data.len() as u64).unwrap_or(0), ..Default::default() }, measurements.convert_us);
+                    }
+                    decode_trace.record(TraceSample {
+                        frames: picture.is_some() as u64, dropped: picture.is_none() as u64,
+                        cpu_work_us: measurements.cpu_work_us, cpu_samples: measurements.cpu_samples,
+                        max_cpu_work_us: measurements.cpu_work_us,
+                        bytes: unit.len() as u64,
+                        width: picture.map(|p| p.frame.w as u32).unwrap_or(0),
+                        height: picture.map(|p| p.frame.h as u32).unwrap_or(0),
+                        keyframes: picture.map(|p| p.stats.is_keyframe as u64).unwrap_or(0),
+                        ..Default::default()
+                    }, started);
+                    let produced_picture = picture.is_some();
+                    let delivery = deliver_decoded(&mut pacer, decoded, measurements.request_keyframe,
+                        last_decoded_ts.is_some(), Instant::now());
+                    if produced_picture { last_decoded_ts = Some(completed_ts); }
+                    if delivery == DecodeDelivery::RequestKeyframe {
+                        let sent = maybe_send_pli(pc, &mut last_pli, packet.header.ssrc).await;
+                        decode_trace.record(TraceSample {
+                            pli_sent: sent as u64,
+                            pli_suppressed: (!sent) as u64,
+                            ..Default::default()
+                        }, None);
+                    }
+                } // end non-stale branch
+                assembly.recycle(unit);
             }
         }
-    }
-}
-
-fn decode_unit(
-    decoder: &mut H264Decoder,
-    unit: &[u8],
-    event_tx: &mpsc::UnboundedSender<MediaEvent>,
-) -> Option<DecodedPicture> {
-    match decoder.decode(unit) {
-        Ok(frame) => frame,
-        Err(e) => {
-            let _ = event_tx.send(MediaEvent::Error(e.to_string()));
-            None
+        pacer.drain_due(&mut emit);
+        let dropped = pacer.dropped() - reported_pacer_drops;
+        if dropped != 0 {
+            decode_trace.record(TraceSample { dropped, ..Default::default() }, None);
+            reported_pacer_drops = pacer.dropped();
         }
     }
 }
@@ -2463,6 +2996,52 @@ fn wire_ice_events(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn frame_slot_reservation_never_replaces_queued_unit() {
+        let slot = FrameSlot::default();
+        let stop = AtomicBool::new(false);
+        assert!(slot.wait_for_capacity(&stop));
+        assert!(slot.publish(vec![1, 2, 3], Duration::from_millis(16)));
+        assert!(!slot.publish(vec![9], Duration::from_millis(16)));
+        let (unit, _) = slot.take().await;
+        assert_eq!(unit, vec![1, 2, 3]);
+        assert!(slot.wait_for_capacity(&stop));
+    }
+
+    #[tokio::test]
+    async fn congestion_preserves_the_encoded_prediction_chain() {
+        let profile = QualityProfile::custom(320, 180, 1000, 60).unwrap();
+        let slot = Arc::new(FrameSlot::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let (events, _rx) = mpsc::unbounded_channel();
+        let (_reconfig, configs) = std::sync::mpsc::channel();
+        let output = slot.clone();
+        let stopped = stop.clone();
+        let handle = std::thread::spawn(move || encode_loop(
+            VideoSource::SyntheticBall, profile, EngineKind::Software, &stopped, &output,
+            &Arc::new(std::sync::Mutex::new(None)), &Arc::new(std::sync::Mutex::new(CandidateCensus::default())),
+            &events, &configs, &AtomicBool::new(false),
+        ));
+        let mut reference = VideoEncoder::new(&profile, 320, 180, EngineKind::Software).unwrap();
+        let mut decoder = H264Decoder::new().unwrap();
+        let result = async {
+            for n in 0..12 {
+                if n == 3 { tokio::time::sleep(Duration::from_millis(150)).await; }
+                let (unit, _) = tokio::time::timeout(Duration::from_secs(2), slot.take()).await.map_err(|_| "sender stalled")?;
+                let expected = reference.encode_frame(&synthetic_frame(320, 180, n)).unwrap().unwrap();
+                if unit != expected { return Err("encoded reference was skipped while output stalled"); }
+                if decoder.decode(&unit).unwrap().is_none() { return Err("picture failed to decode"); }
+            }
+            Ok(())
+        }.await;
+        stop.store(true, Ordering::Release);
+        slot.poison();
+        handle.join().unwrap();
+        assert_eq!(result, Ok(()));
+        assert!(!slot.wait_for_capacity(&AtomicBool::new(false)), "closed source cannot restart");
+        assert!(!slot.publish(vec![1], Duration::ZERO), "closed source rejects late publish");
+    }
+
     #[test]
     fn matching_scale_and_encoder_view_borrow_pixels() {
         let frame = I420Frame { w: 4, h: 2, data: (0..12).collect() };
@@ -2543,17 +3122,13 @@ mod tests {
                 &intra_,
             );
         });
-        for n in 0..5 {
-            ext_tx.send(ExternalFrame::Cpu(gray(128, 96, 16 + n * 20))).unwrap();
-        }
-        drop(ext_tx); // source gone: loop must end by itself, bounded
-        // Drain latest-only units on a throwaway runtime (take is async).
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("test runtime");
         let mut units = 0;
-        for _ in 0..3 {
+        for n in 0..3 {
+            ext_tx.send(ExternalFrame::Cpu(gray(128, 96, 16 + n * 20))).unwrap();
             let got = rt.block_on(async {
                 tokio::time::timeout(Duration::from_secs(10), slot.take()).await
             });
@@ -2563,6 +3138,7 @@ mod tests {
             units += 1;
         }
         assert_eq!(units, 3);
+        drop(ext_tx); // source gone: loop must end by itself, bounded
         // Loop exits on disconnect (bounded by the pacing tick + timeout).
         handle.join().expect("encode loop thread");
         let mut saw_gone = false;
@@ -2620,15 +3196,6 @@ mod tests {
                 &intra_,
             );
         });
-        let feeder = std::thread::spawn(move || {
-            for n in 0..24u8 {
-                if ext_tx.send(ExternalFrame::Cpu(gray(2000, 1000, 16 + n))).is_err() {
-                    break;
-                }
-            }
-        });
-        // Drain units on a throwaway runtime; decode the first to prove the
-        // software fit still applies (output stays 1920x960, never native).
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2636,6 +3203,7 @@ mod tests {
         let mut decoded_dims = None;
         let mut decoder = H264Decoder::new().expect("decoder");
         for take in 0..10 {
+            ext_tx.send(ExternalFrame::Cpu(gray(2000, 1000, 16 + take as u8))).unwrap();
             let got = rt.block_on(async {
                 tokio::time::timeout(Duration::from_secs(15), slot.take()).await
             });
@@ -2647,7 +3215,7 @@ mod tests {
                 }
             }
         }
-        feeder.join().expect("feeder drains into the loop");
+        drop(ext_tx);
         stop.store(true, Ordering::Release);
         handle.join().expect("encode loop thread");
         assert_eq!(decoded_dims, Some((1920, 960)), "software fit still caps output");
@@ -2709,25 +3277,19 @@ mod tests {
                 &intra_,
             );
         });
-        let feeder = std::thread::spawn(move || {
-            for n in 0..16u8 {
-                if ext_tx.send(ExternalFrame::Cpu(gray(5120, 1440, 16 + n))).is_err() {
-                    break;
-                }
-            }
-        });
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("test runtime");
         for take in 0..8 {
+            ext_tx.send(ExternalFrame::Cpu(gray(5120, 1440, 16 + take as u8))).unwrap();
             let got = rt.block_on(async {
                 tokio::time::timeout(Duration::from_secs(20), slot.take()).await
             });
             let (unit, _) = got.unwrap_or_else(|_| panic!("unit {take} arrives"));
             assert!(!unit.is_empty(), "poison pill never counted");
         }
-        feeder.join().expect("feeder drains into the loop");
+        drop(ext_tx);
         stop.store(true, Ordering::Release);
         handle.join().expect("encode loop thread");
         let mut bumps = 0u32;
@@ -2762,6 +3324,53 @@ mod tests {
             }
         }
         assert!(saw_idr, "first access unit carries an IDR");
+    }
+
+    #[test]
+    fn viewer_releases_marked_picture_without_next_timestamp() {
+        use webrtc::rtp::codecs::h264::H264Payloader;
+        use webrtc::rtp::packetizer::Payloader;
+        let mut encoder = H264Encoder::new(Quality::P720).unwrap();
+        let encoded = encoder.encode(&synthetic_frame(1280, 720, 0)).unwrap();
+        let packets = H264Payloader::default().payload(500, &Bytes::from(encoded)).unwrap();
+        assert!(packets.len() > 2, "exercise fragmented IDR and parameter sets");
+        let mut depacketizer = H264Packet::default();
+        let mut assembly = VideoAssembly::default();
+        let mut picture = None;
+        for (i, payload) in packets.iter().enumerate() {
+            assert!(assembly.begin(9000).is_none());
+            let bytes = depacketizer.depacketize(payload).unwrap();
+            let completed = assembly.append(&bytes, i + 1 == packets.len());
+            if i + 1 < packets.len() { assert!(completed.is_none()); }
+            if completed.is_some() { picture = completed; }
+        }
+        let (timestamp, bytes) = picture.expect("last RTP packet must release the picture while the source is idle");
+        assert_eq!(timestamp, 9000);
+        assert!(assembly.begin(9000).is_none());
+        assert!(assembly.append(&bytes, true).is_none(), "duplicate marker cannot replay a picture");
+        let picture = H264Decoder::new().unwrap().decode(&bytes).unwrap().unwrap();
+        assert_eq!((picture.frame.w, picture.frame.h), (1280, 720));
+        assert!(assembly.begin(12000).is_none(), "marked picture cannot replay on rollover");
+    }
+
+    #[test]
+    fn viewer_keeps_timestamp_fallback_without_marker() {
+        let mut assembly = VideoAssembly::default();
+        assert!(assembly.begin(u32::MAX - 100).is_none());
+        assert!(assembly.append(&[1, 2, 3], false).is_none());
+        assert!(assembly.begin(u32::MAX - 100).is_none());
+        assert!(assembly.append(&[4, 5], false).is_none());
+        assert_eq!(assembly.begin(200), Some((u32::MAX - 100, vec![1, 2, 3, 4, 5])));
+        assert!(assembly.begin(300).is_none());
+    }
+
+    #[test]
+    fn compact_viewer_does_not_expand_decoded_pixels_to_rgba() {
+        let mut encoder = H264Encoder::new(Quality::P720).unwrap();
+        let encoded = encoder.encode(&synthetic_frame(1280, 720, 0)).unwrap();
+        let picture = H264Decoder::new().unwrap().decode_for_present(&encoded, true).unwrap().unwrap();
+        assert_eq!(picture.frame.data.len(), 1280 * 720 * 3 / 2,
+            "compact presentation must transport YUV, not an RGBA expansion");
     }
 
     #[test]
@@ -2852,6 +3461,373 @@ mod tests {
         // timestamps are newer, just-about-to-wrap are older.
         assert!(!au_is_stale(Some(u32::MAX), 5), "post-wrap passes");
         assert!(au_is_stale(Some(5), u32::MAX - 5), "pre-wrap straggler drops");
+    }
+
+    fn pacer_picture(id: u8) -> DecodedPicture {
+        DecodedPicture {
+            stats: DecodedStats { w: 2, h: 2, luma_mean: f64::from(id), is_keyframe: false },
+            frame: PresentedFrame { w: 2, h: 2, data: vec![id], format: PixelFormat::I420 },
+        }
+    }
+
+    #[test]
+    fn rtp_frame_interval_maps_clock_ticks() {
+        // 90 kHz timestamps → profile rhythm: 1500 ticks is 60 fps.
+        assert_eq!(rtp_frame_interval(0, 1500), Some(Duration::from_micros(16_666)));
+        assert_eq!(rtp_frame_interval(1500, 4500), Some(Duration::from_micros(33_333)));
+        assert_eq!(rtp_frame_interval(7, 7), None, "same timestamp keeps rhythm");
+        assert_eq!(rtp_frame_interval(0, 90_001), None, ">1s gap keeps rhythm");
+        assert_eq!(
+            rtp_frame_interval(u32::MAX - 749, 750),
+            Some(Duration::from_micros(16_666)),
+            "wrap-around delta still maps"
+        );
+    }
+
+    #[test]
+    fn present_pacer_passes_healthy_stream_without_delay() {
+        // Low-watermark: a lone picture is due at once — a good network
+        // gains ~0 added latency and the buffer sits empty.
+        let mut pacer = PresentPacer::new(Duration::from_micros(16_666));
+        let t0 = Instant::now();
+        assert!(pacer.is_empty());
+        assert!(pacer.push(pacer_picture(1), t0));
+        assert_eq!(pacer.len(), 1);
+        assert_eq!(pacer.next_due(), Some(t0), "lone picture due immediately");
+        let (out, hold_us) = pacer.pop_due(t0).expect("due now");
+        assert_eq!(out.frame.data[0], 1);
+        assert_eq!(hold_us, 0, "lone picture is never retained");
+        assert!(pacer.pop_due(t0).is_none());
+        assert!(pacer.is_empty());
+        assert_eq!(pacer.dropped(), 0);
+        assert_eq!(pacer.next_due(), None, "empty buffer blocks on network");
+        for n in 1..=300 {
+            let now = t0 + Duration::from_micros(n * 16_666);
+            pacer.push(pacer_picture(n as u8), now);
+            let (_, hold_us) = pacer.pop_due(now).expect("steady 60fps must never wait");
+            assert_eq!(hold_us, 0);
+        }
+    }
+
+    #[test]
+    fn present_pacer_smooths_burst_keeps_order_bounds_latency() {
+        // 60 fps rhythm, arrivals outpacing presentation across iterations:
+        // A presents at once, B and C space one interval apart, D past 2
+        // held slots is refused (counted, never reordered, never early).
+        let interval = Duration::from_micros(16_666);
+        let mut pacer = PresentPacer::new(interval);
+        let t0 = Instant::now();
+        assert!(pacer.push(pacer_picture(1), t0));
+        assert_eq!(pacer.next_due(), Some(t0), "first due at once");
+        let (first, hold_us) = pacer.pop_due(t0).expect("first due at once");
+        assert_eq!(first.frame.data[0], 1);
+        assert_eq!(hold_us, 0);
+        assert!(pacer.push(pacer_picture(2), t0));
+        assert_eq!(pacer.next_due(), Some(t0 + interval), "second one interval out");
+        assert!(pacer.push(pacer_picture(3), t0));
+        assert_eq!(pacer.next_due(), Some(t0 + interval), "front still second");
+        assert!(!pacer.push(pacer_picture(4), t0), "past 2 held slots drops");
+        assert_eq!(pacer.dropped(), 1);
+        assert_eq!(pacer.len(), 2, "refused arrival is not queued");
+        assert!(pacer.pop_due(t0).is_none(), "held pictures wait their turn");
+        let (second, hold_us) = pacer.pop_due(t0 + interval).expect("second due");
+        assert_eq!(second.frame.data[0], 2);
+        assert_eq!(hold_us, 16_666, "one scheduled interval of retention");
+        // The third was scheduled two intervals out: the full buffer adds at
+        // most 2 intervals (~33.3ms @60fps) of extra latency.
+        assert_eq!(pacer.next_due(), Some(t0 + 2 * interval), "third two intervals out");
+        assert!(pacer.pop_due(t0 + 2 * interval - Duration::from_micros(1)).is_none());
+        let (third, hold_us) = pacer.pop_due(t0 + 2 * interval).expect("third due");
+        assert_eq!(third.frame.data[0], 3);
+        assert_eq!(hold_us, 33_332, "two scheduled intervals of retention");
+        assert!(pacer.is_empty());
+    }
+
+    #[test]
+    fn present_pacer_reanchors_after_gap_without_burst_debt() {
+        // After a 10 s gap the next picture is due at once — the missed
+        // slots are skipped, never caught up as a burst.
+        let interval = Duration::from_micros(16_666);
+        let mut pacer = PresentPacer::new(interval);
+        let t0 = Instant::now();
+        pacer.push(pacer_picture(1), t0);
+        assert!(pacer.pop_due(t0).is_some());
+        let late = t0 + Duration::from_secs(10);
+        assert!(pacer.push(pacer_picture(2), late));
+        assert_eq!(pacer.next_due(), Some(late), "overdue reanchors to now");
+        assert!(pacer.pop_due(late).is_some());
+        // Interval updates stay in the sane presenter range (1ms..1s): a
+        // same-instant arrival after clamping to 1s waits one second.
+        pacer.set_interval(Duration::from_secs(10));
+        assert!(pacer.push(pacer_picture(3), late));
+        assert_eq!(pacer.next_due(), Some(late + Duration::from_secs(1)), "clamped to 1s");
+        assert!(pacer.pop_due(late).is_none());
+        assert!(pacer.pop_due(late + Duration::from_secs(1)).is_some());
+    }
+
+    #[test]
+    fn present_pacer_pause_does_not_slow_resumed_stream() {
+        let interval = Duration::from_micros(16_667);
+        let mut pacer = PresentPacer::new(interval);
+        let t = Instant::now();
+        pacer.observe_interval(interval);
+        pacer.push(pacer_picture(0), t);
+        pacer.pop_due(t);
+        let resumed = t + Duration::from_millis(500);
+        pacer.observe_interval(Duration::from_millis(500));
+        pacer.push(pacer_picture(1), resumed);
+        assert!(pacer.pop_due(resumed).is_some());
+        pacer.observe_interval(interval);
+        pacer.push(pacer_picture(2), resumed + interval);
+        assert!(pacer.pop_due(resumed + interval).is_some(), "pause must not add delay after resuming");
+        let mut fresh = PresentPacer::new(DEFAULT_PRESENT_INTERVAL);
+        fresh.observe_interval(Duration::from_millis(500));
+        assert_eq!(fresh.interval, DEFAULT_PRESENT_INTERVAL, "even the first delta can be a join pause");
+        fresh.observe_interval(interval);
+        assert_eq!(fresh.interval, interval);
+    }
+
+    #[test]
+    fn present_pacer_late_wakeup_keeps_only_latest_due_picture() {
+        let interval = Duration::from_micros(16_667);
+        let mut pacer = PresentPacer::new(interval);
+        let t = Instant::now();
+        pacer.push(pacer_picture(0), t);
+        pacer.pop_due(t);
+        pacer.push(pacer_picture(1), t);
+        pacer.push(pacer_picture(2), t);
+        let resumed = t + Duration::from_millis(100);
+        let (picture, _) = pacer.pop_due(resumed).unwrap();
+        assert_eq!(picture.frame.data[0], 2, "do not replay stale pictures after a stall");
+        assert!(pacer.pop_due(resumed).is_none());
+        assert_eq!(pacer.dropped(), 1);
+        pacer.push(pacer_picture(3), resumed);
+        assert_eq!(pacer.next_due(), Some(resumed + interval));
+    }
+
+    #[test]
+    fn pacer_overflow_drop_leaves_decoder_chain_intact() {
+        // Post-decode presentation drop is not a loss: the decoder already
+        // advanced its references, so refusing a pacer arrival must neither
+        // arm recovery nor ask for a keyframe — the next delta still pictures.
+        let mut enc = H264Encoder::new(Quality::P720).expect("encoder");
+        let mut dec = H264Decoder::new().expect("decoder");
+        let mut pacer = PresentPacer::new(Duration::from_micros(33_333));
+        let t0 = Instant::now();
+        let unit = enc.encode(&synthetic_frame(1280, 720, 0)).expect("priming IDR");
+        assert!(contains_idr(&unit), "stream starts on an IDR");
+        let picture = dec.decode(&unit).expect("decode").expect("IDR pictures");
+        assert!(pacer.push(picture, t0));
+        // Fill both slots, then overflow: the refused picture is counted by
+        // the caller (decode.dropped) while the decoder is never touched.
+        let unit = enc.encode(&synthetic_frame(1280, 720, 1)).expect("delta");
+        assert!(!contains_idr(&unit), "test drives deltas, not IDRs");
+        let picture = dec.decode(&unit).expect("decode").expect("delta pictures");
+        assert!(pacer.push(picture, t0));
+        let unit = enc.encode(&synthetic_frame(1280, 720, 2)).expect("delta");
+        let picture = dec.decode(&unit).expect("decode").expect("delta pictures");
+        assert_eq!(deliver_decoded(&mut pacer, Ok(Some(picture)), false, true, t0),
+            DecodeDelivery::PresentationDrop, "production overflow policy never requests PLI");
+        assert_eq!(pacer.dropped(), 1);
+        assert!(!dec.waiting_for_keyframe(), "post-decode drop arms no recovery");
+        assert_eq!(dec.backend_name(), "openh264", "no backend switch");
+        // The chain continues on deltas alone: no IDR, no PLI needed.
+        for n in 3..6 {
+            let unit = enc.encode(&synthetic_frame(1280, 720, n)).expect("encode");
+            assert!(!contains_idr(&unit), "still deltas, no forced IDR");
+            let picture = dec.decode(&unit).expect("decode").expect("chain intact");
+            assert!(!dec.waiting_for_keyframe());
+            let _ = picture;
+        }
+    }
+
+    #[test]
+    fn decoder_error_after_first_picture_requests_keyframe() {
+        let mut pacer = PresentPacer::new(DEFAULT_PRESENT_INTERVAL);
+        let now = Instant::now();
+        assert_eq!(deliver_decoded(&mut pacer, Err(MediaError::Codec("injected".into())), false, true, now),
+            DecodeDelivery::RequestKeyframe);
+        assert_eq!(deliver_decoded(&mut pacer, Ok(None), false, true, now), DecodeDelivery::Pending);
+        assert_eq!(deliver_decoded(&mut pacer, Ok(None), true, true, now), DecodeDelivery::RequestKeyframe);
+        assert_eq!(deliver_decoded(&mut pacer, Ok(None), false, false, now), DecodeDelivery::RequestKeyframe);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn present_pacer_releases_while_serial_decoder_is_blocked() {
+        let (release, wait) = std::sync::mpsc::channel();
+        let mut worker = crate::worker::SerialWorker::start("pacer-test-decode", move || move |()| {
+            wait.recv_timeout(Duration::from_secs(2)).expect("presentation must run before decode finishes")
+        }).unwrap();
+        let mut pacer = PresentPacer::new(Duration::from_millis(16));
+        let now = Instant::now();
+        pacer.push(pacer_picture(0), now);
+        pacer.pop_due(now);
+        pacer.push(pacer_picture(1), now);
+        let mut presented = 0;
+        let result = tokio::time::timeout(Duration::from_secs(1), pacer.wait(worker.run(()), &mut |picture, _| {
+            assert_eq!(picture.frame.data[0], 1);
+            presented += 1;
+            release.send(42).unwrap();
+        })).await.expect("no dependency on decoder completion").unwrap();
+        assert_eq!(result, 42);
+        assert_eq!(presented, 1);
+    }
+
+    #[test]
+    fn present_pacer_tracks_sustained_rate_changes() {
+        let mut pacer = PresentPacer::new(Duration::from_micros(16_667));
+        pacer.observe_interval(Duration::from_micros(16_667));
+        for sample in [33_333, 16_667, 100_000, 16_667] {
+            for _ in 0..80 { pacer.observe_interval(Duration::from_micros(sample)); }
+            assert!(pacer.interval.abs_diff(Duration::from_micros(sample)) < Duration::from_micros(10));
+        }
+    }
+
+    #[test]
+    fn pacer_ewma_first_sample_wins_then_tracks() {
+        // Seed is only a guess: the first real delta sets the clock outright,
+        // later ones move it by alpha (0.125), always clamped 1ms..1s.
+        let mut pacer = PresentPacer::new(Duration::from_micros(16_666));
+        pacer.observe_interval(Duration::from_micros(33_333));
+        assert_eq!(pacer.interval, Duration::from_micros(33_333), "first sample wins");
+        pacer.observe_interval(Duration::from_micros(33_333));
+        assert_eq!(pacer.interval, Duration::from_micros(33_333), "steady rate holds");
+        pacer.observe_interval(Duration::from_micros(16_666));
+        assert_eq!(pacer.interval, Duration::from_micros(31_250), "one alpha step down");
+        pacer.observe_interval(Duration::from_secs(10));
+        assert!(pacer.interval <= Duration::from_secs(1), "clamped");
+        pacer.observe_interval(Duration::from_micros(0));
+        assert!(pacer.interval >= Duration::from_millis(1), "clamped");
+    }
+
+    #[test]
+    fn present_pacer_irons_arrival_wobble_without_phase_jumps() {
+        // ±8ms arrival wobble around 16.7ms with an exact clock: releases must
+        // leave on the regular grid (output jitter ≪ input jitter), in order,
+        // with nothing dropped and no schedule jump bigger than one slew step.
+        let interval = Duration::from_micros(16_666);
+        let mut pacer = PresentPacer::new(interval);
+        let t0 = Instant::now();
+        assert!(pacer.push(pacer_picture(0), t0));
+        let mut arrivals = vec![t0];
+        for (k, wobble) in [8_000i64, -8_000, 8_000, -8_000, 8_000, -8_000, 8_000, -8_000]
+            .iter()
+            .enumerate()
+        {
+            let grid = t0 + Duration::from_micros((k as u64 + 1) * 16_666);
+            arrivals.push(if *wobble >= 0 {
+                grid + Duration::from_micros(*wobble as u64)
+            } else {
+                grid - Duration::from_micros((-*wobble) as u64)
+            });
+        }
+        let mut releases: Vec<(u8, Instant)> = Vec::new();
+        for (id, &at) in arrivals.iter().enumerate().skip(1) {
+            while let Some(due) = pacer.next_due() {
+                if due > at {
+                    break;
+                }
+                let (pic, _) = pacer.pop_due(due).expect("due reached");
+                releases.push((pic.frame.data[0], due));
+            }
+            assert!(pacer.push(pacer_picture(id as u8), at), "wobble must not overflow");
+        }
+        while let Some(due) = pacer.next_due() {
+            let (pic, _) = pacer.pop_due(due).expect("flush");
+            releases.push((pic.frame.data[0], due));
+        }
+        // Anchor released at once, then everything in arrival order.
+        assert_eq!(releases[0].0, 0);
+        for w in releases.windows(2) {
+            assert_eq!(w[1].0, w[0].0 + 1, "order never changes");
+        }
+        // Input swings wildly, output stays on grid within one slew step.
+        let in_gaps: Vec<i64> = arrivals.windows(2)
+            .map(|w| w[1].duration_since(w[0]).as_micros() as i64)
+            .collect();
+        let in_spread = in_gaps.iter().max().unwrap() - in_gaps.iter().min().unwrap();
+        assert!(in_spread > 20_000, "test input actually wobbles (spread {in_spread}us)");
+        for w in releases.windows(2) {
+            let gap = w[1].1.duration_since(w[0].1).as_micros() as i64;
+            assert!(
+                (gap - 16_666).abs() <= 2_000,
+                "release grid regular (gap {gap}us)"
+            );
+        }
+        assert_eq!(pacer.dropped(), 0);
+    }
+
+    #[test]
+    fn present_pacer_slews_small_lag_reanchors_big_hole() {
+        // A lag within what the buffer can absorb only nudges the schedule
+        // (≤2ms); a 100ms hole reanchors at once with no leftover debt.
+        let interval = Duration::from_micros(16_666);
+        let mut pacer = PresentPacer::new(interval);
+        let t0 = Instant::now();
+        assert!(pacer.push(pacer_picture(1), t0));
+        assert!(pacer.pop_due(t0).is_some());
+        // Small lag (5ms): nudged by one slew step, not jumped to now.
+        assert!(pacer.push(pacer_picture(2), t0 + interval + Duration::from_micros(5_000)));
+        assert_eq!(pacer.next_due(), Some(t0 + interval + Duration::from_micros(2_000)));
+        assert!(pacer.pop_due(t0 + interval + Duration::from_micros(5_000)).is_some());
+        // Big hole on a fresh grid: arrival 100ms late reanchors at once.
+        let mut pacer = PresentPacer::new(interval);
+        assert!(pacer.push(pacer_picture(1), t0));
+        assert!(pacer.pop_due(t0).is_some());
+        assert!(pacer.push(pacer_picture(2), t0 + interval));
+        assert!(pacer.pop_due(t0 + interval).is_some());
+        let late = t0 + interval + Duration::from_micros(100_000);
+        assert!(pacer.push(pacer_picture(3), late));
+        assert_eq!(pacer.next_due(), Some(late), "big hole reanchors, no debt");
+        assert!(pacer.pop_due(late).is_some());
+        // The grid restarts from the reanchor, not from the stale schedule.
+        assert!(pacer.push(pacer_picture(4), late + interval));
+        assert_eq!(pacer.next_due(), Some(late + interval));
+        assert_eq!(pacer.dropped(), 0);
+    }
+
+    #[test]
+    fn present_pacer_follows_true_rate_below_seed_without_debt() {
+        // 30 fps arrivals with a 60 fps seed, wired like read_loop (observe
+        // each ts delta, then push): the clock converges and releases settle
+        // on 33.3ms with no accumulated lag and no drops.
+        let mut pacer = PresentPacer::new(Duration::from_micros(16_666));
+        let t0 = Instant::now();
+        assert!(pacer.push(pacer_picture(0), t0));
+        let mut prev_ts = 0u32;
+        let mut releases: Vec<Instant> = Vec::new();
+        for k in 1..=8u64 {
+            let at = t0 + Duration::from_micros(k * 33_333);
+            let cur_ts = prev_ts + 3000;
+            if let Some(rhythm) = rtp_frame_interval(prev_ts, cur_ts) {
+                pacer.observe_interval(rhythm);
+            }
+            prev_ts = cur_ts;
+            while let Some(due) = pacer.next_due() {
+                if due > at {
+                    break;
+                }
+                let (_, _) = pacer.pop_due(due).expect("due reached");
+                releases.push(due);
+            }
+            assert!(pacer.push(pacer_picture(k as u8), at), "true rate must not overflow");
+        }
+        while let Some(due) = pacer.next_due() {
+            let (_, _) = pacer.pop_due(due).expect("flush");
+            releases.push(due);
+        }
+        assert_eq!(releases[0], t0, "anchor immediate");
+        for w in releases.windows(2) {
+            let gap = w[1].duration_since(w[0]).as_micros() as i64;
+            assert!(
+                (gap - 33_333).abs() <= 3_000,
+                "settled on the true 30fps grid (gap {gap}us)"
+            );
+        }
+        let last_arrival = t0 + Duration::from_micros(8 * 33_333);
+        let debt = releases.last().unwrap().saturating_duration_since(last_arrival);
+        assert!(debt <= Duration::from_micros(2 * 33_333), "no accumulated debt ({debt:?})");
+        assert_eq!(pacer.dropped(), 0);
     }
 
     #[test]
@@ -2947,6 +3923,63 @@ mod tests {
             !answer.contains("m=video 0"),
             "video m-line must not be rejected"
         );
+    }
+
+    #[tokio::test]
+    async fn shared_encoder_survives_first_viewer_leaving_and_reconfigures() {
+        let (p1_tx, p1_rx) = mpsc::unbounded_channel();
+        let (p2_tx, p2_rx) = mpsc::unbounded_channel();
+        let p1 = Publisher::start_with_profile(VideoSource::SyntheticBall,
+            QualityProfile::custom(320, 180, 1000, 30).unwrap(), EngineKind::Software, Some(vec![]), p1_tx).await.unwrap();
+        let p2 = p1.fork(Some(vec![]), p2_tx, None).await.unwrap();
+        assert!(Arc::ptr_eq(&p1.shared, &p2.shared), "fork starts no second encoder");
+        let counts: Vec<_> = (0..2).map(|_| Arc::new(std::sync::atomic::AtomicU64::new(0))).collect();
+        let dims: Vec<_> = (0..2).map(|_| Arc::new(std::sync::atomic::AtomicU64::new(0))).collect();
+        let mut viewers = Vec::new();
+        let mut viewer_rx = Vec::new();
+        for i in 0..2 {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let count = counts[i].clone(); let dim = dims[i].clone();
+            viewers.push(NativeViewer::start(Some(vec![]), tx, Arc::new(move |frame| {
+                count.fetch_add(1, Ordering::Relaxed);
+                dim.store(((frame.w as u64) << 32) | frame.h as u64, Ordering::Relaxed);
+            })).await.unwrap());
+            viewer_rx.push(rx);
+        }
+        let mut publishers = [p1, p2];
+        let mut publisher_rx = [p1_rx, p2_rx];
+        for i in 0..2 {
+            let offer = publishers[i].create_offer().await.unwrap();
+            let answer = viewers[i].set_remote_offer(&offer).await.unwrap();
+            publishers[i].set_remote_answer(&answer).await.unwrap();
+        }
+        let mut stage = 0;
+        let mut after_close = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+        while tokio::time::Instant::now() < deadline {
+            for i in 0..2 {
+                while let Ok(event) = publisher_rx[i].try_recv() {
+                    if let MediaEvent::IceCandidate { candidate } = event { viewers[i].add_remote_candidate(&candidate).await.unwrap(); }
+                }
+                while let Ok(event) = viewer_rx[i].try_recv() {
+                    if let MediaEvent::IceCandidate { candidate } = event { publishers[i].add_remote_candidate(&candidate).await.unwrap(); }
+                }
+            }
+            if stage == 0 && counts.iter().all(|c| c.load(Ordering::Relaxed) >= 5) {
+                publishers[0].stop().await;
+                viewers[0].stop().await;
+                after_close = counts[1].load(Ordering::Relaxed);
+                publishers[1].reconfigure(QualityProfile::custom(640, 360, 1500, 30).unwrap()).unwrap();
+                stage = 1;
+            }
+            if stage == 1 && counts[1].load(Ordering::Relaxed) >= after_close + 5 && dims[1].load(Ordering::Relaxed) == (640u64 << 32) | 360 {
+                stage = 2; break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for i in 0..2 { publishers[i].stop().await; viewers[i].stop().await; }
+        assert_eq!(stage, 2, "both viewers must decode, then survivor must follow reconfiguration");
+        assert!(publishers[1].shared.encode_stop.load(Ordering::Acquire), "last viewer stops the shared encoder");
     }
 
     async fn rtp_pair(
@@ -3088,7 +4121,7 @@ mod tests {
                 assert!(FrameValidator::non_black(stats.luma_mean), "non-black");
                 // Pixels ride along exactly once: dims match, RGBA sized.
                 assert_eq!((picture.frame.w, picture.frame.h), (1280, 720));
-                assert_eq!(picture.frame.rgba.len(), 1280 * 720 * 4);
+                assert_eq!(picture.frame.data.len(), 1280 * 720 * 4);
                 if validator.motion(stats.luma_mean) {
                     motions += 1;
                 }
@@ -3328,7 +4361,7 @@ mod tests {
         assert!(contains_idr(&first_b), "reconfig lands on an IDR");
         let picture = dec.decode(&first_b).expect("decode B").expect("picture B");
         assert_eq!((picture.frame.w, picture.frame.h), (480, 270));
-        assert_eq!(picture.frame.rgba.len(), 480 * 270 * 4);
+        assert_eq!(picture.frame.data.len(), 480 * 270 * 4);
         // Stream continues at the new size.
         for n in 1..5 {
             let unit = enc_b.encode(&synthetic_frame(480, 270, n)).expect("encode B");
@@ -3369,11 +4402,7 @@ mod tests {
         // new_auto decodes. Pictures arrive at encode dims, non-black.
         let _guard = HW_ENV_LOCK.lock().expect("hw lock");
         let profile = QualityProfile::custom(640, 360, 2000, 30).expect("profile");
-        let engine = if crate::mfdec::probe_hardware().is_ok() {
-            EngineKind::Hardware
-        } else {
-            EngineKind::Software
-        };
+        let engine = EngineKind::Auto;
         // Demanded hardware may still refuse odd sizes: fall back to
         // software for the ENCODE side (the decode side under test is what
         // matters here).
@@ -3403,6 +4432,7 @@ mod tests {
             }
         }
         assert!(pictures >= 2, "roundtrip yields pictures (saw {pictures})");
+        #[cfg(target_os = "windows")]
         if crate::mfdec::probe_hardware().is_ok() {
             assert_ne!(
                 dec.backend_name(),
@@ -3677,19 +4707,15 @@ mod tests {
         while !gen_seen || !saw_post_idr {
             let remaining = fence_line.saturating_duration_since(tokio::time::Instant::now());
             assert!(!remaining.is_zero(), "fence/IDR never observed");
-            match tokio::time::timeout(remaining, event_rx.recv()).await {
-                Ok(Some(MediaEvent::Keyframe)) => {
-                    if gen_seen {
-                        saw_post_idr = true;
-                    }
-                }
-                Ok(Some(MediaEvent::Stats(stats))) => {
-                    if stats.generation == 1 {
-                        gen_seen = true;
-                    }
-                }
-                Ok(_) => {}
-                Err(_) => panic!("event channel closed early"),
+            tokio::select! {
+                event = event_rx.recv() => match event {
+                    Some(MediaEvent::Keyframe) if gen_seen => saw_post_idr = true,
+                    Some(MediaEvent::Stats(stats)) if stats.generation == 1 => gen_seen = true,
+                    None => panic!("event channel closed early"),
+                    _ => {}
+                },
+                (unit, _) = slot.take() => { let _ = dec.decode(&unit).expect("decode during reconfig"); },
+                _ = tokio::time::sleep(remaining) => panic!("fence/IDR never observed"),
             }
         }
         // Phase 2: the SAME decoder now yields 360p (SPS-driven, no reset).
@@ -3709,7 +4735,7 @@ mod tests {
                     (picture.frame.w, picture.frame.h)
                 );
                 if (picture.frame.w, picture.frame.h) == (640, 360) {
-                    assert_eq!(picture.frame.rgba.len(), 640 * 360 * 4);
+                    assert_eq!(picture.frame.data.len(), 640 * 360 * 4);
                     saw_b = true;
                 }
             }
@@ -3845,5 +4871,78 @@ mod tests {
         // Drop releases exactly once even on the error path above.
         drop(gpu);
         assert_eq!(TEST_RELEASES.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod native_decoder_recovery_tests {
+    use super::*;
+    use golive_platform::decode::{Nv12Picture, VideoDecoder};
+    struct FailingDecoder;
+    impl VideoDecoder for FailingDecoder {
+        fn decode(&mut self, _: &[u8]) -> Result<Option<Nv12Picture>, String> { Err("injected driver failure".into()) }
+        fn parameter_sets(&self) -> Vec<u8> { Vec::new() }
+    }
+    #[test]
+    fn hardware_failure_waits_for_idr_before_software_deltas() {
+        let profile = QualityProfile { w: 320, h: 180, fps: 60, bitrate_kbps: 600 };
+        let mut encoder = H264Encoder::new_with_profile(&profile, 320, 180).unwrap();
+        let frame = synthetic_frame(320,180,0);
+        let idr = encoder.encode(&frame).unwrap();
+        assert!(contains_idr(&idr));
+        let delta = encoder.encode(&synthetic_frame(320,180,1)).unwrap();
+        assert!(!contains_idr(&delta));
+        let mut decoder = H264Decoder::Native(Box::new(FailingDecoder));
+        assert!(decoder.decode_for_present(&delta,true).unwrap().is_none());
+        assert!(matches!(decoder, H264Decoder::RecoveringSoftware { .. }));
+        assert!(decoder.waiting_for_keyframe(), "mid-stream recovery must request a fresh IDR");
+        assert!(decoder.decode_for_present(&delta,true).unwrap().is_none());
+        let recovered = decoder.decode_for_present(&idr,true).unwrap().unwrap();
+        assert_eq!((recovered.frame.w,recovered.frame.h), (320,180));
+        assert_eq!(decoder.backend_name(), "openh264");
+        assert!(decoder.decode_for_present(&delta,true).unwrap().is_some());
+    }
+    #[test]
+    fn recovery_reuses_valid_parameter_sets_for_an_idr_without_headers() {
+        struct CachedFailure(Vec<u8>);
+        impl VideoDecoder for CachedFailure {
+            fn decode(&mut self, _: &[u8]) -> Result<Option<Nv12Picture>, String> { Err("injected".into()) }
+            fn parameter_sets(&self) -> Vec<u8> { self.0.clone() }
+        }
+        let mut encoder = H264Encoder::new(Quality::P720).unwrap();
+        let unit = encoder.encode(&synthetic_frame(1280,720,0)).unwrap();
+        let mut headers = Vec::new(); let mut idr = Vec::new();
+        for range in annexb_nals(&unit) {
+            let nal = &unit[range];
+            if matches!(nal_type(nal), Some(7 | 8)) { headers.extend_from_slice(nal); }
+            else { idr.extend_from_slice(nal); }
+        }
+        assert!(!headers.is_empty()); assert!(contains_idr(&idr));
+        let mut decoder = H264Decoder::Native(Box::new(CachedFailure(headers)));
+        assert!(decoder.decode_for_present(&idr,true).unwrap().is_some());
+        assert_eq!(decoder.backend_name(), "openh264");
+    }
+    #[test]
+    fn invalid_native_output_recovers_instead_of_retrying_broken_backend() {
+        struct InvalidOutput;
+        impl VideoDecoder for InvalidOutput {
+            fn decode(&mut self, _: &[u8]) -> Result<Option<Nv12Picture>, String> {
+                Ok(Some(Nv12Picture { width: 320, height: 180, data: vec![0] }))
+            }
+            fn parameter_sets(&self) -> Vec<u8> { Vec::new() }
+        }
+        let mut encoder = H264Encoder::new(Quality::P720).unwrap();
+        let idr = encoder.encode(&synthetic_frame(1280,720,0)).unwrap();
+        let mut decoder = H264Decoder::Native(Box::new(InvalidOutput));
+        assert!(decoder.decode_for_present(&idr,true).unwrap().is_some());
+        assert_eq!(decoder.backend_name(), "openh264");
+    }
+    #[test]
+    fn hardware_failure_on_idr_recovers_in_the_same_call() {
+        let mut encoder = H264Encoder::new(Quality::P720).unwrap();
+        let idr = encoder.encode(&synthetic_frame(1280,720,0)).unwrap();
+        let mut decoder = H264Decoder::Native(Box::new(FailingDecoder));
+        assert!(decoder.decode_for_present(&idr,true).unwrap().is_some());
+        assert_eq!(decoder.backend_name(), "openh264");
     }
 }

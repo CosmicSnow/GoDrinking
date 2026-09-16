@@ -1,0 +1,35 @@
+<!doctype html><meta charset="utf-8"><title>Viewer GPU checks</title><style>canvas{width:240px;height:240px;image-rendering:pixelated;margin:12px}pre{white-space:pre-wrap}</style><h1>Viewer GPU checks</h1><pre id="result">Running…</pre><script type="module">
+import { createPlayerRenderer, frameToRgba } from './playerRenderer.js';
+const results=[];const check=(name,ok)=>{results.push({name,ok});if(!ok)throw Error(name)};
+const canvas=document.createElement('canvas');document.body.append(canvas);
+const r=createPlayerRenderer(canvas);check('real WebGL available',r.backend==='webgl');
+const gl=canvas.getContext('webgl');
+function verify(frame,label){
+ r.draw(frame); const actual=new Uint8Array(frame.width*frame.height*4);
+ gl.readPixels(0,0,frame.width,frame.height,gl.RGBA,gl.UNSIGNED_BYTE,actual);
+ const expected=frameToRgba(frame);let maxError=0;
+ for(let y=0;y<frame.height;y++)for(let x=0;x<frame.width*4;x++)maxError=Math.max(maxError,Math.abs(expected[y*frame.width*4+x]-actual[(frame.height-1-y)*frame.width*4+x]));
+ check(label+' orientation and color max error '+maxError,maxError<=3);check(label+' GL error',gl.getError()===gl.NO_ERROR);
+}
+try {
+ const y=[81,81,145,145,81,81,145,145,41,41,235,235,41,41,235,235];
+ const i420={seq:1,width:4,height:4,format:1,pixels:new Uint8Array([...y,90,54,240,128,240,34,110,128])};
+ const nv12={...i420,format:2,pixels:new Uint8Array([...y,90,240,54,34,240,110,128,128])};
+ verify(i420,'I420 initial');verify(i420,'I420 texture reuse');verify(nv12,'NV12');verify(nv12,'NV12 texture reuse');
+ const rgba={seq:1,width:2,height:2,format:0,pixels:new Uint8Array([255,0,0,255,0,255,0,255,0,0,255,255,255,255,255,255])};
+ verify(rgba,'RGBA resized');verify(i420,'return to I420');
+ const widePixels=new Uint8Array(1920*2*3/2).fill(128);for(let i=0;i<1920*2;i++)widePixels[i]=i%2?235:16;
+ verify({seq:2,width:1920,height:2,format:1,pixels:widePixels},'1080p width pixel precision');
+ const c2=document.createElement('canvas');document.body.append(c2);const original=c2.getContext.bind(c2);c2.getContext=(kind,options)=>kind==='webgl'?null:original(kind,options);
+ const cpu=createPlayerRenderer(c2);check('2D fallback selected',cpu.backend==='canvas2d');cpu.draw(nv12);
+ const got=c2.getContext('2d').getImageData(0,0,4,4).data;check('fallback NV12 colors',got.every((v,i)=>v===frameToRgba(nv12)[i]));
+ const ext=gl.getExtension('WEBGL_lose_context');
+ if(ext){
+  const event=(name)=>new Promise((resolve,reject)=>{const t=setTimeout(()=>reject(Error(name+' timeout')),5000);canvas.addEventListener(name,()=>{clearTimeout(t);resolve()},{once:true})});
+  let waited=event('webglcontextlost');ext.loseContext();await waited;
+  let rejected=false;try{r.draw(i420)}catch{rejected=true}check('lost context rejects draw/ack',rejected);
+  await new Promise(resolve=>setTimeout(resolve,250));waited=event('webglcontextrestored');ext.restoreContext();await waited;verify(nv12,'restored context resources');
+ }
+ verify(i420,'final color chart');document.querySelector('#result').textContent=JSON.stringify({passed:true,results},null,2);
+}catch(e){document.querySelector('#result').textContent=JSON.stringify({passed:false,error:String(e),results},null,2)}
+</script>

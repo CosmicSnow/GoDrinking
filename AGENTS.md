@@ -7,10 +7,10 @@ behavior changes need tests; platform code stays behind traits.
 ## 1. Architecture and crate roles
 
 ```text
-app/                  golive-app: thin Tauri shell. Commands validate input,
+app/                  golive-app crate: thin Tauri shell. Commands validate input,
                       drive the core, return. Core events become Tauri events.
                       NO product logic here. Two bins:
-                      - golive-app   (src/main.rs: Tauri app, owns main thread)
+                      - goDrinking   (src/main.rs: Tauri app, owns main thread)
                       - golive-video (src/bin/video.rs: one helper process per
                         watched link, owns its winit event loop + softbuffer
                         CPU blit; fed RGBA over IPC, acks 0x01 per present)
@@ -79,7 +79,7 @@ live); web commands from `app/web/`; server commands from `server/`.
 | What        | Command |
 |-------------|---------|
 | Web dev     | `npm run dev` in `app/web/` (Vite `:1420`, strict — must match `devUrl`) |
-| Desktop dev | `cargo tauri dev -- --bin golive-app` in `app/` (picks the app bin; helpers spawn automatically) |
+| Desktop dev | `cargo tauri dev -- --bin goDrinking` in `app/` (picks the app bin; helpers spawn automatically) |
 | Web build   | `npm run build` in `app/web/` — **ALWAYS FIRST**: `tsc --noEmit && vite build` → `web/dist`. `beforeBuildCommand` is EMPTY, so Tauri never builds the frontend; a stale `dist/` means a stale UI. |
 | Tauri build | `cargo tauri build` in `app/` (after the web build; the `golive-video` helper must sit next to the binary — `scripts/e2e-packaged.sh` copies it into `Contents/MacOS` for the packaged app) |
 | Windows native | on a Windows machine: `cargo tauri build` (same order: web build first) |
@@ -92,6 +92,10 @@ cross) therefore REQUIRES `--features tauri/custom-protocol` — without it the
 packaged exe points at `devUrl` instead of the bundled `frontendDist`.
 
 ## 5. Tests
+
+- Reusable suite from repo root: `python3 scripts/verify.py` (`python` on Windows). Setup and coverage: `TESTING.md`. Includes app integration tests, not just `--lib`; missing fields in integration fixtures must not go unnoticed.
+- Desktop performance gate: `python3 scripts/verify.py --desktop` (graphical session + FFmpeg). Builds fresh frontend/binaries and tests 1/2 viewers; a cadence failure remains a failure even at a 60 FPS average.
+- Windows release executables must pass `python scripts/check-windows-gui.py app/target/release/goDrinking.exe app/target/release/golive-video.exe` to prevent accidental console windows.
 
 - `npm test` in `app/web/` — vitest (`api.test.ts`, `e2e.test.ts`; Tauri APIs mocked).
 - `cargo test` in `app/` — lib unit tests (video math/protocol, bridge pump,

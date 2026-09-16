@@ -18,6 +18,8 @@
 //! a window never presents an old frame as new, and never spins an idle
 //! black window (the shell only spawns us on the first frame).
 
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use golive_app::video::{
     connect_helper, draw_text, help_visible, is_double_click, letterbox, rgba_to_xrgb8888,
     initial_window_size, scale_rgba_bilinear, text_height_px, text_width_px, HelperStream,

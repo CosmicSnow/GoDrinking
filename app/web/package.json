@@ -1,15 +1,17 @@
 {
   "name": "golive-web",
   "private": true,
-  "version": "0.7.5",
+  "version": "0.7.6",
   "description": "goDrinking Sala mínima (React+TS+Vite). Intents via comandos Tauri, snapshots sob demanda + eventos signal-event/media-event. Build gera dist/ (frontendDist da casca Tauri).",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:browser": "playwright test"
   },
   "devDependencies": {
+    "@playwright/test": "1.63.0",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.5",
     "@vitejs/plugin-react": "4.7.0",
