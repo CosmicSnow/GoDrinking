@@ -4,6 +4,14 @@
 > AGENTS.md, seção Bugs). Nunca marcar como feito no lugar — remover a
 > linha. A lista contém só bugs abertos.
 
+Atualização 15/09 (host observado por 180 s): reproduzida pausa de encode
+354,771 ms (CPU 3,602 ms), alinhada com gaps 303,756/304,870 ms dos dois viewers.
+Conclusão VT levou 275,043 ms; thread observada em espera, sem novos page-ins
+do host no intervalo. Conversão também teve pausa 152,133 ms com pouca CPU.
+O recurso que bloqueou ainda não foi identificado; não basta aumentar o pacer.
+BUG-001 continua aberto. Evidências e limites em
+[DIAGNOSTICO-host-2026-09-15.md](DIAGNOSTICO-host-2026-09-15.md).
+
 **Estado em 13/09/2026:** BUG-001/002 continuam abertos para validação remota e Windows. Viewer YUV/WebGL reduz o payload de pixels em 62,5%; último controle local atingiu 60 FPS e gap máximo de 26,538 ms. Outros ensaios falharam no gate de cadência, incluindo dois viewers com pausas de ~98 ms. Proteção de H.264, encoder/captura compartilhados e gate WGC antes do readback foram implementados e testados nos limites descritos em [OTIMIZACOES-video-2026-09-13.md](OTIMIZACOES-video-2026-09-13.md). As notas de ~13 FPS e ausência de GPU na tabela são observações históricas, superadas pelos traces posteriores; não descrevem todo o pipeline atual. BUG-004 reproduzido novamente na dependência Opus (SSE4.1/SSSE3), sem alteração permanente de flags.
 
 Atualização 15/09: decoder macOS VideoToolbox e fallback para software testados;
@@ -26,6 +34,14 @@ Build macOS atualizado; cadência ainda FAIL: 1 viewer 164ms, 2 viewers
 935/917ms, com host encode 905ms na janela dos dois viewers. Retenção agendada
 média 11–13,5ms, capacidade 2 preservada. Detalhes e logs em
 [MELHORIA-viewer-2026-09-15.md](MELHORIA-viewer-2026-09-15.md).
+
+Investigação adicional do host em 15/09: baseline reproduziu encode 785ms;
+subestágios instrumentados mostraram pausas com pouca CPU. Controles com/sem
+trace variaram; escrita de trace não é causa necessária. Filme de 12 frames
+e repetição do original passaram com dois viewers, mas ensaios anteriores
+reprovaram. Pressão de memória/agendamento seguem hipóteses, sem atribuição
+de kernel. Sem mudança de buffer ou codec. Ver
+[DIAGNOSTICO-host-2026-09-15.md](DIAGNOSTICO-host-2026-09-15.md).
 
 | ID      | Sintoma                                                        | Status         | Desde                    | Suspeita / notas |
 |---------|----------------------------------------------------------------|----------------|--------------------------|------------------|
