@@ -11,6 +11,8 @@ import { StreamPlayer } from "./StreamPlayer";
  */
 
 import { useEffect, useRef, useState } from "react";
+import { version as APP_VERSION } from "../package.json";
+import { checkForUpdate, openUpdateUrl, type UpdateInfo } from "./update";
 import {
   createRoom,
   getE2ePlan,
@@ -59,6 +61,7 @@ import {
 import {
   HomeScreen,
   RoomScreen,
+  UpdateModal,
   frameRefreshDue,
   resolveDesired,
   shareIntentFromResolved,
@@ -779,6 +782,55 @@ export default function App() {
     });
   };
 
+  // Verificação de atualização: UMA vez no mount (sem polling) + botão
+  // manual na home. Falha silenciosa (repo privado/offline = sem popup).
+  // Guarda contra mount duplo (StrictMode); exibe uma vez por abertura.
+  const [update, setUpdate] = useState<UpdateInfo | null>(null);
+  const [updateOpen, setUpdateOpen] = useState(false);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const updateChecked = useRef(false);
+  useEffect(() => {
+    if (updateChecked.current) return;
+    updateChecked.current = true;
+    let live = true;
+    checkForUpdate(APP_VERSION).then((info) => {
+      if (live && info) {
+        setUpdate(info);
+        setUpdateOpen(true);
+      }
+    });
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  const handleCheckUpdate = (): void => {
+    if (checkingUpdate) return;
+    setCheckingUpdate(true);
+    checkForUpdate(APP_VERSION).then(
+      (info) => {
+        setCheckingUpdate(false);
+        if (info) {
+          setUpdate(info);
+          setUpdateOpen(true);
+        }
+      },
+      () => {
+        setCheckingUpdate(false);
+      },
+    );
+  };
+
+  const updateModal = (
+    <UpdateModal
+      current={APP_VERSION}
+      info={update}
+      open={updateOpen}
+      onClose={() => setUpdateOpen(false)}
+      onOpenUrl={(url) => openUpdateUrl(url)}
+    />
+  );
+
   if (e2ePlan) {
     const phase = e2eReport?.phase ?? "boot";
     const summary =
@@ -800,25 +852,30 @@ export default function App() {
 
   if (screen === "home") {
     return (
-      <HomeScreen
-        server={server}
-        onServer={setServerBase}
-        defaultServer={DEFAULT_SERVER}
-        tab={tab}
-        onTab={setTab}
-        nickname={nickname}
-        onNickname={setNickname}
-        password={password}
-        onPassword={setPassword}
-        code={code}
-        onCode={setCode}
-        busy={busy}
-        error={error}
-        onCreate={handleCreate}
-        onJoin={handleJoin}
-        createdCode={roomCode}
-        mock={isMock}
-      />
+      <>
+        <HomeScreen
+          server={server}
+          onServer={setServerBase}
+          defaultServer={DEFAULT_SERVER}
+          tab={tab}
+          onTab={setTab}
+          nickname={nickname}
+          onNickname={setNickname}
+          password={password}
+          onPassword={setPassword}
+          code={code}
+          onCode={setCode}
+          busy={busy}
+          error={error}
+          onCreate={handleCreate}
+          onJoin={handleJoin}
+          createdCode={roomCode}
+          mock={isMock}
+          onCheckUpdate={handleCheckUpdate}
+          checkingUpdate={checkingUpdate}
+        />
+        {updateModal}
+      </>
     );
   }
 
@@ -826,7 +883,8 @@ export default function App() {
   const shareLive = snapshot?.share.state === "live";
 
   return (
-    <RoomScreen
+    <>
+      <RoomScreen
       roomCode={roomCode}
       nickname={nickname.trim() || "Convidado"}
       snapshot={snapshot}
@@ -882,6 +940,8 @@ export default function App() {
       audioExcluded={audioExcluded}
       onToggleAudioExclude={handleToggleAudioExclude}
       mock={isMock}
-    />
+      />
+      {updateModal}
+    </>
   );
 }

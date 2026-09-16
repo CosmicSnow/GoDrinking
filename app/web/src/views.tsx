@@ -7,8 +7,10 @@
  */
 
 import { useEffect, useRef, useState } from "react";
+import { version as APP_VERSION } from "../package.json";
 import { StreamPlayer } from "./StreamPlayer";
 import { isTauri, playerMuteAll } from "./api";
+import type { UpdateInfo } from "./update";
 import type {
   AudioApp,
   CapabilitySet,
@@ -628,6 +630,63 @@ function useToast(): { toast: string | null; show: (message: string) => void } {
 }
 
 // ---------------------------------------------------------------------------
+// Atualização disponível: mesmo pattern .modal.small dos outros modais.
+// Puro (props -> markup); abrir URLs é callback do App.
+// ---------------------------------------------------------------------------
+
+export interface UpdateModalProps {
+  /** Versão atual (ex.: "0.7.7"). */
+  current: string;
+  /** Dados da release nova (null = nada a mostrar). */
+  info: UpdateInfo | null;
+  /** Visível ou não (sempre no DOM, como os outros modais). */
+  open: boolean;
+  onClose: () => void;
+  onOpenUrl: (url: string) => void;
+}
+
+export function UpdateModal(props: UpdateModalProps): React.JSX.Element {
+  const { current, info, open, onClose, onOpenUrl } = props;
+  if (!info) return <></>;
+  return (
+    <div className="modal-back" hidden={!open} data-hook="update-available">
+      <div className="modal small" role="dialog" aria-modal="true" aria-label="Atualização disponível">
+        <div className="modal-head">
+          <h2>Atualização disponível</h2>
+          <button type="button" className="icon-btn" aria-label="Fechar" onClick={onClose}>
+            ✕
+          </button>
+        </div>
+        <p className="modal-note top">
+          Versão nova: v{info.latest} (você usa v{current}).
+        </p>
+        <div className="modal-foot" style={{ justifyContent: "flex-start", flexWrap: "wrap" }}>
+          <button type="button" className="btn ghost" onClick={onClose}>
+            Cancelar
+          </button>
+          <button
+            type="button"
+            className="btn ghost"
+            onClick={() => onOpenUrl(info.releasesUrl)}
+          >
+            Baixar do site
+          </button>
+          {info.assetUrl ? (
+            <button
+              type="button"
+              className="btn primary"
+              onClick={() => onOpenUrl(info.assetUrl as string)}
+            >
+              Baixar direto
+            </button>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Tela inicial: criar / entrar (lobby 2 panes).
 // ---------------------------------------------------------------------------
 
@@ -655,6 +714,10 @@ export interface HomeProps {
   createdCode?: string | null;
   /** Selo visual discreto do modo navegador (mock, sem Tauri). Só visual. */
   mock?: boolean;
+  /** Re-verificação manual de atualização (botão ao lado da versão). */
+  onCheckUpdate?: () => void;
+  /** true enquanto a verificação manual está em voo. */
+  checkingUpdate?: boolean;
 }
 
 export function HomeScreen(props: HomeProps) {
@@ -662,7 +725,7 @@ export function HomeScreen(props: HomeProps) {
     server = "", onServer, defaultServer = "",
     nickname = "", onNickname,
     password, onPassword, code, onCode, busy, error, onCreate, onJoin,
-    mock = false,
+    mock = false, onCheckUpdate, checkingUpdate = false,
   } = props;
   const { toast } = useToast();
   return (
@@ -833,7 +896,17 @@ export function HomeScreen(props: HomeProps) {
               {error ? (
                 <p className="lobby-error" id="lobbyError" role="alert">{error}</p>
               ) : null}
-              <small id="lobbyNote">Tela direto de um PC para outro. O servidor só apresenta, nunca vê o vídeo. <span style={{ opacity: 0.6, fontSize: 11 }}>· v0.7.5</span></small>
+              <small id="lobbyNote">Tela direto de um PC para outro. O servidor só apresenta, nunca vê o vídeo. <span style={{ opacity: 0.6, fontSize: 11 }}>· v{APP_VERSION}</span>{onCheckUpdate ? (
+                <span style={{ opacity: 0.6, fontSize: 11 }}> · <button
+                  type="button"
+                  className="btn ghost small"
+                  style={{ padding: "1px 8px", fontSize: 11 }}
+                  onClick={onCheckUpdate}
+                  disabled={busy || checkingUpdate}
+                >
+                  {checkingUpdate ? "Verificando…" : "Verificar atualização"}
+                </button></span>
+              ) : null}</small>
             </div>
           </div>
         </main>
