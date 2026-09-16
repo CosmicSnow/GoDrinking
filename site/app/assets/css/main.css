@@ -209,11 +209,15 @@ a:hover {
   padding-top: var(--space-xl);
   padding-bottom: var(--space-xl);
   border-bottom: 1px solid var(--line);
+  /* Contém os cantos da foto rotacionada: sem scroll horizontal em 390px */
+  overflow: clip;
 }
 
 .hero-grid {
   display: grid;
-  grid-template-columns: 1.15fr 1fr;
+  /* Coluna da foto alargada (foto maior): ~583px contra ~521px do texto
+     no layout máximo de 1160px. */
+  grid-template-columns: 1fr 1.12fr;
   gap: var(--space-lg);
   align-items: start;
 }
@@ -239,7 +243,10 @@ a:hover {
 }
 
 .hero-title {
-  font-size: clamp(2.8rem, 7vw, 5.4rem);
+  /* Linha 2 ("Não seus dados!▊") mede ~7.93em travada em nowrap:
+     5.4vw acompanha a coluna de texto (1fr) em 2 colunas, teto 4rem
+     para caber nos ~521px da coluna no layout máximo. */
+  font-size: min(5.4vw, 4rem);
   font-weight: 700;
   margin: 0 0 var(--space-md) 0;
 }
@@ -307,112 +314,144 @@ a:hover {
   color: var(--lime-dark);
 }
 
-/* Window mock */
-.mock-window {
+/* Real app screenshot no hero — flutua com a quina inferior direita erguida;
+   no hover/focus "pousa na mesa" (reta, sem sombra) */
+.shot-frame {
+  margin: 0;
+  min-width: 0;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: #fff;
   overflow: hidden;
-  box-shadow: 8px 8px 0 rgba(17,17,17,0.08);
+  transform-style: preserve-3d;
+  /* Repouso: rotateX+ traz a base para frente, rotateY- traz a direita
+     para frente → quina inferior direita erguida em direção ao leitor.
+     Origem no canto superior esquerdo, preso "à mesa". */
+  transform-origin: left top;
+  transform: perspective(1200px) rotateX(6deg) rotateY(-8deg);
+  /* Sombrinha suave projetada para o lado oposto da quina erguida */
+  box-shadow: -18px 24px 48px -8px rgba(17,17,17,0.30);
+  transition: transform 0.35s ease, box-shadow 0.35s ease;
 }
 
-.mock-titlebar {
+.shot-frame:hover,
+.shot-frame:focus-within,
+.shot-frame:focus-visible {
+  transform: perspective(1200px) rotateX(0deg) rotateY(0deg);
+  box-shadow: 0 0 0 0 rgba(17,17,17,0);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shot-frame {
+    transform: none;
+    box-shadow: none;
+    transition: none;
+  }
+}
+
+.shot-img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+/* Foto clicável do hero (abre o lightbox) */
+.shot-zoom {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  cursor: zoom-in;
+}
+
+.shot-zoom:focus-visible {
+  outline: 3px solid var(--lime-dark);
+  outline-offset: 2px;
+}
+
+/* Lightbox da captura de tela */
+body.no-scroll {
+  overflow: hidden;
+}
+
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
   display: flex;
   align-items: center;
-  gap: 0.45rem;
-  padding: 0.7rem 0.85rem;
-  border-bottom: 1px solid var(--line-soft);
-  background: var(--bg-2);
+  justify-content: center;
+  padding: clamp(0.75rem, 3vw, 1.5rem);
+  background: rgba(17,17,17,0.85);
+  cursor: zoom-out;
 }
 
-.mock-dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  border: 1px solid var(--line);
-  background: #fff;
+.lightbox-img {
+  width: min(90vw, 1200px);
+  max-height: 86vh;
+  height: auto;
+  object-fit: contain;
+  border: 1px solid rgba(247,245,240,0.25);
+  border-radius: var(--radius);
+  background: #111;
+  box-shadow: 0 24px 80px rgba(0,0,0,0.5);
 }
 
-.mock-title {
-  margin-left: auto;
-  font-family: 'DM Mono', monospace;
-  font-size: 0.7rem;
-  color: var(--gray);
-}
-
-.mock-body {
-  padding: 1.25rem;
-}
-
-.mock-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-sm);
-  margin-bottom: 1rem;
-}
-
-.mock-label {
-  font-family: 'DM Mono', monospace;
-  font-size: 0.72rem;
-  text-transform: uppercase;
-  color: var(--gray);
-}
-
-.mock-code {
-  font-family: 'DM Mono', monospace;
-  font-size: 1.6rem;
-  font-weight: 500;
-  letter-spacing: 0.12em;
-  padding: 0.5rem 0.9rem;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
+.lightbox-close {
+  position: absolute;
+  top: 1rem;
+  right: 1rem;
+  width: 2.75rem;
+  height: 2.75rem;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid var(--bg);
+  border-radius: 999px;
   background: var(--bg);
+  color: var(--ink);
+  font-size: 1.6rem;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
 }
 
-.mock-button {
-  font-family: 'DM Sans', sans-serif;
-  font-weight: 600;
-  font-size: 0.85rem;
-  padding: 0.5rem 0.9rem;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
+.lightbox-close:hover {
   background: var(--lime);
   color: var(--ink);
-  cursor: pointer;
 }
 
-.mock-button:hover {
-  background: var(--lime-dark);
-  color: #fff;
+/* Transição suave de abertura/fechamento */
+.lightbox-enter-active,
+.lightbox-leave-active {
+  transition: opacity 0.3s ease;
 }
 
-.mock-status {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  font-family: 'DM Mono', monospace;
-  font-size: 0.78rem;
-  color: var(--gray);
-  margin-top: 0.75rem;
+.lightbox-enter-active .lightbox-img,
+.lightbox-leave-active .lightbox-img {
+  transition: transform 0.3s ease;
 }
 
-.mock-status::before {
-  content: '';
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--lime);
-  animation: pulse 1.8s infinite;
+.lightbox-enter-from,
+.lightbox-leave-to {
+  opacity: 0;
 }
 
-.mock-ascii {
-  font-family: 'DM Mono', monospace;
-  font-size: 0.62rem;
-  line-height: 1.4;
-  color: var(--gray);
-  margin-top: 0.6rem;
-  opacity: 0.85;
+.lightbox-enter-from .lightbox-img,
+.lightbox-leave-to .lightbox-img {
+  transform: scale(0.96);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lightbox,
+  .lightbox-img,
+  .lightbox-enter-active,
+  .lightbox-leave-active,
+  .lightbox-enter-active .lightbox-img,
+  .lightbox-leave-active .lightbox-img {
+    transition: none;
+  }
 }
 
 /* Section titles */
@@ -711,6 +750,14 @@ a:hover {
   margin-bottom: var(--space-sm);
 }
 
+.download-box .hero-actions {
+  justify-content: center;
+}
+
+.download-box .section-intro {
+  margin-inline: auto;
+}
+
 .download-note {
   font-family: 'DM Mono', monospace;
   font-size: 0.8rem;
@@ -731,6 +778,62 @@ a:hover {
   display: flex;
   align-items: center;
   gap: 0.4rem;
+}
+
+.sign-note {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: var(--space-lg);
+  background: #fff;
+  text-align: center;
+  max-width: 760px;
+  margin-inline: auto;
+  margin-top: var(--space-lg);
+}
+
+.sign-note h3 {
+  margin-bottom: var(--space-sm);
+}
+
+.sign-note p {
+  margin-bottom: var(--space-sm);
+}
+
+.sign-how {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-md);
+  text-align: left;
+  margin-bottom: var(--space-md);
+}
+
+.sign-how h4 {
+  margin-bottom: 0.25rem;
+}
+
+.sign-how p {
+  font-size: 0.95rem;
+}
+
+@media (max-width: 560px) {
+  .sign-how {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Parágrafo de doações: negrito + marca-texto que respira (só fundo e
+   brilho animam — sem mudança de layout/tamanho). */
+.sign-donate {
+  font-weight: 700;
+  padding: 0.6rem 0.9rem;
+  border-radius: var(--radius-sm);
+  animation: donate-breathe 3.2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sign-donate {
+    animation: none;
+  }
 }
 
 /* FAQ */
@@ -883,6 +986,10 @@ summary:hover {
 }
 
 /* Blinking cursor */
+.hero-title .nowrap {
+  white-space: nowrap;
+}
+
 .cursor {
   display: inline-block;
   width: 0.55em;
@@ -922,8 +1029,25 @@ summary:hover {
   50% { opacity: 0; }
 }
 
+@keyframes donate-breathe {
+  0%, 100% {
+    background-color: rgba(122,191,74,0.12);
+    box-shadow: 0 0 0 rgba(122,191,74,0);
+  }
+  50% {
+    background-color: rgba(122,191,74,0.28);
+    box-shadow: 0 0 18px rgba(122,191,74,0.35);
+  }
+}
+
 /* Responsive */
 @media (max-width: 900px) {
+  .hero-title {
+    /* Coluna única full-bleed: 11.5vw mantém a linha 2 inteira
+       (ex. 390px → ~44.9px, linha 2 ocupa ~91% da largura). */
+    font-size: min(11.5vw, 4.45rem);
+  }
+
   .hero-grid,
   .def-grid,
   .cards-grid,
@@ -969,15 +1093,5 @@ summary:hover {
 
   .btn {
     width: 100%;
-  }
-
-  .mock-row {
-    flex-direction: column;
-    align-items: stretch;
-  }
-
-  .mock-code {
-    font-size: 1.3rem;
-    text-align: center;
   }
 }
