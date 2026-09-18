@@ -655,7 +655,10 @@ impl AppState {
         let mut share_audio = match window_audio_id(&source) {
             Some(id) => audio::ShareAudio::start_for_window(id).ok(),
             None if matches!(source, ShareSource::Display(_)) => {
-                audio::ShareAudio::start(Vec::new()).ok()
+                // Display share starts with the default audio exclusions
+                // (Discord + our own app/helper); the host can untoggle any
+                // of them via set_audio_exclusions.
+                audio::ShareAudio::start(golive_platform::default_excluded_tokens()).ok()
             }
             None => None,
         };

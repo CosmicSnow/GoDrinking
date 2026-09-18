@@ -58,7 +58,6 @@ pub fn list_audio_apps() -> Vec<AudioApp> {
     let mut entry = PROCESSENTRY32W::default();
     entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
     let mut more = unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok();
-    let own_pid = std::process::id();
     while more {
         let len = entry
             .szExeFile
@@ -67,7 +66,9 @@ pub fn list_audio_apps() -> Vec<AudioApp> {
             .unwrap_or(entry.szExeFile.len());
         let exe = String::from_utf16_lossy(&entry.szExeFile[..len]);
         let pid = entry.th32ProcessID;
-        if pid != 0 && pid != own_pid && !exe.is_empty() {
+        // Own process stays listed so the host can see/toggle it; the
+        // default exclusion tokens still cover it (toggleable default).
+        if pid != 0 && !exe.is_empty() {
             let name = exe
                 .strip_suffix(".exe")
                 .or_else(|| exe.strip_suffix(".EXE"))
@@ -175,7 +176,6 @@ fn resolve_exclusion_root(excluded_apps: &[String]) -> Option<(String, u32)> {
         let _ = CloseHandle(snapshot);
         out
     };
-    let own_pid = std::process::id();
     let matches_token = |exe: &str, token: &str| {
         exe.eq_ignore_ascii_case(token)
             || exe.eq_ignore_ascii_case(&format!("{token}.exe"))
@@ -186,11 +186,12 @@ fn resolve_exclusion_root(excluded_apps: &[String]) -> Option<(String, u32)> {
         .map(|item| item.trim())
         .filter(|item| !item.is_empty())
     {
+        // No self-skip: self tokens (goDrinking/golive-video exe names) must
+        // resolve so the host can toggle our own audio off like any app.
         let mut pids: Vec<(u32, u32)> = snapshot
             .iter()
             .filter(|(_, _, exe)| matches_token(exe, token))
             .map(|(pid, ppid, _)| (*pid, *ppid))
-            .filter(|(pid, _)| *pid != own_pid)
             .collect();
         if pids.is_empty() {
             continue;

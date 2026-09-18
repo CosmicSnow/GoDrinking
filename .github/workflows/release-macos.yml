@@ -1,0 +1,74 @@
+name: Release macOS dmg
+
+# Native macOS build for goDrinking .dmg (Tauri bundler).
+# Manual-only: run from GitHub Actions UI, or build+upload locally via
+# scripts/release.sh (which is the usual path). The dmg is uploaded
+# straight to the GitHub release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and upload (e.g. v0.7.6)"
+        required: true
+        type: string
+      upload:
+        description: "Upload the dmg to the GitHub release"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build goDrinking.dmg
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/web/package-lock.json
+
+      - name: Install web deps (npm ci, lockfile)
+        run: npm --prefix app/web ci
+
+      - name: Build web (same command as scripts/release.sh)
+        run: npm --prefix app/web run build
+
+      - name: Set up Rust stable
+        # macos-latest already ships stable Rust; this only pins it.
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+
+      - name: Build goDrinking.dmg (Tauri bundler)
+        working-directory: app
+        run: cargo tauri build --bundles dmg
+
+      - name: Verify dmg exists
+        run: |
+          shopt -s nullglob
+          DMGS=(app/target/release/bundle/dmg/*.dmg)
+          shopt -u nullglob
+          if [ "${#DMGS[@]}" -eq 0 ]; then echo "no .dmg found in app/target/release/bundle/dmg/" >&2; exit 1; fi
+          ls -lh "${DMGS[@]}"
+
+      - name: Ensure release and upload dmg
+        if: ${{ inputs.upload }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --generate-notes
+          gh release upload "$TAG" app/target/release/bundle/dmg/*.dmg --clobber
+          gh release view "$TAG" --json assets --jq '.assets[].name'

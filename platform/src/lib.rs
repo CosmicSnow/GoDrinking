@@ -26,7 +26,10 @@ pub mod types;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
-pub use audio::{app_excluded_by_token, AudioApp, EncodedAudioPacket};
+pub use audio::{
+    app_excluded_by_token, default_excluded_tokens, AudioApp, EncodedAudioPacket,
+    DEFAULT_EXCLUDED_TOKENS,
+};
 pub use capability::{capabilities, CapabilitySet, Support};
 pub use convert::{bgra_to_i420, convert_error, ConvertError};
 pub use error::{PlatformError, PERMISSION_HINT};

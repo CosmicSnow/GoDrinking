@@ -61,6 +61,86 @@ export function visibleAudioApps(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Persistência local da home (Seu Nick + Servidor) via localStorage.
+// ---------------------------------------------------------------------------
+
+/** Chave do "Seu Nick" no localStorage (App.tsx inicia daqui e salva ao mudar). */
+export const NICKNAME_STORAGE_KEY = "golive.nickname";
+/** Chave do "Servidor" no localStorage (ausente = DEFAULT_SERVER do App). */
+export const SERVER_STORAGE_KEY = "golive.server";
+
+/** Leitura segura: SSR/testes sem window e modo privado nunca quebram. */
+export function readStoredSetting(key: string): string | null {
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return null;
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+/** Escrita segura: sem persistência (modo privado/SSR), a sessão segue sem salvar. */
+export function writeStoredSetting(key: string, value: string): void {
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return;
+    window.localStorage.setItem(key, value);
+  } catch {
+    // Sem persistência: nada a fazer (o estado da sessão continua valendo).
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Exclusões padrão do "Ignorar Áudio de Apps".
+// ---------------------------------------------------------------------------
+
+/**
+ * Tokens de exclusão padrão (espelha `DEFAULT_EXCLUDED_TOKENS` em
+ * platform/src/audio.rs — manter as duas listas em sync): Discord (eco de
+ * call) + o próprio app/helper (bundle id Tauri + nomes de exe/processo).
+ */
+export const DEFAULT_AUDIO_EXCLUSION_TOKENS: string[] = [
+  "Discord",
+  "com.hnc.Discord",
+  "Discord.exe",
+  "dev.golive.sala",
+  "goDrinking",
+  "goDrinking.exe",
+  "golive-video",
+  "golive-video.exe",
+];
+
+/**
+ * Espelha `app_excluded_by_token` (platform/src/audio.rs): contains
+ * case-insensitive do token no nome ou no id (bundle id / exe).
+ */
+export function audioAppMatchesToken(
+  name: string,
+  id: string | null | undefined,
+  token: string,
+): boolean {
+  const needle = token.trim().toLowerCase();
+  if (!needle) return false;
+  if (name.toLowerCase().includes(needle)) return true;
+  return id?.toLowerCase().includes(needle) ?? false;
+}
+
+/**
+ * Ids dos apps listados que casam com algum token padrão. O App mescla no
+ * `audioExcluded` ao carregar a lista (defaults que o host pode destildar
+ * via handleToggleAudioExclude — a guarda mora no App, não aqui).
+ */
+export function defaultExcludedAppIds(apps: AudioApp[]): string[] {
+  const ids: string[] = [];
+  for (const app of apps) {
+    if (ids.includes(app.id)) continue;
+    if (DEFAULT_AUDIO_EXCLUSION_TOKENS.some((token) => audioAppMatchesToken(app.name, app.id, token))) {
+      ids.push(app.id);
+    }
+  }
+  return ids;
+}
+
 export function validateNickname(nickname: string): string | null {
   const name = nickname.trim();
   if (name.length < 2 || name.length > 24)

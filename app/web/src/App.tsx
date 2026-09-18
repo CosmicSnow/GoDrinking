@@ -62,10 +62,15 @@ import {
   HomeScreen,
   RoomScreen,
   UpdateModal,
+  NICKNAME_STORAGE_KEY,
+  SERVER_STORAGE_KEY,
+  defaultExcludedAppIds,
   frameRefreshDue,
+  readStoredSetting,
   resolveDesired,
   shareIntentFromResolved,
   watchingStillLive,
+  writeStoredSetting,
   validateCode,
   validateNickname,
   validatePassword,
@@ -107,9 +112,11 @@ const mediaSummary = (event: MediaEvent): string => {
 export default function App() {
   const [screen, setScreen] = useState<"home" | "room">("home");
   const [tab, setTab] = useState<"create" | "join">("create");
-  const [server, setServerBase] = useState(DEFAULT_SERVER);
+  // Servidor + apelido persistem no localStorage (volta a home preenchida);
+  // vazios/ausentes caem nos fallbacks de sempre (DEFAULT_SERVER/"Convidado").
+  const [server, setServerBase] = useState(() => readStoredSetting(SERVER_STORAGE_KEY) ?? DEFAULT_SERVER);
   // Apelido interno (sem input visível na home fiel ao goDrinking2).
-  const [nickname, setNickname] = useState("Convidado");
+  const [nickname, setNickname] = useState(() => readStoredSetting(NICKNAME_STORAGE_KEY) ?? "Convidado");
   const [password, setPassword] = useState("");
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
@@ -144,6 +151,9 @@ export default function App() {
   const [caps, setCaps] = useState<CapabilitySet | null>(null);
   const [audioApps, setAudioApps] = useState<AudioApp[]>([]);
   const [audioExcluded, setAudioExcluded] = useState<string[]>([]);
+  // Ids que o host destildou à mão: os defaults (Discord/próprio app) nunca
+  // re-adicionam esses ids ao recarregar a lista. Limpo ao parar o share.
+  const audioUserKept = useRef<Set<string>>(new Set());
   const [lastSignal, setLastSignal] = useState<string | null>(null);
   const [lastMedia, setLastMedia] = useState<string | null>(null);
   const [stats, setStats] = useState<ViewerStats | null>(null);
@@ -226,6 +236,32 @@ export default function App() {
     return fallback;
   };
 
+  // Home persistente: Servidor + Seu Nick voltam preenchidos (fallbacks de
+  // create/join — `trim() || DEFAULT` — continuam valendo para vazio).
+  useEffect(() => {
+    writeStoredSetting(SERVER_STORAGE_KEY, server);
+  }, [server]);
+  useEffect(() => {
+    writeStoredSetting(NICKNAME_STORAGE_KEY, nickname);
+  }, [nickname]);
+
+  /**
+   * Mescla os defaults (Discord + próprio app/helper) no `audioExcluded` ao
+   * carregar a lista, avisando o backend para o tap excluir de verdade.
+   * Ids destildados à mão (audioUserKept) nunca voltam sozinhos.
+   */
+  const seedDefaultAudioExclusions = (apps: AudioApp[]): void => {
+    const matched = defaultExcludedAppIds(apps).filter((id) => !audioUserKept.current.has(id));
+    if (matched.length === 0) return;
+    setAudioExcluded((current) => {
+      const fresh = matched.filter((id) => !current.includes(id));
+      if (fresh.length === 0) return current;
+      const next = [...current, ...fresh];
+      if (!isMock) void setAudioExclusions(next).catch(() => undefined);
+      return next;
+    });
+  };
+
   /** Lê snapshot + contadores agora (botão, pós-intent, pós-evento). */
   const refresh = async (): Promise<void> => {
     if (isMock) {
@@ -283,10 +319,13 @@ export default function App() {
     }
     try {
       if (snap?.share.state === "live" || snap?.share.state === "starting") {
-        setAudioApps(await listAudioApps());
+        const apps = await listAudioApps();
+        setAudioApps(apps);
+        seedDefaultAudioExclusions(apps);
       } else {
         setAudioApps([]);
         setAudioExcluded([]);
+        audioUserKept.current.clear();
       }
     } catch {
       setAudioApps([]);
@@ -366,12 +405,15 @@ export default function App() {
     if (!live) {
       setAudioApps([]);
       setAudioExcluded([]);
+      audioUserKept.current.clear();
       return;
     }
     let cancelled = false;
     listAudioApps().then(
       (apps) => {
-        if (!cancelled) setAudioApps(apps);
+        if (cancelled) return;
+        setAudioApps(apps);
+        seedDefaultAudioExclusions(apps);
       },
       () => {
         if (!cancelled) setAudioApps([]);
@@ -684,19 +726,26 @@ export default function App() {
       setLastMedia("frame (não-preto: não)");
       setAudioApps([]);
       setAudioExcluded([]);
+      audioUserKept.current.clear();
       return;
     }
     void runIntent(async () => {
       await stopShare();
       setAudioApps([]);
       setAudioExcluded([]);
+      audioUserKept.current.clear();
     });
   };
 
   const handleToggleAudioExclude = (id: string): void => {
-    const next = audioExcluded.includes(id)
-      ? audioExcluded.filter((item) => item !== id)
-      : [...audioExcluded, id];
+    const excluding = !audioExcluded.includes(id);
+    const next = excluding
+      ? [...audioExcluded, id]
+      : audioExcluded.filter((item) => item !== id);
+    // Destildar à mão marca o id: os defaults não re-adicionam; tildar à mão
+    // desmarca (o default volta a valer na próxima lista fresca).
+    if (excluding) audioUserKept.current.delete(id);
+    else audioUserKept.current.add(id);
     setAudioExcluded(next);
     if (isMock) return;
     void setAudioExclusions(next).catch(() => undefined);

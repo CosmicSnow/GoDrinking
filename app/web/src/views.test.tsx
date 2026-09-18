@@ -10,11 +10,17 @@ import {
   QualityPanel,
   RoomScreen,
   WINDOW_HINT,
+  DEFAULT_AUDIO_EXCLUSION_TOKENS,
+  NICKNAME_STORAGE_KEY,
+  SERVER_STORAGE_KEY,
+  audioAppMatchesToken,
+  defaultExcludedAppIds,
   formatBps,
   formatDelayMs,
   formatFps,
   frameRefreshDue,
   linkLabel,
+  readStoredSetting,
   resolveDesired,
   salaLabel,
   shareIntentFromResolved,
@@ -22,6 +28,7 @@ import {
   sourceKindOf,
   watchingStillLive,
   visibleAudioApps,
+  writeStoredSetting,
   isSelf,
   roomTilesClassName,
   stageCellClassName,
@@ -146,6 +153,19 @@ describe("validação (regras do backend, sem segredos nas mensagens)", () => {
     expect(validateSource("movie:")).not.toBeNull();
     expect(validateSource("display:")).not.toBeNull();
     expect(validateSource("window:")).not.toBeNull();
+  });
+});
+
+describe("persistência da home (localStorage, sem quebrar sem window)", () => {
+  it("chaves estáveis de nick + servidor", () => {
+    expect(NICKNAME_STORAGE_KEY).toBe("golive.nickname");
+    expect(SERVER_STORAGE_KEY).toBe("golive.server");
+  });
+
+  it("sem window: leitura null, escrita sem throw", () => {
+    expect(typeof window).toBe("undefined");
+    expect(readStoredSetting(NICKNAME_STORAGE_KEY)).toBeNull();
+    expect(() => writeStoredSetting(NICKNAME_STORAGE_KEY, "Ana")).not.toThrow();
   });
 });
 
@@ -463,6 +483,46 @@ describe("RoomScreen (snapshot → markup, sem inferência)", () => {
     expect(names.filter((name) => name === "Chrome")).toHaveLength(1);
     expect(names.indexOf("Chrome")).toBeLessThan(names.indexOf("Discord"));
     expect(names.indexOf("Discord")).toBeLessThan(names.indexOf("Safari"));
+  });
+
+  it("matcher de exclusão espelha o backend (contains, case-insensitive)", () => {
+    expect(audioAppMatchesToken("Discord", "com.hnc.Discord", "Discord")).toBe(true);
+    expect(audioAppMatchesToken("Discord Helper (Renderer)", "x", "Discord")).toBe(true);
+    expect(audioAppMatchesToken("Discord", "com.hnc.Discord.helper", "com.hnc.Discord")).toBe(true);
+    expect(audioAppMatchesToken("discord", "COM.HNC.DISCORD", "Discord")).toBe(true);
+    expect(audioAppMatchesToken("Discord", "com.hnc.Discord", "Discord.exe")).toBe(false);
+    expect(audioAppMatchesToken("Safari", "com.apple.Safari", "Discord")).toBe(false);
+    expect(audioAppMatchesToken("Discord", "com.hnc.Discord", "")).toBe(false);
+    expect(audioAppMatchesToken("Discord", "com.hnc.Discord", "   ")).toBe(false);
+  });
+
+  it("defaults cobrem Discord + próprio app/helper (sync com platform)", () => {
+    expect(DEFAULT_AUDIO_EXCLUSION_TOKENS).toContain("Discord");
+    expect(DEFAULT_AUDIO_EXCLUSION_TOKENS).toContain("com.hnc.Discord");
+    expect(DEFAULT_AUDIO_EXCLUSION_TOKENS).toContain("Discord.exe");
+    expect(DEFAULT_AUDIO_EXCLUSION_TOKENS).toContain("dev.golive.sala");
+    expect(DEFAULT_AUDIO_EXCLUSION_TOKENS).toContain("goDrinking.exe");
+    expect(DEFAULT_AUDIO_EXCLUSION_TOKENS).toContain("golive-video.exe");
+    const apps: AudioApp[] = [
+      { name: "Discord", id: "com.hnc.Discord", pid: 9, emitting_audio: true },
+      { name: "Safari", id: "com.apple.Safari", pid: 8, emitting_audio: false },
+      { name: "goDrinking", id: "goDrinking.exe", pid: 7, emitting_audio: false },
+      { name: "golive-video", id: "golive-video.exe", pid: 6, emitting_audio: false },
+    ];
+    expect(defaultExcludedAppIds(apps)).toEqual([
+      "com.hnc.Discord",
+      "goDrinking.exe",
+      "golive-video.exe",
+    ]);
+  });
+
+  it("defaults não engolem apps alheios nem duplicam ids", () => {
+    const apps: AudioApp[] = [
+      { name: "Safari", id: "com.apple.Safari", pid: 8, emitting_audio: false },
+      { name: "Discord", id: "com.hnc.Discord", pid: 9, emitting_audio: true },
+      { name: "Discord", id: "com.hnc.Discord", pid: 10, emitting_audio: false },
+    ];
+    expect(defaultExcludedAppIds(apps)).toEqual(["com.hnc.Discord"]);
   });
 
   it("ninguém compartilhando: palco vazio honesto, sidebar intacta", () => {
