@@ -22,7 +22,7 @@ O nome confunde de propósito. Não é Go, não é app de bar, e não tem nada a
 - Compartilhar a tela inteira ou só uma janela, com miniatura antes de confirmar.
 - Assistir ao compartilhamento de uma ou mais pessoas da sala.
 - Ajustar qualidade (resolução, fps e bitrate) e compartilhar o áudio do PC, com opção de tirar apps específicos da mistura.
-- Funcionar entre sistemas diferentes, o host pode estar no Windows e quem assiste no macOS, ou o contrário.
+- Funciona entre sistemas diferentes, o host pode estar no Windows e quem assiste no macOS, ou o contrário.
 
 ## O que o projeto não é
 
