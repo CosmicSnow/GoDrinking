@@ -37,7 +37,11 @@ O jeito normal é baixar o instalador pronto na página de releases:
 - Releases: https://github.com/CosmicSnow/GoDrinking/releases
 - A página do site também aponta para a release mais recente: https://godrinking.jouymaker.com
 
-Tem build para Windows e para macOS (Apple Silicon). Baixe só desses dois endereços. Não aceite o instalador repassado por outra pessoa, por link solto em grupo, DM ou qualquer fonte fora do site e do repositório. Um arquivo repassado pode ter sido alterado no caminho e não tem como garantir que é o mesmo que saiu daqui. Se você instalar algo que não veio das fontes oficiais, a conta é sua: eu não sou responsável por modificação que terceiros tenham feito no arquivo.
+Tem build para Windows e para macOS (Apple Silicon). Baixe só desses dois endereços. 
+
+<ATENÇÃO!!!>
+Não aceite o instalador repassado por outra pessoa, por link solto em grupo, DM ou qualquer fonte fora do site e do repositório. Um arquivo repassado pode ter sido alterado no caminho e não tem como garantir que é o mesmo que saiu daqui. Se você instalar algo que não veio das fontes oficiais, a conta é sua: eu não sou responsável por modificação que terceiros tenham feito no arquivo.
+</ATENÇÃO!!!>
 
 Se o sistema reclamar que o app não tem assinatura digital, é esperado. Assinar custa dinheiro e este é um projeto independente, o código aberto está aqui para você conferir ou compilar por conta própria.
 
