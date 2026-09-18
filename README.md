@@ -55,9 +55,16 @@ Tudo acontece na janela principal, não tem conta nem configuração prévia.
 
 Para começar uma sala, escolha um apelido (letras, números, espaço, ponto, hífen e underline, de 2 a 24 caracteres), escreva uma senha (de 4 a 64 caracteres) e clique em Criar sala. O app mostra um código de 6 caracteres. Copie e mande para quem você quer chamar, por onde for mais fácil.
 
-Para entrar, a pessoa coloca o mesmo código, o apelido dela e a senha, e clica em Entrar. Se a sala pedir aprovação, ela aguarda a líder admitir. Dentro da sala, o botão de compartilhar lista as telas e janelas com miniatura. É só escolher e confirmar. Para assistir, clique em Assistir ao lado de quem está compartilhando. O vídeo abre em uma janela própria, dá para fixar e dar zoom. Sair da sala é o botão de sair, e a líder pode admitir ou remover gente.
+Para entrar, a pessoa coloca o mesmo código, o apelido dela e a senha, e clica em Entrar. 
+Dentro da sala, o botão de compartilhar lista as telas e janelas com miniatura. 
+Para assistir, clique em Assistir ao lado de quem está compartilhando. 
+Dá para fixar e dar zoom e controlar volume ou mutar. 
+Sair da sala é o botão de sair.
 
-O campo de servidor quase nunca precisa mudar. O padrão já aponta para o servidor público. Você só mexe ali se hospedar o seu próprio servidor na sua rede, aí é só colar o endereço e usar normal.
+O campo de servidor não precisa mudar. O padrão já aponta para o servidor público. 
+Você só mexe neste campo se hospedar o seu próprio servidor na sua rede, aí é só colar o endereço e usar normal.
+Inclusive todos tem a liberdade de fazer isso! Mas isso não é obrigatório para usar com amigos,
+é mais para quem quiser uma camada nova ou customizar alguma coisa.
 
 ## Rodar a partir do código
 
