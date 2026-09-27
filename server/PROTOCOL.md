@@ -16,6 +16,43 @@ candidates.
   (and a malformed WebSocket upgrade target gets `400` then close). These
   failures do not terminate the server.
 
+### Optional reverse-proxy client identity
+
+By default, client identity for per-IP limits and authentication penalties is
+the direct TCP socket peer. The server ignores all proxy identity headers.
+Deployments may opt in to `TRUSTED_PROXY_PEER`, whose value must be the exact
+IP literal of the immediate trusted reverse proxy peer (for example, the
+Nginx Proxy Manager (NPM) address that connects directly to this server). When
+the socket peer matches that configured address, the request must include the
+`X-Real-IP` header. Its value must be exactly one valid IPv4 or IPv6 literal:
+missing, malformed, or non-single values (including comma-separated lists) are
+rejected with HTTP `400`. This rule applies to both HTTP requests and WebSocket
+upgrade requests. A peer that does not match `TRUSTED_PROXY_PEER` is untrusted
+and its `X-Real-IP` header is ignored; its socket peer remains its identity.
+`X-GoDrinking-Client-IP`, `X-Forwarded-For`, and `CF-Connecting-IP` are never
+used as request identity. If the variable is unset, all requests use the
+socket peer, as before.
+
+Enabling this setting requires a coordinated deployment, in this order:
+
+1. Configure NPM's real-IP handling so `$remote_addr` is derived from
+   `CF-Connecting-IP` only when the TCP peer is in Cloudflare's maintained,
+   verified CIDR ranges (`set_real_ip_from`); do not trust that header from
+   arbitrary peers. Restrict NPM ingress to Cloudflare as appropriate. NPM's
+   included `proxy.conf` must overwrite `X-Real-IP` with `$remote_addr` (rather
+   than append or pass through a client-supplied value).
+2. Restrict access to the origin and backend so clients cannot bypass the
+   trusted proxy and so only the intended immediate proxy can reach the server.
+3. Only after the proxy behavior and network restrictions are in place, set
+   `TRUSTED_PROXY_PEER` to that exact NPM peer IP in `.env.production` or the
+   deployment secret store, then deploy/restart the server.
+
+Do not trust `X-Forwarded-For` or `CF-Connecting-IP` directly as backend
+identity, and do not enable `TRUSTED_PROXY_PEER` before NPM's Cloudflare-only
+real-IP trust and `X-Real-IP` overwrite behavior are verified and protected.
+These are deployment requirements; this documentation does not assert that
+any current production deployment has been configured or fixed.
+
 ## REST
 
 All POST bodies are JSON, max 64 KiB. Errors: `400 {"ok":false,"error":"invalid"}`,
@@ -123,16 +160,15 @@ When a state quota is exhausted, a new record is refused with WebSocket
 body/WebSocket frame; 4 concurrent password scrypt jobs; 64 candidates per
 attempt; 8 KiB per candidate. Heartbeat expiry is 5 min (heartbeat expected
 every 30 s); disconnect grace is 8 s after socket close without reconnect.
-Per-IP rate limits use the direct TCP peer address (not forwarded proxy
-headers), per rolling 60 s: create 10, join 20, leave 30, and WebSocket
-upgrades 30. Only these supported REST routes are rate-limited; unmatched REST
-routes are denied before rate limiting. Five authentication failures in 10 min
-ignore that peer IP for 5 min. When deployed behind a proxy, clients may share the
-proxy's peer IP, so rate limits and authentication penalties can aggregate
-across them. This shared-IP limitation remains unresolved: the server uses the
-direct TCP peer address and does not trust proxy identity headers, so a proxy
-deployment has no per-client identity strategy at this layer. Do not treat
-these IP-based limits or penalties as per-end-user production protections.
+Per-IP rate limits use the request identity (the direct TCP peer by default;
+see [Optional reverse-proxy client identity](#optional-reverse-proxy-client-identity)
+for the explicitly configured trusted-proxy opt-in), per rolling 60 s: create
+10, join 20, leave 30, and WebSocket upgrades 30. Only these supported REST
+routes are rate-limited; unmatched REST routes are denied before rate limiting.
+Five authentication failures in 10 min ignore that identity for 5 min. Without
+the opt-in, clients behind one proxy share its peer identity, so limits and
+authentication penalties can aggregate across them. Do not treat these IP-based
+limits or penalties as per-end-user production protections.
 Heartbeat TTL, GC interval (15 s default), and disconnect grace are tunable via
 `HEARTBEAT_TTL_MS`, `GC_INTERVAL_MS`, and `DISCONNECT_GRACE_MS`.
 

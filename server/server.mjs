@@ -11,11 +11,48 @@
 // ICE candidates.
 
 import http from "node:http";
+import { isIP } from "node:net";
 import { randomBytes, scrypt, timingSafeEqual } from "node:crypto";
 import { WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 18790);
 const BIND = process.env.BIND || "127.0.0.1";
+
+function normalizeIp(value) {
+  if (typeof value !== "string" || value.length === 0 || value.includes("%") || value.trim() !== value) return null;
+  const version = isIP(value);
+  if (version === 4) return value;
+  if (version !== 6) return null;
+
+  let address = value.toLowerCase();
+  const embeddedV4 = address.match(/(?:^|:)(\d+\.\d+\.\d+\.\d+)$/);
+  if (embeddedV4) {
+    const octets = embeddedV4[1].split(".").map(Number);
+    address = address.slice(0, -embeddedV4[1].length) + `${((octets[0] << 8) | octets[1]).toString(16)}:${((octets[2] << 8) | octets[3]).toString(16)}`;
+  }
+  const halves = address.split("::");
+  const left = halves[0] ? halves[0].split(":") : [];
+  const right = halves.length > 1 && halves[1] ? halves[1].split(":") : [];
+  const groups = halves.length === 1
+    ? left
+    : [...left, ...Array(8 - left.length - right.length).fill("0"), ...right];
+  if (groups.length !== 8) return null;
+  const bytes = groups.flatMap((group) => {
+    const n = Number.parseInt(group, 16);
+    return [(n >> 8) & 0xff, n & 0xff];
+  });
+  if (bytes.slice(0, 10).every((byte) => byte === 0) && bytes[10] === 255 && bytes[11] === 255) {
+    return bytes.slice(12).join(".");
+  }
+  return bytes.map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+const trustedProxyEnv = process.env.TRUSTED_PROXY_PEER;
+const trustedProxyPeer = trustedProxyEnv === undefined ? null : normalizeIp(trustedProxyEnv);
+if (trustedProxyEnv !== undefined && !trustedProxyPeer) {
+  console.error("invalid TRUSTED_PROXY_PEER: expected a single IP literal");
+  process.exit(1);
+}
 
 // Default is loopback. Docker sets BIND=0.0.0.0 (or ::) behind a reverse proxy.
 // Binding a specific public address is still refused.
@@ -90,7 +127,20 @@ const reservedRoomCodes = new Set();
 
 function ipOf(req) {
   const ip = req.socket.remoteAddress || "-";
-  return ip.startsWith("::ffff:") ? ip.slice(7) : ip;
+  return normalizeIp(ip) || ip;
+}
+
+function requestIp(req) {
+  const peer = ipOf(req);
+  if (!trustedProxyPeer || peer !== trustedProxyPeer) return { ip: peer, invalid: false };
+
+  const values = [];
+  for (let i = 0; i < req.rawHeaders.length; i += 2) {
+    if (req.rawHeaders[i].toLowerCase() === "x-real-ip") values.push(req.rawHeaders[i + 1]);
+  }
+  if (values.length !== 1) return { ip: null, invalid: true };
+  const forwardedIp = normalizeIp(values[0]);
+  return forwardedIp ? { ip: forwardedIp, invalid: false } : { ip: null, invalid: true };
 }
 
 // Never logs secrets: only level, ip, event, code, member id (opaque).
@@ -567,7 +617,8 @@ function readBody(req) {
 
 const server = http.createServer(async (req, res) => {
   try {
-  const ip = ipOf(req);
+  const { ip, invalid: invalidIdentity } = requestIp(req);
+  if (invalidIdentity) return invalid(res);
   let url;
   try {
     url = new URL(req.url, "http://localhost");
@@ -864,6 +915,12 @@ wss.on("connection", (ws, req, meta) => {
 });
 
 server.on("upgrade", (req, socket, head) => {
+  const { ip, invalid: invalidIdentity } = requestIp(req);
+  if (invalidIdentity) {
+    socket.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+    socket.destroy();
+    return;
+  }
   let url;
   try {
     url = new URL(req.url, "http://localhost");
@@ -872,7 +929,6 @@ server.on("upgrade", (req, socket, head) => {
     socket.destroy();
     return;
   }
-  const ip = ipOf(req);
   if (isIgnored(ip)) {
     socket.destroy();
     return;
