@@ -25,6 +25,7 @@ if (!/^(127\.\d+\.\d+\.\d+|::1|::ffff:127\.\d+\.\d+\.\d+|localhost|0\.0\.0\.0|::
 }
 
 const MAX_ROOMS = 256;
+const MAX_ACTIVE_SCRYPT = 4;
 const MAX_ACCEPTED = 8;
 const MAX_PENDING = 8;
 const MAX_WS = 512;
@@ -34,6 +35,23 @@ const DISCONNECT_GRACE_MS = Number(process.env.DISCONNECT_GRACE_MS || 8 * 1000);
 const BODY_LIMIT = 64 * 1024;
 const MAX_CANDIDATE_BYTES = 8 * 1024;
 const MAX_CANDIDATES_PER_ATTEMPT = 64;
+const MAX_SIGNAL_LINKS_PER_ROOM = 256;
+const MAX_SIGNAL_LINKS_GLOBAL = 4096;
+const MAX_CANDIDATE_KEYS_PER_ROOM = 256;
+const MAX_CANDIDATE_KEYS_GLOBAL = 8192;
+const WS_MESSAGE_BURST = 1024;
+const WS_MESSAGE_RATE = 256;
+const WS_BYTE_BURST = 8 * 1024 * 1024;
+const WS_BYTE_RATE = 1024 * 1024;
+const WS_CONTROL_BURST = 32;
+const WS_CONTROL_RATE = 8;
+const WS_OUTBOUND_MAX_BUFFERED = 2 * 1024 * 1024;
+const WS_OUTBOUND_GLOBAL_MAX_BUFFERED = 32 * 1024 * 1024;
+const WS_GLOBAL_MESSAGE_BURST = 8192;
+const WS_GLOBAL_MESSAGE_RATE = 2048;
+const WS_GLOBAL_BYTE_BURST = 32 * 1024 * 1024;
+const WS_GLOBAL_BYTE_RATE = 4 * 1024 * 1024;
+const HEARTBEAT_ROSTER_INTERVAL_MS = 250;
 const HEADER_TIMEOUT_MS = 5 * 1000;
 const REQUEST_TIMEOUT_MS = 15 * 1000;
 const WS_PING_MS = 30 * 1000;
@@ -55,10 +73,15 @@ const tokens = new Map();
 const rate = new Map();
 /** ip -> { fails: number[], until: number } */
 const ignore = new Map();
-/** linkKey -> current attempt (string) */
+/** linkKey -> { attempt, code, fromId, toId } */
 const attempts = new Map();
-/** linkKey|attempt -> routed candidate count */
+/** linkKey+attempt -> { count, code, fromId, toId, attempt } */
 const candidateCounts = new Map();
+const signalLinksByRoom = new Map();
+const candidateKeysByRoom = new Map();
+let activeScrypt = 0;
+let reservedRoomCreates = 0;
+const reservedRoomCodes = new Set();
 
 // Member = { id, nickname, token, state: "pending"|"accepted",
 //            joinedAt, heartbeatAt, ws, share }
@@ -96,6 +119,16 @@ function scryptAsync(password, salt) {
       else resolve(key);
     });
   });
+}
+
+function acquireScrypt() {
+  if (activeScrypt >= MAX_ACTIVE_SCRYPT) return false;
+  activeScrypt += 1;
+  return true;
+}
+
+function releaseScrypt() {
+  activeScrypt -= 1;
 }
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -136,7 +169,19 @@ const busy = (res) => sendJson(res, 429, { ok: false, error: "busy" });
 const full = (res) => sendJson(res, 429, { ok: false, error: "full" });
 
 function send(ws, obj) {
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+  if (!ws || ws.readyState !== 1) return;
+  const data = JSON.stringify(obj);
+  const bytes = Buffer.byteLength(data);
+  let globallyBuffered = 0;
+  for (const client of wss.clients) globallyBuffered += client.bufferedAmount;
+  if (ws.bufferedAmount + bytes > WS_OUTBOUND_MAX_BUFFERED ||
+      globallyBuffered + bytes > WS_OUTBOUND_GLOBAL_MAX_BUFFERED) {
+    ws.terminate();
+    return;
+  }
+  ws.send(data, (error) => {
+    if (error && ws.readyState === 1) ws.terminate();
+  });
 }
 
 // --- Rate limit + ignore list ----------------------------------------------
@@ -211,20 +256,42 @@ function nextMaster(room, leavingId) {
 }
 
 function purgeSignalState(code) {
-  for (const key of [...attempts.keys()]) {
-    if (key.startsWith(code + "|")) attempts.delete(key);
+  for (const [key, entry] of attempts) {
+    if (entry.code === code) attempts.delete(key);
   }
-  for (const key of [...candidateCounts.keys()]) {
-    if (key.startsWith(code + "|")) candidateCounts.delete(key);
+  for (const [key, entry] of candidateCounts) {
+    if (entry.code === code) candidateCounts.delete(key);
   }
+  signalLinksByRoom.delete(code);
+  candidateKeysByRoom.delete(code);
+}
+
+function purgeMemberSignalState(code, memberId) {
+  for (const [key, entry] of attempts) {
+    if (entry.code === code && (entry.fromId === memberId || entry.toId === memberId)) {
+      attempts.delete(key);
+      signalLinksByRoom.set(code, Math.max(0, (signalLinksByRoom.get(code) ?? 1) - 1));
+    }
+  }
+  for (const [key, entry] of candidateCounts) {
+    if (entry.code === code && (entry.fromId === memberId || entry.toId === memberId)) {
+      candidateCounts.delete(key);
+      candidateKeysByRoom.set(code, Math.max(0, (candidateKeysByRoom.get(code) ?? 1) - 1));
+    }
+  }
+  if (signalLinksByRoom.get(code) === 0) signalLinksByRoom.delete(code);
+  if (candidateKeysByRoom.get(code) === 0) candidateKeysByRoom.delete(code);
 }
 
 /** Removes a member, invalidates its token, closes its socket. */
 function removeMember(room, memberId, reason) {
   const member = room.members.get(memberId);
   if (!member) return;
+  clearTimeout(member.disconnectTimer);
+  member.disconnectTimer = null;
   const wasMaster = room.masterId === memberId;
   room.members.delete(memberId);
+  purgeMemberSignalState(room.code, memberId);
   tokens.delete(member.token);
   send(member.ws, { t: reason });
   if (member.ws) member.ws.close(4000, reason);
@@ -300,32 +367,54 @@ function validSignalEnvelope(payload) {
 }
 
 function linkKey(code, fromId, toId, payload) {
-  const pair = [String(fromId), String(toId)].sort().join("~");
-  return `${code}|${pair}|${String(payload.session)}|${String(payload.share)}|${String(payload.link)}`;
+  const pair = [String(fromId), String(toId)].sort();
+  return JSON.stringify([code, pair[0], pair[1], payload.session, payload.share, payload.link]);
 }
 
-// Offers establish the current attempt; anything stale or over budget drops.
-function attemptAllowed(key, payload) {
+function incrementRoomCount(map, code) {
+  map.set(code, (map.get(code) ?? 0) + 1);
+}
+
+function decrementRoomCount(map, code) {
+  const next = (map.get(code) ?? 0) - 1;
+  if (next > 0) map.set(code, next);
+  else map.delete(code);
+}
+
+// Offers establish the current attempt; candidate-before-offer remains valid.
+function attemptAllowed(code, fromId, toId, key, payload) {
   const attempt = String(payload.attempt);
   if (payload.type === "offer") {
     const current = attempts.get(key);
-    if (current !== undefined && attempt !== current) {
+    if (current && attempt !== current.attempt) {
       const incoming = Number(attempt);
-      const known = Number(current);
+      const known = Number(current.attempt);
       if (Number.isFinite(incoming) && Number.isFinite(known)) {
         if (incoming < known) return false;
       }
     }
-    attempts.set(key, attempt);
+    if (!current) {
+      if ((signalLinksByRoom.get(code) ?? 0) >= MAX_SIGNAL_LINKS_PER_ROOM ||
+          attempts.size >= MAX_SIGNAL_LINKS_GLOBAL) return "full";
+      incrementRoomCount(signalLinksByRoom, code);
+    }
+    attempts.set(key, { attempt, code, fromId, toId });
     return true;
   }
   const current = attempts.get(key);
-  if (current !== undefined && attempt !== current) return false;
+  if (current && attempt !== current.attempt) return false;
   if (payload.type === "candidate") {
-    const countKey = `${key}|${attempt}`;
-    const count = candidateCounts.get(countKey) ?? 0;
-    if (count >= MAX_CANDIDATES_PER_ATTEMPT) return false;
-    candidateCounts.set(countKey, count + 1);
+    const countKey = JSON.stringify([key, attempt]);
+    const entry = candidateCounts.get(countKey);
+    if ((entry?.count ?? 0) >= MAX_CANDIDATES_PER_ATTEMPT) return false;
+    if (!entry) {
+      if ((candidateKeysByRoom.get(code) ?? 0) >= MAX_CANDIDATE_KEYS_PER_ROOM ||
+          candidateCounts.size >= MAX_CANDIDATE_KEYS_GLOBAL) return "full";
+      incrementRoomCount(candidateKeysByRoom, code);
+      candidateCounts.set(countKey, { count: 1, code, fromId, toId, attempt, linkKey: key });
+    } else {
+      entry.count += 1;
+    }
   }
   return true;
 }
@@ -335,49 +424,64 @@ function attemptAllowed(key, payload) {
 async function handleCreate(ip, json, res) {
   if (!validNickname(json.nickname)) return invalid(res);
   if (!validPassword(json.password)) return invalid(res);
-  if (rooms.size >= MAX_ROOMS) return busy(res);
+  if (!acquireScrypt()) return busy(res);
+  let reserved = false;
   let code = null;
-  for (let i = 0; i < 10; i += 1) {
-    const c = randomCode();
-    if (!rooms.has(c)) {
-      code = c;
-      break;
+  try {
+    if (rooms.size + reservedRoomCreates >= MAX_ROOMS) return busy(res);
+    reservedRoomCreates += 1;
+    reserved = true;
+    for (let i = 0; i < 10; i += 1) {
+      const c = randomCode();
+      if (!rooms.has(c) && !reservedRoomCodes.has(c)) {
+        code = c;
+        reservedRoomCodes.add(c);
+        break;
+      }
     }
+    if (!code) return busy(res);
+    const salt = randomBytes(16);
+    const hash = await scryptAsync(json.password, salt);
+    const memberId = randomMemberId();
+    const token = randomToken();
+    const now = Date.now();
+    const room = {
+      code,
+      passwordHash: hash,
+      passwordSalt: salt,
+      admission: json.admission === true,
+      masterId: memberId,
+      createdAt: now,
+      members: new Map(),
+    };
+    room.members.set(memberId, {
+      id: memberId,
+      nickname: json.nickname.trim(),
+      token,
+      state: "accepted",
+      joinedAt: now,
+      heartbeatAt: now,
+      ws: null,
+      share: false,
+    });
+    // A reserved code cannot normally be taken; guard the commit regardless.
+    if (rooms.has(code)) return busy(res);
+    rooms.set(code, room);
+    tokens.set(token, { code, memberId });
+    log("info", ip, "create", code, memberId);
+    ok(res, { ok: true, code, memberId, token });
+  } finally {
+    if (reserved) reservedRoomCreates -= 1;
+    if (code) reservedRoomCodes.delete(code);
+    releaseScrypt();
   }
-  if (!code) return busy(res);
-  const salt = randomBytes(16);
-  const hash = await scryptAsync(json.password, salt);
-  const memberId = randomMemberId();
-  const token = randomToken();
-  const now = Date.now();
-  const room = {
-    code,
-    passwordHash: hash,
-    passwordSalt: salt,
-    admission: json.admission === true,
-    masterId: memberId,
-    createdAt: now,
-    members: new Map(),
-  };
-  room.members.set(memberId, {
-    id: memberId,
-    nickname: json.nickname.trim(),
-    token,
-    state: "accepted",
-    joinedAt: now,
-    heartbeatAt: now,
-    ws: null,
-    share: false,
-  });
-  rooms.set(code, room);
-  tokens.set(token, { code, memberId });
-  log("info", ip, "create", code, memberId);
-  ok(res, { ok: true, code, memberId, token });
 }
 
 async function handleJoin(ip, code, json, res) {
   const room = rooms.get(code);
   const password = typeof json.password === "string" ? json.password : "";
+  if (!acquireScrypt()) return busy(res);
+  try {
   if (!room) {
     // Indistinguishable from wrong password: same cost, same delay, same deny.
     await scryptAsync("", randomBytes(16));
@@ -394,6 +498,8 @@ async function handleJoin(ip, code, json, res) {
     log("warn", ip, "join", code, "-", "denied");
     return deny(res);
   }
+  // The room may have been removed while password verification was pending.
+  if (rooms.get(code) !== room) return deny(res);
   let accepted = 0;
   let pending = 0;
   for (const m of room.members.values()) {
@@ -426,6 +532,9 @@ async function handleJoin(ip, code, json, res) {
   }
   broadcastRoster(room);
   ok(res, { ok: true, status: state, memberId, token });
+  } finally {
+    releaseScrypt();
+  }
 }
 
 function handleLeave(ip, code, json, res) {
@@ -457,8 +566,14 @@ function readBody(req) {
 }
 
 const server = http.createServer(async (req, res) => {
+  try {
   const ip = ipOf(req);
-  const url = new URL(req.url, "http://localhost");
+  let url;
+  try {
+    url = new URL(req.url, "http://localhost");
+  } catch {
+    return invalid(res);
+  }
   const path = url.pathname;
 
   if (req.method === "GET" && path === "/health") {
@@ -496,14 +611,14 @@ const server = http.createServer(async (req, res) => {
   }
   if (!json || typeof json !== "object") return invalid(res);
 
-  try {
-    if (route === "create") return await handleCreate(ip, json, res);
-    const code = normalizeCode(m[1]);
-    if (route === "join") return await handleJoin(ip, code, json, res);
-    return handleLeave(ip, code, json, res);
-  } catch (err) {
-    log("warn", ip, "error", route, err.message);
-    return deny(res);
+  if (route === "create") return await handleCreate(ip, json, res);
+  const code = normalizeCode(m[1]);
+  if (route === "join") return await handleJoin(ip, code, json, res);
+  return handleLeave(ip, code, json, res);
+  } catch {
+    // Async request handlers must never reject into Node's unhandled-rejection path.
+    if (!res.headersSent && !res.destroyed) deny(res);
+    else if (!res.destroyed) res.destroy();
   }
 });
 
@@ -513,7 +628,40 @@ server.on("clientError", (_err, socket) => socket.destroy());
 
 // --- WebSocket -------------------------------------------------------------
 
-const wss = new WebSocketServer({ noServer: true, maxPayload: BODY_LIMIT });
+const wss = new WebSocketServer({
+  noServer: true,
+  maxPayload: BODY_LIMIT,
+  maxFragments: 32,
+  maxBufferedChunks: 1024,
+  perMessageDeflate: false,
+  autoPong: false,
+});
+
+function makeTokenBucket(capacity, rate, now = Date.now()) {
+  return { tokens: capacity, capacity, rate, updatedAt: now };
+}
+
+function takeToken(bucket, amount = 1, now = Date.now()) {
+  const elapsed = Math.max(0, now - bucket.updatedAt) / 1000;
+  bucket.tokens = Math.min(bucket.capacity, bucket.tokens + elapsed * bucket.rate);
+  bucket.updatedAt = now;
+  if (bucket.tokens < amount) return false;
+  bucket.tokens -= amount;
+  return true;
+}
+
+// Process-wide ingress budget, shared by every socket. Charge before parsing;
+// a single abusive connection cannot multiply the per-socket allowance.
+const globalWsMessageBucket = makeTokenBucket(WS_GLOBAL_MESSAGE_BURST, WS_GLOBAL_MESSAGE_RATE);
+const globalWsByteBucket = makeTokenBucket(WS_GLOBAL_BYTE_BURST, WS_GLOBAL_BYTE_RATE);
+
+function takeGlobalWsTokens(bytes, now = Date.now()) {
+  return takeToken(globalWsMessageBucket, 1, now) && takeToken(globalWsByteBucket, bytes, now);
+}
+
+function wsDataBytes(data) {
+  return Buffer.isBuffer(data) ? data.length : Buffer.byteLength(String(data));
+}
 
 function handleSignal(room, member, msg) {
   const toId = typeof msg.to === "string" ? msg.to : "";
@@ -526,14 +674,21 @@ function handleSignal(room, member, msg) {
     send(member.ws, { t: "error", error: "invalid" });
     return;
   }
-  if (!attemptAllowed(linkKey(room.code, member.id, dest.id, msg.payload), msg.payload)) {
+  const key = linkKey(room.code, member.id, dest.id, msg.payload);
+  const allowed = attemptAllowed(room.code, member.id, dest.id, key, msg.payload);
+  if (allowed === "full") {
+    send(member.ws, { t: "error", error: "full" });
+    return;
+  }
+  if (!allowed) {
     send(member.ws, { t: "error", error: "stale" });
     return;
   }
   send(dest.ws, { t: "signal", from: member.id, to: dest.id, payload: msg.payload });
 }
 
-function handleWsMessage(room, member, raw) {
+function handleWsMessage(room, member, ws, raw) {
+  if (member.ws !== ws || room.members.get(member.id) !== member) return;
   let msg;
   try {
     msg = JSON.parse(raw.toString());
@@ -548,7 +703,11 @@ function handleWsMessage(room, member, raw) {
   member.heartbeatAt = Date.now();
 
   if (msg.t === "heartbeat") {
-    send(member.ws, { t: "roster", entries: rosterEntries(room), master_id: room.masterId });
+    const now = Date.now();
+    if (now - (ws.lastHeartbeatRosterAt ?? 0) >= HEARTBEAT_ROSTER_INTERVAL_MS) {
+      ws.lastHeartbeatRosterAt = now;
+      send(ws, { t: "roster", entries: rosterEntries(room), master_id: room.masterId });
+    }
     return;
   }
   if (member.state !== "accepted") {
@@ -556,7 +715,9 @@ function handleWsMessage(room, member, raw) {
     return;
   }
   if (msg.t === "announce-share" || msg.t === "stop-share") {
-    member.share = msg.t === "announce-share";
+    const share = msg.t === "announce-share";
+    if (member.share === share) return;
+    member.share = share;
     log("info", "-", "share", room.code, member.id);
     broadcastRoster(room);
     return;
@@ -634,10 +795,29 @@ wss.on("connection", (ws, req, meta) => {
     }
   }
   member.ws = ws;
+  clearTimeout(member.disconnectTimer);
+  member.disconnectTimer = null;
+  member.connectionGeneration = (member.connectionGeneration ?? 0) + 1;
   member.heartbeatAt = Date.now();
   ws.isAlive = true;
-  ws.on("pong", () => {
-    ws.isAlive = true;
+  ws.on("pong", (data) => {
+    const now = Date.now();
+    if (!takeToken(ws.pongBucket, 1, now) || !takeGlobalWsTokens(data.length, now)) {
+      ws.terminate();
+      return;
+    }
+    if (ws.isAlive === false) ws.isAlive = true;
+  });
+  ws.on("ping", (data) => {
+    const now = Date.now();
+    if (!takeToken(ws.pingBucket, 1, now) || !takeGlobalWsTokens(data.length, now) ||
+        ws.bufferedAmount + data.length + 2 > WS_OUTBOUND_MAX_BUFFERED) {
+      ws.terminate();
+      return;
+    }
+    ws.pong(data, undefined, (error) => {
+      if (error && ws.readyState === 1) ws.terminate();
+    });
   });
   ws.on("error", () => {});
   if (member.state === "pending") {
@@ -647,25 +827,51 @@ wss.on("connection", (ws, req, meta) => {
     send(ws, { t: "roster", entries: rosterEntries(room), master_id: room.masterId });
   }
   log("info", ip, "ws", room.code, member.id);
-  ws.on("message", (data) => handleWsMessage(room, member, data));
+  const bucketNow = Date.now();
+  ws.messageBucket = makeTokenBucket(WS_MESSAGE_BURST, WS_MESSAGE_RATE, bucketNow);
+  ws.byteBucket = makeTokenBucket(WS_BYTE_BURST, WS_BYTE_RATE, bucketNow);
+  ws.pingBucket = makeTokenBucket(WS_CONTROL_BURST, WS_CONTROL_RATE, bucketNow);
+  ws.pongBucket = makeTokenBucket(WS_CONTROL_BURST, WS_CONTROL_RATE, bucketNow);
+  ws.on("message", (data) => {
+    if (member.ws !== ws || room.members.get(member.id) !== member) return;
+    const now = Date.now();
+    const bytes = wsDataBytes(data);
+    if (!takeToken(ws.messageBucket, 1, now) || !takeToken(ws.byteBucket, bytes, now) ||
+        !takeGlobalWsTokens(bytes, now)) {
+      ws.terminate();
+      return;
+    }
+    handleWsMessage(room, member, ws, data);
+  });
   ws.on("close", () => {
     if (member.ws !== ws) return;
     member.ws = null;
-    const tokenAtClose = member.token;
+    const generation = member.connectionGeneration;
     const memberId = member.id;
     const code = room.code;
-    setTimeout(() => {
+    clearTimeout(member.disconnectTimer);
+    member.disconnectTimer = setTimeout(() => {
       const currentRoom = rooms.get(code);
       if (!currentRoom) return;
       const current = currentRoom.members.get(memberId);
-      if (current && current.token === tokenAtClose && !current.ws) {
+      if (current && current.connectionGeneration === generation && !current.ws) {
+        current.disconnectTimer = null;
         removeMember(currentRoom, memberId, "gone");
       }
     }, DISCONNECT_GRACE_MS);
+    member.disconnectTimer.unref?.();
   });
 });
 
 server.on("upgrade", (req, socket, head) => {
+  let url;
+  try {
+    url = new URL(req.url, "http://localhost");
+  } catch {
+    socket.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+    socket.destroy();
+    return;
+  }
   const ip = ipOf(req);
   if (isIgnored(ip)) {
     socket.destroy();
@@ -681,7 +887,6 @@ server.on("upgrade", (req, socket, head) => {
     socket.destroy();
     return;
   }
-  const url = new URL(req.url, "http://localhost");
   const token = url.searchParams.get("token") || "";
   const entry = tokens.get(token);
   if (!entry) {
@@ -701,7 +906,9 @@ setInterval(() => {
       continue;
     }
     ws.isAlive = false;
-    ws.ping();
+    ws.ping(undefined, (error) => {
+      if (error && ws.readyState === 1) ws.terminate();
+    });
   }
 }, WS_PING_MS);
 
