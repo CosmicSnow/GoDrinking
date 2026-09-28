@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Local release: web build (first) + macOS .dmg + Windows exe (xwin cross) + gh release upload.
+# Local release: web build (first) + macOS .dmg + optional Windows exe workflow + gh release upload.
 #
 # Usage:
 #   bash scripts/release.sh [--skip-macos] [--skip-windows] [--skip-upload]
 #
 # Artifacts:
-#   - macOS: app/target/release/bundle/dmg/*.dmg  (via `cargo tauri build --bundles dmg` in app/)
+#   - macOS: app/target/release/bundle/dmg/goDrinking_${VERSION}_aarch64.dmg
 #   - Windows: goDrinking.exe built natively on windows-latest via
 #     .github/workflows/release-windows.yml (triggered below) and uploaded
 #     straight to the GitHub release — never downloaded locally.
@@ -58,15 +58,49 @@ if [ "$SKIP_MACOS" = true ]; then
   echo "release: skipping macOS build (--skip-macos)"
 else
   echo "release: building macOS .dmg..."
-  (cd "$ROOT/app" && cargo tauri build --bundles dmg)
-  shopt -s nullglob
-  DMGS=("$ROOT"/app/target/release/bundle/dmg/*.dmg)
-  shopt -u nullglob
-  if [ "${#DMGS[@]}" -eq 0 ]; then
-    echo "release: macOS .dmg not found in app/target/release/bundle/dmg/*.dmg" >&2
+  HOST_TRIPLE="$(cd "$ROOT/app" && rustc -vV | awk '/^host:/ { print $2 }')"
+  if [ "$HOST_TRIPLE" != "aarch64-apple-darwin" ]; then
+    echo "release: macOS release requires host target aarch64-apple-darwin (found: ${HOST_TRIPLE:-unknown})" >&2
     exit 1
   fi
-  DMG="${DMGS[0]}"
+  DMG="$ROOT/app/target/release/bundle/dmg/goDrinking_${VERSION}_aarch64.dmg"
+  SIDECAR_DIR="$ROOT/app/target/release/sidecars"
+  mkdir -p "$SIDECAR_DIR"
+  echo "release: building golive-video helper for $HOST_TRIPLE..."
+  (cd "$ROOT/app" && cargo build --release --locked --bin golive-video --features video-helper-bin)
+  install -m 755 "$ROOT/app/target/release/golive-video" "$SIDECAR_DIR/goDrinking-video-$HOST_TRIPLE"
+  # Remove only the exact expected artifact. Never accidentally publish a stale or
+  # differently named DMG left by a previous build.
+  rm -f "$DMG"
+  echo "release: bundling signed DMG with the goDrinking-video sidecar..."
+  (cd "$ROOT/app" && cargo tauri build --bundles dmg --config '{"bundle":{"externalBin":["target/release/sidecars/goDrinking-video"]}}')
+  if [ ! -f "$DMG" ]; then
+    echo "release: expected macOS .dmg was not produced: $DMG" >&2
+    exit 1
+  fi
+
+  # Inspect the actual mounted app before allowing the artifact to be published.
+  MOUNT_POINT="$(mktemp -d "${TMPDIR:-/tmp}/godrinking-release.XXXXXX")"
+  MOUNTED=false
+  cleanup_dmg_mount() {
+    if [ "$MOUNTED" = true ]; then hdiutil detach "$MOUNT_POINT" -quiet || true; fi
+    rmdir "$MOUNT_POINT" 2>/dev/null || true
+  }
+  trap cleanup_dmg_mount EXIT
+  hdiutil attach "$DMG" -readonly -nobrowse -mountpoint "$MOUNT_POINT" >/dev/null
+  MOUNTED=true
+  if [ ! -x "$MOUNT_POINT/goDrinking.app/Contents/MacOS/goDrinking-video" ]; then
+    echo "release: mounted DMG is missing executable goDrinking-video sidecar" >&2
+    exit 1
+  fi
+  if find "$MOUNT_POINT" -exec basename {} \; | grep -qi 'golive'; then
+    echo "release: mounted DMG contains a basename with forbidden 'golive' text" >&2
+    exit 1
+  fi
+  hdiutil detach "$MOUNT_POINT" -quiet
+  MOUNTED=false
+  rmdir "$MOUNT_POINT"
+  trap - EXIT
   echo "release: dmg=$DMG"
   ls -lh "$DMG"
 fi
@@ -141,6 +175,36 @@ if [ "${#ARTIFACTS[@]}" -eq 0 ]; then
   exit 1
 fi
 
+# A mac-only publish must attach to the already-existing release without
+# creating or moving a tag. Confirm that the local tag and remote tag resolve
+# to precisely the same commit before touching release assets.
+MAC_ONLY=false
+if [ "$SKIP_WINDOWS" = true ] && [ "$SKIP_MACOS" = false ]; then MAC_ONLY=true; fi
+if [ "$MAC_ONLY" = true ]; then
+  LOCAL_TAG_COMMIT="$(git -C "$ROOT" rev-parse "$TAG^{commit}" 2>/dev/null || true)"
+  REMOTE_TAGS="$(git -C "$ROOT" ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}")"
+  REMOTE_TAG_COMMIT="$(printf '%s\n' "$REMOTE_TAGS" | awk -v ref="refs/tags/$TAG^{}" '$2 == ref { print $1 }')"
+  if [ -z "$REMOTE_TAG_COMMIT" ]; then
+    REMOTE_TAG_COMMIT="$(printf '%s\n' "$REMOTE_TAGS" | awk -v ref="refs/tags/$TAG" '$2 == ref { print $1 }')"
+  fi
+  if [ -z "$LOCAL_TAG_COMMIT" ] || [ -z "$REMOTE_TAG_COMMIT" ] || [ "$LOCAL_TAG_COMMIT" != "$REMOTE_TAG_COMMIT" ]; then
+    echo "release: refusing mac-only publish: local and remote $TAG tags must exist and resolve to the same commit" >&2
+    exit 1
+  fi
+  if [ "${#ARTIFACTS[@]}" -ne 1 ] || [ "${ARTIFACTS[0]}" != "$DMG" ]; then
+    echo "release: refusing mac-only publish: only the verified DMG may be uploaded" >&2
+    exit 1
+  fi
+  if ! (cd "$ROOT" && gh release view "$TAG" >/dev/null 2>&1); then
+    echo "release: refusing mac-only publish: GitHub release $TAG does not exist" >&2
+    exit 1
+  fi
+  EXISTING_ASSETS="$(cd "$ROOT" && gh release view "$TAG" --json assets --jq '.assets[].name')"
+  if printf '%s\n' "$EXISTING_ASSETS" | grep -qxF "$(basename "$DMG")"; then
+    echo "release: refusing to overwrite existing DMG asset $(basename "$DMG") on $TAG" >&2
+    exit 1
+  fi
+else
 if git -C "$ROOT" rev-parse "$TAG" >/dev/null 2>&1; then
   echo "release: tag $TAG already exists locally"
 else
@@ -155,8 +219,13 @@ else
   echo "release: creating gh release $TAG"
   (cd "$ROOT" && gh release create "$TAG" --title "$TAG" --generate-notes)
 fi
+fi
 
 echo "release: uploading ${#ARTIFACTS[@]} artifact(s) to $TAG"
-(cd "$ROOT" && gh release upload "$TAG" "${ARTIFACTS[@]}" --clobber)
+if [ "$MAC_ONLY" = true ]; then
+  (cd "$ROOT" && gh release upload "$TAG" "${ARTIFACTS[@]}")
+else
+  (cd "$ROOT" && gh release upload "$TAG" "${ARTIFACTS[@]}" --clobber)
+fi
 echo "release: done TAG=$TAG"
 for f in "${ARTIFACTS[@]}"; do ls -lh "$f"; done

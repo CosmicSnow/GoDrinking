@@ -71,7 +71,7 @@ def main():
         if web_built:
             run('app', ['cargo', 'test', '--release', '--features', 'tauri/custom-protocol', '--tests', '--', '--show-output'], app)
         if args.desktop or sys.platform == 'win32':
-            built = web_built and run('desktop-build', ['cargo', 'build', '--release', '--features', 'tauri/custom-protocol', '--bins'], app)
+            built = web_built and run('desktop-build', ['cargo', 'build', '--release', '--features', 'tauri/custom-protocol,video-helper-bin', '--bins'], app)
             if built and sys.platform == 'win32':
                 run('windows-no-console', [sys.executable, 'scripts/check-windows-gui.py',
                     'app/target/release/goDrinking.exe', 'app/target/release/golive-video.exe'])

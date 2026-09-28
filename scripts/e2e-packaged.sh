@@ -44,7 +44,7 @@ fail() { echo "E2E-FAIL: $1" >&2; return 1; }
 # product-branded name expected by the packaged macOS app.
 HELPER_SRC="$ROOT/app/target/$E2E_PROFILE/golive-video"
 HELPER_DST="$(dirname "$BIN")/goDrinking-video"
-[ -f "$HELPER_SRC" ] || { fail "helper missing: run cargo build --bin golive-video in app/"; exit 1; }
+[ -f "$HELPER_SRC" ] || { fail "helper missing: run cargo build --bin golive-video --features video-helper-bin in app/"; exit 1; }
 if [ "$HELPER_SRC" -ef "$HELPER_DST" ]; then :; else cp -f "$HELPER_SRC" "$HELPER_DST" || { fail "helper stage failed"; exit 1; }; fi
 chmod +x "$HELPER_DST" || { fail "helper stage failed"; exit 1; }
 [ -f "$SERVER" ] || { fail "server missing: $SERVER"; exit 1; }

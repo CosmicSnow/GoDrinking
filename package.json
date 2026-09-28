@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "build:windows": "npm --prefix app/web run build && cd app && cargo tauri build -- --bin goDrinking",
-    "build:release": "npm --prefix app/web run build && cd app && cargo tauri build --no-bundle -- --bin goDrinking --bin golive-video",
+    "build:release": "npm --prefix app/web run build && cd app && cargo tauri build --no-bundle -- --bin goDrinking --bin golive-video --features video-helper-bin",
     "release": "bash scripts/release.sh"
   }
 }

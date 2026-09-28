@@ -10,6 +10,9 @@ description = "goDrinking thin Tauri shell over golive-core. No product logic: c
 name = "golive_app"
 crate-type = ["rlib"]
 
+[features]
+video-helper-bin = []
+
 [[bin]]
 name = "goDrinking"
 path = "src/main.rs"
@@ -17,6 +20,7 @@ path = "src/main.rs"
 [[bin]]
 name = "golive-video"
 path = "src/bin/video.rs"
+required-features = ["video-helper-bin"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
