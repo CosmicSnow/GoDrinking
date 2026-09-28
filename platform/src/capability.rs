@@ -53,13 +53,22 @@ pub const fn capabilities() -> CapabilitySet {
             exclusion: yes("process loopback exclui cada app marcado"),
         }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
     {
         CapabilitySet {
-            display: no("apenas macOS/Windows"),
-            window: no("apenas macOS/Windows"),
-            app_audio: no("apenas macOS/Windows"),
-            exclusion: no("apenas macOS/Windows"),
+            display: yes("portal ScreenCast + lista Wayland"),
+            window: yes("diálogo do portal"),
+            app_audio: yes("PipeWire, mix dos apps não marcados"),
+            exclusion: yes("PipeWire, mix dos apps não marcados"),
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        CapabilitySet {
+            display: no("apenas macOS/Windows/Linux"),
+            window: no("apenas macOS/Windows/Linux"),
+            app_audio: no("apenas macOS/Windows/Linux"),
+            exclusion: no("apenas macOS/Windows/Linux"),
         }
     }
 }
@@ -79,12 +88,14 @@ mod tests {
     #[test]
     fn app_audio_is_supported_on_desktop() {
         let caps = capabilities();
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         {
             assert!(caps.app_audio.supported);
             assert!(caps.exclusion.supported);
+            assert!(caps.display.supported);
+            assert!(caps.window.supported);
         }
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
         {
             assert!(!caps.app_audio.supported);
             assert!(!caps.exclusion.supported);

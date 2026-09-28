@@ -39,6 +39,11 @@ platform-windows/     golive-platform-windows: DXGI Desktop Duplication
                       (displays) + Windows.Graphics.Capture (windows).
                       Same VideoSource shape as macOS. Wired target-gated
                       in app/Cargo.toml.
+platform-linux/       golive-platform-linux: xdg-desktop-portal ScreenCast
+                      for pixels (MemPtr BGRA) and PipeWire per-app audio
+                      mixed in-process. Wayland lists monitors; the portal
+                      dialog confirms the source. Wired target-gated
+                      in app/Cargo.toml.
 server/               server.mjs: rendezvous signaling ONLY (routes envelopes,
                       never carries media, never parses SDP/candidates).
                       Contract: server/PROTOCOL.md (normative).
@@ -47,7 +52,7 @@ app/web/              React+TS+Vite frontend. Intents via Tauri commands;
                       to web/dist = Tauri frontendDist (git-ignored).
 ```
 
-## 2. Cross-platform requirement (Windows + macOS)
+## 2. Cross-platform requirement (Windows + macOS + Linux)
 
 - ALL OS code lives in its platform crate behind `golive_platform::VideoSource`
   (`enumerate` / `open` / `start`). `golive-core` never imports OS bindings;
@@ -63,6 +68,11 @@ app/web/              React+TS+Vite frontend. Intents via Tauri commands;
   Feeder + helper ship together — any wire change versions BOTH sides.
 - Denial is typed (`PlatformError::PermissionDenied` + Settings copy), never
   silence. Titles/pixels/tokens/SDP never reach logs.
+- Linux capture stays in `platform-linux/`: portal ScreenCast for video,
+  PipeWire node copies mixed in-process for per-app audio. No VAAPI. The
+  first share confirms the source in the desktop dialog; a restore token
+  skips it later. `enumerate()` lists Wayland outputs and does not open
+  that dialog.
 
 ## 3. Windows screen capture
 

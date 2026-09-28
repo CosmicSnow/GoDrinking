@@ -13,13 +13,15 @@ use std::time::Duration;
 use golive_platform_macos::{list_audio_apps as os_list, start_audio_tap as os_start, AudioTap};
 #[cfg(target_os = "windows")]
 use golive_platform_windows::{list_audio_apps as os_list, start_audio_tap as os_start, AudioTap};
+#[cfg(target_os = "linux")]
+use golive_platform_linux::{list_audio_apps as os_list, start_audio_tap as os_start, AudioTap};
 
 pub fn list_apps() -> Vec<AudioApp> {
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     {
         os_list()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         Vec::new()
     }
@@ -34,7 +36,7 @@ pub struct ShareAudio {
 }
 
 struct OsTap {
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     _inner: AudioTap,
 }
 
@@ -132,8 +134,14 @@ fn start_window_tap(window_id: &str, tx: SyncSender<EncodedAudioPacket>) -> Resu
                 .map_err(|error| error.to_string());
         }
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        let _ = window_id;
+        return start_tap(&golive_platform::default_excluded_tokens(), tx);
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     let _ = window_id;
+    #[cfg(not(target_os = "linux"))]
     start_tap(&[], tx)
 }
 
@@ -141,16 +149,16 @@ fn start_tap(
     excluded: &[String],
     tx: SyncSender<EncodedAudioPacket>,
 ) -> Result<OsTap, String> {
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     {
         os_start(excluded, tx)
             .map(|inner| OsTap { _inner: inner })
             .map_err(|error| error.to_string())
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         let _ = (excluded, tx);
-        Err("áudio do sistema: apenas macOS/Windows".into())
+        Err("áudio do sistema: apenas macOS, Windows e Linux".into())
     }
 }
 

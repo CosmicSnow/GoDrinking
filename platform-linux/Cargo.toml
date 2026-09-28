@@ -1,0 +1,19 @@
+[package]
+name = "golive-platform-linux"
+version = "0.7.5"
+edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0"
+description = "goDrinking Linux capture backend (xdg-desktop-portal screen + PipeWire per-app audio)."
+
+[lib]
+name = "golive_platform_linux"
+crate-type = ["rlib"]
+
+[dependencies]
+golive-platform = { path = "../platform" }
+pipewire = "0.9"
+zbus = "4.4"
+wayland-client = "0.31"
+opus = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
