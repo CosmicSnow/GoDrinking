@@ -1,5 +1,9 @@
 # changelog
 
+## v0.7.15
+
+- fix: windows builds only produce goDrinking.exe, no golive-video helper
+
 ## v0.7.14
 
 - fix: windows share shows the mouse cursor on display capture

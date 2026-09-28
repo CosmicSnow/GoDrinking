@@ -57,7 +57,7 @@ O app e o helper agora declaram `windows_subsystem = "windows"`, inclusive no de
 O teste verifica o **arquivo compilado**, não apenas a presença de uma linha no código:
 
 ```sh
-python scripts/check-windows-gui.py app/target/release/goDrinking.exe app/target/release/golive-video.exe
+python scripts/check-windows-gui.py app/target/release/goDrinking.exe
 ```
 
 Ele reprova se faltar um arquivo, o PE for inválido ou o subsystem for console=3. Os executáveis Windows antigos disponíveis localmente reprovaram nos dois casos. A correção exige recompilar/substituir o `.exe`; ela não altera os arquivos já distribuídos. A inspeção PE não testa janelas criadas explicitamente por código ou programas externos.

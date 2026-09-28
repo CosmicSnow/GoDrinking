@@ -1,9 +1,9 @@
 {
   "name": "golive",
-  "version": "0.7.14",
+  "version": "0.7.15",
   "private": true,
   "scripts": {
-    "build:windows": "npm --prefix app/web run build && cd app && cargo tauri build",
+    "build:windows": "npm --prefix app/web run build && cd app && cargo tauri build -- --bin goDrinking",
     "build:release": "npm --prefix app/web run build && cd app && cargo tauri build --no-bundle -- --bin goDrinking --bin golive-video",
     "release": "bash scripts/release.sh"
   }

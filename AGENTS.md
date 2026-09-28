@@ -95,7 +95,7 @@ packaged exe points at `devUrl` instead of the bundled `frontendDist`.
 
 - Reusable suite from repo root: `python3 scripts/verify.py` (`python` on Windows). Setup and coverage: `TESTING.md`. Includes app integration tests, not just `--lib`; missing fields in integration fixtures must not go unnoticed.
 - Desktop performance gate: `python3 scripts/verify.py --desktop` (graphical session + FFmpeg). Builds fresh frontend/binaries and tests 1/2 viewers; a cadence failure remains a failure even at a 60 FPS average.
-- Windows release executables must pass `python scripts/check-windows-gui.py app/target/release/goDrinking.exe app/target/release/golive-video.exe` to prevent accidental console windows.
+- Windows release executables must pass `python scripts/check-windows-gui.py app/target/release/goDrinking.exe` to prevent accidental console windows.
 
 - `npm test` in `app/web/` — vitest (`api.test.ts`, `e2e.test.ts`; Tauri APIs mocked).
 - `cargo test` in `app/` — lib unit tests (video math/protocol, bridge pump,
