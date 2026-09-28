@@ -1,5 +1,12 @@
 # changelog
 
+## v0.7.10
+
+- fix: windows screen share no longer echoes when both peers share, and discord is not mixed back in
+- fix: windows display share shows the mouse cursor
+- fix: windows window share no longer draws the capture border
+- fix: "ignorar áudio de apps" shows which apps are playing sound
+
 ## v0.7.9
 
 - feat: player volume can boost to 200%; double-click resets to 100%

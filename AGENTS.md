@@ -156,7 +156,27 @@ packaged exe points at `devUrl` instead of the bundled `frontendDist`.
 - A bug that is 100% fixed AND verified is REMOVED from `BUGS.md`.
   Never mark done-in-place; the list holds open bugs only.
 
-## 9. Commit style
+## 9. Version on every commit
+
+Every commit bumps the product version before it is created. Default is the
+patch number (`0.7.9` → `0.7.10`). If the developer names a specific version,
+use that and do not increment past it.
+
+Keep these in sync (same string; `v` prefix only on the changelog heading
+and the git tag):
+
+- `package.json`
+- `app/Cargo.toml` and the `golive-app` entry in `app/Cargo.lock`
+- `app/tauri.conf.json`
+- `app/web/package.json` and the root `version` fields in
+  `app/web/package-lock.json`
+- `CHANGELOG.md` (`## vX.Y.Z` at the top)
+
+Do not bump `core/`, `platform/`, `platform-macos/`, or `platform-windows/`
+crate versions — those are not the product version. The release tag is
+`v` + this version (`v0.7.10`).
+
+## 10. Commit style
 
 Short `type: subject` headers, lowercase, no trailing period. Usual types:
 `feat:`, `fix:`, `refactor:`, `release:`. `sala:` prefix for Sala-lane work,
