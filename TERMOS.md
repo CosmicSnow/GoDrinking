@@ -34,7 +34,7 @@ Você usa o programa por sua conta e risco. Você escolhe o que aparece na tela,
 
 Os responsáveis pelo repositório não participam da sua sala, não escolhem o conteúdo e não têm como revisar a transmissão, porque a mídia não passa por eles. Não monitoram a sua tela. Não são provedores do conteúdo que os participantes trocam entre si.
 
-Na medida máxima permitida pela lei brasileira, os responsáveis pelo repositório não respondem por dano, prejuízo, lucro cessante, perda de dados, vazamento entre participantes, uso indevido por terceiros, indisponibilidade, ou reclamação de autoridade, decorrente do uso ou da impossibilidade de uso.
+Os responsáveis pelo repositório não respondem por dano, prejuízo, perda de dados, vazamento entre participantes, uso indevido por terceiros ou indisponibilidade, decorrente do uso ou da impossibilidade de uso.
 
 Isso inclui, sem esgotar a lista:
 
@@ -45,14 +45,14 @@ Isso inclui, sem esgotar a lista:
 - instalador, binário ou código alterado por alguém que não seja um responsável pelo repositório;
 - falha de rede, de sistema ou de outro serviço fora deste repositório.
 
-Você concorda em indenizar e manter indenes os responsáveis pelo repositório diante de reclamação, processo, multa ou despesa, inclusive honorários razoáveis de defesa, causada pelo seu uso, pelo uso de quem você convidou quando esse uso decorre do acesso que você deu, ou pelo descumprimento destes termos. Essa obrigação só existe no que a lei permitir exigir de você.
+Se o seu uso gerar reclamação de terceiro contra os responsáveis pelo repositório, você assume essa reclamação e os custos razoáveis de defesa.
 
 ## 5. O que você não pode fazer
 
-É proibido usar o goDrinking para qualquer fim ilícito no Brasil ou no país de quem participa. Em especial, é proibido:
+É proibido usar o goDrinking para fim ilícito. Em especial, é proibido:
 
 - transmitir, pedir ou armazenar material de abuso sexual de criança ou adolescente;
-- compartilhar imagem, voz ou tela de alguém sem o consentimento ou a base legal exigida;
+- compartilhar imagem, voz ou tela de alguém sem o consentimento necessário;
 - invadir sistema, capturar credencial, aplicar golpe ou fraudar;
 - violar direito autoral ou expor dado pessoal de terceiro sem permissão;
 - usar a sala para vigiar pessoa que não aceitou estar nela;
@@ -69,7 +69,7 @@ O servidor público trata só o que a sinalização precisa para a sala existir:
 
 A conexão até o servidor público pode passar por rede de terceiro, como o seu provedor e a Cloudflare. Esses terceiros têm regras próprias e podem ver metadados de conexão que este projeto não controla. Endereço IP observado na borda não é conteúdo da tela.
 
-Você é o responsável, perante a LGPD e as demais leis, pelos dados pessoais que a sua transmissão expõe. Os responsáveis pelo repositório não se tornam controladores do conteúdo da sua tela por hospedarem a sinalização.
+Você responde pelos dados e pelo conteúdo que a sua transmissão expõe. Hospedar a sinalização não torna os responsáveis pelo repositório responsáveis pela sua tela.
 
 ## 7. Cópias e instaladores
 
@@ -77,14 +77,8 @@ Baixe o instalador só pelas fontes oficiais indicadas no `README.md`: o site do
 
 Quem modifica o código e distribui a modificação responde sozinho pela modificação e por quem a instala. Não pode atribuir essa versão aos responsáveis pelo repositório.
 
-## 8. O que estes termos não fazem
+## 8. Mudanças
 
-Estes termos não autorizam crime, não cobrem uso ilícito e não afastam dever que a lei brasileira imponha de forma obrigatória. Se alguma frase daqui for considerada inválida, as outras continuam valendo. Nenhuma frase deve ser lida como renúncia a direito que não possa ser renunciado, nem como confissão de obrigação que a lei não crie.
+Estes termos não autorizam uso ilícito. Se alguma frase for inválida, as outras continuam valendo.
 
-Os responsáveis pelo repositório não são o Estado, não representam autoridade e não prometem que o uso do programa esteja livre de fiscalização, bloqueio ou ordem judicial. Se uma autoridade exigir algo que a lei imponha a quem opera um servidor, isso será tratado na medida dessa ordem. Este documento não é um pedido para descumprir a lei.
-
-## 9. Lei e mudanças
-
-Estes termos são regidos pelas leis da República Federativa do Brasil. Mudança futura passa a valer quando publicada neste arquivo, no endereço do repositório. Continuar usando o programa depois da publicação significa aceitar a versão nova. Quem não concordar deve parar de usar.
-
-Dúvida sobre estes termos pode ser enviada por um issue neste repositório. Issue não é canal para denúncia de emergência nem substitui autoridade pública.
+Mudança futura passa a valer quando publicada neste arquivo. Continuar usando o programa depois da publicação significa aceitar a versão nova. Quem não concordar deve parar de usar.
