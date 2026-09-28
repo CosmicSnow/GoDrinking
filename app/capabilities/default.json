@@ -1,11 +1,18 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "identifier": "default",
-  "description": "Minimal capabilities: frontend may listen to backend events and backend may emit them. Nothing else.",
+  "description": "Frontend may listen to backend events, and may open only this repository's GitHub release URLs.",
   "windows": ["main", "player-*"],
   "permissions": [
     "core:event:allow-listen",
     "core:event:allow-emit",
-    "core:event:allow-unlisten"
+    "core:event:allow-unlisten",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://github.com/CosmicSnow/GoDrinking/releases" },
+        { "url": "https://github.com/CosmicSnow/GoDrinking/releases/**" }
+      ]
+    }
   ]
 }

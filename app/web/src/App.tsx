@@ -876,7 +876,9 @@ export default function App() {
       info={update}
       open={updateOpen}
       onClose={() => setUpdateOpen(false)}
-      onOpenUrl={(url) => openUpdateUrl(url)}
+      onOpenUrl={(url) => {
+        void openUpdateUrl(url);
+      }}
     />
   );
 

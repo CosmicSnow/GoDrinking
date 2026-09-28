@@ -11,6 +11,24 @@ export const UPDATE_API_URL = `https://api.github.com/repos/${UPDATE_REPO}/relea
 export const RELEASES_URL = `https://github.com/${UPDATE_REPO}/releases`;
 export const RELEASES_LATEST_URL = `${RELEASES_URL}/latest`;
 export const UPDATE_TIMEOUT_MS = 8000;
+const UPDATE_RELEASES_PATH = "/CosmicSnow/GoDrinking/releases";
+
+/** Only official GitHub release pages and assets for this repository. */
+export function isUpdateUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return (
+      parsed.protocol === "https:" &&
+      parsed.username === "" &&
+      parsed.password === "" &&
+      parsed.hostname === "github.com" &&
+      (parsed.pathname === UPDATE_RELEASES_PATH ||
+        parsed.pathname.startsWith(`${UPDATE_RELEASES_PATH}/`))
+    );
+  } catch {
+    return false;
+  }
+}
 
 export interface ReleaseAsset {
   id?: number;
@@ -147,7 +165,10 @@ export async function checkForUpdate(
     return {
       latest,
       tag: data.tag_name,
-      assetUrl: asset?.browser_download_url ?? null,
+      assetUrl:
+        asset && isUpdateUrl(asset.browser_download_url)
+          ? asset.browser_download_url
+          : null,
       releasesUrl,
     };
   } catch {
@@ -157,9 +178,75 @@ export async function checkForUpdate(
   }
 }
 
-/** Abre a URL de download (nova aba no navegador / navegador do SO no Tauri). */
-export function openUpdateUrl(url: string): void {
-  if (typeof window !== "undefined" && typeof window.open === "function") {
-    window.open(url, "_blank", "noopener,noreferrer");
+/**
+ * Tenta abrir a URL via plugin opener do Tauri (navegador do SO).
+ * Devolve true quando conseguiu; false quando não está no Tauri,
+ * o plugin falta/falha, ou o import dinâmico não resolve.
+ * Nunca joga — qualquer falha vira false para o fallback browser.
+ */
+async function tryTauriOpen(url: string): Promise<boolean> {
+  try {
+    const core = await import("@tauri-apps/api/core");
+    const isTauri =
+      typeof core.isTauri === "function" ? core.isTauri() : false;
+    if (!isTauri) return false;
+    const { openUrl } = await import("@tauri-apps/plugin-opener");
+    await openUrl(url);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Abre a URL de download no navegador do SO (Tauri) ou nova aba (browser).
+ *
+ * - No Tauri empacotado (Windows/macOS): `openUrl` do plugin-opener abre o
+ *   navegador padrão do SO — vale tanto para a página de releases ("Baixar
+ *   do site") quanto para o asset direto ("Baixar direto", GitHub redireciona
+ *   para o binário da plataforma). `window.open` sozinho é bloqueado/sem
+ *   efeito no WebView, por isso o plugin vem primeiro.
+ * - No browser puro (mock.ts): `window.open` + fallback de clique em âncora
+ *   (o clique dispara o download direto do asset; para a página, navega).
+ * - Em falha do plugin, cai para o caminho browser automaticamente.
+ * - Nunca joga (o modal não pode quebrar).
+ */
+export async function openUpdateUrl(url: string): Promise<void> {
+  if (!isUpdateUrl(url)) return;
+  try {
+    if (await tryTauriOpen(url)) return;
+  } catch {
+    // segue para o fallback browser abaixo
+  }
+  try {
+    if (typeof window !== "undefined") {
+      if (typeof window.open === "function") {
+        const win = window.open(url, "_blank", "noopener,noreferrer");
+        if (win) {
+          try {
+            win.opener = null;
+          } catch {
+            // ignora: só endurece contra tab-napping
+          }
+          return;
+        }
+      }
+      // window.open bloqueado/nulo (WebView sem plugin, popup-blocker):
+      // clique em âncora dispara download direto ou navegação.
+      const doc = window.document;
+      if (doc?.createElement && doc.body) {
+        const anchor = doc.createElement("a");
+        anchor.href = url;
+        anchor.target = "_blank";
+        anchor.rel = "noopener noreferrer";
+        doc.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        return;
+      }
+      window.location.href = url;
+    }
+  } catch {
+    // nunca joga: modal deve sobreviver a qualquer falha de abertura
   }
 }

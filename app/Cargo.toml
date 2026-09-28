@@ -1,6 +1,6 @@
 [package]
 name = "golive-app"
-version = "0.7.8"
+version = "0.7.9"
 edition = "2021"
 default-run = "goDrinking"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -27,6 +27,7 @@ golive-core = { path = "../core" }
 # Capture platform abstraction (pure trait/types; core never imports this).
 golive-platform = { path = "../platform" }
 tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Share-modal thumbnails: PNG encode + data-URL base64 (offline-safe: both

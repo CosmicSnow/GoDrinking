@@ -1,5 +1,10 @@
 # changelog
 
+## v0.7.9
+
+- feat: player volume can boost to 200%; double-click resets to 100%
+- fix: open update downloads in the OS browser, limited to this repository's GitHub release URLs
+
 ## v0.7.8
 
 - feat: persist "seu nick" and "servidor" on the user machine (localStorage), restored on next open

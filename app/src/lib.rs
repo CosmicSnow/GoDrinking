@@ -1829,6 +1829,7 @@ pub fn run_with(state: Arc<AppState>) {
     screen::install_decoder_backend();
     let log_state = Arc::clone(&state);
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .manage(state)
         .setup(move |app| {
             if let Ok(mut inner) = log_state.inner.lock() { inner.desktop = Some(app.handle().clone()); }

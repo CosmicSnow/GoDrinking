@@ -267,7 +267,7 @@ impl ViewerPlayback {
         })
     }
 
-    pub fn set_gain(&self, gain: f32) { self.gain.store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed); }
+    pub fn set_gain(&self, gain: f32) { self.gain.store(gain.clamp(0.0, 2.0).to_bits(), Ordering::Relaxed); }
 
     pub fn callback(&self) -> Arc<dyn Fn(&[f32]) + Send + Sync> {
         let queue = Arc::clone(&self.queue);
@@ -346,6 +346,28 @@ mod tests {
         assert_eq!(samples, [0.4, -0.2, 0.0]);
         apply_gain(&mut samples, 0.0);
         assert_eq!(samples, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn playback_gain_preserves_boost_and_defensively_clamps() {
+        let playback = ViewerPlayback {
+            gain: Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits())),
+            queue: Arc::new(Mutex::new(VecDeque::new())),
+            stop: Arc::new(AtomicBool::new(false)),
+            _thread: None,
+        };
+
+        playback.set_gain(1.5);
+        let stored = f32::from_bits(playback.gain.load(Ordering::Relaxed));
+        assert_eq!(stored, 1.5);
+        let mut samples = [0.4];
+        apply_gain(&mut samples, stored);
+        assert!((samples[0] - 0.6).abs() < f32::EPSILON);
+
+        playback.set_gain(3.0);
+        assert_eq!(f32::from_bits(playback.gain.load(Ordering::Relaxed)), 2.0);
+        playback.set_gain(-1.0);
+        assert_eq!(f32::from_bits(playback.gain.load(Ordering::Relaxed)), 0.0);
     }
 
     #[test]

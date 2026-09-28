@@ -20,6 +20,11 @@ pub struct PlayerState {
     pub mute_all: bool,
 }
 const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const MAX_PLAYER_VOLUME: f32 = 2.0;
+
+fn valid_player_volume(volume: f32) -> bool {
+    volume.is_finite() && (0.0..=MAX_PLAYER_VOLUME).contains(&volume)
+}
 
 /// Ack-gap histogram bands for the present stage (>20/>25/>34/>50 ms).
 /// Nested: one 60 ms stall counts in all four. Pure so tests own time.
@@ -341,7 +346,7 @@ pub fn player_audio(
     volume: f32,
     muted: bool,
 ) -> Result<(), String> {
-    if !volume.is_finite() || !(0.0..=1.0).contains(&volume) {
+    if !valid_player_volume(volume) {
         return Err("volume inválido".into());
     }
     let snapshot = {
@@ -598,5 +603,15 @@ mod tests {
         let next = s.dispatch().unwrap();
         assert_ne!(next.seq, first.seq);
         assert_eq!(&next.bytes[20..], &[9; 8]);
+    }
+
+    #[test]
+    fn player_volume_accepts_bounded_boost_and_rejects_invalid_values() {
+        for volume in [0.0, 1.0, MAX_PLAYER_VOLUME] {
+            assert!(valid_player_volume(volume), "expected {volume} to be valid");
+        }
+        for volume in [-f32::EPSILON, MAX_PLAYER_VOLUME + 0.01, f32::NAN, f32::INFINITY] {
+            assert!(!valid_player_volume(volume), "expected {volume:?} to be invalid");
+        }
     }
 }

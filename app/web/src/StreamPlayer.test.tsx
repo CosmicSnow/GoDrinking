@@ -31,7 +31,7 @@ describe("stream presentation", () => {
 
   it("bounds zoom and offers the same volume/fullscreen/return controls in a popup", () => {
     const html = renderToStaticMarkup(createElement(StreamPlayer, { member: "a", nickname: "Ana", popupWindow: true }));
-    for (const label of ["Voltar à sala", "Volume de Ana", "Ampliar", "100%", "<canvas"]) expect(html).toContain(label);
+    for (const label of ["Voltar à sala", "Volume de Ana", 'max="200"', 'value="100"', "100% é o padrão", "Ampliar", "<canvas"]) expect(html).toContain(label);
     expect(html).not.toContain("Em pop-up");
   });
 
@@ -39,7 +39,7 @@ describe("stream presentation", () => {
     const html = renderToStaticMarkup(createElement(StreamPlayer, {
       member: "a", nickname: "Ana", onPin: () => undefined, onStop: () => undefined,
     }));
-    for (const label of ["Fixar", "Pop-up", "Ampliar", "100%", "Volume de Ana", "Parar de ver", "Aguardando vídeo"]) {
+    for (const label of ["Fixar", "Pop-up", "Ampliar", 'max="200"', 'value="100"', "100% é o padrão", "Volume de Ana", "Parar de ver", "Aguardando vídeo"]) {
       expect(html).toContain(label);
     }
     expect(html).not.toContain("Em pop-up");

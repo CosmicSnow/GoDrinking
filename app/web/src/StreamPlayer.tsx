@@ -126,6 +126,9 @@ export function StreamPlayer({ member, nickname, pinned, popupWindow = false, on
   const audio = (volume: number, muted: boolean) => {
     void playerAudio(member, volume, muted).catch(e => setError(String(e)));
   };
+  const resetVolume = () => audio(1, state.muted);
+  const volumePercent = Math.round(state.volume * 100);
+  const volumeTitle = `Volume: ${volumePercent}% — 100% é o padrão, até 200% de reforço; duplo-clique para 100%`;
   return <article ref={host} className={`tile stream-player${pinned ? " is-pinned" : ""}${detached ? " is-popup" : ""}`} data-hook="tile-stream" data-member={member} tabIndex={0} aria-label={`Transmissão de ${nickname}`}
     onKeyDown={e => {
       if ((e.target as HTMLElement).matches("input,button,select")) return;
@@ -148,7 +151,7 @@ export function StreamPlayer({ member, nickname, pinned, popupWindow = false, on
       <button type="button" className="tbtn" data-testid="player-popup" disabled={moving} onClick={() => void move()} title={state.popup ? "Voltar para a sala" : "Abrir apenas esta transmissão em outra janela"}>{moving ? "Movendo…" : state.popup ? "Voltar à sala" : "Pop-up ↗"}</button>
       {!detached ? <><button type="button" className="tbtn full" onClick={() => void full()} title="Tela cheia (F ou duplo-clique)">Ampliar</button><button type="button" className="tbtn zoom-reset" onClick={reset} title="Restaurar zoom e posição (0)">{Math.round(zoom.scale * 100)}%</button></> : null}
       <div className="player-volume"><button type="button" className={`tbtn mute${state.muted ? " on" : ""}`} onClick={() => audio(state.volume, !state.muted)} aria-pressed={state.muted} title={state.mute_all ? "Áudio geral silenciado" : "Silenciar esta transmissão"}>{state.muted ? "Mudo" : "Som"}</button>
-      <input type="range" min="0" max="100" value={Math.round(state.volume * 100)} aria-label={`Volume de ${nickname}`} title={`Volume: ${Math.round(state.volume * 100)}%`} onChange={e => audio(Number(e.target.value) / 100, state.muted)} /></div>
+      <input type="range" min="0" max="200" value={volumePercent} aria-label={`Volume de ${nickname}`} aria-valuetext={`${volumePercent}%${volumePercent > 100 ? " (reforço)" : ""}`} title={volumeTitle} onChange={e => audio(Number(e.target.value) / 100, state.muted)} onDoubleClick={resetVolume} /></div>
       {onStop ? <button type="button" className="tbtn warn" onClick={onStop}>Parar de ver</button> : null}
     </div>
   </article>;
