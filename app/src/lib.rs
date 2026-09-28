@@ -150,16 +150,12 @@ pub fn backend_note_for(backend: Option<&str>) -> Option<String> {
             None
         }
         Some("openh264") => Some(
-            if cfg!(target_os = "windows") {
-                if std::env::var_os("GOLIVE_DISABLE_HW").is_some() {
-                    "hardware desabilitado (GOLIVE_DISABLE_HW)".to_owned()
-                } else {
-                    "NVENC indisponível — usando OpenH264 (software)".to_owned()
-                }
+            if std::env::var_os("GOLIVE_DISABLE_HW").is_some() {
+                "hardware desabilitado (GOLIVE_DISABLE_HW)".to_owned()
+            } else if cfg!(target_os = "windows") {
+                "NVENC indisponível — usando OpenH264 (software)".to_owned()
             } else if cfg!(not(target_os = "macos")) {
                 "sem aceleração de hardware nesta plataforma".to_owned()
-            } else if std::env::var_os("GOLIVE_DISABLE_HW").is_some() {
-                "hardware desabilitado (GOLIVE_DISABLE_HW)".to_owned()
             } else {
                 "probe de hardware falhou — ver log de sessão".to_owned()
             },

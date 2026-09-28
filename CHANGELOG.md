@@ -1,5 +1,9 @@
 # changelog
 
+## v0.7.15
+
+- feat: linux screen share through the desktop portal, with per-app PipeWire audio
+
 ## v0.7.14
 
 - fix: windows share shows the mouse cursor on display capture

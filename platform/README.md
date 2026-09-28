@@ -23,6 +23,11 @@ platform-macos/            golive-platform-macos (macOS only)
                            ScreenCaptureKit via pure objc2 bindings
                            (no Swift toolchain — undeployable here, see below)
 
+platform-linux/            golive-platform-linux (Linux only)
+  src/lib.rs               LinuxSource: Wayland monitor list, portal
+                           ScreenCast frames, KDE thumbnail
+  src/audio.rs             PipeWire per-app tap, 48 kHz mix, Opus
+
 core (media::VideoSource::External)
   consumes std-channel I420Frame only. Knows no backend.
 

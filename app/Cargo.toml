@@ -1,6 +1,6 @@
 [package]
 name = "golive-app"
-version = "0.7.14"
+version = "0.7.15"
 edition = "2021"
 default-run = "goDrinking"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -59,6 +59,10 @@ golive-platform-macos = { path = "../platform-macos" }
 # the macOS backend above: other platforms build without it.
 [target.'cfg(target_os = "windows")'.dependencies]
 golive-platform-windows = { path = "../platform-windows" }
+
+# Linux capture backend (xdg-desktop-portal + PipeWire). Target-gated.
+[target.'cfg(target_os = "linux")'.dependencies]
+golive-platform-linux = { path = "../platform-linux" }
 
 # RGBA conversion is on the live receive path; unoptimized OpenH264 misses
 # the 720p30 frame budget even when native decoding is fast.

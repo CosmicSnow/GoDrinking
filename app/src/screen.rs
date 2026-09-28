@@ -229,11 +229,17 @@ fn open_stream(
         let stream = source.start(config)?;
         Ok((stream, golive_platform_windows::WindowsSource::restart_order(info)))
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        let mut source = golive_platform_linux::LinuxSource::open(info)?;
+        let stream = source.start(config)?;
+        Ok((stream, golive_platform_linux::LinuxSource::restart_order(info)))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         let _ = (info, config);
         Err(PlatformError::UnsupportedPlatform {
-            reason: "captura de tela: apenas macOS (Windows planejado)",
+            reason: "captura de tela: apenas macOS, Windows e Linux",
         })
     }
 }
@@ -455,10 +461,14 @@ pub fn enumerate_sources() -> Result<Vec<SourceInfo>, PlatformError> {
     {
         golive_platform_windows::enumerate()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        golive_platform_linux::enumerate()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         Err(PlatformError::UnsupportedPlatform {
-            reason: "captura de tela: apenas macOS (Windows planejado)",
+            reason: "captura de tela: apenas macOS, Windows e Linux",
         })
     }
 }
@@ -506,11 +516,15 @@ fn thumbnail_for(info: &SourceInfo) -> Result<BgraFrame, PlatformError> {
     {
         golive_platform_windows::thumbnail(info.kind, &info.id)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        golive_platform_linux::thumbnail(info.kind, &info.id)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         let _ = info;
         Err(PlatformError::UnsupportedPlatform {
-            reason: "miniaturas: apenas macOS (Windows planejado)",
+            reason: "miniaturas: apenas macOS, Windows e Linux",
         })
     }
 }
@@ -704,15 +718,26 @@ mod tests {
 
     #[test]
     fn enumerate_fails_typed_off_macos() {
-        // On macOS/Windows enumerate() touches the OS (prompt/denial) —
-        // unit tests must NEVER treat that as UnsupportedPlatform.
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        // On a desktop enumerate() touches the OS. Linux lists Wayland
+        // outputs and does not open the portal dialog. A headless runner
+        // may fail typed, and that failure is never UnsupportedPlatform.
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
         {
             let error = enumerate_sources().unwrap_err();
             assert!(matches!(
                 error,
                 PlatformError::UnsupportedPlatform { .. }
             ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let caps = crate::screen::capabilities();
+            assert!(caps.display.supported);
+            assert!(caps.window.supported);
+            match enumerate_sources() {
+                Ok(list) => assert!(!list.is_empty()),
+                Err(error) => assert!(!matches!(error, PlatformError::UnsupportedPlatform { .. })),
+            }
         }
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
