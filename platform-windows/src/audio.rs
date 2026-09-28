@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 
 const FRAME_SAMPLES: usize = 960 * 2;
 const MAX_INCLUDE: usize = 16;
-const ACTIVE_WINDOW: Duration = Duration::from_millis(250);
 
 pub struct AudioTap {
     shutdown: Arc<AtomicBool>,
@@ -344,13 +343,12 @@ struct PcmCapture {
     capture: wasapi::AudioCaptureClient,
     pending: VecDeque<u8>,
     pcm: VecDeque<f32>,
+    discontinuity: bool,
 }
 
 struct LiveInclude {
     pid: u32,
     capture: PcmCapture,
-    last_data: Instant,
-    produced: bool,
 }
 
 struct MixCapture {
@@ -387,6 +385,7 @@ fn init_capture(mut client: wasapi::AudioClient, kind: &str) -> Result<PcmCaptur
         capture,
         pending: VecDeque::new(),
         pcm: VecDeque::new(),
+        discontinuity: false,
     })
 }
 
@@ -423,12 +422,16 @@ fn pull_pcm(stream: &mut PcmCapture) -> bool {
         if frames == 0 {
             break;
         }
-        let Ok(_info) = stream
+        let Ok(info) = stream
             .capture
             .read_from_device_to_deque(&mut stream.pending)
         else {
             break;
         };
+        if info.flags.data_discontinuity {
+            stream.discontinuity = true;
+            stream.pending.clear();
+        }
         got = true;
         while stream.pending.len() >= 8 {
             let mut frame = [0_u8; 8];
@@ -481,12 +484,18 @@ fn encode_frame(
     match encoder.encode_float(frame, &mut output) {
         Ok(size) if size > 0 => {
             output.truncate(size);
-            match opus_tx.try_send(EncodedAudioPacket {
+            let packet = EncodedAudioPacket {
                 data: output,
                 duration: Duration::from_millis(20),
-            }) {
-                Ok(()) | Err(TrySendError::Full(_)) => true,
-                Err(TrySendError::Disconnected(_)) => false,
+            };
+            let deadline = Instant::now() + Duration::from_millis(40);
+            loop {
+                match opus_tx.try_send(packet.clone()) {
+                    Ok(()) => return true,
+                    Err(TrySendError::Disconnected(_)) => return false,
+                    Err(TrySendError::Full(_)) if Instant::now() >= deadline => return true,
+                    Err(TrySendError::Full(_)) => thread::sleep(Duration::from_millis(2)),
+                }
             }
         }
         _ => true,
@@ -504,21 +513,30 @@ fn wasapi_mix(
     else {
         return;
     };
+    let mut next_emit = Instant::now();
+    let mut prev = [0.0f32; 2];
     while !shutdown.load(Ordering::Acquire) {
-        let mut got = false;
+        let mut force = false;
         for stream in &mut mix.streams {
-            if pull_pcm(stream) {
-                got = true;
+            if pull_pcm(stream) && stream.discontinuity {
+                force = true;
+                stream.discontinuity = false;
+            }
+            if trim_latency(&mut stream.pcm) {
+                force = true;
             }
         }
-        while let Some(frame) = take_frame(&mut mix.streams) {
-            if !encode_frame(&mut encoder, &frame, &opus_tx) {
-                return;
+        let now = Instant::now();
+        if now >= next_emit {
+            if let Some(mut frame) = take_frame(&mut mix.streams) {
+                declick(&mut prev, &mut frame, force);
+                if !encode_frame(&mut encoder, &frame, &opus_tx) {
+                    return;
+                }
+                next_emit = pace_next(next_emit, now);
             }
         }
-        if !got {
-            thread::sleep(Duration::from_millis(5));
-        }
+        thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -546,6 +564,8 @@ fn selective_loop(
         .spawn(move || watch_includes(watch_tokens, sub_tx, watch_shutdown))
         .ok();
     let mut clients: Vec<LiveInclude> = Vec::new();
+    let mut next_emit = Instant::now();
+    let mut prev = [0.0f32; 2];
     while !shutdown.load(Ordering::Acquire) {
         while let Ok(client) = sub_rx.try_recv() {
             if clients.iter().any(|existing| existing.pid == client.pid) {
@@ -553,24 +573,28 @@ fn selective_loop(
             }
             clients.push(client);
         }
-        let mut got = false;
+        let mut force = false;
         let now = Instant::now();
         for client in &mut clients {
-            if pull_pcm(&mut client.capture) {
-                got = true;
-                client.last_data = now;
-                client.produced = true;
+            if pull_pcm(&mut client.capture) && client.capture.discontinuity {
+                force = true;
+                client.capture.discontinuity = false;
+            }
+            if trim_latency(&mut client.capture.pcm) {
+                force = true;
             }
         }
-        while let Some(frame) = mix_ready(&mut clients, now) {
-            if !encode_frame(&mut encoder, &frame, &opus_tx) {
-                let _ = watcher.and_then(|thread| thread.join().ok());
-                return;
+        if now >= next_emit {
+            if let Some(mut frame) = mix_ready(&mut clients) {
+                declick(&mut prev, &mut frame, force);
+                if !encode_frame(&mut encoder, &frame, &opus_tx) {
+                    let _ = watcher.and_then(|thread| thread.join().ok());
+                    return;
+                }
+                next_emit = pace_next(next_emit, now);
             }
         }
-        if !got {
-            thread::sleep(Duration::from_millis(5));
-        }
+        thread::sleep(Duration::from_millis(2));
     }
     let _ = watcher.and_then(|thread| thread.join().ok());
 }
@@ -599,12 +623,7 @@ fn watch_includes(tokens: Vec<String>, sub_tx: mpsc::Sender<LiveInclude>, shutdo
             if let Some(capture) = open_include(pid) {
                 opened.insert(pid);
                 if sub_tx
-                    .send(LiveInclude {
-                        pid,
-                        capture,
-                        last_data: Instant::now(),
-                        produced: false,
-                    })
+                    .send(LiveInclude { pid, capture })
                     .is_err()
                 {
                     return;
@@ -620,17 +639,18 @@ fn watch_includes(tokens: Vec<String>, sub_tx: mpsc::Sender<LiveInclude>, shutdo
     }
 }
 
-fn mix_ready(clients: &mut [LiveInclude], now: Instant) -> Option<Vec<f32>> {
+fn mix_ready(clients: &mut [LiveInclude]) -> Option<Vec<f32>> {
     if clients.is_empty() {
         return None;
     }
-    let mut gating = Vec::new();
-    for (index, client) in clients.iter().enumerate() {
-        let recent = client.produced && now.duration_since(client.last_data) < ACTIVE_WINDOW;
-        if client.capture.pcm.len() >= FRAME_SAMPLES || recent {
-            gating.push(index);
-        }
-    }
+    // Only clients holding a full frame take part. Waiting on a client that
+    // just went quiet stalls the shared 20 ms clock and drops audio.
+    let gating: Vec<usize> = clients
+        .iter()
+        .enumerate()
+        .filter(|(_, client)| client.capture.pcm.len() >= FRAME_SAMPLES)
+        .map(|(index, _)| index)
+        .collect();
     if gating.is_empty() {
         return None;
     }
@@ -639,20 +659,12 @@ fn mix_ready(clients: &mut [LiveInclude], now: Instant) -> Option<Vec<f32>> {
         .map(|index| clients[*index].capture.pcm.len())
         .min()
         .unwrap_or(0);
-    let max_len = gating
-        .iter()
-        .map(|index| clients[*index].capture.pcm.len())
-        .max()
-        .unwrap_or(0);
-    if min_len < FRAME_SAMPLES && max_len < FRAME_SAMPLES * 10 {
+    if min_len < FRAME_SAMPLES {
         return None;
     }
     let mut frame = vec![0.0f32; FRAME_SAMPLES];
     let mut mixed = false;
     for index in gating {
-        if clients[index].capture.pcm.len() < FRAME_SAMPLES {
-            continue;
-        }
         mixed = true;
         for sample in &mut frame {
             *sample += clients[index].capture.pcm.pop_front().unwrap_or(0.0);
@@ -667,9 +679,48 @@ fn mix_ready(clients: &mut [LiveInclude], now: Instant) -> Option<Vec<f32>> {
     Some(frame)
 }
 
+fn pace_next(next_emit: Instant, now: Instant) -> Instant {
+    let next = next_emit + Duration::from_millis(20);
+    if next + Duration::from_millis(40) < now {
+        now + Duration::from_millis(20)
+    } else {
+        next
+    }
+}
+
+fn trim_latency(pcm: &mut VecDeque<f32>) -> bool {
+    let cap = FRAME_SAMPLES * 15;
+    if pcm.len() <= cap {
+        return false;
+    }
+    let keep = FRAME_SAMPLES * 5;
+    let drop = pcm.len() - keep;
+    pcm.drain(..drop);
+    true
+}
+
+fn declick(prev: &mut [f32; 2], frame: &mut [f32], force: bool) {
+    if frame.len() < 4 {
+        return;
+    }
+    let jump = (frame[0] - prev[0]).abs().max((frame[1] - prev[1]).abs());
+    if force || jump > 0.2 {
+        let frames = (frame.len() / 2).min(48);
+        for index in 0..frames {
+            let gain = (index as f32 + 1.0) / frames as f32;
+            let base = index * 2;
+            frame[base] = prev[0] + (frame[base] - prev[0]) * gain;
+            frame[base + 1] = prev[1] + (frame[base + 1] - prev[1]) * gain;
+        }
+    }
+    let last = frame.len() - 2;
+    prev[0] = frame[last];
+    prev[1] = frame[last + 1];
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{include_roots, Proc};
+    use super::{declick, include_roots, Proc};
 
     fn proc(pid: u32, ppid: u32, exe: &str) -> Proc {
         Proc {
@@ -703,5 +754,19 @@ mod tests {
         let procs = vec![proc(10, 1, "Discord.exe"), proc(20, 1, "goDrinking.exe"), proc(30, 1, "chrome.exe")];
         let roots = include_roots(&procs, &[10, 20, 30], &["goDrinking.exe".into()], 20, "goDrinking.exe");
         assert_eq!(roots, vec![10, 30]);
+    }
+
+    #[test]
+    fn declick_ramps_a_pop_and_leaves_a_smooth_join() {
+        let mut prev = [0.0f32; 2];
+        let mut popped = vec![0.8f32, -0.8, 0.8, -0.8, 0.8, -0.8, 0.8, -0.8];
+        declick(&mut prev, &mut popped, false);
+        assert!(popped[0].abs() < 0.25, "{}", popped[0]);
+        assert!((popped[6] - 0.8).abs() < 0.05, "{}", popped[6]);
+        prev = [0.02, -0.01];
+        let mut smooth = vec![0.02f32, -0.01, 0.03, -0.02];
+        let before = smooth.clone();
+        declick(&mut prev, &mut smooth, false);
+        assert_eq!(smooth, before);
     }
 }

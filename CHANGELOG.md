@@ -1,5 +1,12 @@
 # changelog
 
+## v0.7.14
+
+- fix: windows share shows the mouse cursor on display capture
+- fix: windows window share no longer draws the colored capture border
+- fix: windows share captures each heard app in isolation (experimental); muted apps are never captured, so they cannot leak back choppy
+- fix: windows share mix no longer stalls when an app goes quiet, removing the random audio pop
+
 ## v0.7.12
 
 - fix: muted apps are left out of the windows share entirely; the rest of the audio stays normal
