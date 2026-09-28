@@ -13,6 +13,8 @@
 
 O goDrinking é um app de sala com tela compartilhada para Windows e macOS. Você cria uma sala com senha, passa um código de 6 letras para quem você quer chamar, e cada pessoa escolhe o que compartilhar e o que assistir. O vídeo vai direto de um PC para o outro por WebRTC. O servidor só apresenta as pessoas e segura a sala aberta, ele nunca recebe a imagem da sua tela.
 
+Usar o aplicativo, o código ou o servidor público significa aceitar os [Termos de uso](TERMOS.md). O programa é oferecido como está. Quem usa responde pelo que compartilha e por cumprir a lei. Os responsáveis pelo repositório não operam a transmissão e não respondem pelo uso que for dado ao programa.
+
 O nome confunde de propósito. Não é Go, não é app de bar, e não tem nada a ver com bebida. Em português a gente fala "vai tomando", alguém traduziu e ficou goDrinking.
 
 ## O que dá para fazer
@@ -140,3 +142,4 @@ Abra um issue contando o que aconteceu, o que você esperava, se é Windows ou m
 - Releases: https://github.com/CosmicSnow/GoDrinking/releases
 - Código: https://github.com/CosmicSnow/GoDrinking
 - Licença: PolyForm Noncommercial, arquivo `LICENSE`
+- Termos de uso: [TERMOS.md](TERMOS.md). Usar o aplicativo é aceitar esses termos.
