@@ -27,6 +27,9 @@ jobs:
     name: Build goDrinking.dmg
     runs-on: macos-15
     timeout-minutes: 90
+    env:
+      # CMake 4 removed compatibility with Opus's older minimum version.
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - name: Checkout main dispatch commit
         uses: actions/checkout@v4
