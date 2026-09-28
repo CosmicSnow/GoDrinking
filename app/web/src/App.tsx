@@ -409,18 +409,23 @@ export default function App() {
       return;
     }
     let cancelled = false;
-    listAudioApps().then(
-      (apps) => {
-        if (cancelled) return;
-        setAudioApps(apps);
-        seedDefaultAudioExclusions(apps);
-      },
-      () => {
-        if (!cancelled) setAudioApps([]);
-      },
-    );
+    const pull = () => {
+      listAudioApps().then(
+        (apps) => {
+          if (cancelled) return;
+          setAudioApps(apps);
+          seedDefaultAudioExclusions(apps);
+        },
+        () => {
+          if (!cancelled) setAudioApps([]);
+        },
+      );
+    };
+    pull();
+    const timer = window.setInterval(pull, 1000);
     return () => {
       cancelled = true;
+      window.clearInterval(timer);
     };
   }, [isMock, screen, snapshot?.share.state]);
 

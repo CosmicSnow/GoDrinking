@@ -201,6 +201,10 @@ fn grab_wgc_frame(readback: &mut Readback, pool: &Direct3D11CaptureFramePool) ->
 /// current content regardless of desktop change events, so stills work even
 /// on a static screen (DXGI duplication only fires on presents — its lone
 /// `AcquireNextFrame(2000)` times out on an idle desktop).
+fn hide_capture_border(session: &windows::Graphics::Capture::GraphicsCaptureSession) {
+    let _ = session.SetIsBorderRequired(false);
+}
+
 fn grab_still(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
@@ -220,6 +224,7 @@ fn grab_still(
     )
     .map_err(|e| map_windows(&e))?;
     let session = pool.CreateCaptureSession(item).map_err(|e| map_windows(&e))?;
+    hide_capture_border(&session);
     session.StartCapture().map_err(|e| map_windows(&e))?;
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut grabbed = None;
@@ -383,6 +388,7 @@ pub fn run_window(
     if let Err(e) = session.SetIsCursorCaptureEnabled(true) {
         let _ = e;
     }
+    hide_capture_border(&session);
     if let Err(e) = session.StartCapture() {
         fail(map_windows(&e));
         return;

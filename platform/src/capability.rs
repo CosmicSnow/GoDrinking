@@ -50,7 +50,7 @@ pub const fn capabilities() -> CapabilitySet {
             display: yes("DXGI Desktop Duplication"),
             window: yes("Windows.Graphics.Capture (pode pedir permissão no primeiro uso)"),
             app_audio: yes("WASAPI loopback"),
-            exclusion: yes("process loopback (um app por sessão)"),
+            exclusion: yes("process loopback exclui cada app marcado"),
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]

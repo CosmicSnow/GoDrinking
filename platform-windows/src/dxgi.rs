@@ -12,13 +12,14 @@ use windows::Win32::Graphics::Dxgi::{
     IDXGIResource, DXGI_OUTPUT_DESC,
 };
 
-use crate::copy::{gate_open, initial_last_ns, interval_ns, now_ns};
+use crate::copy::{
+    composite_pointer, gate_open, initial_last_ns, interval_ns, now_ns, PointerShape,
+};
 use crate::d3d::{create_device, texture_to_bgra, Readback};
 use crate::map::{denied, is_access_lost, is_wait_timeout, map_windows};
 
 pub fn enumerate_displays() -> Result<Vec<SourceInfo>, PlatformError> {
-    let factory: IDXGIFactory1 =
-        unsafe { CreateDXGIFactory1() }.map_err(|e| map_windows(&e))?;
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.map_err(|e| map_windows(&e))?;
     let mut out = Vec::new();
     let mut adapter_index = 0u32;
     loop {
@@ -70,8 +71,7 @@ fn device_name(desc: &DXGI_OUTPUT_DESC) -> String {
 }
 
 fn find_output(id: &str) -> Result<(IDXGIAdapter1, IDXGIOutput1), PlatformError> {
-    let factory: IDXGIFactory1 =
-        unsafe { CreateDXGIFactory1() }.map_err(|e| map_windows(&e))?;
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.map_err(|e| map_windows(&e))?;
     let mut adapter_index = 0u32;
     loop {
         let adapter: IDXGIAdapter1 = match unsafe { factory.EnumAdapters1(adapter_index) } {
@@ -172,6 +172,10 @@ pub fn run_display(
         }
     };
     let (device, context, dup) = opened;
+    let (origin_x, origin_y) = unsafe { output.GetDesc() }
+        .map(|desc| (desc.DesktopCoordinates.left, desc.DesktopCoordinates.top))
+        .unwrap_or((0, 0));
+    let mut cursor = CursorOverlay::default();
     let mut dup = Some(dup);
     let mut readback = Readback::new(device.clone(), context);
     let applied = golive_platform::capture_config_for(config.width, config.height, config.fps);
@@ -185,17 +189,25 @@ pub fn run_display(
     while !stop_flag.load(Ordering::Acquire) {
         let mut info = windows::Win32::Graphics::Dxgi::DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
-        match unsafe { dup.as_ref().unwrap().AcquireNextFrame(100, &mut info, &mut resource) } {
+        match unsafe {
+            dup.as_ref()
+                .unwrap()
+                .AcquireNextFrame(100, &mut info, &mut resource)
+        } {
             Ok(()) => {
+                cursor.update(dup.as_ref().unwrap(), &info, origin_x, origin_y);
                 let now = now_ns();
                 if gate_open(last_ns.load(Ordering::Relaxed), now, interval) {
                     if let Some(resource) = resource {
                         if let Ok(tex) = resource.cast::<ID3D11Texture2D>() {
-                            if let Ok(frame) = readback.texture_to_bgra(&tex) {
+                            if let Ok(mut frame) = readback.texture_to_bgra(&tex) {
+                                cursor.paint(&mut frame);
                                 let _ = frame_tx.try_send(CapturePacket::Cpu(frame));
                                 last_ns.store(
                                     golive_platform::cadence::advance_capture_clock(
-                                        last_ns.load(Ordering::Relaxed), now, interval,
+                                        last_ns.load(Ordering::Relaxed),
+                                        now,
+                                        interval,
                                     ),
                                     Ordering::Relaxed,
                                 );
@@ -210,7 +222,7 @@ pub fn run_display(
                 match crate::resource::replace_after_drop(&mut dup, || {
                     unsafe { output.DuplicateOutput(&device) }.map_err(|e| map_windows(&e))
                 }) {
-                    Ok(()) => {},
+                    Ok(()) => {}
                     Err(error) => {
                         if let Ok(mut guard) = error_slot.lock() {
                             *guard = Some(error);
@@ -225,6 +237,67 @@ pub fn run_display(
                 }
                 return;
             }
+        }
+    }
+}
+
+#[derive(Default)]
+struct CursorOverlay {
+    visible: bool,
+    x: i32,
+    y: i32,
+    shape: Option<PointerShape>,
+}
+
+impl CursorOverlay {
+    fn update(
+        &mut self,
+        dup: &IDXGIOutputDuplication,
+        info: &windows::Win32::Graphics::Dxgi::DXGI_OUTDUPL_FRAME_INFO,
+        origin_x: i32,
+        origin_y: i32,
+    ) {
+        if info.PointerShapeBufferSize > 0 && info.PointerShapeBufferSize <= 1_048_576 {
+            let mut buf = vec![0u8; info.PointerShapeBufferSize as usize];
+            let mut required = 0u32;
+            let mut shape =
+                windows::Win32::Graphics::Dxgi::DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+            if unsafe {
+                dup.GetFramePointerShape(
+                    info.PointerShapeBufferSize,
+                    buf.as_mut_ptr().cast(),
+                    &mut required,
+                    &mut shape,
+                )
+            }
+            .is_ok()
+            {
+                let bytes = (required as usize).min(buf.len());
+                buf.truncate(bytes);
+                self.shape = Some(PointerShape {
+                    kind: shape.Type,
+                    width: shape.Width,
+                    height: shape.Height,
+                    pitch: shape.Pitch,
+                    hotspot_x: shape.HotSpot.x,
+                    hotspot_y: shape.HotSpot.y,
+                    pixels: buf,
+                });
+            }
+        }
+        if info.LastMouseUpdateTime != 0 {
+            self.visible = info.PointerPosition.Visible.as_bool();
+            self.x = info.PointerPosition.Position.x - origin_x;
+            self.y = info.PointerPosition.Position.y - origin_y;
+        }
+    }
+
+    fn paint(&self, frame: &mut BgraFrame) {
+        if !self.visible {
+            return;
+        }
+        if let Some(shape) = &self.shape {
+            composite_pointer(frame, shape, self.x, self.y);
         }
     }
 }
