@@ -108,12 +108,9 @@ jobs:
 
       - name: Build goDrinking.dmg (Tauri bundler)
         working-directory: app
-        env:
-          # Empty identity and the config override disable signing for this CI DMG.
-          APPLE_SIGNING_IDENTITY: ""
         run: >-
-          cargo tauri build --bundles dmg
-          --config '{"bundle":{"externalBin":["binaries/goDrinking-video"],"macOS":{"signingIdentity":null}}}'
+          cargo tauri build --bundles dmg --no-sign
+          --config '{"bundle":{"externalBin":["binaries/goDrinking-video"]}}'
 
       - name: Verify dmg contents
         run: |
