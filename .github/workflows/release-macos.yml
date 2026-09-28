@@ -3,7 +3,8 @@ name: Release macOS dmg
 # Native macOS build for goDrinking .dmg (Tauri bundler).
 # Manual-only: run from GitHub Actions UI, or build+upload locally via
 # scripts/release.sh (which is the usual path). The dmg is uploaded
-# straight to the GitHub release.
+# straight to the GitHub release. The macOS app intentionally builds from
+# the selected main commit, which may be newer than the existing release tag.
 
 on:
   workflow_dispatch:
@@ -24,13 +25,13 @@ permissions:
 jobs:
   build:
     name: Build goDrinking.dmg
-    runs-on: macos-latest
-    timeout-minutes: 45
+    runs-on: macos-15
+    timeout-minutes: 90
     steps:
-      - name: Checkout tag
+      - name: Checkout main dispatch commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - name: Set up Node 22
@@ -39,6 +40,42 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: app/web/package-lock.json
+
+      - name: Validate release tag
+        id: validate-release-tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          DISPATCH_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$DISPATCH_REF" != "refs/heads/main" ]; then
+            echo "this workflow must be dispatched from main" >&2
+            exit 1
+          fi
+          if [ "$(git rev-parse HEAD)" != "${GITHUB_SHA}" ]; then
+            echo "checked-out commit is not the main dispatch commit" >&2
+            exit 1
+          fi
+          EXPECTED_TAG="v$(node -p "require('./package.json').version")"
+          if [ "$RELEASE_TAG" != "$EXPECTED_TAG" ]; then
+            echo "requested tag does not match main product version ($EXPECTED_TAG)" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$RELEASE_TAG^{commit}" HEAD; then
+            echo "release tag is not an ancestor of the main dispatch commit" >&2
+            exit 1
+          fi
+          REMOTE_TAG_LINES="$(git ls-remote --refs origin "refs/tags/$RELEASE_TAG" || true)"
+          if [ -z "$REMOTE_TAG_LINES" ] || [ "$(printf '%s\n' "$REMOTE_TAG_LINES" | wc -l | tr -d ' ')" -ne 1 ]; then
+            echo "remote release tag is missing or returned multiple refs" >&2
+            exit 1
+          fi
+          read -r TAG_REF_SHA TAG_REF_NAME <<< "$REMOTE_TAG_LINES"
+          if [ "$TAG_REF_NAME" != "refs/tags/$RELEASE_TAG" ]; then
+            echo "remote lookup returned an unexpected tag ref" >&2
+            exit 1
+          fi
+          echo "tag_ref_sha=$TAG_REF_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Install web deps (npm ci, lockfile)
         run: npm --prefix app/web ci
@@ -50,25 +87,101 @@ jobs:
         # macos-latest already ships stable Rust; this only pins it.
         run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
 
+      - name: Install Tauri CLI
+        run: |
+          cargo install tauri-cli --version 2.11.4 --locked
+          cargo tauri --version | grep -Fx 'tauri-cli 2.11.4'
+
+      - name: Build native helper and stage Tauri external binary
+        working-directory: app
+        run: |
+          set -euo pipefail
+          TARGET="$(rustc -vV | awk '/^host: / { print $2 }')"
+          if [ -z "$TARGET" ]; then echo "could not determine Rust host triple" >&2; exit 1; fi
+          cargo build --release --locked --bin golive-video
+          mkdir -p binaries
+          cp "target/release/golive-video" "binaries/goDrinking-video-$TARGET"
+          chmod +x "binaries/goDrinking-video-$TARGET"
+
       - name: Build goDrinking.dmg (Tauri bundler)
         working-directory: app
-        run: cargo tauri build --bundles dmg
+        env:
+          # Empty identity and the config override disable signing for this CI DMG.
+          APPLE_SIGNING_IDENTITY: ""
+        run: >-
+          cargo tauri build --bundles dmg
+          --config '{"bundle":{"externalBin":["binaries/goDrinking-video"],"macOS":{"signingIdentity":null}}}'
 
-      - name: Verify dmg exists
+      - name: Verify dmg contents
         run: |
+          set -euo pipefail
           shopt -s nullglob
           DMGS=(app/target/release/bundle/dmg/*.dmg)
           shopt -u nullglob
           if [ "${#DMGS[@]}" -eq 0 ]; then echo "no .dmg found in app/target/release/bundle/dmg/" >&2; exit 1; fi
           ls -lh "${DMGS[@]}"
+          test "$RUNNER_ARCH" = "ARM64" || { echo "expected an ARM64 macOS runner, got $RUNNER_ARCH" >&2; exit 1; }
+          for dmg in "${DMGS[@]}"; do
+            [[ "${dmg##*/}" == *aarch64.dmg ]] || { echo "ARM64 runner produced an unexpected DMG name: ${dmg##*/}" >&2; exit 1; }
+          done
+          for dmg in "${DMGS[@]}"; do
+            mountpoint="$(mktemp -d "$RUNNER_TEMP/godrinking-dmg.XXXXXX")"
+            if ! hdiutil attach "$dmg" -readonly -nobrowse -mountpoint "$mountpoint"; then
+              rmdir "$mountpoint"
+              exit 1
+            fi
+            if [ ! -x "$mountpoint/goDrinking.app/Contents/MacOS/goDrinking-video" ]; then
+              echo "DMG is missing executable goDrinking.app/Contents/MacOS/goDrinking-video" >&2
+              hdiutil detach "$mountpoint" -quiet || true
+              exit 1
+            fi
+            if find "$mountpoint" -print | while IFS= read -r path; do
+              basename="${path##*/}"
+              if [[ "$(printf '%s' "$basename" | tr '[:upper:]' '[:lower:]')" == *golive* ]]; then
+                echo "distributed path contains forbidden golive name: $path" >&2
+                exit 1
+              fi
+            done; then
+              :
+            else
+              hdiutil detach "$mountpoint" -quiet || true
+              exit 1
+            fi
+            hdiutil detach "$mountpoint" -quiet
+          done
 
       - name: Ensure release and upload dmg
         if: ${{ inputs.upload }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          EXPECTED_TAG_REF_SHA: ${{ steps.validate-release-tag.outputs.tag_ref_sha }}
         run: |
           set -euo pipefail
-          TAG="${{ inputs.tag }}"
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --generate-notes
-          gh release upload "$TAG" app/target/release/bundle/dmg/*.dmg --clobber
-          gh release view "$TAG" --json assets --jq '.assets[].name'
+          CURRENT_TAG_LINES="$(git ls-remote --refs origin "refs/tags/$RELEASE_TAG" || true)"
+          if [ -z "$CURRENT_TAG_LINES" ] || [ "$(printf '%s\n' "$CURRENT_TAG_LINES" | wc -l | tr -d ' ')" -ne 1 ]; then
+            echo "fresh remote lookup found no unique release tag ref; refusing upload" >&2
+            exit 1
+          fi
+          read -r CURRENT_TAG_REF_SHA CURRENT_TAG_REF_NAME <<< "$CURRENT_TAG_LINES"
+          if [ "$CURRENT_TAG_REF_NAME" != "refs/tags/$RELEASE_TAG" ]; then
+            echo "fresh remote lookup returned an unexpected tag ref; refusing upload" >&2
+            exit 1
+          fi
+          if [ "$CURRENT_TAG_REF_SHA" != "$EXPECTED_TAG_REF_SHA" ]; then
+            echo "release tag ref changed during the build; refusing upload" >&2
+            exit 1
+          fi
+          gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' > existing-assets.txt
+          shopt -s nullglob
+          DMGS=(app/target/release/bundle/dmg/*.dmg)
+          shopt -u nullglob
+          for dmg in "${DMGS[@]}"; do
+            asset="${dmg##*/}"
+            if grep -Fxq "$asset" existing-assets.txt; then
+              echo "release asset already exists: $asset" >&2
+              exit 1
+            fi
+          done
+          gh release upload "$RELEASE_TAG" "${DMGS[@]}"
+          gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name'

@@ -40,11 +40,10 @@ rm -f "$HOST_TRACE"/golive-trace-*.jsonl "$VIEWER_TRACE"/golive-trace-*.jsonl
 
 fail() { echo "E2E-FAIL: $1" >&2; return 1; }
 [ -n "$BIN" ] && [ -x "$BIN" ] || { fail "no executable inside $APP/Contents/MacOS"; exit 1; }
-# Video helper: Tauri bundles only the main binary, so the harness stages
-# golive-video next to it (same dir the shell searches at runtime).
-# Production packaging would use bundle.externalBin — documented follow-up.
+# Cargo's internal helper target keeps its existing name; stage it under the
+# product-branded name expected by the packaged macOS app.
 HELPER_SRC="$ROOT/app/target/$E2E_PROFILE/golive-video"
-HELPER_DST="$(dirname "$BIN")/golive-video"
+HELPER_DST="$(dirname "$BIN")/goDrinking-video"
 [ -f "$HELPER_SRC" ] || { fail "helper missing: run cargo build --bin golive-video in app/"; exit 1; }
 if [ "$HELPER_SRC" -ef "$HELPER_DST" ]; then :; else cp -f "$HELPER_SRC" "$HELPER_DST" || { fail "helper stage failed"; exit 1; }; fi
 chmod +x "$HELPER_DST" || { fail "helper stage failed"; exit 1; }

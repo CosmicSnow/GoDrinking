@@ -501,16 +501,38 @@ pub struct LinkStats {
 // Helper discovery + process management.
 // ---------------------------------------------------------------------------
 
-/// Locates the helper binary: alongside the current exe. That covers both
-/// layouts — `target/debug/golive-video` next to the dev binary and
-/// `Contents/MacOS/golive-video` next to the packaged binary (the e2e
-/// script copies it there after `tauri build`).
+/// Locates the helper binary: alongside the current exe. Developer builds use
+/// the Cargo binary name; a packaged macOS app uses its product-branded name
+/// so the internal Cargo target name is not exposed in the distributed app.
 pub fn helper_path() -> PathBuf {
-    let name = helper_file_name();
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(name)))
+    let exe = std::env::current_exe().ok();
+    let name = exe
+        .as_deref()
+        .map(helper_name_for_exe)
+        .unwrap_or_else(helper_file_name);
+    exe.and_then(|exe| exe.parent().map(|dir| dir.join(name)))
         .unwrap_or_else(|| PathBuf::from(name))
+}
+
+fn helper_name_for_exe(exe: &std::path::Path) -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        let packaged_macos_layout = exe.parent().is_some_and(|macos| {
+            macos.file_name().is_some_and(|name| name == "MacOS")
+                && macos.parent().is_some_and(|contents| {
+                    contents.file_name().is_some_and(|name| name == "Contents")
+                        && contents
+                            .parent()
+                            .and_then(std::path::Path::file_name)
+                            .and_then(std::ffi::OsStr::to_str)
+                            .is_some_and(|name| name.ends_with(".app"))
+                })
+        });
+        if packaged_macos_layout {
+            return "goDrinking-video";
+        }
+    }
+    helper_file_name()
 }
 
 // ---------------------------------------------------------------------------
@@ -1006,6 +1028,16 @@ fn drain_present_acks(sock: &mut FeedStream) -> std::io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn packaged_macos_uses_branded_helper_name_only() {
+        let packaged =
+            std::path::Path::new("/Applications/goDrinking.app/Contents/MacOS/goDrinking");
+        let developer = std::path::Path::new("/repo/app/target/debug/goDrinking");
+        assert_eq!(helper_name_for_exe(packaged), "goDrinking-video");
+        assert_eq!(helper_name_for_exe(developer), helper_file_name());
+    }
 
     fn connected_pair() -> (std::net::TcpStream, std::net::TcpStream) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
