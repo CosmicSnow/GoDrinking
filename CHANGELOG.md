@@ -1,5 +1,9 @@
 # changelog
 
+## v0.7.12
+
+- fix: muted apps are left out of the windows share entirely; the rest of the audio stays normal
+
 ## v0.7.11
 
 - fix: windows share audio is one continuous stream again (no chopped mix)
