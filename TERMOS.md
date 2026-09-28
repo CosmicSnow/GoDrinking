@@ -18,6 +18,8 @@ O goDrinking é um programa de compartilhamento de tela entre computadores. A im
 
 Não há relay de mídia e não há TURN. Se a conexão direta não fecha, a transmissão não acontece. Isso é limite do desenho, não falha que os responsáveis se obriguem a corrigir.
 
+O projeto não incentiva uso errado, abusivo ou ilícito. O uso que ele apoia é o comum e lícito: compartilhar gameplay, trabalhar, fazer trabalho de faculdade, participar de reunião, colaborar numa peça artística ou conversar entre desenvolvedores. Tela compartilhada para essas coisas, com as pessoas que você chamou para a sala.
+
 O programa é oferecido para uso não comercial, nos limites do arquivo `LICENSE` (PolyForm Noncommercial 1.0.0). Estes termos não substituem a licença. Em caso de conflito sobre cópia, modificação ou distribuição do código, prevalece a licença. Em caso de conflito sobre o uso do aplicativo e do servidor público, prevalecem estes termos.
 
 ## 3. Oferecido como está
@@ -49,7 +51,7 @@ Se o seu uso gerar reclamação de terceiro contra os responsáveis pelo reposit
 
 ## 5. O que você não pode fazer
 
-É proibido usar o goDrinking para fim ilícito. Em especial, é proibido:
+O projeto não incentiva esses usos. É proibido usar o goDrinking para fim ilícito. Em especial, é proibido:
 
 - transmitir, pedir ou armazenar material de abuso sexual de criança ou adolescente;
 - compartilhar imagem, voz ou tela de alguém sem o consentimento necessário;
