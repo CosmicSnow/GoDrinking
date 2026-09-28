@@ -101,7 +101,7 @@ jobs:
           set -euo pipefail
           TARGET="$(rustc -vV | awk '/^host: / { print $2 }')"
           if [ -z "$TARGET" ]; then echo "could not determine Rust host triple" >&2; exit 1; fi
-          cargo build --release --locked --bin golive-video
+          cargo build --release --locked --bin golive-video --features video-helper-bin
           mkdir -p binaries
           cp "target/release/golive-video" "binaries/goDrinking-video-$TARGET"
           chmod +x "binaries/goDrinking-video-$TARGET"
