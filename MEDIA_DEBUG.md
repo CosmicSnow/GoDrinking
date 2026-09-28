@@ -367,8 +367,7 @@ pode não ter sucessor. Não atribuir esse custo à emissão do registro atual.
 
 O cadence salva `start_ms`/`end_ms`, snapshots de memória no macOS e aceita
 `--sample-host` e `--no-host-trace` (controle que não aprova o gate completo).
-O exemplo `encode_probe` isola o encoder de WebRTC/WebView. Experimentos e
-limitações em [DIAGNOSTICO-host-2026-09-15.md](DIAGNOSTICO-host-2026-09-15.md).
+O exemplo `encode_probe` isola o encoder de WebRTC/WebView.
 
 
 `max_work_end_ms` / `max_gap_end_ms` registram o término do pico selecionado,
