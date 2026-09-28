@@ -1,20 +1,21 @@
 //! Windows system-audio capture. Video stays in the other modules.
 //!
-//! Process loopback excludes only one tree, so a system mix cannot drop
-//! Discord and this process together. The share therefore mixes include-mode
-//! captures of every playing app that is not selected for exclusion. That
-//! keeps remote playback (this process) and Discord out of the room.
+//! The shared mix is one continuous WASAPI stream (engine-exclude this
+//! process when it should not be heard). Other ignored apps are cancelled
+//! from that stream and never become the clock — stitching their loopbacks
+//! together is what chopped the audio.
 
 use golive_platform::{app_excluded_by_token, AudioApp, EncodedAudioPacket, PlatformError};
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const FRAME_SAMPLES: usize = 960 * 2;
-const MAX_INCLUDE: usize = 16;
+const MAX_SUBTRACT: usize = 8;
+const HISTORY_CAP: usize = 48_000 * 120 / 1000 * 2;
 
 pub struct AudioTap {
     shutdown: Arc<AtomicBool>,
@@ -81,7 +82,9 @@ pub fn start_audio_tap(
 ) -> Result<AudioTap, PlatformError> {
     let _ = wasapi::initialize_mta();
     if is_process_loopback_supported() {
-        return spawn_include_mix(excluded_tokens, opus_tx);
+        if let Ok(tap) = spawn_continuous(excluded_tokens, opus_tx.clone()) {
+            return Ok(tap);
+        }
     }
     spawn_device_loopback(opus_tx)
 }
@@ -99,16 +102,29 @@ pub fn start_audio_tap_include(
     spawn_mix(vec![client], opus_tx, "include")
 }
 
-fn spawn_include_mix(
+fn spawn_continuous(
     tokens: &[String],
     opus_tx: SyncSender<EncodedAudioPacket>,
 ) -> Result<AudioTap, PlatformError> {
+    let self_pid = std::process::id();
+    let self_exe = current_exe_name();
+    let procs = process_snapshot();
+    let (engine_self, subtract) = subtract_plan(&procs, tokens, self_pid, &self_exe);
+    let main_client = if engine_self {
+        match wasapi::AudioClient::new_application_loopback_client(self_pid, false) {
+            Ok(client) => client,
+            Err(_) => device_client()?,
+        }
+    } else {
+        device_client()?
+    };
+    let main = init_capture(main_client, "mix")?;
     let tokens = tokens.to_vec();
     let shutdown = Arc::new(AtomicBool::new(false));
     let worker_shutdown = Arc::clone(&shutdown);
     let thread = thread::Builder::new()
         .name("golive-audio-opus".into())
-        .spawn(move || include_mix_loop(tokens, opus_tx, worker_shutdown))
+        .spawn(move || continuous_loop(main, tokens, subtract, opus_tx, worker_shutdown))
         .map_err(|error| PlatformError::Internal(error.to_string()))?;
     Ok(AudioTap {
         shutdown,
@@ -288,48 +304,28 @@ fn excluded_pids(procs: &[Proc], tokens: &[String], self_pid: u32, self_exe: &st
     excluded
 }
 
-fn include_roots(
-    procs: &[Proc],
-    session_pids: &[u32],
-    tokens: &[String],
-    self_pid: u32,
-    self_exe: &str,
-) -> Vec<u32> {
+fn subtract_plan(procs: &[Proc], tokens: &[String], self_pid: u32, self_exe: &str) -> (bool, Vec<u32>) {
     let excluded = excluded_pids(procs, tokens, self_pid, self_exe);
-    let mut wanted = HashSet::new();
-    for pid in session_pids {
-        if *pid == 0 || excluded.contains(pid) {
+    let engine_self = excluded.contains(&self_pid);
+    let mut roots = Vec::new();
+    for proc in procs {
+        if proc.pid == 0 || !excluded.contains(&proc.pid) {
             continue;
         }
-        if procs
-            .iter()
-            .any(|proc| proc.pid == *pid && excluded.contains(&proc.ppid))
-        {
+        if engine_self && (proc.pid == self_pid || is_descendant(procs, proc.pid, self_pid)) {
             continue;
         }
-        if procs
-            .iter()
-            .any(|proc| excluded.contains(&proc.pid) && is_descendant(procs, *pid, proc.pid))
-        {
+        if excluded.contains(&proc.ppid) {
             continue;
         }
-        wanted.insert(*pid);
+        roots.push(proc.pid);
     }
-    let mut roots: Vec<u32> = wanted
-        .iter()
-        .copied()
-        .filter(|pid| {
-            !wanted
-                .iter()
-                .any(|other| *other != *pid && is_descendant(procs, *pid, *other))
-        })
-        .collect();
     roots.sort_unstable();
     roots.dedup();
-    if roots.len() > MAX_INCLUDE {
-        roots.truncate(MAX_INCLUDE);
+    if roots.len() > MAX_SUBTRACT {
+        roots.truncate(MAX_SUBTRACT);
     }
-    roots
+    (engine_self, roots)
 }
 
 struct PcmCapture {
@@ -350,6 +346,7 @@ struct MixCapture {
 
 unsafe impl Send for MixCapture {}
 unsafe impl Send for LiveInclude {}
+unsafe impl Send for PcmCapture {}
 
 impl Drop for PcmCapture {
     fn drop(&mut self) {
@@ -433,9 +430,6 @@ fn pull_pcm(stream: &mut PcmCapture) -> bool {
                 .push_back(f32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]));
         }
     }
-    while stream.pcm.len() > FRAME_SAMPLES * 8 {
-        stream.pcm.pop_front();
-    }
     got
 }
 
@@ -493,7 +487,7 @@ fn wasapi_mix(
 ) {
     let _ = wasapi::initialize_mta();
     let Ok(mut encoder) =
-        opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Voip)
+        opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Audio)
     else {
         return;
     };
@@ -520,128 +514,185 @@ fn open_include(pid: u32) -> Option<PcmCapture> {
     init_capture(client, "include").ok()
 }
 
-fn include_mix_loop(
+fn continuous_loop(
+    mut main: PcmCapture,
     tokens: Vec<String>,
+    initial_subtract: Vec<u32>,
     opus_tx: SyncSender<EncodedAudioPacket>,
     shutdown: Arc<AtomicBool>,
 ) {
     let _ = wasapi::initialize_mta();
     let Ok(mut encoder) =
-        opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Voip)
+        opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::Audio)
     else {
         return;
     };
-    let self_pid = std::process::id();
-    let self_exe = current_exe_name();
-    let mut live: Vec<LiveInclude> = Vec::new();
-    let mut fallback: Option<PcmCapture> = None;
-    let mut next_refresh = Instant::now();
+    let (sub_tx, sub_rx) = mpsc::channel::<LiveInclude>();
+    let watch_shutdown = Arc::clone(&shutdown);
+    let watcher = thread::Builder::new()
+        .name("golive-audio-exclude".into())
+        .spawn(move || watch_subtract(tokens, initial_subtract, sub_tx, watch_shutdown))
+        .ok();
+    let mut subs: Vec<LiveInclude> = Vec::new();
+    let mut history: Vec<VecDeque<f32>> = Vec::new();
     while !shutdown.load(Ordering::Acquire) {
-        if fallback.is_none() && Instant::now() >= next_refresh {
-            if !refresh_includes(&mut live, &tokens, self_pid, &self_exe) && live.is_empty() {
-                fallback = fallback_capture(&tokens, self_pid, &self_exe);
+        while let Ok(sub) = sub_rx.try_recv() {
+            if subs.iter().any(|existing| existing.pid == sub.pid) {
+                continue;
             }
-            next_refresh = Instant::now() + Duration::from_millis(500);
+            history.push(VecDeque::new());
+            subs.push(sub);
         }
-        let mut got = false;
-        if let Some(capture) = fallback.as_mut() {
-            if pull_pcm(capture) {
+        let mut got = pull_pcm(&mut main);
+        for (index, sub) in subs.iter_mut().enumerate() {
+            if pull_pcm(&mut sub.capture) {
                 got = true;
             }
-            while let Some(frame) = take_frame(std::slice::from_mut(capture)) {
-                if !encode_frame(&mut encoder, &frame, &opus_tx) {
-                    return;
-                }
+            while let Some(sample) = sub.capture.pcm.pop_front() {
+                history[index].push_back(sample);
             }
-        } else {
-            for client in &mut live {
-                if pull_pcm(&mut client.capture) {
-                    got = true;
-                }
+            while history[index].len() > HISTORY_CAP {
+                history[index].pop_front();
             }
-            let mut streams: Vec<&mut PcmCapture> =
-                live.iter_mut().map(|client| &mut client.capture).collect();
-            while let Some(frame) = take_frame_refs(&mut streams) {
-                if !encode_frame(&mut encoder, &frame, &opus_tx) {
-                    return;
-                }
+        }
+        while main.pcm.len() >= FRAME_SAMPLES {
+            let mut frame: Vec<f32> = main.pcm.drain(..FRAME_SAMPLES).collect();
+            for hist in &history {
+                let samples: Vec<f32> = hist.iter().copied().collect();
+                cancel_block(&mut frame, &samples);
+            }
+            if !encode_frame(&mut encoder, &frame, &opus_tx) {
+                let _ = watcher.and_then(|thread| thread.join().ok());
+                return;
             }
         }
         if !got {
             thread::sleep(Duration::from_millis(5));
         }
     }
+    let _ = watcher.and_then(|thread| thread.join().ok());
 }
 
-fn take_frame_refs(streams: &mut [&mut PcmCapture]) -> Option<Vec<f32>> {
-    if !streams
-        .iter()
-        .any(|stream| stream.pcm.len() >= FRAME_SAMPLES)
-    {
-        return None;
-    }
-    let mut frame = vec![0.0f32; FRAME_SAMPLES];
-    let mut mixed = false;
-    for stream in streams {
-        if stream.pcm.len() < FRAME_SAMPLES {
-            continue;
-        }
-        mixed = true;
-        for sample in &mut frame {
-            *sample += stream.pcm.pop_front().unwrap_or(0.0);
-        }
-    }
-    if mixed {
-        for sample in &mut frame {
-            *sample = sample.clamp(-1.0, 1.0);
-        }
-    }
-    mixed.then_some(frame)
-}
-
-fn refresh_includes(
-    live: &mut Vec<LiveInclude>,
-    tokens: &[String],
-    self_pid: u32,
-    self_exe: &str,
-) -> bool {
-    let Ok(sessions) = active_session_pids() else {
-        return false;
-    };
-    let procs = process_snapshot();
-    let wanted = include_roots(&procs, &sessions, tokens, self_pid, self_exe);
-    live.retain(|client| wanted.contains(&client.pid));
-    for pid in wanted {
-        if live.iter().any(|client| client.pid == pid) {
-            continue;
-        }
-        if live.len() >= MAX_INCLUDE {
-            break;
+fn watch_subtract(
+    tokens: Vec<String>,
+    initial_subtract: Vec<u32>,
+    sub_tx: mpsc::Sender<LiveInclude>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let _ = wasapi::initialize_mta();
+    let mut opened: HashSet<u32> = HashSet::new();
+    for pid in initial_subtract {
+        if shutdown.load(Ordering::Acquire) {
+            return;
         }
         if let Some(capture) = open_include(pid) {
-            live.push(LiveInclude { pid, capture });
+            opened.insert(pid);
+            if sub_tx.send(LiveInclude { pid, capture }).is_err() {
+                return;
+            }
         }
+    }
+    while !shutdown.load(Ordering::Acquire) {
+        for _ in 0..20 {
+            if shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let self_pid = std::process::id();
+        let self_exe = current_exe_name();
+        let (_, wanted) = subtract_plan(&process_snapshot(), &tokens, self_pid, &self_exe);
+        for pid in wanted {
+            if opened.contains(&pid) {
+                continue;
+            }
+            if let Some(capture) = open_include(pid) {
+                opened.insert(pid);
+                if sub_tx.send(LiveInclude { pid, capture }).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn cancel_block(frame: &mut [f32], history: &[f32]) -> bool {
+    let width = frame.len();
+    if width < 2 || width % 2 != 0 || history.len() < width {
+        return false;
+    }
+    let exclude_energy: f32 = history.iter().map(|sample| sample * sample).sum();
+    if exclude_energy < 1e-4 {
+        return false;
+    }
+    let before: f32 = frame.iter().map(|sample| sample * sample).sum();
+    if before < 1e-5 {
+        return false;
+    }
+    let max_off = (history.len() - width) / 2;
+    let step = 8usize;
+    let mut best_off = 0usize;
+    let mut best_after = f32::MAX;
+    let mut best_gain = 0.0f32;
+    let mut offset = 0usize;
+    while offset <= max_off {
+        let (after, gain) = residual_gain(frame, history, offset * 2);
+        if after < best_after {
+            best_after = after;
+            best_off = offset;
+            best_gain = gain;
+        }
+        if step == 0 || offset > max_off.saturating_sub(step) {
+            break;
+        }
+        offset += step;
+    }
+    let fine_lo = best_off.saturating_sub(step);
+    let fine_hi = (best_off + step).min(max_off);
+    for offset in fine_lo..=fine_hi {
+        let (after, gain) = residual_gain(frame, history, offset * 2);
+        if after < best_after {
+            best_after = after;
+            best_off = offset;
+            best_gain = gain;
+        }
+    }
+    if best_gain <= 0.0 || best_after >= before * 0.8 {
+        return false;
+    }
+    let start = best_off * 2;
+    for index in 0..width {
+        frame[index] = (frame[index] - best_gain * history[start + index]).clamp(-1.0, 1.0);
     }
     true
 }
 
-fn fallback_capture(tokens: &[String], self_pid: u32, self_exe: &str) -> Option<PcmCapture> {
-    let excluded = excluded_pids(&process_snapshot(), tokens, self_pid, self_exe);
-    if excluded.contains(&self_pid) {
-        if let Ok(client) = wasapi::AudioClient::new_application_loopback_client(self_pid, false) {
-            if let Ok(capture) = init_capture(client, "exclude") {
-                return Some(capture);
-            }
-        }
+fn residual_gain(main: &[f32], exclude: &[f32], offset: usize) -> (f32, f32) {
+    let mut dot = 0.0f32;
+    let mut exclude_energy = 0.0f32;
+    let mut main_energy = 0.0f32;
+    for index in 0..main.len() {
+        let sample = exclude[offset + index];
+        let mixed = main[index];
+        dot += mixed * sample;
+        exclude_energy += sample * sample;
+        main_energy += mixed * mixed;
     }
-    device_client()
-        .ok()
-        .and_then(|client| init_capture(client, "device").ok())
+    if exclude_energy < 1e-8 || dot <= 0.0 {
+        return (main_energy, 0.0);
+    }
+    let gain = (dot / exclude_energy).clamp(0.0, 1.25);
+    let mut after = 0.0f32;
+    for index in 0..main.len() {
+        let delta = main[index] - gain * exclude[offset + index];
+        after += delta * delta;
+    }
+    (after, gain)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{include_roots, Proc};
+    use super::{cancel_block, subtract_plan, Proc};
 
     fn proc(pid: u32, ppid: u32, exe: &str) -> Proc {
         Proc {
@@ -652,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn share_mix_skips_discord_and_self_but_keeps_other_players() {
+    fn continuous_mix_excludes_self_and_cancels_discord_only() {
         let procs = vec![
             proc(10, 1, "Discord.exe"),
             proc(11, 10, "Discord.exe"),
@@ -660,41 +711,33 @@ mod tests {
             proc(20, 1, "goDrinking.exe"),
             proc(21, 20, "golive-video.exe"),
             proc(30, 1, "chrome.exe"),
-            proc(31, 30, "chrome.exe"),
         ];
-        let tokens = vec![
-            "Discord".into(),
-            "goDrinking".into(),
-            "golive-video.exe".into(),
-        ];
-        let sessions = vec![10, 11, 12, 20, 21, 30, 31];
-        assert_eq!(
-            include_roots(&procs, &sessions, &tokens, 20, "goDrinking.exe"),
-            vec![30]
-        );
+        let tokens = vec!["Discord".into(), "goDrinking".into(), "golive-video.exe".into()];
+        let (engine_self, subtract) = subtract_plan(&procs, &tokens, 20, "goDrinking.exe");
+        assert!(engine_self);
+        assert_eq!(subtract, vec![10, 12]);
     }
 
     #[test]
-    fn empty_tokens_still_drop_self_playback() {
-        let procs = vec![
-            proc(20, 1, "goDrinking.exe"),
-            proc(10, 1, "Discord.exe"),
-            proc(30, 1, "chrome.exe"),
-        ];
-        let roots = include_roots(&procs, &[10, 20, 30], &[], 20, "goDrinking.exe");
-        assert_eq!(roots, vec![10, 30]);
-    }
-
-    #[test]
-    fn untoggled_self_can_be_heard() {
+    fn empty_tokens_exclude_only_self() {
         let procs = vec![proc(20, 1, "goDrinking.exe"), proc(10, 1, "Discord.exe")];
-        let roots = include_roots(
-            &procs,
-            &[10, 20],
-            &["Discord.exe".into()],
-            20,
-            "goDrinking.exe",
-        );
-        assert_eq!(roots, vec![20]);
+        let (engine_self, subtract) = subtract_plan(&procs, &[], 20, "goDrinking.exe");
+        assert!(engine_self);
+        assert!(subtract.is_empty());
+    }
+
+    #[test]
+    fn cancel_block_removes_a_delayed_copy_without_touching_silence() {
+        let frame = vec![0.5, -0.25, 0.5, -0.25];
+        let mut history = vec![0.0; 8];
+        history[4] = 0.5;
+        history[5] = -0.25;
+        history[6] = 0.5;
+        history[7] = -0.25;
+        let mut out = frame.clone();
+        assert!(cancel_block(&mut out, &history));
+        assert!(out.iter().all(|sample| sample.abs() < 0.01), "{out:?}");
+        let mut quiet = vec![0.0; 4];
+        assert!(!cancel_block(&mut quiet, &history));
     }
 }

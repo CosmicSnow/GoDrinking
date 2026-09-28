@@ -1,5 +1,9 @@
 # changelog
 
+## v0.7.11
+
+- fix: windows share audio is one continuous stream again (no chopped mix)
+
 ## v0.7.10
 
 - fix: windows screen share no longer echoes when both peers share, and discord is not mixed back in
