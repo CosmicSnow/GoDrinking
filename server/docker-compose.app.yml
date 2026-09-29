@@ -17,6 +17,9 @@ services:
     environment:
       # Immediate NPM peer on main-npm; update if npm-app-1 changes address.
       TRUSTED_PROXY_PEER: "192.168.96.7"
+      DIAGNOSTIC_LOG_PATH: /var/log/godrinking/events.jsonl
+    volumes:
+      - diagnostics:/var/log/godrinking
     expose:
       - "${PORT:-8787}"
     healthcheck:
@@ -27,3 +30,7 @@ services:
       start_period: 10s
     networks:
       - main-npm
+
+volumes:
+  diagnostics:
+    name: godrinking-rendezvous-diagnostics

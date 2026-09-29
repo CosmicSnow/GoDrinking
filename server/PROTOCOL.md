@@ -174,3 +174,38 @@ Heartbeat TTL, GC interval (15 s default), and disconnect grace are tunable via
 
 The Docker Compose `/health` check reports container health only; Docker does
 not automatically restart a container merely because it becomes unhealthy.
+
+## Diagnóstico operacional (somente sinalização)
+
+O Compose de produção define `DIAGNOSTIC_LOG_PATH=/var/log/godrinking/events.jsonl`
+e monta o volume Docker nomeado `godrinking-rendezvous-diagnostics` nesse
+diretório. O volume fica no host e persiste quando o container é recriado.
+Sem essa variável, o servidor não grava o arquivo. Cada linha é JSON com
+apenas `ts`, `event`, `reason` e `count`; eventos repetidos são agregados em
+janelas de 10 segundos. Os arquivos são restritos ao usuário do container e
+rotacionados em aproximadamente 10 MiB por arquivo (atual + 3 anteriores).
+Não coloque este volume em um serviço público de logs.
+
+Para consultar no host do runner, sem publicar os dados no Actions:
+
+```sh
+docker exec godrinking-rendezvous-prod sh -c 'tail -n 100 /var/log/godrinking/events.jsonl'
+docker volume inspect godrinking-rendezvous-diagnostics
+```
+
+`watch:forwarded` e `signal:offer`/`signal:answer` indicam somente que o
+servidor **tentou encaminhar** a sinalização. `watch:rejected`,
+`signal:rejected` e `*:target_offline` apontam falhas observáveis pelo servidor.
+`share:announced` confirma apenas o aviso de compartilhamento, não a captura;
+`auth:*`, `websocket:closed`, `websocket:ping_timeout`,
+`grace_expiry:expired`, `heartbeat_expiry:expired` e `pressure:*` ajudam a comparar o horário da falha
+com perda de presença ou limites de capacidade. Os registros não incluem IP,
+apelido, código da sala, ID do membro, token, senha, SDP nem candidatos ICE.
+Não permitem identificar qual pessoa ou sala foi afetada. Um processo morto
+sem SIGTERM pode perder a janela atual; o início seguinte ainda será registrado.
+
+O servidor **não recebe mídia P2P**: ele não sabe se a conexão ICE fechou,
+se a captura iniciou, se os quadros chegaram ou se o player congelou. Ausência
+de erros nesses registros não prova que a transmissão funcionou. Para isolar
+uma parada de vídeo, correlacione o horário com traços do aplicativo em quem
+compartilha e em quem assiste (ver `MEDIA_DEBUG.md` na raiz).

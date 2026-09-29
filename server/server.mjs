@@ -14,6 +14,7 @@ import http from "node:http";
 import { isIP } from "node:net";
 import { randomBytes, scrypt, timingSafeEqual } from "node:crypto";
 import { WebSocketServer } from "ws";
+import { createDiagnostics } from "./diagnostics.mjs";
 
 const PORT = Number(process.env.PORT || 18790);
 const BIND = process.env.BIND || "127.0.0.1";
@@ -50,14 +51,14 @@ function normalizeIp(value) {
 const trustedProxyEnv = process.env.TRUSTED_PROXY_PEER;
 const trustedProxyPeer = trustedProxyEnv === undefined ? null : normalizeIp(trustedProxyEnv);
 if (trustedProxyEnv !== undefined && !trustedProxyPeer) {
-  console.error("invalid TRUSTED_PROXY_PEER: expected a single IP literal");
+  console.error("invalid TRUSTED_PROXY_PEER");
   process.exit(1);
 }
 
 // Default is loopback. Docker sets BIND=0.0.0.0 (or ::) behind a reverse proxy.
 // Binding a specific public address is still refused.
 if (!/^(127\.\d+\.\d+\.\d+|::1|::ffff:127\.\d+\.\d+\.\d+|localhost|0\.0\.0\.0|::)$/.test(BIND)) {
-  console.error(`refusing non-local bind: ${BIND}`);
+  console.error("refusing non-local bind");
   process.exit(1);
 }
 
@@ -143,11 +144,14 @@ function requestIp(req) {
   return forwardedIp ? { ip: forwardedIp, invalid: false } : { ip: null, invalid: true };
 }
 
-// Never logs secrets: only level, ip, event, code, member id (opaque).
-function log(level, ip, event, code = "-", member = "-") {
-  const line = [new Date().toISOString(), level, ip, event, code, member].join(" ");
-  if (level === "warn") console.warn(line);
-  else console.log(line);
+// Legacy call sites may pass identities; never persist or print those arguments.
+const diagnostics = createDiagnostics(process.env.DIAGNOSTIC_LOG_PATH || "");
+function log(_level, _ip, event, _code, _member, result) {
+  if (event === "ws") diagnostics.record("websocket", "connected");
+  if (event === "gc-room") diagnostics.record("room", "removed");
+  if (event === "rate") diagnostics.record("pressure", "request_limit");
+  if (event === "ignored") diagnostics.record("auth", "ignored");
+  if (event === "join" && (result === "denied" || result === "full")) diagnostics.record("auth", result);
 }
 
 function randomToken() {
@@ -226,11 +230,15 @@ function send(ws, obj) {
   for (const client of wss.clients) globallyBuffered += client.bufferedAmount;
   if (ws.bufferedAmount + bytes > WS_OUTBOUND_MAX_BUFFERED ||
       globallyBuffered + bytes > WS_OUTBOUND_GLOBAL_MAX_BUFFERED) {
+    diagnostics.record("pressure", ws.bufferedAmount + bytes > WS_OUTBOUND_MAX_BUFFERED ? "outbound_limit" : "global_limit");
     ws.terminate();
     return;
   }
   ws.send(data, (error) => {
-    if (error && ws.readyState === 1) ws.terminate();
+    if (error && ws.readyState === 1) {
+      diagnostics.record("websocket", "send_error");
+      ws.terminate();
+    }
   });
 }
 
@@ -345,7 +353,6 @@ function removeMember(room, memberId, reason) {
   tokens.delete(member.token);
   send(member.ws, { t: reason });
   if (member.ws) member.ws.close(4000, reason);
-  log("info", "-", reason === "kicked" ? "kick" : "leave", room.code, memberId);
   if (room.members.size === 0 || ![...room.members.values()].some((m) => m.state === "accepted")) {
     // Nobody left to hold the room (pending-only rooms never existed).
     if ([...room.members.values()].length === 0) {
@@ -718,24 +725,33 @@ function handleSignal(room, member, msg) {
   const toId = typeof msg.to === "string" ? msg.to : "";
   const dest = room.members.get(toId);
   if (!dest || dest.state !== "accepted" || dest.id === member.id) {
+    diagnostics.record("signal", "rejected");
     send(member.ws, { t: "error", error: "forbidden" });
     return;
   }
   if (!validSignalEnvelope(msg.payload)) {
+    diagnostics.record("signal", "rejected");
     send(member.ws, { t: "error", error: "invalid" });
     return;
   }
   const key = linkKey(room.code, member.id, dest.id, msg.payload);
   const allowed = attemptAllowed(room.code, member.id, dest.id, key, msg.payload);
   if (allowed === "full") {
+    diagnostics.record("signal", "rejected");
     send(member.ws, { t: "error", error: "full" });
     return;
   }
   if (!allowed) {
+    diagnostics.record("signal", "rejected");
     send(member.ws, { t: "error", error: "stale" });
     return;
   }
+  if (!dest.ws || dest.ws.readyState !== 1) {
+    diagnostics.record("signal", "target_offline");
+    return;
+  }
   send(dest.ws, { t: "signal", from: member.id, to: dest.id, payload: msg.payload });
+  diagnostics.record("signal", msg.payload.type === "offer" ? "offer" : msg.payload.type === "answer" ? "answer" : "forwarded");
 }
 
 function handleWsMessage(room, member, ws, raw) {
@@ -769,6 +785,7 @@ function handleWsMessage(room, member, ws, raw) {
     const share = msg.t === "announce-share";
     if (member.share === share) return;
     member.share = share;
+    diagnostics.record("share", share ? "announced" : "stopped");
     log("info", "-", "share", room.code, member.id);
     broadcastRoster(room);
     return;
@@ -776,10 +793,16 @@ function handleWsMessage(room, member, ws, raw) {
   if (msg.t === "watch" || msg.t === "unwatch") {
     const dest = typeof msg.to === "string" ? room.members.get(msg.to) : null;
     if (!dest || dest.state !== "accepted" || dest.id === member.id) {
+      diagnostics.record("watch", "rejected");
       send(member.ws, { t: "error", error: "forbidden" });
       return;
     }
+    if (!dest.ws || dest.ws.readyState !== 1) {
+      diagnostics.record("watch", "target_offline");
+      return;
+    }
     send(dest.ws, { t: msg.t, from: member.id, to: dest.id });
+    if (msg.t === "watch") diagnostics.record("watch", "forwarded");
     return;
   }
   if (SIGNAL_TYPES.has(msg.t)) {
@@ -839,6 +862,7 @@ wss.on("connection", (ws, req, meta) => {
     return;
   }
   if (member.ws && member.ws !== ws) {
+    diagnostics.record("websocket", "replaced");
     try {
       member.ws.close(4000, "replaced");
     } catch {
@@ -854,6 +878,7 @@ wss.on("connection", (ws, req, meta) => {
   ws.on("pong", (data) => {
     const now = Date.now();
     if (!takeToken(ws.pongBucket, 1, now) || !takeGlobalWsTokens(data.length, now)) {
+      diagnostics.record("pressure", "control_limit");
       ws.terminate();
       return;
     }
@@ -863,11 +888,15 @@ wss.on("connection", (ws, req, meta) => {
     const now = Date.now();
     if (!takeToken(ws.pingBucket, 1, now) || !takeGlobalWsTokens(data.length, now) ||
         ws.bufferedAmount + data.length + 2 > WS_OUTBOUND_MAX_BUFFERED) {
+      diagnostics.record("pressure", "inbound_limit");
       ws.terminate();
       return;
     }
     ws.pong(data, undefined, (error) => {
-      if (error && ws.readyState === 1) ws.terminate();
+      if (error && ws.readyState === 1) {
+        diagnostics.record("websocket", "send_error");
+        ws.terminate();
+      }
     });
   });
   ws.on("error", () => {});
@@ -889,6 +918,7 @@ wss.on("connection", (ws, req, meta) => {
     const bytes = wsDataBytes(data);
     if (!takeToken(ws.messageBucket, 1, now) || !takeToken(ws.byteBucket, bytes, now) ||
         !takeGlobalWsTokens(bytes, now)) {
+      diagnostics.record("pressure", "inbound_limit");
       ws.terminate();
       return;
     }
@@ -896,6 +926,7 @@ wss.on("connection", (ws, req, meta) => {
   });
   ws.on("close", () => {
     if (member.ws !== ws) return;
+    diagnostics.record("websocket", "closed");
     member.ws = null;
     const generation = member.connectionGeneration;
     const memberId = member.id;
@@ -907,6 +938,7 @@ wss.on("connection", (ws, req, meta) => {
       const current = currentRoom.members.get(memberId);
       if (current && current.connectionGeneration === generation && !current.ws) {
         current.disconnectTimer = null;
+        diagnostics.record("grace_expiry", "expired");
         removeMember(currentRoom, memberId, "gone");
       }
     }, DISCONNECT_GRACE_MS);
@@ -934,11 +966,13 @@ server.on("upgrade", (req, socket, head) => {
     return;
   }
   if (!rateLimit(ip, "ws", RATE_LIMITS.ws)) {
+    diagnostics.record("pressure", "upgrade_limit");
     socket.write("HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n");
     socket.destroy();
     return;
   }
   if (wss.clients.size >= MAX_WS) {
+    diagnostics.record("pressure", "upgrade_limit");
     socket.write("HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n");
     socket.destroy();
     return;
@@ -958,12 +992,16 @@ server.on("upgrade", (req, socket, head) => {
 setInterval(() => {
   for (const ws of wss.clients) {
     if (!ws.isAlive) {
+      diagnostics.record("websocket", "ping_timeout");
       ws.terminate();
       continue;
     }
     ws.isAlive = false;
     ws.ping(undefined, (error) => {
-      if (error && ws.readyState === 1) ws.terminate();
+      if (error && ws.readyState === 1) {
+        diagnostics.record("websocket", "send_error");
+        ws.terminate();
+      }
     });
   }
 }, WS_PING_MS);
@@ -975,7 +1013,7 @@ setInterval(() => {
   for (const room of [...rooms.values()]) {
     for (const member of [...room.members.values()]) {
       if (now - member.heartbeatAt > HEARTBEAT_TTL_MS) {
-        log("warn", "-", "gc-member", room.code, member.id);
+        diagnostics.record("heartbeat_expiry", "expired");
         removeMember(room, member.id, "gone");
         if (!rooms.has(room.code)) break;
       }
@@ -997,11 +1035,15 @@ setInterval(() => {
 server.listen(PORT, BIND, () => {
   const addr = server.address();
   const port = typeof addr === "object" && addr ? addr.port : PORT;
-  log("info", "-", "listen", `${BIND}:${port}`);
+  diagnostics.record("startup", "started");
+  diagnostics.flush();
+  // BIND has been validated above; retain the address for IPv4/IPv6 test harnesses.
+  console.log(`listen ${BIND}:${port}`);
 });
 
 function shutdown() {
-  log("info", "-", "shutdown");
+  diagnostics.record("shutdown", "stopped");
+  diagnostics.close();
   for (const ws of wss.clients) ws.terminate();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 1000).unref();

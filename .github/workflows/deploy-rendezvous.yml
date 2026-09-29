@@ -81,4 +81,8 @@ jobs:
           docker compose -f docker-compose.app.yml pull
           docker rm -f godrinking-rendezvous-prod || true
           docker compose -f docker-compose.app.yml up -d --force-recreate
+          docker volume inspect godrinking-rendezvous-diagnostics >/dev/null
+          docker exec godrinking-rendezvous-prod sh -ec 'test "$(id -u)" = 10001 && test -w /var/log/godrinking && touch /var/log/godrinking/.write-check && rm /var/log/godrinking/.write-check'
+          # Access restricted diagnostics only on the deployment host, e.g.:
+          # docker exec godrinking-rendezvous-prod cat /var/log/godrinking/events.jsonl
           docker image prune -f

@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node server.mjs",
-    "test": "node test_rooms.mjs && node test_auth.mjs && node test_admit.mjs && node test_signaling.mjs && node test_limits.mjs && node test_kick.mjs && node test_succession.mjs && node test_heartbeat.mjs && node test_disconnect.mjs && node test_ratelimit.mjs && node test_nomedia.mjs && node test_malformed_target.mjs && node test_kdf_capacity.mjs && node test_resilience.mjs && node test_signal_state_capacity.mjs && node test_attempt_budget.mjs && node test_reconnect_grace.mjs && node test_multipeer_burst.mjs && node test_control_frames.mjs && node test_ws_fragments.mjs && node test_global_ws_budget.mjs && node test_trusted_proxy_identity.mjs"
+    "test": "node test_rooms.mjs && node test_auth.mjs && node test_admit.mjs && node test_signaling.mjs && node test_limits.mjs && node test_kick.mjs && node test_succession.mjs && node test_heartbeat.mjs && node test_disconnect.mjs && node test_ratelimit.mjs && node test_nomedia.mjs && node test_diagnostics.mjs && node test_malformed_target.mjs && node test_kdf_capacity.mjs && node test_resilience.mjs && node test_signal_state_capacity.mjs && node test_attempt_budget.mjs && node test_reconnect_grace.mjs && node test_multipeer_burst.mjs && node test_control_frames.mjs && node test_ws_fragments.mjs && node test_global_ws_budget.mjs && node test_trusted_proxy_identity.mjs"
   },
   "dependencies": {
     "ws": "8.21.3"

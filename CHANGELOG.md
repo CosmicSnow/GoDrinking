@@ -1,5 +1,10 @@
 # changelog
 
+## v0.7.15
+
+- feat: persist privacy-safe, aggregated rendezvous diagnostics in a Docker volume for troubleshooting signaling failures
+- docs: track the intermittent multi-viewer screen freeze while its cause remains unconfirmed
+
 ## v0.7.14
 
 - fix: windows share shows the mouse cursor on display capture
