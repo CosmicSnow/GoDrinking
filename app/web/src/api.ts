@@ -334,6 +334,27 @@ export function previewSource(kind: string, id: string): Promise<SourcePreview> 
   return invoke<SourcePreview>("preview_source", { kind, id });
 }
 
+/** Fonte pré-visualizável ao vivo (modal Compartilhar). */
+export type PreviewKind = "display" | "window" | "camera";
+
+/**
+ * Inicia o preview ao vivo de uma fonte listada. Devolve um token opaco;
+ * frames GLP2/format-0 chegam no `channel` até `previewStop(token)`.
+ * Erra tipado (permissão, fonte sumida, câmera ocupada) — nunca silencioso.
+ */
+export function previewStart(
+  kind: PreviewKind,
+  id: string,
+  channel: import("@tauri-apps/api/core").Channel<ArrayBuffer>,
+): Promise<string> {
+  return invoke<string>("preview_start", { kind, id, channel });
+}
+
+/** Para um preview ao vivo. Idempotente; token desconhecido é Ok. */
+export function previewStop(token: string): Promise<void> {
+  return invoke<void>("preview_stop", { token });
+}
+
 /** Capacidades sem tocar no SO (nunca pede permissão). */
 export function sourceCapabilities(): Promise<CapabilitySet> {
   return invoke<CapabilitySet>("source_capabilities");

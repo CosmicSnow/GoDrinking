@@ -9,7 +9,8 @@
 import { useEffect, useRef, useState } from "react";
 import { version as APP_VERSION } from "../package.json";
 import { StreamPlayer } from "./StreamPlayer";
-import { isTauri, playerMuteAll } from "./api";
+import { PreviewPlayer, useAppFocus } from "./PreviewPlayer";
+import { isTauri, playerMuteAll, previewStop } from "./api";
 import type { UpdateInfo } from "./update";
 import type {
   AudioApp,
@@ -1249,6 +1250,11 @@ export function RoomScreen(props: RoomProps) {
   const [shareTab, setShareTab] = useState<"screens" | "apps" | "cameras">("screens");
   // Webcam PiP sobre a tela: id da câmera ("" = só a tela). Limpo ao fechar.
   const [comboCam, setComboCam] = useState("");
+  // Preview ao vivo: token opaco do backend + último erro (o thumb segue).
+  const [previewToken, setPreviewToken] = useState<string | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  // O preview só roda com a janela do app em foco (pausa fora dela).
+  const appFocused = useAppFocus();
   const [audioQuery, setAudioQuery] = useState("");
   const [audioSoundOnly, setAudioSoundOnly] = useState(false);
   const { toast, show } = useToast();
@@ -1325,6 +1331,27 @@ export function RoomScreen(props: RoomProps) {
     if (raw.startsWith("window:") && raw.slice("window:".length).trim()) return raw;
     return null;
   })();
+  // Alvo do preview ao vivo: fonte com id real (tela, janela ou webcam).
+  const previewTarget: { kind: "display" | "window" | "camera"; id: string } | null = (() => {
+    const raw = source.trim();
+    const kinds = ["display", "window", "camera"] as const;
+    for (const kind of kinds) {
+      if (raw.startsWith(`${kind}:`)) {
+        const id = raw.slice(kind.length + 1).trim();
+        if (!id) return null;
+        return { kind, id };
+      }
+    }
+    return null;
+  })();
+  // Compartilhar derruba o preview antes (a mesma câmera não abre duas
+  // vezes): parar → fechar → ir ao ar, sem guess.
+  const stopPreviewForShare = (): Promise<void> => {
+    const token = previewToken;
+    setPreviewToken(null);
+    if (!token) return Promise.resolve();
+    return previewStop(token).catch(() => undefined);
+  };
   // Previews lazy do modal: ao abrir ou trocar de aba/lista, pede os thumbs
   // da aba visível com debounce (o App cacheia por kind:id; sem thumb, o
   // gradiente continua). Callback via ref para não refogar o debounce.
@@ -1839,6 +1866,24 @@ export function RoomScreen(props: RoomProps) {
               ) : null}
             </>
           ) : null}
+          {previewTarget ? (
+            <>
+              <p className="hint">Pré-visualização ao vivo (só com o app em foco).</p>
+              <PreviewPlayer
+                kind={previewTarget.kind}
+                id={previewTarget.id}
+                active={shareOpen && appFocused}
+                onToken={setPreviewToken}
+                onError={setPreviewError}
+              />
+              {shareOpen && !appFocused ? (
+                <p className="hint">Pausado — volte ao app para ver o preview.</p>
+              ) : null}
+              {previewError ? (
+                <p className="error" role="alert">{previewError}</p>
+              ) : null}
+            </>
+          ) : null}
           {sourceKindOf(source) === "synthetic" ? (
             <p className="hint"><code>synthetic</code> gera a bola de teste.</p>
           ) : null}
@@ -1931,13 +1976,17 @@ export function RoomScreen(props: RoomProps) {
               type="button"
               className="btn primary"
               onClick={() => {
-                if (comboScreen && comboCam && onShareCombo) {
-                  onShareCombo(comboScreen, comboCam);
-                } else {
-                  onShare();
-                }
+                // A mesma câmera não abre duas vezes: o preview cai antes
+                // do share subir (ordem stop-first, como o set_quality).
                 setShareOpen(false);
                 say("Iniciando compartilhamento…");
+                void stopPreviewForShare().then(() => {
+                  if (comboScreen && comboCam && onShareCombo) {
+                    onShareCombo(comboScreen, comboCam);
+                  } else {
+                    onShare();
+                  }
+                });
               }}
               disabled={busy}
             >

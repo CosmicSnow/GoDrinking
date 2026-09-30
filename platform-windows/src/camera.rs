@@ -244,6 +244,10 @@ pub fn run_camera(
                     }
                     break;
                 }
+                // Pace failures: a dead device reports in ~3s instead of
+                // burning the budget in a hot microsecond loop; transient
+                // blips (a second of bad frames) ride through.
+                std::thread::sleep(Duration::from_millis(100));
             }
         }
     }
@@ -274,6 +278,8 @@ pub fn thumbnail_camera(id: &str) -> Result<BgraFrame, PlatformError> {
                     let _ = camera.stop_stream();
                     return Err(map_open_error(id, &error));
                 }
+                // Don't hot-spin a dead device while waiting out the deadline.
+                std::thread::sleep(Duration::from_millis(50));
             }
         }
     }

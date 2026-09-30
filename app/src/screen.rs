@@ -460,6 +460,228 @@ pub fn overlay_pip(base: &BgraFrame, overlay: &BgraFrame) -> BgraFrame {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Local live preview (share modal). Own lightweight OS reads, independent
+// from share bridges: cameras pump continuously, screens poll one-shot
+// stills (no second OS stream, no GPU-packets problem). Frames are packed
+// small (≤320px) as GLP2/format-0 RGBA — the SAME wire the player speaks
+// (see player.rs dispatch + parsePlayerFrame), so the frontend reuses its
+// renderer. Runs only while the modal is open AND the app is focused
+// (frontend-gated); stops are explicit (modal close, blur, share confirm,
+// leave). Tauri-free: the command layer forwards packets to a Channel.
+// ---------------------------------------------------------------------------
+
+/// Preview long side (px). Small enough to stay cheap over IPC.
+pub const PREVIEW_LIVE_MAX_W: u32 = 320;
+/// Camera preview cadence (~8fps): live feel without encode-grade cost.
+pub const PREVIEW_CAMERA_TICK: Duration = Duration::from_millis(120);
+/// Screen still cadence (~1.4fps): cheap + feedback-safe at small size.
+pub const PREVIEW_STILL_INTERVAL: Duration = Duration::from_millis(700);
+/// Consecutive unreadable stills before the preview reports failure.
+pub const PREVIEW_MAX_STILL_ERRORS: u32 = 8;
+/// Latest-only preview channel depth (drop, never queue stale).
+const PREVIEW_CHANNEL_DEPTH: usize = 2;
+
+/// One preview frame: sequence + dims + tight RGBA pixels.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviewPacket {
+    pub seq: u32,
+    pub w: u32,
+    pub h: u32,
+    pub rgba: Vec<u8>,
+}
+
+impl PreviewPacket {
+    /// GLP2 wire bytes (magic + LE seq/w/h/format + pixels). Must match
+    /// player.rs dispatch and the frontend parsePlayerFrame — the three
+    /// ship together. `format` is always 0 (RGBA).
+    pub fn glp2_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(20 + self.rgba.len());
+        bytes.extend_from_slice(b"GLP2");
+        bytes.extend_from_slice(&self.seq.to_le_bytes());
+        bytes.extend_from_slice(&self.w.to_le_bytes());
+        bytes.extend_from_slice(&self.h.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&self.rgba);
+        bytes
+    }
+}
+
+/// Handle to a running preview. `stop()` is idempotent and bounded; `Drop`
+/// stops best-effort.
+pub struct PreviewHandle {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PreviewHandle {
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for PreviewHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Fit `(w, h)` into [`PREVIEW_LIVE_MAX_W`] preserving aspect, even dims,
+/// floor 2. Pure. Oversized inputs shrink; small inputs stay native (never
+/// upscale: a 160px webcam stays 160px).
+pub fn fit_preview_dims(w: u32, h: u32) -> Option<(u32, u32)> {
+    if w < 2 || h < 2 {
+        return None;
+    }
+    if w <= PREVIEW_LIVE_MAX_W {
+        return Some((w - w % 2, h - h % 2));
+    }
+    let tw = PREVIEW_LIVE_MAX_W;
+    let th = ((h as u64 * tw as u64 / w as u64) as u32).max(2);
+    Some((tw - tw % 2, th - th % 2))
+}
+
+/// Downscales `frame` to preview size and swizzles BGRA→opaque RGBA.
+/// `None` on degenerate input — the caller skips the frame. Pure.
+pub fn pack_preview(seq: u32, frame: &BgraFrame) -> Option<PreviewPacket> {
+    let (tw, th) = fit_preview_dims(frame.w, frame.h)?;
+    let small = scale_bgra_bilinear(frame, tw, th);
+    if small.data.len() != (tw as usize) * (th as usize) * 4 {
+        return None;
+    }
+    let mut rgba = Vec::with_capacity(small.data.len());
+    for px in small.data.chunks_exact(4) {
+        rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
+    }
+    Some(PreviewPacket { seq, w: tw, h: th, rgba })
+}
+
+/// Starts a local preview for one listed source id. Returns the packet
+/// channel plus the owning handle. Pre-flight safe: on `Err` nothing runs.
+/// Cameras pump their OS stream; screens poll one-shot stills.
+pub fn start_preview_stream(
+    kind: SourceKind,
+    id: &str,
+) -> Result<(mpsc::Receiver<PreviewPacket>, PreviewHandle), PlatformError> {
+    if !matches!(kind, SourceKind::Display | SourceKind::Window | SourceKind::Camera) {
+        return Err(PlatformError::InvalidSource { reason: "preview: tela, janela ou webcam" });
+    }
+    let id = id.trim();
+    if id.is_empty() {
+        return Err(PlatformError::InvalidSource { reason: "id vazio" });
+    }
+    let info = enumerate_sources()?
+        .into_iter()
+        .find(|item| item.kind == kind && item.id == id)
+        .ok_or_else(|| PlatformError::SourceGone { id: id.to_owned() })?;
+    let (tx, rx) = mpsc::sync_channel::<PreviewPacket>(PREVIEW_CHANNEL_DEPTH);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_ = Arc::clone(&stop);
+    let thread = std::thread::Builder::new()
+        .name("golive-preview".into())
+        .spawn(move || {
+            if matches!(info.kind, SourceKind::Camera) {
+                pump_camera_preview(&info, &tx, &stop_);
+            } else {
+                pump_still_preview(&info, &tx, &stop_, &mut || thumbnail_for(&info));
+            }
+        })
+        .map_err(|e| PlatformError::Internal(format!("thread de preview: {e}")))?;
+    Ok((rx, PreviewHandle { stop, thread: Some(thread) }))
+}
+
+/// Camera preview pump: opens the OS stream once, packs kept frames at
+/// preview size on the tick gate, latest-only. Ends on stop, device end,
+/// or persistent failure (typed via channel close — the command layer
+/// reports the stall; kinds/counts only, never pixels).
+fn pump_camera_preview(
+    info: &SourceInfo,
+    tx: &mpsc::SyncSender<PreviewPacket>,
+    stop: &AtomicBool,
+) {
+    let config = golive_platform::capture_config_for(640, 480, 10);
+    let mut stream = match open_stream(info, &config) {
+        Ok((stream, _)) => stream,
+        Err(_) => return,
+    };
+    let mut seq = 0u32;
+    let mut last_sent: Option<Instant> = None;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        match stream.next_frame(PREVIEW_CAMERA_TICK + Duration::from_millis(400)) {
+            Ok(CapturePacket::Cpu(bgra)) => {
+                let now = Instant::now();
+                if !should_forward(last_sent, now, PREVIEW_CAMERA_TICK) {
+                    continue;
+                }
+                if let Some(packet) = pack_preview(seq, &bgra) {
+                    seq = seq.wrapping_add(1);
+                    last_sent = Some(now);
+                    if tx.try_send(packet).is_err() {
+                        break; // Receiver gone (stop raced us) — exit.
+                    }
+                }
+            }
+            // Overlay-incompatible GPU packets never occur here (no
+            // compositing), but a retained packet has no CPU pixels to
+            // pack — skip rather than misinterpret.
+            Ok(CapturePacket::Gpu(_)) => continue,
+            Err(NextError::Timeout) => continue,
+            Err(NextError::Ended) | Err(NextError::Failed(_)) => break,
+        }
+    }
+    stream.stop(Duration::from_secs(2)).ok();
+}
+
+/// Screen preview pump: one-shot stills on an interval (no persistent OS
+/// stream, no GPU packets by construction). `still` is a closure so tests
+/// script frames/failures without a backend. Aborts after
+/// [`PREVIEW_MAX_STILL_ERRORS`] consecutive failures.
+fn pump_still_preview(
+    info: &SourceInfo,
+    tx: &mpsc::SyncSender<PreviewPacket>,
+    stop: &AtomicBool,
+    still: &mut dyn FnMut() -> Result<BgraFrame, PlatformError>,
+) {
+    let _ = info;
+    let mut seq = 0u32;
+    let mut errors = 0u32;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        match still() {
+            Ok(frame) => {
+                errors = 0;
+                if let Some(packet) = pack_preview(seq, &frame) {
+                    seq = seq.wrapping_add(1);
+                    if tx.try_send(packet).is_err() {
+                        break;
+                    }
+                }
+            }
+            Err(_) => {
+                errors += 1;
+                if errors >= PREVIEW_MAX_STILL_ERRORS {
+                    break;
+                }
+            }
+        }
+        // Interval sleep, stop-responsive (10 slices).
+        for _ in 0..10 {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(PREVIEW_STILL_INTERVAL / 10);
+        }
+    }
+}
+
 /// Opens + starts the platform stream for one listed source, alongside the
 /// backend's [`RestartOrder`] for that source (each arm answers through the
 /// platform abstraction — this stays the single cfg-gated selection point;
@@ -1048,6 +1270,189 @@ mod tests {
         let out = overlay_pip(&base, &cam);
         assert_eq!(out.stride, 12);
         assert_eq!(out.data.len(), base.data.len());
+    }
+
+    #[test]
+    fn preview_fit_shrinks_wide_never_upscales() {
+        assert_eq!(fit_preview_dims(0, 10), None);
+        assert_eq!(fit_preview_dims(640, 480), Some((320, 240)));
+        assert_eq!(fit_preview_dims(1920, 1080), Some((320, 180)));
+        // Small native stays native (evened, never upscaled).
+        assert_eq!(fit_preview_dims(160, 120), Some((160, 120)));
+        assert_eq!(fit_preview_dims(161, 121), Some((160, 120)));
+    }
+
+    #[test]
+    fn preview_pack_swizzles_bgra_to_opaque_rgba() {
+        // 2x2: red, green, blue, white in BGRA → RGBA with forced alpha.
+        let src = BgraFrame {
+            w: 2,
+            h: 2,
+            stride: 8,
+            format: PixelFormat::Bgra8888,
+            data: vec![
+                0, 0, 255, 0, 0, 255, 0, 0,
+                255, 0, 0, 0, 255, 255, 255, 0,
+            ],
+        };
+        let packet = pack_preview(7, &src).unwrap();
+        assert_eq!((packet.seq, packet.w, packet.h), (7, 2, 2));
+        assert_eq!(
+            packet.rgba,
+            vec![
+                255, 0, 0, 255, 0, 255, 0, 255,
+                0, 0, 255, 255, 255, 255, 255, 255,
+            ]
+        );
+        // GLP2 wire: magic + LE seq/w/h/format + pixels (player-compatible).
+        let wire = packet.glp2_bytes();
+        assert_eq!(&wire[..4], b"GLP2");
+        assert_eq!(&wire[4..8], &7u32.to_le_bytes());
+        assert_eq!(&wire[8..12], &2u32.to_le_bytes());
+        assert_eq!(&wire[12..16], &2u32.to_le_bytes());
+        assert_eq!(&wire[16..20], &0u32.to_le_bytes());
+        assert_eq!(&wire[20..], packet.rgba.as_slice());
+        // Degenerate input never panics — the pump skips the frame.
+        let empty = BgraFrame {
+            w: 0,
+            h: 0,
+            stride: 0,
+            format: PixelFormat::Bgra8888,
+            data: Vec::new(),
+        };
+        assert!(pack_preview(0, &empty).is_none());
+    }
+
+    #[test]
+    fn still_pump_streams_scripted_stills_then_stops() {
+        let info = SourceInfo {
+            kind: SourceKind::Display,
+            id: "mock-1".into(),
+            name: "Mock".into(),
+            w: 64,
+            h: 64,
+        };
+        let frame = solid_bgra(64, 64, 10, 200, 30);
+        let (tx, rx) = mpsc::sync_channel::<PreviewPacket>(8);
+        let stop = AtomicBool::new(false);
+        let worker = std::thread::spawn(move || {
+            let mut still = || Ok(frame.clone());
+            pump_still_preview(&info, &tx, &stop, &mut still);
+        });
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(packet) => got.push(packet),
+                Err(e) => panic!("still pump stalled: {e:?}"),
+            }
+        }
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0].w, got[0].h), (64, 64));
+        assert_eq!(got[1].seq, got[0].seq + 1);
+        assert_eq!(got[0].rgba.len(), 64 * 64 * 4);
+        drop(rx);
+        worker.join().expect("pump exits when receiver drops");
+    }
+
+    #[test]
+    fn still_pump_aborts_on_persistent_failure() {
+        let info = SourceInfo {
+            kind: SourceKind::Window,
+            id: "gone".into(),
+            name: "Mock".into(),
+            w: 0,
+            h: 0,
+        };
+        let (tx, rx) = mpsc::sync_channel::<PreviewPacket>(8);
+        let stop = AtomicBool::new(false);
+        // 8 consecutive failures × 700ms: aborts in ~6s, never hangs.
+        let start = Instant::now();
+        pump_still_preview(
+            &info,
+            &tx,
+            &stop,
+            &mut || -> Result<BgraFrame, PlatformError> {
+                Err(PlatformError::SourceGone { id: "gone".into() })
+            },
+        );
+        assert!(start.elapsed() < Duration::from_secs(30));
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    #[ignore]
+    fn hw_camera_preview_streams_small_packets() {
+        // Needs a physical webcam; never runs in CI:
+        // `cargo test -p golive-app --lib hw_camera_preview -- --ignored --nocapture`
+        // Virtual devices with no fulfillable mode are skipped honestly.
+        let listed = enumerate_sources().expect("real enumerate");
+        // A device may open yet never deliver frames (virtual cameras) —
+        // only a received packet proves a previewable webcam.
+        let mut opened = None;
+        for cam in listed.iter().filter(|s| s.kind == SourceKind::Camera) {
+            match start_preview_stream(cam.kind, &cam.id) {
+                Ok((rx, handle)) => {
+                    match rx.recv_timeout(Duration::from_secs(12)) {
+                        Ok(first) => {
+                            opened = Some((first, rx, handle));
+                            break;
+                        }
+                        Err(e) => eprintln!("preview camera without frames: {e}"),
+                    }
+                }
+                Err(e) => eprintln!("preview skipping camera: {e}"),
+            }
+        }
+        let (first, rx, mut handle) = opened.expect("a previewable webcam");
+        assert!((2..=PREVIEW_LIVE_MAX_W).contains(&first.w));
+        assert_eq!(first.rgba.len(), first.w as usize * first.h as usize * 4);
+        for _ in 0..2 {
+            let packet = rx.recv_timeout(Duration::from_secs(15)).expect("preview packet");
+            assert!((2..=PREVIEW_LIVE_MAX_W).contains(&packet.w));
+            assert_eq!(packet.rgba.len(), packet.w as usize * packet.h as usize * 4);
+            let wire = packet.glp2_bytes();
+            assert_eq!(&wire[..4], b"GLP2");
+        }
+        handle.stop();
+    }
+
+    #[test]
+    fn camera_pack_path_fits_mock_frames_at_preview_size() {
+        use golive_platform::mock::MockSource;
+        use golive_platform::VideoSource;
+        let info = SourceInfo {
+            kind: SourceKind::Display,
+            id: "mock-1".into(),
+            name: "Mock".into(),
+            w: 640,
+            h: 480,
+        };
+        let mut source = MockSource::open(&info).unwrap();
+        source.frames = vec![MockSource::display("x", 640, 480)
+            .with_solid_frame(200, 30, 30)
+            .frames
+            .remove(0)];
+        let stream = source.start(&CaptureConfig::default()).unwrap();
+        let (tx, rx) = mpsc::sync_channel::<PreviewPacket>(8);
+        let pump = std::thread::spawn(move || {
+            let mut seq = 0u32;
+            for _ in 0..2 {
+                match stream.next_frame(Duration::from_secs(5)) {
+                    Ok(CapturePacket::Cpu(bgra)) => {
+                        if let Some(packet) = pack_preview(seq, &bgra) {
+                            seq += 1;
+                            let _ = tx.try_send(packet);
+                        }
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        });
+        let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // 640x480 capture fits preview 320px untouched in aspect.
+        assert_eq!((first.w, first.h), (320, 240));
+        assert_eq!(first.rgba.len(), 320 * 240 * 4);
+        pump.join().expect("packing pass ends");
     }
 
     #[test]

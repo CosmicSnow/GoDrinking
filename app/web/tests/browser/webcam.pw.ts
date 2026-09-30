@@ -39,6 +39,8 @@ test('uso 3 (só webcam): aba Webcams lista e seleciona camera:<id>', async ({ p
   await page.getByText('Webcam · 1280×720').first().click();
   await expect(page.locator('.source.sel').first()).toBeVisible({ timeout: 8000 });
   await expect(page.locator('#source-kind')).toHaveValue('camera');
+  // Mock (sem Tauri): preview ao vivo vira placeholder honesto, sem invoke.
+  await expect(page.getByTestId('preview-mock')).toBeVisible({ timeout: 8000 });
 });
 
 test('uso 1 (stream + webcam): tela selecionada oferece PiP com a webcam', async ({ page }) => {

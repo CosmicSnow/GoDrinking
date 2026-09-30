@@ -727,8 +727,7 @@ describe("fontes de captura (select + capacidades)", () => {
     expect(html).toContain("Compartilhar");
   });
 
-  it("thumb vira <img> quando há preview; sem preview, gradiente FONTE", () => {
-    const withThumb = renderToStaticMarkup(
+  it("thumb vira <img> quando há preview; sem preview, gradiente FONTE", () => {    const withThumb = renderToStaticMarkup(
       createElement(
         RoomScreen,
         roomProps({
@@ -756,6 +755,29 @@ describe("fontes de captura (select + capacidades)", () => {
     );
     expect(plain).toContain("FONTE");
     expect(plain).not.toContain("data:image");
+  });
+
+  it("fonte com id real mostra o box de preview ao vivo (mock: placeholder)", () => {
+    const html = renderToStaticMarkup(
+      createElement(
+        RoomScreen,
+        roomProps({
+          source: "camera:0",
+          sources: [
+            { kind: "camera", id: "0", name: "Webcam · 1280×720", w: 1280, h: 720 },
+          ],
+        }),
+      ),
+    );
+    expect(html).toContain("Pré-visualização ao vivo");
+    expect(html).toContain("preview-mock");
+  });
+
+  it("sem fonte escolhida, sem box de preview", () => {
+    const html = renderToStaticMarkup(
+      createElement(RoomScreen, roomProps({ source: "synthetic" })),
+    );
+    expect(html).not.toContain("Pré-visualização ao vivo");
   });
 });
 

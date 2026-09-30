@@ -27,7 +27,9 @@ use golive_core::owner::{Fence, Owner, OwnerSnapshot};
 use golive_core::signal::SignalClient;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::ipc::{Channel, InvokeResponseBody};
 use tokio::sync::mpsc;
 
 pub const DEFAULT_SERVER: &str = "https://together.jouymaker.com";
@@ -327,7 +329,8 @@ pub struct E2ePlan {
     /// File where this instance reports JSON status.
     pub status_file: String,
     /// Share source selector ("synthetic" default | "movie:<path>" |
-    /// "display:<id>" | "window:<id>"). Optional so existing plans keep
+    /// "display:<id>" | "window:<id>" | "camera:<id>" |
+    /// "combo:display:<id>+camera:<cid>"). Optional so existing plans keep
     /// working unchanged (absent == synthetic). The viewer ignores it.
     #[serde(default)]
     pub share: Option<String>,
@@ -429,6 +432,10 @@ struct Inner {
     /// census line went out (log once per process, not per Stats event).
     last_logged_backend: Option<String>,
     census_logged: bool,
+    /// Live modal previews by token (see `preview_start`). Own OS reads,
+    /// independent from share bridges; stopped explicitly (modal close,
+    /// blur, share confirm) and swept on stop_share/leave. Kind + id only.
+    previews: HashMap<String, screen::PreviewHandle>,
 }
 
 /// Decode-side observation for one watched member.
@@ -466,6 +473,7 @@ impl AppState {
                 last_logged_backend: None,
                 census_logged: false,
                 share_source: None,
+                previews: HashMap::new(),
             }),
             session_log: Mutex::new(session_log::SessionLog::disabled()),
             operations: tokio::sync::Mutex::new(()),
@@ -633,6 +641,7 @@ impl AppState {
     /// best-effort. Idempotent.
     pub async fn leave(self: &Arc<Self>) -> Result<(), String> {
         let _operation = self.operations.lock().await;
+        self.stop_all_previews();
         let (signal, publishers, viewers, audio) = {
             let mut inner = self
                 .inner
@@ -1091,6 +1100,7 @@ impl AppState {
     /// deterministically.
     pub async fn stop_share(self: &Arc<Self>) -> Result<(), String> {
         let _operation = self.operations.lock().await;
+        self.stop_all_previews();
         let (publishers, audio) = {
             let mut inner = self
                 .inner
@@ -1527,6 +1537,86 @@ impl AppState {
         }
     }
 
+    /// Starts a live modal preview for one listed source. Returns an opaque
+    /// token; frames flow as GLP2/format-0 (player-compatible) on `channel`
+    /// until `preview_stop`, modal close/blur (frontend), share confirm
+    /// (which stops first, then shares), or stop_share/leave (sweep).
+    /// Own OS reads, independent from share bridges — a busy device (e.g.
+    /// already shared elsewhere) fails typed, never silently.
+    pub fn preview_start(
+        &self,
+        kind: &str,
+        id: &str,
+        channel: Channel,
+    ) -> Result<String, String> {
+        let kind = match kind {
+            "display" => golive_platform::SourceKind::Display,
+            "window" => golive_platform::SourceKind::Window,
+            "camera" => golive_platform::SourceKind::Camera,
+            _ => return Err("preview: fonte é display, window ou camera".into()),
+        };
+        let (rx, handle) =
+            screen::start_preview_stream(kind, id).map_err(|e| e.to_string())?;
+        let token = {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            format!("pv-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
+        };
+        // Forwarder: packets → GLP2 → Channel; exits when the pump ends
+        // (stop or device failure) or the webview stops receiving. The pump
+        // owns the lifetime (its end drops the channel side); explicit stops
+        // and the stop_share/leave sweep bound everything else.
+        if std::thread::Builder::new()
+            .name("golive-preview-send".into())
+            .spawn(move || {
+                for packet in rx {
+                    if channel
+                        .send(InvokeResponseBody::Raw(packet.glp2_bytes()))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .is_err()
+        {
+            drop(handle);
+            return Err("preview: sem thread de envio".into());
+        }
+        self.inner
+            .lock()
+            .map_err(|_| "state lock poisoned".to_string())?
+            .previews
+            .insert(token.clone(), handle);
+        // Milestone: kind only (never ids).
+        let kind_name = match kind {
+            golive_platform::SourceKind::Display => "display",
+            golive_platform::SourceKind::Window => "window",
+            golive_platform::SourceKind::Camera => "camera",
+        };
+        self.session_log(format!("preview start kind={kind_name}"));
+        Ok(token)
+    }
+
+    /// Stops one live preview. Idempotent; unknown tokens are Ok.
+    pub fn preview_stop(&self, token: &str) {
+        if let Ok(mut inner) = self.inner.lock() {
+            if let Some(mut handle) = inner.previews.remove(token) {
+                handle.stop();
+            }
+        }
+    }
+
+    /// Stops every live preview (stop_share/leave sweep).
+    pub fn stop_all_previews(&self) {
+        let handles: Vec<screen::PreviewHandle> = match self.inner.lock() {
+            Ok(mut inner) => inner.previews.drain().map(|(_, h)| h).collect(),
+            Err(_) => Vec::new(),
+        };
+        for mut handle in handles {
+            handle.stop();
+        }
+    }
+
     /// Backend-observed media counters (observational, redacted). Pollable
     /// fallback next to push events. `presented` is summed live from the
     /// native windows (acks), the rest is bumped by forward tasks.
@@ -1896,6 +1986,26 @@ async fn preview_source(
 }
 
 #[tauri::command]
+async fn preview_start(
+    state: State<'_, Arc<AppState>>,
+    kind: String,
+    id: String,
+    channel: Channel,
+) -> Result<String, String> {
+    // Device open rendezvouses (camera permission/first frame): never block
+    // the async runtime on it.
+    let owned = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || owned.preview_start(&kind, &id, channel))
+        .await
+        .map_err(|e| format!("preview: {e}"))?
+}
+
+#[tauri::command]
+fn preview_stop(state: State<'_, Arc<AppState>>, token: String) {
+    state.preview_stop(&token);
+}
+
+#[tauri::command]
 fn get_media_counters(state: State<'_, Arc<AppState>>) -> Result<MediaCounters, String> {
     state.get_media_counters()
 }
@@ -1959,6 +2069,8 @@ pub fn run_with(state: Arc<AppState>) {
             get_snapshot,
             get_roster,
             preview_source,
+            preview_start,
+            preview_stop,
             get_media_counters,
             set_server,
             get_e2e_plan,
@@ -2094,6 +2206,84 @@ mod e2e_plan_tests {
             r#"{"state":"ok"}"#
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod preview_command_tests {
+    use super::*;
+    use tauri::ipc::{Channel, InvokeResponseBody};
+
+    #[test]
+    fn preview_start_rejects_unknown_kind_without_touching_os() {
+        let state = Arc::new(AppState::new());
+        assert!(state.preview_start("screen", "1", Channel::new(|_| Ok(()))).is_err());
+        assert!(state.preview_start("", "", Channel::new(|_| Ok(()))).is_err());
+        // Unknown tokens stop silently (idempotent by design).
+        state.preview_stop("pv-nope");
+        state.stop_all_previews();
+    }
+
+    #[test]
+    #[ignore]
+    fn hw_preview_command_streams_glp2_to_channel() {
+        // Real webcam through the Tauri command layer (no webview involved).
+        // Run explicitly, serially (single-open device):
+        // cargo test -p golive-app --lib hw_preview_command -- --ignored --nocapture --test-threads=1
+        use std::time::Duration;
+        let listed = screen::enumerate_sources().expect("real enumerate");
+        let cams: Vec<_> = listed
+            .iter()
+            .filter(|s| s.kind == golive_platform::SourceKind::Camera)
+            .collect();
+        if cams.is_empty() {
+            eprintln!("no camera on this machine; skipping");
+            return;
+        }
+        let state = Arc::new(AppState::new());
+        for cam in cams {
+            // A device may open yet never deliver frames (virtual cameras) —
+            // only received bytes prove a previewable webcam.
+            let (tx_one, rx_one) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+            let channel = Channel::new(move |body| {
+                if let InvokeResponseBody::Raw(bytes) = body {
+                    let _ = tx_one.try_send(bytes);
+                }
+                Ok(())
+            });
+            let token = match state.preview_start("camera", &cam.id, channel) {
+                Ok(token) => token,
+                Err(e) => {
+                    eprintln!("preview skipping camera: {e}");
+                    continue;
+                }
+            };
+            let mut frames = Vec::new();
+            let mut live = true;
+            for _ in 0..3 {
+                match rx_one.recv_timeout(Duration::from_secs(12)) {
+                    Ok(bytes) => {
+                        assert!(bytes.len() > 20 && &bytes[..4] == b"GLP2");
+                        frames.push(bytes);
+                    }
+                    Err(e) => {
+                        eprintln!("preview camera without frames: {e}");
+                        live = false;
+                        break;
+                    }
+                }
+            }
+            // Stop is idempotent; the sweep covers the rest.
+            state.preview_stop(&token);
+            state.preview_stop(&token);
+            if live {
+                assert_eq!(frames.len(), 3);
+                state.stop_all_previews();
+                return;
+            }
+        }
+        state.stop_all_previews();
+        panic!("a previewable webcam");
     }
 }
 

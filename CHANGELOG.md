@@ -1,5 +1,9 @@
 # changelog
 
+## v0.7.17
+
+- feat: preview ao vivo no modal Compartilhar (webcam contínua ~8fps, tela em stills ~1.4fps, só com o app em foco); comandos `preview_start`/`preview_stop`, mesmo fio GLP2 do player, para antes de compartilhar
+
 ## v0.7.16
 
 - feat: detectar webcam — `camera:<id>` transmite só a webcam, `combo:display:<id>+camera:<cid>` (ou `combo:window:…`) compõe tela + webcam no canto num feed só; modal Compartilhar ganha a aba Webcams, a fonte Webcam e o PiP "tela + webcam"; segunda instância assiste sem protocolo novo
