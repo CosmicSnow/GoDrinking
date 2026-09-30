@@ -1,5 +1,9 @@
 # changelog
 
+## v0.7.16
+
+- feat: detectar webcam — `camera:<id>` transmite só a webcam, `combo:display:<id>+camera:<cid>` (ou `combo:window:…`) compõe tela + webcam no canto num feed só; modal Compartilhar ganha a aba Webcams, a fonte Webcam e o PiP "tela + webcam"; segunda instância assiste sem protocolo novo
+
 ## v0.7.15
 
 - feat: persist privacy-safe, aggregated rendezvous diagnostics in a Docker volume for troubleshooting signaling failures

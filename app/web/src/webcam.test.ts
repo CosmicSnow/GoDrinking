@@ -12,6 +12,7 @@
 import { describe, expect, it } from "vitest";
 import {
   sourceKindOf,
+  validateCombo,
   validateSource,
 } from "./views";
 import { mockCaps, mockSources } from "./mock";
@@ -80,5 +81,24 @@ describe("webcam TDD — segunda instância (uso real: outro peer assiste a webc
     expect((cameraShare.kind as string)).toBe("camera");
     // O watch continua endereçando o membro (não o kind) — sem novo comando.
     expect(roster[0].id).toBe("m-host");
+  });
+});
+
+describe("webcam — combo tela+webcam (uso real: um feed só, viewer sem protocolo novo)", () => {
+  it("combo válido de display/window + camera passa", () => {
+    expect(validateSource("combo:display:1+camera:0")).toBeNull();
+    expect(validateSource("combo:window:42+camera:1")).toBeNull();
+    expect(sourceKindOf("combo:display:1+camera:0")).toBe("combo");
+  });
+
+  it("combo rejeita tela que não é tela e câmera sem id", () => {
+    expect(validateCombo("combo:camera:0+camera:1")).not.toBeNull();
+    expect(validateCombo("combo:synthetic+camera:0")).not.toBeNull();
+    expect(validateCombo("combo:display:1+camera:")).not.toBeNull();
+    expect(validateCombo("combo:display:   +camera:0")).not.toBeNull();
+    expect(validateCombo("combo:display:1")).not.toBeNull();
+    expect(validateCombo("combo:")).not.toBeNull();
+    expect(validateSource("combo:display:1+camera:0")).toBeNull();
+    expect(validateSource("combo:camera:0+camera:1")).not.toBeNull();
   });
 });

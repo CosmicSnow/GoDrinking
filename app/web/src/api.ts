@@ -8,7 +8,9 @@
  * - join_room {code, nickname, password} -> string (nosso member id)
  * - leave {} -> ()
  * - start_share {source, w?, h?, bitrateKbps?, fps?} -> ()
- *   ("synthetic", "movie:/caminho", "display:<id>", "window:<id>");
+ *   ("synthetic", "movie:/caminho", "display:<id>", "window:<id>",
+ *   "camera:<id>", "combo:display:<id>+camera:<cid>" ou
+ *   "combo:window:<id>+camera:<cid>" = tela + webcam no canto, um feed só);
  *   perfil opcional (senão 720p30)
  * - stop_share {} -> ()
  * - set_quality {w, h, bitrate_kbps, fps, preset?} -> {profile, generation}
@@ -284,7 +286,7 @@ export function setServer(base: string): Promise<string> {
 
 /** Uma fonte capturável listada pelo backend. */
 export interface SourceInfo {
-  kind: "display" | "window";
+  kind: "display" | "window" | "camera";
   id: string;
   name: string;
   w: number;
@@ -309,6 +311,11 @@ export interface Support {
 export interface CapabilitySet {
   display: Support;
   window: Support;
+  /**
+   * Webcam (opcional: backends antigos não emitem — a UI trata ausente
+   * como desconhecido e libera a opção; o backend valida de verdade).
+   */
+  camera?: Support;
   app_audio: Support;
   exclusion: Support;
 }

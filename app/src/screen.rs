@@ -49,6 +49,9 @@ pub struct BridgeHandle {
     core_tx: mpsc::SyncSender<ExternalFrame>,
     live: Arc<Mutex<QualityProfile>>,
     order: RestartOrder,
+    /// Set when this bridge composites screen + webcam (PiP): `info` is the
+    /// screen, this is the camera. `reconfigure` restarts both, stop-first.
+    combo_camera: Option<SourceInfo>,
 }
 
 impl BridgeHandle {
@@ -67,6 +70,30 @@ impl BridgeHandle {
     /// rolls publishers back upstream, same as today; no resurrection).
     /// Bounded (stream start rendezvous has a deadline).
     pub fn reconfigure(&mut self, profile: QualityProfile) -> Result<(), PlatformError> {
+        // Combo (screen + webcam PiP) restarts both OS streams, always
+        // stop-first: DXGI allows one duplication per output and a webcam
+        // reopen races driver teardown. A spawn failure leaves no stream —
+        // the typed `Err` rolls publishers back upstream, same as single.
+        if let Some(camera) = self.combo_camera.clone() {
+            self.stop.store(true, Ordering::Release);
+            if let Some(old) = self.thread.take() {
+                let _ = old.join();
+            }
+            let screen_config = profile_config(&self.info, &profile);
+            let camera_config = profile_config(&camera, &profile);
+            let (thread, stop) = spawn_composite_stream(
+                self.info.clone(),
+                camera.clone(),
+                screen_config,
+                camera_config,
+                self.core_tx.clone(),
+                Arc::clone(&self.live),
+            )?;
+            self.thread = Some(thread);
+            self.stop = stop;
+            self.combo_camera = Some(camera);
+            return Ok(());
+        }
         let config = profile_config(&self.info, &profile);
         let order = self.order;
         // Disjoint field captures: the retire closure owns stop/thread, the
@@ -177,7 +204,7 @@ pub fn start_capture(
         spawn_stream(info.clone(), config, core_tx.clone(), Arc::clone(&live))?;
     Ok((
         core_rx,
-        BridgeHandle { stop, thread: Some(thread), info: info.clone(), core_tx, live, order },
+        BridgeHandle { stop, thread: Some(thread), info: info.clone(), core_tx, live, order, combo_camera: None },
     ))
 }
 
@@ -199,10 +226,238 @@ pub fn start_capture_for(
     let label = match kind {
         SourceKind::Display => format!("display:{id}"),
         SourceKind::Window => format!("window:{id}"),
+        SourceKind::Camera => format!("camera:{id}"),
     };
     let config = profile_config(&info, &profile);
     let (rx, handle) = start_capture(&info, config, live)?;
     Ok((rx, handle, label))
+}
+
+/// Starts a screen + webcam composite share (webcam as a corner overlay).
+/// One publisher feed, protocol-unchanged: the core and viewers see a
+/// single External stream. Pre-flight safe like `start_capture_for`.
+/// `label` mirrors the share descriptor (`combo:display:<id>+camera:<cid>`).
+pub fn start_capture_combo(
+    screen_kind: SourceKind,
+    screen_id: &str,
+    camera_id: &str,
+    profile: QualityProfile,
+    live: Arc<Mutex<QualityProfile>>,
+) -> Result<(mpsc::Receiver<ExternalFrame>, BridgeHandle, String), PlatformError> {
+    if !matches!(screen_kind, SourceKind::Display | SourceKind::Window) {
+        return Err(PlatformError::InvalidSource { reason: "combo exige tela ou janela" });
+    }
+    if camera_id.trim().is_empty() {
+        return Err(PlatformError::InvalidSource { reason: "combo exige webcam" });
+    }
+    let listed = enumerate_sources()?;
+    let screen = listed
+        .iter()
+        .find(|item| item.kind == screen_kind && item.id == screen_id)
+        .ok_or_else(|| PlatformError::SourceGone { id: screen_id.to_owned() })?
+        .clone();
+    let camera = listed
+        .iter()
+        .find(|item| item.kind == SourceKind::Camera && item.id == camera_id)
+        .ok_or_else(|| PlatformError::SourceGone { id: camera_id.to_owned() })?
+        .clone();
+    let screen_tag = match screen_kind {
+        SourceKind::Display => "display",
+        SourceKind::Window => "window",
+        SourceKind::Camera => unreachable!("filtrado acima"),
+    };
+    let label = format!("combo:{screen_tag}:{screen_id}+camera:{camera_id}");
+    let (core_tx, core_rx) = mpsc::sync_channel::<ExternalFrame>(CHANNEL_DEPTH);
+    let screen_config = profile_config(&screen, &profile);
+    let camera_config = profile_config(&camera, &profile);
+    let (thread, stop) = spawn_composite_stream(
+        screen.clone(),
+        camera.clone(),
+        screen_config,
+        camera_config,
+        core_tx.clone(),
+        Arc::clone(&live),
+    )?;
+    Ok((
+        core_rx,
+        BridgeHandle {
+            stop,
+            thread: Some(thread),
+            info: screen,
+            core_tx,
+            live,
+            order: RestartOrder::StopFirst,
+            combo_camera: Some(camera),
+        },
+        label,
+    ))
+}
+
+/// Opens both OS streams for a composite share and pumps them through one
+/// compositor thread. `open_stream` rendezvouses each start, so no second
+/// rendezvous here; a second-open failure closes the first (pre-flight).
+fn spawn_composite_stream(
+    screen: SourceInfo,
+    camera: SourceInfo,
+    screen_config: CaptureConfig,
+    camera_config: CaptureConfig,
+    core_tx: mpsc::SyncSender<ExternalFrame>,
+    live: Arc<Mutex<QualityProfile>>,
+) -> Result<(std::thread::JoinHandle<()>, Arc<AtomicBool>), PlatformError> {
+    let (mut screen_stream, _) = open_stream(&screen, &screen_config)?;
+    let (mut camera_stream, _) = match open_stream(&camera, &camera_config) {
+        Ok(opened) => opened,
+        Err(error) => {
+            screen_stream.stop(Duration::from_secs(2)).ok();
+            return Err(error);
+        }
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_ = Arc::clone(&stop);
+    let thread = std::thread::Builder::new()
+        .name("golive-screen-camera-combo".into())
+        .spawn(move || {
+            pump_composite(&mut screen_stream, &mut camera_stream, &core_tx, &stop_, &live);
+            screen_stream.stop(Duration::from_secs(2)).ok();
+            camera_stream.stop(Duration::from_secs(2)).ok();
+        })
+        .map_err(|e| PlatformError::Internal(format!("thread da ponte: {e}")))?;
+    Ok((thread, stop))
+}
+
+/// Composite pump: latest screen frame + latest webcam frame → one feed.
+/// The webcam is a corner overlay (see `overlay_pip`); when it is missing
+/// or dead the screen flows alone (degraded, never wedged). GPU screen
+/// packets forward retained (overlay skipped for that frame). Ends when the
+/// screen ends/fails or `stop` fires.
+fn pump_composite(
+    screen: &mut FrameStream,
+    camera: &mut FrameStream,
+    core_tx: &mpsc::SyncSender<ExternalFrame>,
+    stop: &AtomicBool,
+    live: &Arc<Mutex<QualityProfile>>,
+) {
+    let mut last_forwarded: Option<Instant> = None;
+    let mut camera_dead = false;
+    // Real time source for the gate (tests use run_pump-style injection on
+    // the single pump; composite timing is covered via overlay unit tests
+    // plus the hardware probe).
+    let clock = Instant::now;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let (interval, target) = match live.lock() {
+            Ok(profile) => (profile.frame_duration(), (profile.w, profile.h)),
+            Err(_) => (BRIDGE_TICK, (1280, 720)),
+        };
+        // Drain the webcam to its latest CPU frame (non-blocking); GPU
+        // packets cannot overlay, so they drop here.
+        let mut pip: Option<BgraFrame> = None;
+        if !camera_dead {
+            loop {
+                match camera.next_frame(Duration::ZERO) {
+                    Ok(CapturePacket::Cpu(frame)) => pip = Some(frame),
+                    Ok(CapturePacket::Gpu(_)) => {}
+                    Err(NextError::Timeout) => break,
+                    Err(NextError::Ended) | Err(NextError::Failed(_)) => {
+                        camera_dead = true;
+                        break;
+                    }
+                }
+            }
+        }
+        match screen.next_frame(BRIDGE_TICK) {
+            Ok(CapturePacket::Cpu(bgra)) => {
+                let now = clock();
+                if !should_forward(last_forwarded, now, interval) {
+                    continue;
+                }
+                let (tw, th) = normalize_dims(bgra.w, bgra.h, target.0, target.1);
+                let composed = match pip {
+                    Some(cam) => overlay_pip(&bgra, &cam),
+                    None => bgra,
+                };
+                let small = prepare_bgra(composed, tw, th);
+                match golive_platform::bgra_to_i420(&small) {
+                    Ok(planar) => {
+                        let mut data =
+                            Vec::with_capacity((planar.w * planar.h * 3 / 2) as usize);
+                        data.extend_from_slice(&planar.y);
+                        data.extend_from_slice(&planar.u);
+                        data.extend_from_slice(&planar.v);
+                        let frame = I420Frame { w: planar.w as usize, h: planar.h as usize, data };
+                        last_forwarded = Some(advance_forwarded(last_forwarded, now, interval));
+                        let _ = core_tx.try_send(ExternalFrame::Cpu(frame));
+                    }
+                    Err(e) => {
+                        eprintln!("screen convert skipped: {e}");
+                    }
+                }
+            }
+            Ok(CapturePacket::Gpu(gpu)) => {
+                let now = clock();
+                if !should_forward(last_forwarded, now, interval) {
+                    continue;
+                }
+                last_forwarded = Some(advance_forwarded(last_forwarded, now, interval));
+                let _ = core_tx.try_send(ExternalFrame::Gpu(gpu));
+            }
+            Err(NextError::Timeout) => continue,
+            Err(NextError::Ended) | Err(NextError::Failed(_)) => break,
+        }
+    }
+}
+
+/// Overlays `overlay` (webcam) scaled onto the bottom-right corner of `base`
+/// (screen). Opaque blit, 1/32-of-width margin. Degenerate or unfittable
+/// inputs return `base` untouched — the screen never dies for the overlay.
+/// Honors `base` stride (padding preserved). Pure.
+pub fn overlay_pip(base: &BgraFrame, overlay: &BgraFrame) -> BgraFrame {
+    if base.data.is_empty()
+        || base.w < 8
+        || base.h < 8
+        || overlay.data.is_empty()
+        || overlay.w == 0
+        || overlay.h == 0
+    {
+        return base.clone();
+    }
+    let margin = (base.w / 32).max(4).min(32);
+    let mut pip_w = (base.w / 4).clamp(48, 480);
+    let mut pip_h =
+        ((overlay.h as u64 * pip_w as u64 / overlay.w.max(1) as u64) as u32).clamp(2, u32::MAX);
+    // Fit inside the base with margin on both axes (aspect preserved).
+    if pip_w + margin * 2 > base.w {
+        pip_w = base.w.saturating_sub(margin * 2).max(2);
+        pip_h = (overlay.h as u64 * pip_w as u64 / overlay.w.max(1) as u64) as u32;
+    }
+    if pip_h + margin * 2 > base.h {
+        pip_h = base.h.saturating_sub(margin * 2).max(2);
+        pip_w = (overlay.w as u64 * pip_h as u64 / overlay.h.max(1) as u64) as u32;
+    }
+    if pip_w < 2 || pip_h < 2 || pip_w + margin * 2 > base.w || pip_h + margin * 2 > base.h {
+        return base.clone();
+    }
+    let small = scale_bgra_bilinear(overlay, pip_w, pip_h);
+    if small.data.len() != (pip_w as usize) * (pip_h as usize) * 4 {
+        return base.clone();
+    }
+    let mut out = base.clone();
+    let x0 = (base.w - margin - pip_w) as usize;
+    let y0 = (base.h - margin - pip_h) as usize;
+    for y in 0..pip_h as usize {
+        let dst_row = (y0 + y) * base.stride + x0 * 4;
+        let src_row = y * small.stride;
+        if dst_row + pip_w as usize * 4 > out.data.len()
+            || src_row + pip_w as usize * 4 > small.data.len()
+        {
+            break;
+        }
+        out.data[dst_row..dst_row + pip_w as usize * 4]
+            .copy_from_slice(&small.data[src_row..src_row + pip_w as usize * 4]);
+    }
+    out
 }
 
 /// Opens + starts the platform stream for one listed source, alongside the
@@ -748,6 +1003,51 @@ mod tests {
         assert_eq!(small.data[8], 20);
         // Degenerate input never panics.
         assert!(scale_bgra_nearest(&src, 0, 2).data.is_empty());
+    }
+
+    #[test]
+    fn overlay_pip_lands_bottom_right_keeping_base_elsewhere() {
+        // 64x64 blue screen + 16x16 red webcam: PiP is base.w/4 = 16 wide.
+        let base = solid_bgra(64, 64, 0, 0, 255);
+        let cam = solid_bgra(16, 16, 255, 0, 0);
+        let out = overlay_pip(&base, &cam);
+        assert_eq!((out.w, out.h, out.stride), (64, 64, 256));
+        let px = |x: usize, y: usize| -> [u8; 4] {
+            let i = (y * out.stride + x * 4) as usize;
+            [out.data[i], out.data[i + 1], out.data[i + 2], out.data[i + 3]]
+        };
+        // Top-left stays screen blue (BGRA: B=255).
+        assert_eq!(px(2, 2), [255, 0, 0, 255]);
+        // Bottom-right corner is webcam red with margin (64/32=2 → margin 4).
+        assert_eq!(px(63 - 4 - 1, 63 - 4 - 1), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn overlay_pip_degrades_to_base_untouched() {
+        let base = solid_bgra(64, 64, 0, 0, 255);
+        let empty = BgraFrame {
+            w: 0,
+            h: 0,
+            stride: 0,
+            format: PixelFormat::Bgra8888,
+            data: Vec::new(),
+        };
+        // Empty overlay, empty base, tiny base: screen never dies.
+        assert_eq!(overlay_pip(&base, &empty).data, base.data);
+        assert_eq!(overlay_pip(&empty, &base).data, empty.data);
+        let tiny = solid_bgra(4, 4, 1, 2, 3);
+        assert_eq!(overlay_pip(&tiny, &base).data, tiny.data);
+    }
+
+    #[test]
+    fn overlay_pip_preserves_stride_padding() {
+        // Base with padded stride: overlay must not smear padding rows.
+        let data = vec![7u8; 8 * 4 + 16];
+        let base = BgraFrame { w: 2, h: 4, stride: 12, format: PixelFormat::Bgra8888, data };
+        let cam = solid_bgra(8, 8, 200, 30, 30);
+        let out = overlay_pip(&base, &cam);
+        assert_eq!(out.stride, 12);
+        assert_eq!(out.data.len(), base.data.len());
     }
 
     #[test]

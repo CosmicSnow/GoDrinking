@@ -164,20 +164,46 @@ export function validateCode(code: string): string | null {
 export function validateSource(source: string): string | null {
   const raw = source.trim();
   if (raw === "synthetic") return null;
-  if (raw.startsWith("movie:") && raw.length > "movie:".length) return null;
-  if (raw.startsWith("display:") && raw.length > "display:".length) return null;
-  if (raw.startsWith("window:") && raw.length > "window:".length) return null;
-  return "Fonte: 'synthetic', 'movie:/caminho', 'display:<id>' ou 'window:<id>'.";
+  // Ids opacos: vazio ou só-espaço rejeita (o backend dá trim e recusa).
+  for (const prefix of ["movie:", "display:", "window:", "camera:"] as const) {
+    if (raw.startsWith(prefix)) {
+      const id = raw.slice(prefix.length);
+      if (!id.trim()) return `Fonte: '${prefix}<id>' precisa de um id.`;
+      return null;
+    }
+  }
+  if (raw.startsWith("combo:")) return validateCombo(raw);
+  return "Fonte: 'synthetic', 'movie:/caminho', 'display:<id>', 'window:<id>', 'camera:<id>' ou 'combo:display:<id>+camera:<cid>'.";
+}
+
+/**
+ * Valida `combo:display:<id>+camera:<cid>` / `combo:window:<id>+camera:<cid>`
+ * (espelha `ShareSource::parse_combo` no backend; a tela nunca é
+ * synthetic/movie/camera e o combo nunca aninha).
+ */
+export function validateCombo(raw: string): string | null {
+  const rest = raw.slice("combo:".length);
+  const parts = rest.split("+camera:");
+  if (parts.length !== 2) return "Combo: use 'combo:display:<id>+camera:<cid>'.";
+  const [screen, cameraId] = parts;
+  const screenOk =
+    (screen.startsWith("display:") && screen.slice("display:".length).trim() !== "") ||
+    (screen.startsWith("window:") && screen.slice("window:".length).trim() !== "");
+  if (!screenOk) return "Combo: a tela é 'display:<id>' ou 'window:<id>'.";
+  if (!cameraId || !cameraId.trim()) return "Combo: a webcam precisa de um id.";
+  return null;
 }
 
 /** Tipo da fonte a partir do seletor opaco. Puro e testável. */
-export type SourceKindSelect = "synthetic" | "movie" | "display" | "window";
+export type SourceKindSelect = "synthetic" | "movie" | "display" | "window" | "camera" | "combo";
 
 export function sourceKindOf(source: string): SourceKindSelect {
   const raw = source.trim();
+  if (raw.startsWith("combo:")) return "combo";
   if (raw.startsWith("movie:")) return "movie";
   if (raw.startsWith("display:")) return "display";
   if (raw.startsWith("window:")) return "window";
+  if (raw.startsWith("camera:")) return "camera";
   return "synthetic";
 }
 
@@ -1038,6 +1064,8 @@ export interface RoomProps {
   onRefresh: () => void;
   onLeave: () => void;
   onShare: () => void;
+  /** Tela + webcam num feed só (PiP). Ausente = builds antigas sem combo. */
+  onShareCombo?: (screen: string, cameraId: string) => void;
   onStopShare: () => void;
   onWatch: (id: string) => void;
   onUnwatch: (id: string) => void;
@@ -1190,7 +1218,7 @@ export function RoomScreen(props: RoomProps) {
     source, onSource, sources, sourcesError, sourcesDenied = false, caps, onListSources,
     previews, onPreviewsVisible,
     busy, error, lastSignal, lastMedia, quality, linkStats,
-    onRefresh, onLeave, onShare, onStopShare, onWatch, onUnwatch,
+    onRefresh, onLeave, onShare, onShareCombo, onStopShare, onWatch, onUnwatch,
     audioApps = [], audioExcluded = [], onToggleAudioExclude,
     mock = false,
   } = props;
@@ -1218,7 +1246,9 @@ export function RoomScreen(props: RoomProps) {
   const [mutedIds, setMutedIds] = useState<Set<string>>(new Set());
   const [shareOpen, setShareOpen] = useState(false);
   const [txOpen, setTxOpen] = useState(false);
-  const [shareTab, setShareTab] = useState<"screens" | "apps">("screens");
+  const [shareTab, setShareTab] = useState<"screens" | "apps" | "cameras">("screens");
+  // Webcam PiP sobre a tela: id da câmera ("" = só a tela). Limpo ao fechar.
+  const [comboCam, setComboCam] = useState("");
   const [audioQuery, setAudioQuery] = useState("");
   const [audioSoundOnly, setAudioSoundOnly] = useState(false);
   const { toast, show } = useToast();
@@ -1235,7 +1265,10 @@ export function RoomScreen(props: RoomProps) {
     onListSources();
     setShareOpen(true);
   };
-  const closeShare = (): void => setShareOpen(false);
+  const closeShare = (): void => {
+    setShareOpen(false);
+    setComboCam("");
+  };
 
   const handleShareMain = (): void => {
     if (sharing) {
@@ -1248,7 +1281,7 @@ export function RoomScreen(props: RoomProps) {
 
   // Selecionar-confirmar: o clique só seleciona (highlight .sel via `source`);
   // só o botão Compartilhar inicia o share e fecha o modal.
-  const pickSource = (kind: "display" | "window", id: string, name: string): void => {
+  const pickSource = (kind: "display" | "window" | "camera", id: string, name: string): void => {
     onSource(`${kind}:${id}`);
     say(`Fonte escolhida: ${name}. Toque Compartilhar para ir ao ar.`);
   };
@@ -1277,8 +1310,21 @@ export function RoomScreen(props: RoomProps) {
   };
 
   const visibleSources = sources.filter((item) =>
-    shareTab === "screens" ? item.kind === "display" : item.kind === "window",
+    shareTab === "screens"
+      ? item.kind === "display"
+      : shareTab === "apps"
+        ? item.kind === "window"
+        : item.kind === "camera",
   );
+  const cameraSources = sources.filter((item) => item.kind === "camera");
+  // Tela selecionada por extenso (para o combo): só vale display:/window:
+  // com id real — nunca prefixo vazio nem outra fonte.
+  const comboScreen: string | null = (() => {
+    const raw = source.trim();
+    if (raw.startsWith("display:") && raw.slice("display:".length).trim()) return raw;
+    if (raw.startsWith("window:") && raw.slice("window:".length).trim()) return raw;
+    return null;
+  })();
   // Previews lazy do modal: ao abrir ou trocar de aba/lista, pede os thumbs
   // da aba visível com debounce (o App cacheia por kind:id; sem thumb, o
   // gradiente continua). Callback via ref para não refogar o debounce.
@@ -1689,6 +1735,13 @@ export function RoomScreen(props: RoomProps) {
             >
               Aplicativos
             </button>
+            <button
+              type="button"
+              className={shareTab === "cameras" ? "tab active" : "tab"}
+              onClick={() => setShareTab("cameras")}
+            >
+              Webcams
+            </button>
           </div>
           <label htmlFor="source-kind">Fonte</label>
           <select
@@ -1699,6 +1752,7 @@ export function RoomScreen(props: RoomProps) {
               if (kind === "synthetic") onSource("synthetic");
               else if (kind === "movie") onSource("movie:");
               else if (kind === "display") onSource("display:");
+              else if (kind === "camera") onSource("camera:");
               else onSource("window:");
             }}
             disabled={busy || sharing}
@@ -1710,6 +1764,9 @@ export function RoomScreen(props: RoomProps) {
             </option>
             <option value="window" disabled={caps !== null && !caps.window.supported}>
               Janela {caps && !caps.window.supported ? `(${caps.window.reason})` : ""}
+            </option>
+            <option value="camera" disabled={caps?.camera != null && !caps.camera.supported}>
+              Webcam {caps?.camera && !caps.camera.supported ? `(${caps.camera.reason})` : ""}
             </option>
           </select>
           {sourceKindOf(source) === "movie" ? (
@@ -1726,10 +1783,14 @@ export function RoomScreen(props: RoomProps) {
               />
             </>
           ) : null}
-          {sourceKindOf(source) === "display" || sourceKindOf(source) === "window" ? (
+          {sourceKindOf(source) === "display" || sourceKindOf(source) === "window" || sourceKindOf(source) === "camera" ? (
             <>
               <label htmlFor="source-pick">
-                {sourceKindOf(source) === "display" ? "Tela" : "Janela"}
+                {sourceKindOf(source) === "display"
+                  ? "Tela"
+                  : sourceKindOf(source) === "window"
+                    ? "Janela"
+                    : "Webcam"}
               </label>
               <select
                 id="source-pick"
@@ -1758,6 +1819,24 @@ export function RoomScreen(props: RoomProps) {
                 A primeira listagem pode pedir permissão ao sistema. Sem permissão,
                 nada é capturado — o erro acima explica como autorizar.
               </p>
+              {comboScreen && cameraSources.length > 0 && onShareCombo ? (
+                <>
+                  <label htmlFor="combo-cam">Webcam junto (canto do vídeo)</label>
+                  <select
+                    id="combo-cam"
+                    value={comboCam}
+                    onChange={(event) => setComboCam(event.target.value)}
+                    disabled={busy || sharing}
+                  >
+                    <option value="">Só a tela</option>
+                    {cameraSources.map((item) => (
+                      <option key={item.id} value={item.id}>
+                        {item.name}
+                      </option>
+                    ))}
+                  </select>
+                </>
+              ) : null}
             </>
           ) : null}
           {sourceKindOf(source) === "synthetic" ? (
@@ -1852,13 +1931,17 @@ export function RoomScreen(props: RoomProps) {
               type="button"
               className="btn primary"
               onClick={() => {
-                onShare();
+                if (comboScreen && comboCam && onShareCombo) {
+                  onShareCombo(comboScreen, comboCam);
+                } else {
+                  onShare();
+                }
                 setShareOpen(false);
                 say("Iniciando compartilhamento…");
               }}
               disabled={busy}
             >
-              {busy ? "Iniciando…" : "Compartilhar"}
+              {busy ? "Iniciando…" : comboScreen && comboCam ? "Compartilhar tela + webcam" : "Compartilhar"}
             </button>
           </div>
         </div>

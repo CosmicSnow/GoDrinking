@@ -3,7 +3,7 @@ name = "golive-platform-macos"
 version = "0.7.5"
 edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
-description = "goDrinking macOS capture backend (ScreenCaptureKit). macOS only; the pure contract lives in golive-platform."
+description = "goDrinking macOS capture backend (ScreenCaptureKit + webcam). macOS only; the pure contract lives in golive-platform."
 
 [lib]
 name = "golive_platform_macos"
@@ -53,6 +53,9 @@ dispatch2 = { version = "0.3", features = ["objc2"] }
 objc2-core-foundation = "0.3"
 objc2-video-toolbox = "0.3"
 libc = "0.2"
+# Webcam capture (AVFoundation via nokhwa's native input). Same feature set
+# as the Windows backend's mirror module: MJPEG decode + Send pump thread.
+nokhwa = { version = "0.10", default-features = false, features = ["decoding", "input-native", "camera-sync-impl"] }
 
 [dev-dependencies]
 openh264 = "0.9"

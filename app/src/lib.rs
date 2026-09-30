@@ -34,12 +34,17 @@ pub const DEFAULT_SERVER: &str = "https://together.jouymaker.com";
 
 /// Share source selector. Screen capture arrives via the platform bridge
 /// (`display:<id>` / `window:<id>`); synthetic + movie stay untouched.
+/// `camera:<id>` streams a webcam alone; `combo:display:<id>+camera:<cid>`
+/// (or `combo:window:…`) composites screen + webcam corner overlay into one
+/// feed (single publisher, protocol-unchanged).
 #[derive(Clone, Debug)]
 pub enum ShareSource {
     Synthetic,
     Movie(String),
     Display(String),
     Window(String),
+    Camera(String),
+    Combo { screen: Box<ShareSource>, camera: String },
 }
 
 pub(crate) fn initial_share_profile(
@@ -59,6 +64,7 @@ pub(crate) fn initial_share_profile(
 pub(crate) fn window_audio_id(source: &ShareSource) -> Option<&str> {
     match source {
         ShareSource::Window(id) => Some(id.as_str()),
+        ShareSource::Combo { screen, .. } => window_audio_id(screen),
         _ => None,
     }
 }
@@ -85,9 +91,50 @@ impl ShareSource {
             } else {
                 Ok(Self::Window(id.trim().to_owned()))
             }
+        } else if let Some(id) = raw.strip_prefix("camera:") {
+            if id.trim().is_empty() {
+                Err("camera: needs an id (list sources first)".into())
+            } else {
+                Ok(Self::Camera(id.trim().to_owned()))
+            }
+        } else if let Some(rest) = raw.strip_prefix("combo:") {
+            Self::parse_combo(rest)
         } else {
-            Err("fonte: 'synthetic', 'movie:/caminho', 'display:<id>' ou 'window:<id>'".into())
+            Err("fonte: 'synthetic', 'movie:/caminho', 'display:<id>', 'window:<id>', 'camera:<id>' ou 'combo:display:<id>+camera:<cid>'".into())
         }
+    }
+
+    /// Parses `display:<sid>+camera:<cid>` / `window:<sid>+camera:<cid>`.
+    /// The screen half reuses the single-source rules (OS handles never
+    /// contain `+camera:`); anything else is a typed error, never a guess.
+    fn parse_combo(rest: &str) -> Result<Self, String> {
+        let (screen_part, camera_id) = rest.split_once("+camera:").ok_or_else(|| {
+            "combo: use 'combo:display:<id>+camera:<cid>' ou 'combo:window:<id>+camera:<cid>'"
+                .to_owned()
+        })?;
+        if camera_id.trim().is_empty() {
+            return Err("combo: camera: needs an id (list sources first)".into());
+        }
+        let screen = if let Some(id) = screen_part.strip_prefix("display:") {
+            if id.trim().is_empty() {
+                return Err("combo: display: needs an id (list sources first)".into());
+            }
+            Self::Display(id.trim().to_owned())
+        } else if let Some(id) = screen_part.strip_prefix("window:") {
+            if id.trim().is_empty() {
+                return Err("combo: window: needs an id (list sources first)".into());
+            }
+            Self::Window(id.trim().to_owned())
+        } else {
+            return Err(
+                "combo: a tela é 'display:<id>' ou 'window:<id>' (synthetic/movie/camera não combinam)"
+                    .into(),
+            );
+        };
+        Ok(Self::Combo {
+            screen: Box::new(screen),
+            camera: camera_id.trim().to_owned(),
+        })
     }
 }
 
@@ -660,6 +707,16 @@ impl AppState {
                 // of them via set_audio_exclusions.
                 audio::ShareAudio::start(golive_platform::default_excluded_tokens()).ok()
             }
+            None if matches!(
+                &source,
+                ShareSource::Combo { screen, .. }
+                    if matches!(screen.as_ref(), ShareSource::Display(_))
+            ) =>
+            {
+                // Combo over a display: same default exclusions as a plain
+                // display share (the webcam has no system-audio tap).
+                audio::ShareAudio::start(golive_platform::default_excluded_tokens()).ok()
+            }
             None => None,
         };
         let audio_rx = share_audio.as_ref().map(|session| session.subscribe());
@@ -751,6 +808,8 @@ impl AppState {
             ShareSource::Movie(_) => "movie",
             ShareSource::Display(_) => "display",
             ShareSource::Window(_) => "window",
+            ShareSource::Camera(_) => "camera",
+            ShareSource::Combo { .. } => "combo",
         };
         let audio_live = {
             let inner = self.inner.lock().map_err(|_| "state lock poisoned".to_string())?;
@@ -823,6 +882,38 @@ impl AppState {
                     bridge,
                 }
             }
+            ShareSource::Camera(id) => {
+                let (rx, bridge, label) = screen::start_capture_for(
+                    golive_platform::SourceKind::Camera,
+                    id,
+                    profile,
+                    Arc::clone(live),
+                )
+                .map_err(|e| e.to_string())?;
+                Resolved::Bridged {
+                    video: VideoSource::External(ExternalSource { rx, label }),
+                    bridge,
+                }
+            }
+            ShareSource::Combo { screen, camera } => {
+                let (screen_kind, screen_id) = match screen.as_ref() {
+                    ShareSource::Display(id) => (golive_platform::SourceKind::Display, id),
+                    ShareSource::Window(id) => (golive_platform::SourceKind::Window, id),
+                    _ => return Err("combo: a tela é display ou window".into()),
+                };
+                let (rx, bridge, label) = screen::start_capture_combo(
+                    screen_kind,
+                    screen_id,
+                    camera,
+                    profile,
+                    Arc::clone(live),
+                )
+                .map_err(|e| e.to_string())?;
+                Resolved::Bridged {
+                    video: VideoSource::External(ExternalSource { rx, label }),
+                    bridge,
+                }
+            }
         };
         let (video_source, mut bridge) = match resolved {
             Resolved::Direct(video) => (video, None),
@@ -883,15 +974,17 @@ impl AppState {
                 .share_profile
                 .map(|s| s.profile)
                 .unwrap_or_else(|| Quality::P720.profile());
-            // Display/Window share the stored live Arc; its absence alongside
-            // a capture source is inconsistent — refuse rather than fork it.
+            // Display/Window/Camera/Combo share the stored live Arc; its
+            // absence alongside a capture source is inconsistent — refuse
+            // rather than fork it.
             let live = match &source {
-                ShareSource::Display(_) | ShareSource::Window(_) => {
-                    match inner.share_capture.clone() {
-                        Some(live) => live,
-                        None => return false,
-                    }
-                }
+                ShareSource::Display(_)
+                | ShareSource::Window(_)
+                | ShareSource::Camera(_)
+                | ShareSource::Combo { .. } => match inner.share_capture.clone() {
+                    Some(live) => live,
+                    None => return false,
+                },
                 ShareSource::Synthetic | ShareSource::Movie(_) => {
                     Arc::new(Mutex::new(profile))
                 }
@@ -987,6 +1080,8 @@ impl AppState {
             ShareSource::Movie(_) => "movie",
             ShareSource::Display(_) => "display",
             ShareSource::Window(_) => "window",
+            ShareSource::Camera(_) => "camera",
+            ShareSource::Combo { .. } => "combo",
         };
         self.session_log(format!("watch fresh kind={kind}"));
         true
@@ -1417,6 +1512,7 @@ impl AppState {
         let kind = match kind {
             "display" => golive_platform::SourceKind::Display,
             "window" => golive_platform::SourceKind::Window,
+            "camera" => golive_platform::SourceKind::Camera,
             _ => {
                 return SourcePreview { data_url: None, w: 0, h: 0 };
             }
@@ -2020,6 +2116,34 @@ mod share_source_tests {
             ShareSource::parse("window:42").unwrap(),
             ShareSource::Window(_)
         ));
+        assert!(matches!(
+            ShareSource::parse("camera:0").unwrap(),
+            ShareSource::Camera(_)
+        ));
+    }
+
+    #[test]
+    fn parses_combo_screen_plus_camera() {
+        match ShareSource::parse("combo:display:1+camera:0").unwrap() {
+            ShareSource::Combo { screen, camera } => {
+                assert!(matches!(*screen, ShareSource::Display(_)));
+                assert_eq!(camera, "0");
+            }
+            other => panic!("expected combo, got {other:?}"),
+        }
+        match ShareSource::parse("combo:window:42+camera:1").unwrap() {
+            ShareSource::Combo { screen, camera } => {
+                assert!(matches!(*screen, ShareSource::Window(_)));
+                assert_eq!(camera, "1");
+            }
+            other => panic!("expected combo, got {other:?}"),
+        }
+        // Screen half must be display/window; camera id must exist.
+        assert!(ShareSource::parse("combo:camera:0+camera:1").is_err());
+        assert!(ShareSource::parse("combo:synthetic+camera:0").is_err());
+        assert!(ShareSource::parse("combo:display:1+camera:").is_err());
+        assert!(ShareSource::parse("combo:display:1").is_err());
+        assert!(ShareSource::parse("combo:").is_err());
     }
 
     #[test]
@@ -2027,6 +2151,8 @@ mod share_source_tests {
         assert!(ShareSource::parse("display:").is_err());
         assert!(ShareSource::parse("display:   ").is_err());
         assert!(ShareSource::parse("window:").is_err());
+        assert!(ShareSource::parse("camera:").is_err());
+        assert!(ShareSource::parse("camera:   ").is_err());
         assert!(ShareSource::parse("movie:").is_err());
         assert!(ShareSource::parse("screen").is_err());
         assert!(ShareSource::parse("").is_err());
@@ -2036,8 +2162,15 @@ mod share_source_tests {
     fn window_share_uses_window_audio_display_does_not() {
         let window = ShareSource::parse("window:42").unwrap();
         let display = ShareSource::parse("display:\\\\.\\DISPLAY1").unwrap();
+        let camera = ShareSource::parse("camera:0").unwrap();
+        let combo_window = ShareSource::parse("combo:window:42+camera:0").unwrap();
+        let combo_display = ShareSource::parse("combo:display:1+camera:0").unwrap();
         assert_eq!(window_audio_id(&window), Some("42"));
         assert_eq!(window_audio_id(&display), None);
+        assert_eq!(window_audio_id(&camera), None);
+        // Combo inherits the screen half's audio: window taps, display ducks.
+        assert_eq!(window_audio_id(&combo_window), Some("42"));
+        assert_eq!(window_audio_id(&combo_display), None);
         assert_eq!(window_audio_id(&ShareSource::Synthetic), None);
     }
 

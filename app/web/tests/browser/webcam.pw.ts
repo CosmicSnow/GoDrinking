@@ -1,15 +1,12 @@
 import { test, expect } from '@playwright/test';
 
-// TDD RED — navegação real pela UI (sem atalhos de API).
-// Espelha o pedido: validar na UI os 3 usos + visibilidade em outra instância.
+// Navegação real pela UI em modo mock (fontes mock: display + window + camera).
+// Abrir o modal já lista as fontes (openShare → onListSources).
 //
-// Uso 1: stream (tela) + webcam simultâneos
+// Uso 1: stream (tela) + webcam simultâneos (PiP/combo)
 // Uso 2: só stream (regressão)
 // Uso 3: só webcam
-// Uso 4: segunda instância/aba vê o share (repite 1-3 como viewer)
-//
-// Hoje TODOS falham: o modal Compartilhar só conhece display/window,
-// não existe aba/opção "Webcam", nem CapabilitySet.camera.
+// Uso 4: segunda instância/aba vê o share
 
 async function lobbyToRoom(page: any) {
   await page.goto('/');
@@ -19,39 +16,41 @@ async function lobbyToRoom(page: any) {
   await expect(page.getByRole('region', { name: 'Transmissões da sala' })).toBeVisible();
 }
 
-test('uso 2 (regressão): só stream — Listar telas oferece display', async ({ page }) => {
+async function openShareModal(page: any) {
+  const modal = page.locator('[data-hook="share-enumeration"]');
+  for (let i = 0; i < 4 && !(await modal.isVisible()); i++) {
+    await page.locator('[data-hook="share-open"]').first().click();
+  }
+  await expect(modal).toBeVisible({ timeout: 8000 });
+}
+
+test('uso 2 (regressão): só stream — Telas oferece display', async ({ page }) => {
   await lobbyToRoom(page);
-  await page.getByRole('button', { name: /Compartilhar|Iniciar/i }).first().click().catch(() => {});
-  // O botão que abre o modal tem data-hook share-open; o modal lista fontes.
-  const shareOpen = page.locator('[data-hook="share-open"]');
-  if (await shareOpen.count()) await shareOpen.first().click();
-  await page.getByRole('button', { name: /Listar telas/i }).click();
-  await expect(page.getByText(/Display .*·/i).first()).toBeVisible({ timeout: 8000 });
+  await openShareModal(page);
+  await expect(page.getByRole('button', { name: 'Telas', exact: true })).toBeVisible();
+  await expect(page.getByText('Tela principal · 1920×1080').first()).toBeVisible({ timeout: 8000 });
 });
 
-test('uso 3 (só webcam): modal oferece aba/opção Webcam e seleciona camera:<id>', async ({ page }) => {
+test('uso 3 (só webcam): aba Webcams lista e seleciona camera:<id>', async ({ page }) => {
   await lobbyToRoom(page);
-  const shareOpen = page.locator('[data-hook="share-open"]');
-  if (await shareOpen.count()) await shareOpen.first().click();
-  await page.getByRole('button', { name: /Listar telas/i }).click();
-  // A feature exige: aba "Webcam" OU opção camera listada com nome real.
-  const webcamTab = page.getByRole('button', { name: /webcam|câmera|camera/i });
-  await expect(webcamTab.first()).toBeVisible({ timeout: 8000 });
-  await webcamTab.first().click();
-  await expect(page.locator('.source.sel, [data-testid^="source-camera"]').first()).toBeVisible({ timeout: 8000 });
-});
-
-test('uso 1 (stream + webcam): dá para selecionar tela E webcam (PiP/combo)', async ({ page }) => {
-  await lobbyToRoom(page);
-  const shareOpen = page.locator('[data-hook="share-open"]');
-  if (await shareOpen.count()) await shareOpen.first().click();
-  await page.getByRole('button', { name: /Listar telas/i }).click();
-  await expect(page.getByText(/Display .*·/i).first()).toBeVisible({ timeout: 8000 });
-  const webcamTab = page.getByRole('button', { name: /webcam|câmera|camera/i });
-  await expect(webcamTab.first()).toBeVisible({ timeout: 8000 });
-  // Combo = as duas fontes selecionáveis sem uma derrubar a outra.
-  await webcamTab.first().click();
+  await openShareModal(page);
+  await page.getByRole('button', { name: 'Webcams', exact: true }).click();
+  await expect(page.getByText('Webcam · 1280×720').first()).toBeVisible({ timeout: 8000 });
+  await page.getByText('Webcam · 1280×720').first().click();
   await expect(page.locator('.source.sel').first()).toBeVisible({ timeout: 8000 });
+  await expect(page.locator('#source-kind')).toHaveValue('camera');
+});
+
+test('uso 1 (stream + webcam): tela selecionada oferece PiP com a webcam', async ({ page }) => {
+  await lobbyToRoom(page);
+  await openShareModal(page);
+  await expect(page.getByText('Tela principal · 1920×1080').first()).toBeVisible({ timeout: 8000 });
+  await page.getByText('Tela principal · 1920×1080').first().click();
+  await expect(page.locator('.source.sel').first()).toBeVisible({ timeout: 8000 });
+  // Com tela + webcam listada, o combo PiP aparece e arma o botão dedicado.
+  await expect(page.getByLabel('Webcam junto (canto do vídeo)')).toBeVisible({ timeout: 8000 });
+  await page.getByLabel('Webcam junto (canto do vídeo)').selectOption({ index: 1 });
+  await expect(page.getByRole('button', { name: 'Compartilhar tela + webcam', exact: true })).toBeVisible({ timeout: 8000 });
 });
 
 test('uso 4 (segunda instância vê): viewer em outra aba enxerga quem compartilha webcam', async ({ browser }) => {
