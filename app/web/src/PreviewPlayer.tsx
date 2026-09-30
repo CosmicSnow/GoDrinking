@@ -95,15 +95,23 @@ export interface PreviewPlayerProps {
   active: boolean;
   onToken?: (token: string | null) => void;
   onError?: (message: string | null) => void;
+  /**
+   * True enquanto a abertura está em voo (dispositivo abrindo). O dono
+   * desabilita o Compartilhar nesse intervalo: a mesma câmera não abre
+   * duas vezes, e clicar no meio da abertura falharia ocupado.
+   */
+  onPending?: (pending: boolean) => void;
 }
 
-export function PreviewPlayer({ kind, id, active, onToken, onError }: PreviewPlayerProps) {
+export function PreviewPlayer({ kind, id, active, onToken, onError, onPending }: PreviewPlayerProps) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const [frames, setFrames] = useState(0);
   const tokenCb = useRef(onToken);
   tokenCb.current = onToken;
   const errorCb = useRef(onError);
   errorCb.current = onError;
+  const pendingCb = useRef(onPending);
+  pendingCb.current = onPending;
 
   useEffect(() => {
     if (!active || !isTauri()) return;
@@ -134,6 +142,7 @@ export function PreviewPlayer({ kind, id, active, onToken, onError }: PreviewPla
         // Desenho falhou (canvas sumiu): o próximo frame tenta de novo.
       }
     };
+    pendingCb.current?.(true);
     void (async () => {
       try {
         token = await previewStart(kind, id, channel);
@@ -149,10 +158,13 @@ export function PreviewPlayer({ kind, id, active, onToken, onError }: PreviewPla
             failure instanceof Error ? failure.message : "Preview indisponível.",
           );
         }
+      } finally {
+        pendingCb.current?.(false);
       }
     })();
     return () => {
       disposed = true;
+      pendingCb.current?.(false);
       renderer?.dispose();
       tokenCb.current?.(null);
       if (token) void previewStop(token).catch(() => undefined);

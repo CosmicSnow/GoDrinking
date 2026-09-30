@@ -1648,6 +1648,7 @@ impl AppState {
     pub fn selfview_start(&self, channel: Channel) -> Result<String, String> {
         let tap_rx = {
             let inner = self.inner.lock().map_err(|_| "state lock poisoned".to_string())?;
+            let sharing = !inner.publishers.is_empty();
             let mut found: Option<std::sync::mpsc::Receiver<golive_core::media::I420Frame>> = None;
             for session in inner.publishers.values() {
                 if let Some(bridge) = session.bridge.as_ref() {
@@ -1655,7 +1656,15 @@ impl AppState {
                     break;
                 }
             }
-            found.ok_or_else(|| "inicie o compartilhamento para ver seu vídeo".to_string())?
+            // Sem bridge com share no ar = fonte sem captura (synthetic ou
+            // movie): erro próprio, nunca "inicie o compartilhamento".
+            found.ok_or_else(|| {
+                if sharing {
+                    "prévia local só para tela, janela ou webcam".to_string()
+                } else {
+                    "inicie o compartilhamento para ver seu vídeo".to_string()
+                }
+            })?
         };
         let token = {
             static NEXT: AtomicU64 = AtomicU64::new(1);

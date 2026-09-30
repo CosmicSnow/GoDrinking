@@ -1265,6 +1265,14 @@ export function RoomScreen(props: RoomProps) {
   // Preview ao vivo: token opaco do backend + último erro (o thumb segue).
   const [previewToken, setPreviewToken] = useState<string | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
+  // Abertura do preview em voo: o Compartilhar desabilita até assentar
+  // (a mesma câmera não abre duas vezes — clicar no meio falharia ocupado).
+  const [previewPending, setPreviewPending] = useState(false);
+  const previewPendingRef = useRef(false);
+  const handlePreviewPending = (pending: boolean): void => {
+    previewPendingRef.current = pending;
+    setPreviewPending(pending);
+  };
   // Tile "Você" no palco: visível por padrão, removível com ícone e
   // reativável no topo (pref persiste). Espelha o feed do share.
   const [selfViewPref, setSelfViewPref] = useState(() => readSelfviewPref());
@@ -1371,12 +1379,16 @@ export function RoomScreen(props: RoomProps) {
     return null;
   })();
   // Compartilhar derruba o preview antes (a mesma câmera não abre duas
-  // vezes): parar → fechar → ir ao ar, sem guess.
-  const stopPreviewForShare = (): Promise<void> => {
+  // vezes): espera a abertura em voo assentar, para o token, e só então
+  // vai ao ar — sem guess, sem "câmera ocupada".
+  const stopPreviewForShare = async (): Promise<void> => {
+    for (let i = 0; i < 200 && previewPendingRef.current; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
     const token = previewToken;
     setPreviewToken(null);
-    if (!token) return Promise.resolve();
-    return previewStop(token).catch(() => undefined);
+    if (!token) return;
+    await previewStop(token).catch(() => undefined);
   };
   // Previews lazy do modal: ao abrir ou trocar de aba/lista, pede os thumbs
   // da aba visível com debounce (o App cacheia por kind:id; sem thumb, o
@@ -1949,6 +1961,7 @@ export function RoomScreen(props: RoomProps) {
                 active={shareOpen && appFocused}
                 onToken={setPreviewToken}
                 onError={setPreviewError}
+                onPending={handlePreviewPending}
               />
               {shareOpen && !appFocused ? (
                 <p className="hint">Pausado — volte ao app para ver o preview.</p>
@@ -2062,7 +2075,12 @@ export function RoomScreen(props: RoomProps) {
                   }
                 });
               }}
-              disabled={busy}
+              disabled={busy || previewPending}
+              title={
+                previewPending
+                  ? "Aguardando o preview liberar a câmera…"
+                  : "Inicia o compartilhamento da fonte escolhida"
+              }
             >
               {busy ? "Iniciando…" : comboScreen && comboCam ? "Compartilhar tela + webcam" : "Compartilhar"}
             </button>

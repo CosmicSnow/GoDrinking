@@ -1,5 +1,10 @@
 # changelog
 
+## v0.7.19
+
+- fix: streamar + webcam ao mesmo tempo — Compartilhar espera o preview liberar a câmera (botão desabilita em voo) em vez de falhar ocupado; `selfview_start` distingue share sintético de parado
+- test: `camera_preview_share_selfview_flow` (sala real + webcam real) trava a ordem preview → share → self-view
+
 ## v0.7.18
 
 - feat: tile "Você" no palco espelha o share ativo (prévia local, sem reabrir dispositivo); ícone Ocultar + "Mostrar meu vídeo" com pref persistido; comandos `selfview_start`/`selfview_stop`, mesmo fio GLP2 do player
