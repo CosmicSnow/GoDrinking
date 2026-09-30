@@ -40,12 +40,13 @@
 //! (non-BGRA aborts the frame, never misinterprets it).
 
 mod audio;
+mod camera;
 
 pub use audio::{list_audio_apps, start_audio_tap, AudioTap};
 
 use golive_platform::{
     BgraFrame, CaptureConfig, CapturePacket, FrameStream, GpuPixelBuffer, PixelFormat,
-    PlatformError, SourceInfo, SourceKind, VideoSource,
+    PlatformError, RestartOrder, SourceInfo, SourceKind, VideoSource,
 };
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -94,7 +95,9 @@ impl ScSource {
             return Err(PlatformError::InvalidSource { reason: "id vazio" });
         }
         match info.kind {
-            SourceKind::Display | SourceKind::Window => Ok(Self { info: info.clone() }),
+            SourceKind::Display | SourceKind::Window | SourceKind::Camera => {
+                Ok(Self { info: info.clone() })
+            }
         }
     }
 
@@ -193,6 +196,10 @@ pub fn enumerate() -> Result<Vec<SourceInfo>, PlatformError> {
             });
         }
     }
+    // Webcams degrade to absent on query failure; a camera-only list is a
+    // real state (screen-denied Macs can still stream webcam). The
+    // denied-vs-empty verdict applies to the combined list.
+    out.extend(camera::enumerate_cameras());
     if out.is_empty() {
         return Err(PlatformError::permission_denied());
     }
@@ -243,6 +250,14 @@ fn shareable_content() -> Result<Retained<SCShareableContent>, PlatformError> {
 /// never reach logs.
 #[allow(deprecated)] // deprecated for capture; still the one-shot still API.
 pub fn thumbnail(kind: SourceKind, id: &str) -> Result<BgraFrame, PlatformError> {
+    // Webcams grab via AVFoundation (own thread-neutral path, no SCK/CG).
+    if matches!(kind, SourceKind::Camera) {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(PlatformError::InvalidSource { reason: "id vazio" });
+        }
+        return camera::thumbnail_camera(id);
+    }
     use objc2_core_graphics::{
         CGDataProvider, CGDisplayBounds, CGImageGetBitsPerComponent, CGImageGetBitsPerPixel,
         CGImageGetBytesPerRow, CGImageGetDataProvider, CGImageGetHeight, CGImageGetWidth,
@@ -277,6 +292,8 @@ pub fn thumbnail(kind: SourceKind, id: &str) -> Result<BgraFrame, PlatformError>
                 window_id,
                 CGWindowImageOption::Default,
             ),
+            // Webcams return early above (AVFoundation stills, no CG).
+            SourceKind::Camera => unreachable!("webcam sai cedo acima"),
         };
         let image =
             image.ok_or_else(|| PlatformError::Internal("thumbnail indisponível".into()))?;
@@ -327,8 +344,50 @@ impl VideoSource for ScSource {
     fn open(info: &SourceInfo) -> Result<Self, PlatformError> {
         Self::validated(info)
     }
+}
 
+/// Webcam start: validate against a fresh listing, then pump AVFoundation
+/// frames on a worker with the same rendezvous shape as SCK start.
+fn start_camera(info: &SourceInfo, config: &CaptureConfig) -> Result<FrameStream, PlatformError> {
+    let listed = enumerate()?;
+    if listed.iter().all(|item| item.kind != info.kind || item.id != info.id) {
+        return Err(PlatformError::SourceGone { id: info.id.clone() });
+    }
+    let id = info.id.clone();
+    let config = *config;
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<(), PlatformError>>();
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<CapturePacket>(CHANNEL_DEPTH);
+    let error: Arc<Mutex<Option<PlatformError>>> = Arc::new(Mutex::new(None));
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let error_ = Arc::clone(&error);
+    let stop_ = Arc::clone(&stop_flag);
+    let worker = std::thread::Builder::new()
+        .name("golive-avf".into())
+        .spawn(move || {
+            camera::run_camera(id, config, frame_tx, stop_, error_, ready_tx);
+        })
+        .map_err(|e| PlatformError::Internal(format!("thread de captura: {e}")))?;
+    match ready_rx.recv_timeout(START_DEADLINE) {
+        Ok(Ok(())) => Ok(FrameStream::new(frame_rx, error, stop_flag, worker)),
+        Ok(Err(error)) => {
+            stop_flag.store(true, Ordering::Release);
+            let _ = worker.join();
+            Err(error)
+        }
+        Err(_) => {
+            stop_flag.store(true, Ordering::Release);
+            let _ = worker.join();
+            Err(PlatformError::Internal("timeout ao iniciar captura".into()))
+        }
+    }
+}
+
+impl VideoSource for ScSource {
     fn start(&mut self, config: &CaptureConfig) -> Result<FrameStream, PlatformError> {
+        // Webcams bypass SCK entirely (AVFoundation pump, own worker).
+        if matches!(self.info.kind, SourceKind::Camera) {
+            return start_camera(&self.info, config);
+        }
         let info = self.info.clone();
         let config = *config;
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), PlatformError>>();
@@ -359,6 +418,15 @@ impl VideoSource for ScSource {
                 let _ = worker.join();
                 Err(PlatformError::Internal("timeout ao iniciar captura".into()))
             }
+        }
+    }
+
+    fn restart_order(info: &SourceInfo) -> RestartOrder {
+        // Same-device AVFoundation reopen races driver teardown: stop the
+        // old stream first. SCK tolerates concurrent streams (NewFirst).
+        match info.kind {
+            SourceKind::Camera => RestartOrder::StopFirst,
+            SourceKind::Display | SourceKind::Window => RestartOrder::NewFirst,
         }
     }
 }
@@ -723,6 +791,12 @@ fn run_capture(
                     }
                 }
             }
+            // Unreachable via start() (webcams take start_camera), kept as a
+            // loud guard so a future caller can never SCK-capture a camera.
+            SourceKind::Camera => {
+                fail(PlatformError::Internal("webcam usa o caminho AVFoundation".into()));
+                return;
+            }
         };
         let Some(filter) = filter else {
             fail(PlatformError::Internal("filtro vazio".into()));
@@ -750,6 +824,7 @@ fn run_capture(
         let kind = match info.kind {
             SourceKind::Display => "display",
             SourceKind::Window => "window",
+            SourceKind::Camera => "camera",
         };
         eprintln!(
             "golive: capture {}x{}@{}fps ({kind})",

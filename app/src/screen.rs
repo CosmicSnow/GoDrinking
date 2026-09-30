@@ -49,6 +49,55 @@ pub struct BridgeHandle {
     core_tx: mpsc::SyncSender<ExternalFrame>,
     live: Arc<Mutex<QualityProfile>>,
     order: RestartOrder,
+    /// Set when this bridge composites screen + webcam (PiP): `info` is the
+    /// screen, this is the camera. `reconfigure` restarts both, stop-first.
+    combo_camera: Option<SourceInfo>,
+    /// Stage self-view tap: mirrors forwarded CPU frames to the local tile.
+    /// Shared with pump threads; survives `reconfigure` (same handle).
+    tap: FrameTap,
+}
+
+/// Local self-view tap: mirrors forwarded CPU frames to zero or one
+/// attached viewer (the stage self tile). Latest-only (cap 2, skip on
+/// full); attaching replaces any previous tap; a dead receiver clears
+/// itself on the next send. `Clone` shares one tap across the handle and
+/// every pump thread that feeds it.
+#[derive(Clone, Default)]
+pub struct FrameTap {
+    inner: Arc<Mutex<Option<mpsc::SyncSender<I420Frame>>>>,
+}
+
+impl FrameTap {
+    /// Attaches a receiver, replacing any previous one (its side then
+    /// observes disconnect). Returns the tap feed.
+    pub fn attach(&self) -> mpsc::Receiver<I420Frame> {
+        let (tx, rx) = mpsc::sync_channel::<I420Frame>(CHANNEL_DEPTH);
+        if let Ok(mut guard) = self.inner.lock() {
+            *guard = Some(tx);
+        }
+        rx
+    }
+
+    /// Best-effort mirror of one forwarded frame. Never blocks, never
+    /// fails the share: full drops, dead clears.
+    pub fn send(&self, frame: &I420Frame) {
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        if let Some(tx) = guard.as_ref() {
+            if matches!(
+                tx.try_send(frame.clone()),
+                Err(mpsc::TrySendError::Disconnected(_))
+            ) {
+                *guard = None;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn is_attached(&self) -> bool {
+        self.inner.lock().map(|guard| guard.is_some()).unwrap_or(false)
+    }
 }
 
 impl BridgeHandle {
@@ -59,6 +108,12 @@ impl BridgeHandle {
         }
     }
 
+    /// Attaches the stage self-view tap to this bridge's live feed (zero or
+    /// one attached viewer; re-attaching orphans the previous receiver).
+    pub fn attach_tap(&self) -> mpsc::Receiver<I420Frame> {
+        self.tap.attach()
+    }
+
     /// Stream restart at `profile` on the same core channel (latest-only —
     /// no leak). The sequencing follows [`RestartOrder`]: NewFirst starts
     /// the replacement first and only then retires the old stream (a spawn
@@ -67,6 +122,31 @@ impl BridgeHandle {
     /// rolls publishers back upstream, same as today; no resurrection).
     /// Bounded (stream start rendezvous has a deadline).
     pub fn reconfigure(&mut self, profile: QualityProfile) -> Result<(), PlatformError> {
+        // Combo (screen + webcam PiP) restarts both OS streams, always
+        // stop-first: DXGI allows one duplication per output and a webcam
+        // reopen races driver teardown. A spawn failure leaves no stream —
+        // the typed `Err` rolls publishers back upstream, same as single.
+        if let Some(camera) = self.combo_camera.clone() {
+            self.stop.store(true, Ordering::Release);
+            if let Some(old) = self.thread.take() {
+                let _ = old.join();
+            }
+            let screen_config = profile_config(&self.info, &profile);
+            let camera_config = profile_config(&camera, &profile);
+            let (thread, stop) = spawn_composite_stream(
+                self.info.clone(),
+                camera.clone(),
+                screen_config,
+                camera_config,
+                self.core_tx.clone(),
+                Arc::clone(&self.live),
+                self.tap.clone(),
+            )?;
+            self.thread = Some(thread);
+            self.stop = stop;
+            self.combo_camera = Some(camera);
+            return Ok(());
+        }
         let config = profile_config(&self.info, &profile);
         let order = self.order;
         // Disjoint field captures: the retire closure owns stop/thread, the
@@ -85,6 +165,7 @@ impl BridgeHandle {
                     config,
                     self.core_tx.clone(),
                     Arc::clone(&self.live),
+                    self.tap.clone(),
                 )
             },
         )?;
@@ -149,6 +230,7 @@ fn spawn_stream(
     config: CaptureConfig,
     core_tx: mpsc::SyncSender<ExternalFrame>,
     live: Arc<Mutex<QualityProfile>>,
+    tap: FrameTap,
 ) -> Result<(std::thread::JoinHandle<()>, Arc<AtomicBool>, RestartOrder), PlatformError> {
     let (mut stream, order) = open_stream(&info, &config)?;
     let stop = Arc::new(AtomicBool::new(false));
@@ -156,7 +238,7 @@ fn spawn_stream(
     let thread = std::thread::Builder::new()
         .name("golive-screen-bridge".into())
         .spawn(move || {
-            pump_bridge(&mut stream, &core_tx, &stop_, &live, Instant::now);
+            pump_bridge(&mut stream, &core_tx, &stop_, &live, Instant::now, &tap);
         })
         .map_err(|e| PlatformError::Internal(format!("thread da ponte: {e}")))?;
     Ok((thread, stop, order))
@@ -173,11 +255,12 @@ pub fn start_capture(
     live: Arc<Mutex<QualityProfile>>,
 ) -> Result<(mpsc::Receiver<ExternalFrame>, BridgeHandle), PlatformError> {
     let (core_tx, core_rx) = mpsc::sync_channel::<ExternalFrame>(CHANNEL_DEPTH);
+    let tap = FrameTap::default();
     let (thread, stop, order) =
-        spawn_stream(info.clone(), config, core_tx.clone(), Arc::clone(&live))?;
+        spawn_stream(info.clone(), config, core_tx.clone(), Arc::clone(&live), tap.clone())?;
     Ok((
         core_rx,
-        BridgeHandle { stop, thread: Some(thread), info: info.clone(), core_tx, live, order },
+        BridgeHandle { stop, thread: Some(thread), info: info.clone(), core_tx, live, order, combo_camera: None, tap },
     ))
 }
 
@@ -199,10 +282,467 @@ pub fn start_capture_for(
     let label = match kind {
         SourceKind::Display => format!("display:{id}"),
         SourceKind::Window => format!("window:{id}"),
+        SourceKind::Camera => format!("camera:{id}"),
     };
     let config = profile_config(&info, &profile);
     let (rx, handle) = start_capture(&info, config, live)?;
     Ok((rx, handle, label))
+}
+
+/// Starts a screen + webcam composite share (webcam as a corner overlay).
+/// One publisher feed, protocol-unchanged: the core and viewers see a
+/// single External stream. Pre-flight safe like `start_capture_for`.
+/// `label` mirrors the share descriptor (`combo:display:<id>+camera:<cid>`).
+pub fn start_capture_combo(
+    screen_kind: SourceKind,
+    screen_id: &str,
+    camera_id: &str,
+    profile: QualityProfile,
+    live: Arc<Mutex<QualityProfile>>,
+) -> Result<(mpsc::Receiver<ExternalFrame>, BridgeHandle, String), PlatformError> {
+    if !matches!(screen_kind, SourceKind::Display | SourceKind::Window) {
+        return Err(PlatformError::InvalidSource { reason: "combo exige tela ou janela" });
+    }
+    if camera_id.trim().is_empty() {
+        return Err(PlatformError::InvalidSource { reason: "combo exige webcam" });
+    }
+    let listed = enumerate_sources()?;
+    let screen = listed
+        .iter()
+        .find(|item| item.kind == screen_kind && item.id == screen_id)
+        .ok_or_else(|| PlatformError::SourceGone { id: screen_id.to_owned() })?
+        .clone();
+    let camera = listed
+        .iter()
+        .find(|item| item.kind == SourceKind::Camera && item.id == camera_id)
+        .ok_or_else(|| PlatformError::SourceGone { id: camera_id.to_owned() })?
+        .clone();
+    let screen_tag = match screen_kind {
+        SourceKind::Display => "display",
+        SourceKind::Window => "window",
+        SourceKind::Camera => unreachable!("filtrado acima"),
+    };
+    let label = format!("combo:{screen_tag}:{screen_id}+camera:{camera_id}");
+    let (core_tx, core_rx) = mpsc::sync_channel::<ExternalFrame>(CHANNEL_DEPTH);
+    let tap = FrameTap::default();
+    let screen_config = profile_config(&screen, &profile);
+    let camera_config = profile_config(&camera, &profile);
+    let (thread, stop) = spawn_composite_stream(
+        screen.clone(),
+        camera.clone(),
+        screen_config,
+        camera_config,
+        core_tx.clone(),
+        Arc::clone(&live),
+        tap.clone(),
+    )?;
+    Ok((
+        core_rx,
+        BridgeHandle {
+            stop,
+            thread: Some(thread),
+            info: screen,
+            core_tx,
+            live,
+            order: RestartOrder::StopFirst,
+            combo_camera: Some(camera),
+            tap,
+        },
+        label,
+    ))
+}
+
+/// Opens both OS streams for a composite share and pumps them through one
+/// compositor thread. `open_stream` rendezvouses each start, so no second
+/// rendezvous here; a second-open failure closes the first (pre-flight).
+fn spawn_composite_stream(
+    screen: SourceInfo,
+    camera: SourceInfo,
+    screen_config: CaptureConfig,
+    camera_config: CaptureConfig,
+    core_tx: mpsc::SyncSender<ExternalFrame>,
+    live: Arc<Mutex<QualityProfile>>,
+    tap: FrameTap,
+) -> Result<(std::thread::JoinHandle<()>, Arc<AtomicBool>), PlatformError> {
+    let (mut screen_stream, _) = open_stream(&screen, &screen_config)?;
+    let (mut camera_stream, _) = match open_stream(&camera, &camera_config) {
+        Ok(opened) => opened,
+        Err(error) => {
+            screen_stream.stop(Duration::from_secs(2)).ok();
+            return Err(error);
+        }
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_ = Arc::clone(&stop);
+    let thread = std::thread::Builder::new()
+        .name("golive-screen-camera-combo".into())
+        .spawn(move || {
+            pump_composite(&mut screen_stream, &mut camera_stream, &core_tx, &stop_, &live, &tap);
+            screen_stream.stop(Duration::from_secs(2)).ok();
+            camera_stream.stop(Duration::from_secs(2)).ok();
+        })
+        .map_err(|e| PlatformError::Internal(format!("thread da ponte: {e}")))?;
+    Ok((thread, stop))
+}
+
+/// Composite pump: latest screen frame + latest webcam frame → one feed.
+/// The webcam is a corner overlay (see `overlay_pip`); when it is missing
+/// or dead the screen flows alone (degraded, never wedged). GPU screen
+/// packets forward retained (overlay skipped for that frame). Ends when the
+/// screen ends/fails or `stop` fires.
+fn pump_composite(
+    screen: &mut FrameStream,
+    camera: &mut FrameStream,
+    core_tx: &mpsc::SyncSender<ExternalFrame>,
+    stop: &AtomicBool,
+    live: &Arc<Mutex<QualityProfile>>,
+    tap: &FrameTap,
+) {
+    let mut last_forwarded: Option<Instant> = None;
+    let mut camera_dead = false;
+    // Real time source for the gate (tests use run_pump-style injection on
+    // the single pump; composite timing is covered via overlay unit tests
+    // plus the hardware probe).
+    let clock = Instant::now;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let (interval, target) = match live.lock() {
+            Ok(profile) => (profile.frame_duration(), (profile.w, profile.h)),
+            Err(_) => (BRIDGE_TICK, (1280, 720)),
+        };
+        // Drain the webcam to its latest CPU frame (non-blocking); GPU
+        // packets cannot overlay, so they drop here.
+        let mut pip: Option<BgraFrame> = None;
+        if !camera_dead {
+            loop {
+                match camera.next_frame(Duration::ZERO) {
+                    Ok(CapturePacket::Cpu(frame)) => pip = Some(frame),
+                    Ok(CapturePacket::Gpu(_)) => {}
+                    Err(NextError::Timeout) => break,
+                    Err(NextError::Ended) | Err(NextError::Failed(_)) => {
+                        camera_dead = true;
+                        break;
+                    }
+                }
+            }
+        }
+        match screen.next_frame(BRIDGE_TICK) {
+            Ok(CapturePacket::Cpu(bgra)) => {
+                let now = clock();
+                if !should_forward(last_forwarded, now, interval) {
+                    continue;
+                }
+                let (tw, th) = normalize_dims(bgra.w, bgra.h, target.0, target.1);
+                let composed = match pip {
+                    Some(cam) => overlay_pip(&bgra, &cam),
+                    None => bgra,
+                };
+                let small = prepare_bgra(composed, tw, th);
+                match golive_platform::bgra_to_i420(&small) {
+                    Ok(planar) => {
+                        let mut data =
+                            Vec::with_capacity((planar.w * planar.h * 3 / 2) as usize);
+                        data.extend_from_slice(&planar.y);
+                        data.extend_from_slice(&planar.u);
+                        data.extend_from_slice(&planar.v);
+                        let frame = I420Frame { w: planar.w as usize, h: planar.h as usize, data };
+                        last_forwarded = Some(advance_forwarded(last_forwarded, now, interval));
+                        // Self-view tap, independent of core backpressure.
+                        tap.send(&frame);
+                        let _ = core_tx.try_send(ExternalFrame::Cpu(frame));
+                    }
+                    Err(e) => {
+                        eprintln!("screen convert skipped: {e}");
+                    }
+                }
+            }
+            Ok(CapturePacket::Gpu(gpu)) => {
+                let now = clock();
+                if !should_forward(last_forwarded, now, interval) {
+                    continue;
+                }
+                last_forwarded = Some(advance_forwarded(last_forwarded, now, interval));
+                let _ = core_tx.try_send(ExternalFrame::Gpu(gpu));
+            }
+            Err(NextError::Timeout) => continue,
+            Err(NextError::Ended) | Err(NextError::Failed(_)) => break,
+        }
+    }
+}
+
+/// Overlays `overlay` (webcam) scaled onto the bottom-right corner of `base`
+/// (screen). Opaque blit, 1/32-of-width margin. Degenerate or unfittable
+/// inputs return `base` untouched — the screen never dies for the overlay.
+/// Honors `base` stride (padding preserved). Pure.
+pub fn overlay_pip(base: &BgraFrame, overlay: &BgraFrame) -> BgraFrame {
+    if base.data.is_empty()
+        || base.w < 8
+        || base.h < 8
+        || overlay.data.is_empty()
+        || overlay.w == 0
+        || overlay.h == 0
+    {
+        return base.clone();
+    }
+    let margin = (base.w / 32).max(4).min(32);
+    let mut pip_w = (base.w / 4).clamp(48, 480);
+    let mut pip_h =
+        ((overlay.h as u64 * pip_w as u64 / overlay.w.max(1) as u64) as u32).clamp(2, u32::MAX);
+    // Fit inside the base with margin on both axes (aspect preserved).
+    if pip_w + margin * 2 > base.w {
+        pip_w = base.w.saturating_sub(margin * 2).max(2);
+        pip_h = (overlay.h as u64 * pip_w as u64 / overlay.w.max(1) as u64) as u32;
+    }
+    if pip_h + margin * 2 > base.h {
+        pip_h = base.h.saturating_sub(margin * 2).max(2);
+        pip_w = (overlay.w as u64 * pip_h as u64 / overlay.h.max(1) as u64) as u32;
+    }
+    if pip_w < 2 || pip_h < 2 || pip_w + margin * 2 > base.w || pip_h + margin * 2 > base.h {
+        return base.clone();
+    }
+    let small = scale_bgra_bilinear(overlay, pip_w, pip_h);
+    if small.data.len() != (pip_w as usize) * (pip_h as usize) * 4 {
+        return base.clone();
+    }
+    let mut out = base.clone();
+    let x0 = (base.w - margin - pip_w) as usize;
+    let y0 = (base.h - margin - pip_h) as usize;
+    for y in 0..pip_h as usize {
+        let dst_row = (y0 + y) * base.stride + x0 * 4;
+        let src_row = y * small.stride;
+        if dst_row + pip_w as usize * 4 > out.data.len()
+            || src_row + pip_w as usize * 4 > small.data.len()
+        {
+            break;
+        }
+        out.data[dst_row..dst_row + pip_w as usize * 4]
+            .copy_from_slice(&small.data[src_row..src_row + pip_w as usize * 4]);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Local live preview (share modal). Own lightweight OS reads, independent
+// from share bridges: cameras pump continuously, screens poll one-shot
+// stills (no second OS stream, no GPU-packets problem). Frames are packed
+// small (≤320px) as GLP2/format-0 RGBA — the SAME wire the player speaks
+// (see player.rs dispatch + parsePlayerFrame), so the frontend reuses its
+// renderer. Runs only while the modal is open AND the app is focused
+// (frontend-gated); stops are explicit (modal close, blur, share confirm,
+// leave). Tauri-free: the command layer forwards packets to a Channel.
+// ---------------------------------------------------------------------------
+
+/// Preview long side (px). Small enough to stay cheap over IPC.
+pub const PREVIEW_LIVE_MAX_W: u32 = 320;
+/// Camera preview cadence (~8fps): live feel without encode-grade cost.
+pub const PREVIEW_CAMERA_TICK: Duration = Duration::from_millis(120);
+/// Screen still cadence (~1.4fps): cheap + feedback-safe at small size.
+pub const PREVIEW_STILL_INTERVAL: Duration = Duration::from_millis(700);
+/// Consecutive unreadable stills before the preview reports failure.
+pub const PREVIEW_MAX_STILL_ERRORS: u32 = 8;
+/// Latest-only preview channel depth (drop, never queue stale).
+const PREVIEW_CHANNEL_DEPTH: usize = 2;
+
+/// One preview frame: sequence + dims + tight RGBA pixels.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviewPacket {
+    pub seq: u32,
+    pub w: u32,
+    pub h: u32,
+    pub rgba: Vec<u8>,
+}
+
+impl PreviewPacket {
+    /// GLP2 wire bytes (magic + LE seq/w/h/format + pixels). Must match
+    /// player.rs dispatch and the frontend parsePlayerFrame — the three
+    /// ship together. `format` is always 0 (RGBA).
+    pub fn glp2_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(20 + self.rgba.len());
+        bytes.extend_from_slice(b"GLP2");
+        bytes.extend_from_slice(&self.seq.to_le_bytes());
+        bytes.extend_from_slice(&self.w.to_le_bytes());
+        bytes.extend_from_slice(&self.h.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&self.rgba);
+        bytes
+    }
+}
+
+/// Handle to a running preview. `stop()` is idempotent and bounded; `Drop`
+/// stops best-effort.
+pub struct PreviewHandle {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PreviewHandle {
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for PreviewHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Fit `(w, h)` into [`PREVIEW_LIVE_MAX_W`] preserving aspect, even dims,
+/// floor 2. Pure. Oversized inputs shrink; small inputs stay native (never
+/// upscale: a 160px webcam stays 160px).
+pub fn fit_preview_dims(w: u32, h: u32) -> Option<(u32, u32)> {
+    if w < 2 || h < 2 {
+        return None;
+    }
+    if w <= PREVIEW_LIVE_MAX_W {
+        return Some((w - w % 2, h - h % 2));
+    }
+    let tw = PREVIEW_LIVE_MAX_W;
+    let th = ((h as u64 * tw as u64 / w as u64) as u32).max(2);
+    Some((tw - tw % 2, th - th % 2))
+}
+
+/// Downscales `frame` to preview size and swizzles BGRA→opaque RGBA.
+/// `None` on degenerate input — the caller skips the frame. Pure.
+pub fn pack_preview(seq: u32, frame: &BgraFrame) -> Option<PreviewPacket> {
+    let (tw, th) = fit_preview_dims(frame.w, frame.h)?;
+    let small = scale_bgra_bilinear(frame, tw, th);
+    if small.data.len() != (tw as usize) * (th as usize) * 4 {
+        return None;
+    }
+    let mut rgba = Vec::with_capacity(small.data.len());
+    for px in small.data.chunks_exact(4) {
+        rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
+    }
+    Some(PreviewPacket { seq, w: tw, h: th, rgba })
+}
+
+/// Starts a local preview for one listed source id. Returns the packet
+/// channel plus the owning handle. Pre-flight safe: on `Err` nothing runs.
+/// Cameras pump their OS stream; screens poll one-shot stills.
+pub fn start_preview_stream(
+    kind: SourceKind,
+    id: &str,
+) -> Result<(mpsc::Receiver<PreviewPacket>, PreviewHandle), PlatformError> {
+    if !matches!(kind, SourceKind::Display | SourceKind::Window | SourceKind::Camera) {
+        return Err(PlatformError::InvalidSource { reason: "preview: tela, janela ou webcam" });
+    }
+    let id = id.trim();
+    if id.is_empty() {
+        return Err(PlatformError::InvalidSource { reason: "id vazio" });
+    }
+    let info = enumerate_sources()?
+        .into_iter()
+        .find(|item| item.kind == kind && item.id == id)
+        .ok_or_else(|| PlatformError::SourceGone { id: id.to_owned() })?;
+    let (tx, rx) = mpsc::sync_channel::<PreviewPacket>(PREVIEW_CHANNEL_DEPTH);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_ = Arc::clone(&stop);
+    let thread = std::thread::Builder::new()
+        .name("golive-preview".into())
+        .spawn(move || {
+            if matches!(info.kind, SourceKind::Camera) {
+                pump_camera_preview(&info, &tx, &stop_);
+            } else {
+                pump_still_preview(&info, &tx, &stop_, &mut || thumbnail_for(&info));
+            }
+        })
+        .map_err(|e| PlatformError::Internal(format!("thread de preview: {e}")))?;
+    Ok((rx, PreviewHandle { stop, thread: Some(thread) }))
+}
+
+/// Camera preview pump: opens the OS stream once, packs kept frames at
+/// preview size on the tick gate, latest-only. Ends on stop, device end,
+/// or persistent failure (typed via channel close — the command layer
+/// reports the stall; kinds/counts only, never pixels).
+fn pump_camera_preview(
+    info: &SourceInfo,
+    tx: &mpsc::SyncSender<PreviewPacket>,
+    stop: &AtomicBool,
+) {
+    let config = golive_platform::capture_config_for(640, 480, 10);
+    let mut stream = match open_stream(info, &config) {
+        Ok((stream, _)) => stream,
+        Err(_) => return,
+    };
+    let mut seq = 0u32;
+    let mut last_sent: Option<Instant> = None;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        match stream.next_frame(PREVIEW_CAMERA_TICK + Duration::from_millis(400)) {
+            Ok(CapturePacket::Cpu(bgra)) => {
+                let now = Instant::now();
+                if !should_forward(last_sent, now, PREVIEW_CAMERA_TICK) {
+                    continue;
+                }
+                if let Some(packet) = pack_preview(seq, &bgra) {
+                    seq = seq.wrapping_add(1);
+                    last_sent = Some(now);
+                    if tx.try_send(packet).is_err() {
+                        break; // Receiver gone (stop raced us) — exit.
+                    }
+                }
+            }
+            // Overlay-incompatible GPU packets never occur here (no
+            // compositing), but a retained packet has no CPU pixels to
+            // pack — skip rather than misinterpret.
+            Ok(CapturePacket::Gpu(_)) => continue,
+            Err(NextError::Timeout) => continue,
+            Err(NextError::Ended) | Err(NextError::Failed(_)) => break,
+        }
+    }
+    stream.stop(Duration::from_secs(2)).ok();
+}
+
+/// Screen preview pump: one-shot stills on an interval (no persistent OS
+/// stream, no GPU packets by construction). `still` is a closure so tests
+/// script frames/failures without a backend. Aborts after
+/// [`PREVIEW_MAX_STILL_ERRORS`] consecutive failures.
+fn pump_still_preview(
+    info: &SourceInfo,
+    tx: &mpsc::SyncSender<PreviewPacket>,
+    stop: &AtomicBool,
+    still: &mut dyn FnMut() -> Result<BgraFrame, PlatformError>,
+) {
+    let _ = info;
+    let mut seq = 0u32;
+    let mut errors = 0u32;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        match still() {
+            Ok(frame) => {
+                errors = 0;
+                if let Some(packet) = pack_preview(seq, &frame) {
+                    seq = seq.wrapping_add(1);
+                    if tx.try_send(packet).is_err() {
+                        break;
+                    }
+                }
+            }
+            Err(_) => {
+                errors += 1;
+                if errors >= PREVIEW_MAX_STILL_ERRORS {
+                    break;
+                }
+            }
+        }
+        // Interval sleep, stop-responsive (10 slices).
+        for _ in 0..10 {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(PREVIEW_STILL_INTERVAL / 10);
+        }
+    }
 }
 
 /// Opens + starts the platform stream for one listed source, alongside the
@@ -353,6 +893,7 @@ fn pump_bridge(
     stop: &AtomicBool,
     live: &Arc<Mutex<QualityProfile>>,
     mut clock: impl FnMut() -> Instant,
+    tap: &FrameTap,
 ) {
     let mut last_forwarded: Option<Instant> = None;
     let mut trace = Trace::new(Stage::Capture);
@@ -417,6 +958,10 @@ fn pump_bridge(
                         data.extend_from_slice(&planar.v);
                         let frame = I420Frame { w: planar.w as usize, h: planar.h as usize, data };
                         last_forwarded = Some(advance_forwarded(last_forwarded, now, interval));
+                        // Stage self-view tap: mirrors every converted frame,
+                        // independent of core backpressure (a slow encoder
+                        // must not stall the local tile).
+                        tap.send(&frame);
                         // Latest-only: a full channel means the core is
                         // behind; drop this one rather than queue stale.
                         let sent = core_tx.try_send(ExternalFrame::Cpu(frame)).is_ok();
@@ -686,7 +1231,7 @@ mod tests {
             let at = start + interval * n + Duration::from_millis((n % 2) as u64);
             n += 1;
             at
-        });
+        }, &FrameTap::default());
         let forwarded = core_rx.try_iter().count();
         assert_eq!(forwarded, 300, "30fps capture lost frames to 1ms jitter");
     }
@@ -748,6 +1293,302 @@ mod tests {
         assert_eq!(small.data[8], 20);
         // Degenerate input never panics.
         assert!(scale_bgra_nearest(&src, 0, 2).data.is_empty());
+    }
+
+    #[test]
+    fn overlay_pip_lands_bottom_right_keeping_base_elsewhere() {
+        // 64x64 blue screen + 16x16 red webcam: PiP is base.w/4 = 16 wide.
+        let base = solid_bgra(64, 64, 0, 0, 255);
+        let cam = solid_bgra(16, 16, 255, 0, 0);
+        let out = overlay_pip(&base, &cam);
+        assert_eq!((out.w, out.h, out.stride), (64, 64, 256));
+        let px = |x: usize, y: usize| -> [u8; 4] {
+            let i = (y * out.stride + x * 4) as usize;
+            [out.data[i], out.data[i + 1], out.data[i + 2], out.data[i + 3]]
+        };
+        // Top-left stays screen blue (BGRA: B=255).
+        assert_eq!(px(2, 2), [255, 0, 0, 255]);
+        // Bottom-right corner is webcam red with margin (64/32=2 → margin 4).
+        assert_eq!(px(63 - 4 - 1, 63 - 4 - 1), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn overlay_pip_degrades_to_base_untouched() {
+        let base = solid_bgra(64, 64, 0, 0, 255);
+        let empty = BgraFrame {
+            w: 0,
+            h: 0,
+            stride: 0,
+            format: PixelFormat::Bgra8888,
+            data: Vec::new(),
+        };
+        // Empty overlay, empty base, tiny base: screen never dies.
+        assert_eq!(overlay_pip(&base, &empty).data, base.data);
+        assert_eq!(overlay_pip(&empty, &base).data, empty.data);
+        let tiny = solid_bgra(4, 4, 1, 2, 3);
+        assert_eq!(overlay_pip(&tiny, &base).data, tiny.data);
+    }
+
+    #[test]
+    fn overlay_pip_preserves_stride_padding() {
+        // Base with padded stride: overlay must not smear padding rows.
+        let data = vec![7u8; 8 * 4 + 16];
+        let base = BgraFrame { w: 2, h: 4, stride: 12, format: PixelFormat::Bgra8888, data };
+        let cam = solid_bgra(8, 8, 200, 30, 30);
+        let out = overlay_pip(&base, &cam);
+        assert_eq!(out.stride, 12);
+        assert_eq!(out.data.len(), base.data.len());
+    }
+
+    #[test]
+    fn preview_fit_shrinks_wide_never_upscales() {
+        assert_eq!(fit_preview_dims(0, 10), None);
+        assert_eq!(fit_preview_dims(640, 480), Some((320, 240)));
+        assert_eq!(fit_preview_dims(1920, 1080), Some((320, 180)));
+        // Small native stays native (evened, never upscaled).
+        assert_eq!(fit_preview_dims(160, 120), Some((160, 120)));
+        assert_eq!(fit_preview_dims(161, 121), Some((160, 120)));
+    }
+
+    #[test]
+    fn preview_pack_swizzles_bgra_to_opaque_rgba() {
+        // 2x2: red, green, blue, white in BGRA → RGBA with forced alpha.
+        let src = BgraFrame {
+            w: 2,
+            h: 2,
+            stride: 8,
+            format: PixelFormat::Bgra8888,
+            data: vec![
+                0, 0, 255, 0, 0, 255, 0, 0,
+                255, 0, 0, 0, 255, 255, 255, 0,
+            ],
+        };
+        let packet = pack_preview(7, &src).unwrap();
+        assert_eq!((packet.seq, packet.w, packet.h), (7, 2, 2));
+        assert_eq!(
+            packet.rgba,
+            vec![
+                255, 0, 0, 255, 0, 255, 0, 255,
+                0, 0, 255, 255, 255, 255, 255, 255,
+            ]
+        );
+        // GLP2 wire: magic + LE seq/w/h/format + pixels (player-compatible).
+        let wire = packet.glp2_bytes();
+        assert_eq!(&wire[..4], b"GLP2");
+        assert_eq!(&wire[4..8], &7u32.to_le_bytes());
+        assert_eq!(&wire[8..12], &2u32.to_le_bytes());
+        assert_eq!(&wire[12..16], &2u32.to_le_bytes());
+        assert_eq!(&wire[16..20], &0u32.to_le_bytes());
+        assert_eq!(&wire[20..], packet.rgba.as_slice());
+        // Degenerate input never panics — the pump skips the frame.
+        let empty = BgraFrame {
+            w: 0,
+            h: 0,
+            stride: 0,
+            format: PixelFormat::Bgra8888,
+            data: Vec::new(),
+        };
+        assert!(pack_preview(0, &empty).is_none());
+    }
+
+    #[test]
+    fn still_pump_streams_scripted_stills_then_stops() {
+        let info = SourceInfo {
+            kind: SourceKind::Display,
+            id: "mock-1".into(),
+            name: "Mock".into(),
+            w: 64,
+            h: 64,
+        };
+        let frame = solid_bgra(64, 64, 10, 200, 30);
+        let (tx, rx) = mpsc::sync_channel::<PreviewPacket>(8);
+        let stop = AtomicBool::new(false);
+        let worker = std::thread::spawn(move || {
+            let mut still = || Ok(frame.clone());
+            pump_still_preview(&info, &tx, &stop, &mut still);
+        });
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(packet) => got.push(packet),
+                Err(e) => panic!("still pump stalled: {e:?}"),
+            }
+        }
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0].w, got[0].h), (64, 64));
+        assert_eq!(got[1].seq, got[0].seq + 1);
+        assert_eq!(got[0].rgba.len(), 64 * 64 * 4);
+        drop(rx);
+        worker.join().expect("pump exits when receiver drops");
+    }
+
+    #[test]
+    fn still_pump_aborts_on_persistent_failure() {
+        let info = SourceInfo {
+            kind: SourceKind::Window,
+            id: "gone".into(),
+            name: "Mock".into(),
+            w: 0,
+            h: 0,
+        };
+        let (tx, rx) = mpsc::sync_channel::<PreviewPacket>(8);
+        let stop = AtomicBool::new(false);
+        // 8 consecutive failures × 700ms: aborts in ~6s, never hangs.
+        let start = Instant::now();
+        pump_still_preview(
+            &info,
+            &tx,
+            &stop,
+            &mut || -> Result<BgraFrame, PlatformError> {
+                Err(PlatformError::SourceGone { id: "gone".into() })
+            },
+        );
+        assert!(start.elapsed() < Duration::from_secs(30));
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn tap_mirrors_full_skips_dead_clears() {
+        let tap = FrameTap::default();
+        assert!(!tap.is_attached());
+        let frame = |v: u8| I420Frame { w: 2, h: 2, data: vec![v; 6] };
+        // Unattached send is a no-op (share without self-view costs nothing).
+        tap.send(&frame(1));
+        let rx = tap.attach();
+        assert!(tap.is_attached());
+        tap.send(&frame(2));
+        let got = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(got.data, vec![2u8; 6]);
+        // Full channel (cap 2) drops newest instead of blocking the pump.
+        tap.send(&frame(3));
+        tap.send(&frame(4));
+        tap.send(&frame(5));
+        let _ = rx.try_iter().count();
+        // Dead receiver clears the tap on next send.
+        drop(rx);
+        tap.send(&frame(6));
+        assert!(!tap.is_attached());
+        // Re-attach replaces cleanly.
+        let rx2 = tap.attach();
+        assert!(tap.is_attached());
+        tap.send(&frame(7));
+        assert_eq!(rx2.recv_timeout(Duration::from_secs(2)).unwrap().data, vec![7u8; 6]);
+    }
+
+    #[test]
+    #[ignore]
+    fn hw_bridge_tap_mirrors_shared_camera_frames() {
+        // Real webcam through a live share bridge (the exact mechanism the
+        // stage self-view uses). Run explicitly, serially (single-open):
+        // cargo test -p golive-app --lib hw_bridge_tap -- --ignored --nocapture --test-threads=1
+        // Virtual devices with no fulfillable mode are skipped honestly.
+        let listed = enumerate_sources().expect("real enumerate");
+        let live = Arc::new(Mutex::new(QualityProfile::medium()));
+        for cam in listed.iter().filter(|s| s.kind == SourceKind::Camera) {
+            let (core_rx, handle, _) = match start_capture_for(
+                SourceKind::Camera,
+                &cam.id,
+                QualityProfile::medium(),
+                Arc::clone(&live),
+            ) {
+                Ok(opened) => opened,
+                Err(e) => {
+                    eprintln!("tap skipping camera: {e}");
+                    continue;
+                }
+            };
+            let tap_rx = handle.attach_tap();
+            // The core side is intentionally undrained (cap-2 latest-only):
+            // the tap must flow independently of core backpressure.
+            drop(core_rx);
+            match tap_rx.recv_timeout(Duration::from_secs(15)) {
+                Ok(frame) => {
+                    assert!(frame.w >= 2 && frame.h >= 2);
+                    assert_eq!(frame.data.len(), frame.w * frame.h * 3 / 2);
+                    let second = tap_rx.recv_timeout(Duration::from_secs(15)).expect("tap frame");
+                    assert_eq!((second.w, second.h), (frame.w, frame.h));
+                    return;
+                }
+                Err(e) => eprintln!("tap camera without frames: {e:?}"),
+            }
+        }
+        panic!("no tap-proven webcam");
+    }
+
+    #[test]
+    #[ignore]
+    fn hw_camera_preview_streams_small_packets() {
+        // Needs a physical webcam; never runs in CI:
+        // `cargo test -p golive-app --lib hw_camera_preview -- --ignored --nocapture`
+        // Virtual devices with no fulfillable mode are skipped honestly.
+        let listed = enumerate_sources().expect("real enumerate");
+        // A device may open yet never deliver frames (virtual cameras) —
+        // only a received packet proves a previewable webcam.
+        let mut opened = None;
+        for cam in listed.iter().filter(|s| s.kind == SourceKind::Camera) {
+            match start_preview_stream(cam.kind, &cam.id) {
+                Ok((rx, handle)) => {
+                    match rx.recv_timeout(Duration::from_secs(12)) {
+                        Ok(first) => {
+                            opened = Some((first, rx, handle));
+                            break;
+                        }
+                        Err(e) => eprintln!("preview camera without frames: {e}"),
+                    }
+                }
+                Err(e) => eprintln!("preview skipping camera: {e}"),
+            }
+        }
+        let (first, rx, mut handle) = opened.expect("a previewable webcam");
+        assert!((2..=PREVIEW_LIVE_MAX_W).contains(&first.w));
+        assert_eq!(first.rgba.len(), first.w as usize * first.h as usize * 4);
+        for _ in 0..2 {
+            let packet = rx.recv_timeout(Duration::from_secs(15)).expect("preview packet");
+            assert!((2..=PREVIEW_LIVE_MAX_W).contains(&packet.w));
+            assert_eq!(packet.rgba.len(), packet.w as usize * packet.h as usize * 4);
+            let wire = packet.glp2_bytes();
+            assert_eq!(&wire[..4], b"GLP2");
+        }
+        handle.stop();
+    }
+
+    #[test]
+    fn camera_pack_path_fits_mock_frames_at_preview_size() {
+        use golive_platform::mock::MockSource;
+        use golive_platform::VideoSource;
+        let info = SourceInfo {
+            kind: SourceKind::Display,
+            id: "mock-1".into(),
+            name: "Mock".into(),
+            w: 640,
+            h: 480,
+        };
+        let mut source = MockSource::open(&info).unwrap();
+        source.frames = vec![MockSource::display("x", 640, 480)
+            .with_solid_frame(200, 30, 30)
+            .frames
+            .remove(0)];
+        let stream = source.start(&CaptureConfig::default()).unwrap();
+        let (tx, rx) = mpsc::sync_channel::<PreviewPacket>(8);
+        let pump = std::thread::spawn(move || {
+            let mut seq = 0u32;
+            for _ in 0..2 {
+                match stream.next_frame(Duration::from_secs(5)) {
+                    Ok(CapturePacket::Cpu(bgra)) => {
+                        if let Some(packet) = pack_preview(seq, &bgra) {
+                            seq += 1;
+                            let _ = tx.try_send(packet);
+                        }
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        });
+        let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // 640x480 capture fits preview 320px untouched in aspect.
+        assert_eq!((first.w, first.h), (320, 240));
+        assert_eq!(first.rgba.len(), 320 * 240 * 4);
+        pump.join().expect("packing pass ends");
     }
 
     #[test]
@@ -829,7 +1670,7 @@ mod tests {
         let (core_tx, core_rx) = mpsc::sync_channel::<ExternalFrame>(2);
         let stop = AtomicBool::new(false);
         let live = Arc::new(Mutex::new(profile));
-        pump_bridge(&mut stream, &core_tx, &stop, &live, Instant::now);
+        pump_bridge(&mut stream, &core_tx, &stop, &live, Instant::now, &FrameTap::default());
         let mut out = Vec::new();
         while let Ok(packet) = core_rx.recv_timeout(Duration::from_millis(200)) {
             match packet {
@@ -891,7 +1732,7 @@ mod tests {
         let (core_tx, core_rx) = mpsc::sync_channel::<ExternalFrame>(2);
         let stop = AtomicBool::new(false);
         let live = Arc::new(Mutex::new(QualityProfile::medium()));
-        pump_bridge(&mut stream, &core_tx, &stop, &live, Instant::now);
+        pump_bridge(&mut stream, &core_tx, &stop, &live, Instant::now, &FrameTap::default());
         match core_rx.recv_timeout(Duration::from_secs(2)).expect("gpu forwarded") {
             ExternalFrame::Gpu(forwarded) => {
                 // Untouched: same dims/stride, still owned (no convert ran —

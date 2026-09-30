@@ -1,5 +1,22 @@
 # changelog
 
+## v0.7.19
+
+- fix: streamar + webcam ao mesmo tempo — Compartilhar espera o preview liberar a câmera (botão desabilita em voo) em vez de falhar ocupado; `selfview_start` distingue share sintético de parado
+- test: `camera_preview_share_selfview_flow` (sala real + webcam real) trava a ordem preview → share → self-view
+
+## v0.7.18
+
+- feat: tile "Você" no palco espelha o share ativo (prévia local, sem reabrir dispositivo); ícone Ocultar + "Mostrar meu vídeo" com pref persistido; comandos `selfview_start`/`selfview_stop`, mesmo fio GLP2 do player
+
+## v0.7.17
+
+- feat: preview ao vivo no modal Compartilhar (webcam contínua ~8fps, tela em stills ~1.4fps, só com o app em foco); comandos `preview_start`/`preview_stop`, mesmo fio GLP2 do player, para antes de compartilhar
+
+## v0.7.16
+
+- feat: detectar webcam — `camera:<id>` transmite só a webcam, `combo:display:<id>+camera:<cid>` (ou `combo:window:…`) compõe tela + webcam no canto num feed só; modal Compartilhar ganha a aba Webcams, a fonte Webcam e o PiP "tela + webcam"; segunda instância assiste sem protocolo novo
+
 ## v0.7.15
 
 - feat: persist privacy-safe, aggregated rendezvous diagnostics in a Docker volume for troubleshooting signaling failures

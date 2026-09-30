@@ -27,19 +27,26 @@ use golive_core::owner::{Fence, Owner, OwnerSnapshot};
 use golive_core::signal::SignalClient;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::ipc::{Channel, InvokeResponseBody};
 use tokio::sync::mpsc;
 
 pub const DEFAULT_SERVER: &str = "https://together.jouymaker.com";
 
 /// Share source selector. Screen capture arrives via the platform bridge
 /// (`display:<id>` / `window:<id>`); synthetic + movie stay untouched.
+/// `camera:<id>` streams a webcam alone; `combo:display:<id>+camera:<cid>`
+/// (or `combo:window:…`) composites screen + webcam corner overlay into one
+/// feed (single publisher, protocol-unchanged).
 #[derive(Clone, Debug)]
 pub enum ShareSource {
     Synthetic,
     Movie(String),
     Display(String),
     Window(String),
+    Camera(String),
+    Combo { screen: Box<ShareSource>, camera: String },
 }
 
 pub(crate) fn initial_share_profile(
@@ -59,6 +66,7 @@ pub(crate) fn initial_share_profile(
 pub(crate) fn window_audio_id(source: &ShareSource) -> Option<&str> {
     match source {
         ShareSource::Window(id) => Some(id.as_str()),
+        ShareSource::Combo { screen, .. } => window_audio_id(screen),
         _ => None,
     }
 }
@@ -85,9 +93,50 @@ impl ShareSource {
             } else {
                 Ok(Self::Window(id.trim().to_owned()))
             }
+        } else if let Some(id) = raw.strip_prefix("camera:") {
+            if id.trim().is_empty() {
+                Err("camera: needs an id (list sources first)".into())
+            } else {
+                Ok(Self::Camera(id.trim().to_owned()))
+            }
+        } else if let Some(rest) = raw.strip_prefix("combo:") {
+            Self::parse_combo(rest)
         } else {
-            Err("fonte: 'synthetic', 'movie:/caminho', 'display:<id>' ou 'window:<id>'".into())
+            Err("fonte: 'synthetic', 'movie:/caminho', 'display:<id>', 'window:<id>', 'camera:<id>' ou 'combo:display:<id>+camera:<cid>'".into())
         }
+    }
+
+    /// Parses `display:<sid>+camera:<cid>` / `window:<sid>+camera:<cid>`.
+    /// The screen half reuses the single-source rules (OS handles never
+    /// contain `+camera:`); anything else is a typed error, never a guess.
+    fn parse_combo(rest: &str) -> Result<Self, String> {
+        let (screen_part, camera_id) = rest.split_once("+camera:").ok_or_else(|| {
+            "combo: use 'combo:display:<id>+camera:<cid>' ou 'combo:window:<id>+camera:<cid>'"
+                .to_owned()
+        })?;
+        if camera_id.trim().is_empty() {
+            return Err("combo: camera: needs an id (list sources first)".into());
+        }
+        let screen = if let Some(id) = screen_part.strip_prefix("display:") {
+            if id.trim().is_empty() {
+                return Err("combo: display: needs an id (list sources first)".into());
+            }
+            Self::Display(id.trim().to_owned())
+        } else if let Some(id) = screen_part.strip_prefix("window:") {
+            if id.trim().is_empty() {
+                return Err("combo: window: needs an id (list sources first)".into());
+            }
+            Self::Window(id.trim().to_owned())
+        } else {
+            return Err(
+                "combo: a tela é 'display:<id>' ou 'window:<id>' (synthetic/movie/camera não combinam)"
+                    .into(),
+            );
+        };
+        Ok(Self::Combo {
+            screen: Box::new(screen),
+            camera: camera_id.trim().to_owned(),
+        })
     }
 }
 
@@ -280,7 +329,8 @@ pub struct E2ePlan {
     /// File where this instance reports JSON status.
     pub status_file: String,
     /// Share source selector ("synthetic" default | "movie:<path>" |
-    /// "display:<id>" | "window:<id>"). Optional so existing plans keep
+    /// "display:<id>" | "window:<id>" | "camera:<id>" |
+    /// "combo:display:<id>+camera:<cid>"). Optional so existing plans keep
     /// working unchanged (absent == synthetic). The viewer ignores it.
     #[serde(default)]
     pub share: Option<String>,
@@ -382,6 +432,30 @@ struct Inner {
     /// census line went out (log once per process, not per Stats event).
     last_logged_backend: Option<String>,
     census_logged: bool,
+    /// Live modal previews by token (see `preview_start`). Own OS reads,
+    /// independent from share bridges; stopped explicitly (modal close,
+    /// blur, share confirm) and swept on stop_share/leave. Kind + id only.
+    previews: HashMap<String, screen::PreviewHandle>,
+    /// Stage self-view sessions by token (see `selfview_start`). Each owns
+    /// its tap-forwarder stop flag; stopped explicitly (tile hide, share
+    /// stop) and swept on stop_share/leave.
+    selfviews: HashMap<String, SelfviewSession>,
+}
+
+/// One stage self-view session: owns the tap-forwarder stop flag so
+/// `selfview_stop` joins promptly instead of stranding a thread in `recv`.
+struct SelfviewSession {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SelfviewSession {
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 /// Decode-side observation for one watched member.
@@ -419,6 +493,8 @@ impl AppState {
                 last_logged_backend: None,
                 census_logged: false,
                 share_source: None,
+                previews: HashMap::new(),
+                selfviews: HashMap::new(),
             }),
             session_log: Mutex::new(session_log::SessionLog::disabled()),
             operations: tokio::sync::Mutex::new(()),
@@ -586,6 +662,8 @@ impl AppState {
     /// best-effort. Idempotent.
     pub async fn leave(self: &Arc<Self>) -> Result<(), String> {
         let _operation = self.operations.lock().await;
+        self.stop_all_previews();
+        self.stop_all_selfviews();
         let (signal, publishers, viewers, audio) = {
             let mut inner = self
                 .inner
@@ -658,6 +736,16 @@ impl AppState {
                 // Display share starts with the default audio exclusions
                 // (Discord + our own app/helper); the host can untoggle any
                 // of them via set_audio_exclusions.
+                audio::ShareAudio::start(golive_platform::default_excluded_tokens()).ok()
+            }
+            None if matches!(
+                &source,
+                ShareSource::Combo { screen, .. }
+                    if matches!(screen.as_ref(), ShareSource::Display(_))
+            ) =>
+            {
+                // Combo over a display: same default exclusions as a plain
+                // display share (the webcam has no system-audio tap).
                 audio::ShareAudio::start(golive_platform::default_excluded_tokens()).ok()
             }
             None => None,
@@ -751,6 +839,8 @@ impl AppState {
             ShareSource::Movie(_) => "movie",
             ShareSource::Display(_) => "display",
             ShareSource::Window(_) => "window",
+            ShareSource::Camera(_) => "camera",
+            ShareSource::Combo { .. } => "combo",
         };
         let audio_live = {
             let inner = self.inner.lock().map_err(|_| "state lock poisoned".to_string())?;
@@ -823,6 +913,38 @@ impl AppState {
                     bridge,
                 }
             }
+            ShareSource::Camera(id) => {
+                let (rx, bridge, label) = screen::start_capture_for(
+                    golive_platform::SourceKind::Camera,
+                    id,
+                    profile,
+                    Arc::clone(live),
+                )
+                .map_err(|e| e.to_string())?;
+                Resolved::Bridged {
+                    video: VideoSource::External(ExternalSource { rx, label }),
+                    bridge,
+                }
+            }
+            ShareSource::Combo { screen, camera } => {
+                let (screen_kind, screen_id) = match screen.as_ref() {
+                    ShareSource::Display(id) => (golive_platform::SourceKind::Display, id),
+                    ShareSource::Window(id) => (golive_platform::SourceKind::Window, id),
+                    _ => return Err("combo: a tela é display ou window".into()),
+                };
+                let (rx, bridge, label) = screen::start_capture_combo(
+                    screen_kind,
+                    screen_id,
+                    camera,
+                    profile,
+                    Arc::clone(live),
+                )
+                .map_err(|e| e.to_string())?;
+                Resolved::Bridged {
+                    video: VideoSource::External(ExternalSource { rx, label }),
+                    bridge,
+                }
+            }
         };
         let (video_source, mut bridge) = match resolved {
             Resolved::Direct(video) => (video, None),
@@ -883,15 +1005,17 @@ impl AppState {
                 .share_profile
                 .map(|s| s.profile)
                 .unwrap_or_else(|| Quality::P720.profile());
-            // Display/Window share the stored live Arc; its absence alongside
-            // a capture source is inconsistent — refuse rather than fork it.
+            // Display/Window/Camera/Combo share the stored live Arc; its
+            // absence alongside a capture source is inconsistent — refuse
+            // rather than fork it.
             let live = match &source {
-                ShareSource::Display(_) | ShareSource::Window(_) => {
-                    match inner.share_capture.clone() {
-                        Some(live) => live,
-                        None => return false,
-                    }
-                }
+                ShareSource::Display(_)
+                | ShareSource::Window(_)
+                | ShareSource::Camera(_)
+                | ShareSource::Combo { .. } => match inner.share_capture.clone() {
+                    Some(live) => live,
+                    None => return false,
+                },
                 ShareSource::Synthetic | ShareSource::Movie(_) => {
                     Arc::new(Mutex::new(profile))
                 }
@@ -987,6 +1111,8 @@ impl AppState {
             ShareSource::Movie(_) => "movie",
             ShareSource::Display(_) => "display",
             ShareSource::Window(_) => "window",
+            ShareSource::Camera(_) => "camera",
+            ShareSource::Combo { .. } => "combo",
         };
         self.session_log(format!("watch fresh kind={kind}"));
         true
@@ -996,6 +1122,8 @@ impl AppState {
     /// deterministically.
     pub async fn stop_share(self: &Arc<Self>) -> Result<(), String> {
         let _operation = self.operations.lock().await;
+        self.stop_all_previews();
+        self.stop_all_selfviews();
         let (publishers, audio) = {
             let mut inner = self
                 .inner
@@ -1417,6 +1545,7 @@ impl AppState {
         let kind = match kind {
             "display" => golive_platform::SourceKind::Display,
             "window" => golive_platform::SourceKind::Window,
+            "camera" => golive_platform::SourceKind::Camera,
             _ => {
                 return SourcePreview { data_url: None, w: 0, h: 0 };
             }
@@ -1428,6 +1557,184 @@ impl AppState {
                 h: preview.h,
             },
             Err(_) => SourcePreview { data_url: None, w: 0, h: 0 },
+        }
+    }
+
+    /// Starts a live modal preview for one listed source. Returns an opaque
+    /// token; frames flow as GLP2/format-0 (player-compatible) on `channel`
+    /// until `preview_stop`, modal close/blur (frontend), share confirm
+    /// (which stops first, then shares), or stop_share/leave (sweep).
+    /// Own OS reads, independent from share bridges — a busy device (e.g.
+    /// already shared elsewhere) fails typed, never silently.
+    pub fn preview_start(
+        &self,
+        kind: &str,
+        id: &str,
+        channel: Channel,
+    ) -> Result<String, String> {
+        let kind = match kind {
+            "display" => golive_platform::SourceKind::Display,
+            "window" => golive_platform::SourceKind::Window,
+            "camera" => golive_platform::SourceKind::Camera,
+            _ => return Err("preview: fonte é display, window ou camera".into()),
+        };
+        let (rx, handle) =
+            screen::start_preview_stream(kind, id).map_err(|e| e.to_string())?;
+        let token = {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            format!("pv-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
+        };
+        // Forwarder: packets → GLP2 → Channel; exits when the pump ends
+        // (stop or device failure) or the webview stops receiving. The pump
+        // owns the lifetime (its end drops the channel side); explicit stops
+        // and the stop_share/leave sweep bound everything else.
+        if std::thread::Builder::new()
+            .name("golive-preview-send".into())
+            .spawn(move || {
+                for packet in rx {
+                    if channel
+                        .send(InvokeResponseBody::Raw(packet.glp2_bytes()))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .is_err()
+        {
+            drop(handle);
+            return Err("preview: sem thread de envio".into());
+        }
+        self.inner
+            .lock()
+            .map_err(|_| "state lock poisoned".to_string())?
+            .previews
+            .insert(token.clone(), handle);
+        // Milestone: kind only (never ids).
+        let kind_name = match kind {
+            golive_platform::SourceKind::Display => "display",
+            golive_platform::SourceKind::Window => "window",
+            golive_platform::SourceKind::Camera => "camera",
+        };
+        self.session_log(format!("preview start kind={kind_name}"));
+        Ok(token)
+    }
+
+    /// Stops one live preview. Idempotent; unknown tokens are Ok.
+    pub fn preview_stop(&self, token: &str) {
+        if let Ok(mut inner) = self.inner.lock() {
+            if let Some(mut handle) = inner.previews.remove(token) {
+                handle.stop();
+            }
+        }
+    }
+
+    /// Stops every live preview (stop_share/leave sweep).
+    pub fn stop_all_previews(&self) {
+        let handles: Vec<screen::PreviewHandle> = match self.inner.lock() {
+            Ok(mut inner) => inner.previews.drain().map(|(_, h)| h).collect(),
+            Err(_) => Vec::new(),
+        };
+        for mut handle in handles {
+            handle.stop();
+        }
+    }
+
+    /// Starts the stage self-view: mirrors the LIVE share bridge feed into
+    /// `channel` as GLP2/format-1 (contiguous I420, player-compatible) until
+    /// `selfview_stop`, share stop, or leave. No second OS open — the local
+    /// tile reuses the exact frames the encoder gets. Fails honestly when
+    /// nothing is shared (no bridge to tap).
+    pub fn selfview_start(&self, channel: Channel) -> Result<String, String> {
+        let tap_rx = {
+            let inner = self.inner.lock().map_err(|_| "state lock poisoned".to_string())?;
+            let sharing = !inner.publishers.is_empty();
+            let mut found: Option<std::sync::mpsc::Receiver<golive_core::media::I420Frame>> = None;
+            for session in inner.publishers.values() {
+                if let Some(bridge) = session.bridge.as_ref() {
+                    found = Some(bridge.attach_tap());
+                    break;
+                }
+            }
+            // Sem bridge com share no ar = fonte sem captura (synthetic ou
+            // movie): erro próprio, nunca "inicie o compartilhamento".
+            found.ok_or_else(|| {
+                if sharing {
+                    "prévia local só para tela, janela ou webcam".to_string()
+                } else {
+                    "inicie o compartilhamento para ver seu vídeo".to_string()
+                }
+            })?
+        };
+        let token = {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            format!("sv-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_ = Arc::clone(&stop);
+        let mut seq = 0u32;
+        let thread = std::thread::Builder::new()
+            .name("golive-selfview-send".into())
+            .spawn(move || {
+                loop {
+                    if stop_.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let frame = match tap_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                        Ok(frame) => frame,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
+                    // Frontend parsePlayerFrame rejects odd dims — skip the
+                    // frame instead of breaking the tile.
+                    if frame.w < 2 || frame.h < 2 || frame.w % 2 != 0 || frame.h % 2 != 0 {
+                        continue;
+                    }
+                    if frame.data.len() != frame.w * frame.h * 3 / 2 {
+                        continue;
+                    }
+                    let mut bytes = Vec::with_capacity(20 + frame.data.len());
+                    bytes.extend_from_slice(b"GLP2");
+                    bytes.extend_from_slice(&seq.to_le_bytes());
+                    bytes.extend_from_slice(&(frame.w as u32).to_le_bytes());
+                    bytes.extend_from_slice(&(frame.h as u32).to_le_bytes());
+                    bytes.extend_from_slice(&1u32.to_le_bytes());
+                    bytes.extend_from_slice(&frame.data);
+                    seq = seq.wrapping_add(1);
+                    if channel.send(InvokeResponseBody::Raw(bytes)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(|_| "prévia local: sem thread de envio".to_string())?;
+        self.session_log("selfview start".to_string());
+        self.inner
+            .lock()
+            .map_err(|_| "state lock poisoned".to_string())?
+            .selfviews
+            .insert(token.clone(), SelfviewSession { stop, thread: Some(thread) });
+        Ok(token)
+    }
+
+    /// Stops one stage self-view. Idempotent; unknown tokens are Ok.
+    pub fn selfview_stop(&self, token: &str) {
+        let session = match self.inner.lock() {
+            Ok(mut inner) => inner.selfviews.remove(token),
+            Err(_) => None,
+        };
+        if let Some(mut session) = session {
+            session.stop();
+        }
+    }
+
+    /// Stops every stage self-view (stop_share/leave sweep).
+    pub fn stop_all_selfviews(&self) {
+        let sessions: Vec<SelfviewSession> = match self.inner.lock() {
+            Ok(mut inner) => inner.selfviews.drain().map(|(_, s)| s).collect(),
+            Err(_) => Vec::new(),
+        };
+        for mut session in sessions {
+            session.stop();
         }
     }
 
@@ -1800,6 +2107,44 @@ async fn preview_source(
 }
 
 #[tauri::command]
+async fn preview_start(
+    state: State<'_, Arc<AppState>>,
+    kind: String,
+    id: String,
+    channel: Channel,
+) -> Result<String, String> {
+    // Device open rendezvouses (camera permission/first frame): never block
+    // the async runtime on it.
+    let owned = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || owned.preview_start(&kind, &id, channel))
+        .await
+        .map_err(|e| format!("preview: {e}"))?
+}
+
+#[tauri::command]
+fn preview_stop(state: State<'_, Arc<AppState>>, token: String) {
+    state.preview_stop(&token);
+}
+
+#[tauri::command]
+async fn selfview_start(
+    state: State<'_, Arc<AppState>>,
+    channel: Channel,
+) -> Result<String, String> {
+    // Attaching the tap is instant (no device open), but keep the async
+    // shape for forward-compatibility with the preview commands.
+    let owned = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || owned.selfview_start(channel))
+        .await
+        .map_err(|e| format!("prévia local: {e}"))?
+}
+
+#[tauri::command]
+fn selfview_stop(state: State<'_, Arc<AppState>>, token: String) {
+    state.selfview_stop(&token);
+}
+
+#[tauri::command]
 fn get_media_counters(state: State<'_, Arc<AppState>>) -> Result<MediaCounters, String> {
     state.get_media_counters()
 }
@@ -1863,6 +2208,10 @@ pub fn run_with(state: Arc<AppState>) {
             get_snapshot,
             get_roster,
             preview_source,
+            preview_start,
+            preview_stop,
+            selfview_start,
+            selfview_stop,
             get_media_counters,
             set_server,
             get_e2e_plan,
@@ -2002,6 +2351,84 @@ mod e2e_plan_tests {
 }
 
 #[cfg(test)]
+mod preview_command_tests {
+    use super::*;
+    use tauri::ipc::{Channel, InvokeResponseBody};
+
+    #[test]
+    fn preview_start_rejects_unknown_kind_without_touching_os() {
+        let state = Arc::new(AppState::new());
+        assert!(state.preview_start("screen", "1", Channel::new(|_| Ok(()))).is_err());
+        assert!(state.preview_start("", "", Channel::new(|_| Ok(()))).is_err());
+        // Unknown tokens stop silently (idempotent by design).
+        state.preview_stop("pv-nope");
+        state.stop_all_previews();
+    }
+
+    #[test]
+    #[ignore]
+    fn hw_preview_command_streams_glp2_to_channel() {
+        // Real webcam through the Tauri command layer (no webview involved).
+        // Run explicitly, serially (single-open device):
+        // cargo test -p golive-app --lib hw_preview_command -- --ignored --nocapture --test-threads=1
+        use std::time::Duration;
+        let listed = screen::enumerate_sources().expect("real enumerate");
+        let cams: Vec<_> = listed
+            .iter()
+            .filter(|s| s.kind == golive_platform::SourceKind::Camera)
+            .collect();
+        if cams.is_empty() {
+            eprintln!("no camera on this machine; skipping");
+            return;
+        }
+        let state = Arc::new(AppState::new());
+        for cam in cams {
+            // A device may open yet never deliver frames (virtual cameras) —
+            // only received bytes prove a previewable webcam.
+            let (tx_one, rx_one) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+            let channel = Channel::new(move |body| {
+                if let InvokeResponseBody::Raw(bytes) = body {
+                    let _ = tx_one.try_send(bytes);
+                }
+                Ok(())
+            });
+            let token = match state.preview_start("camera", &cam.id, channel) {
+                Ok(token) => token,
+                Err(e) => {
+                    eprintln!("preview skipping camera: {e}");
+                    continue;
+                }
+            };
+            let mut frames = Vec::new();
+            let mut live = true;
+            for _ in 0..3 {
+                match rx_one.recv_timeout(Duration::from_secs(12)) {
+                    Ok(bytes) => {
+                        assert!(bytes.len() > 20 && &bytes[..4] == b"GLP2");
+                        frames.push(bytes);
+                    }
+                    Err(e) => {
+                        eprintln!("preview camera without frames: {e}");
+                        live = false;
+                        break;
+                    }
+                }
+            }
+            // Stop is idempotent; the sweep covers the rest.
+            state.preview_stop(&token);
+            state.preview_stop(&token);
+            if live {
+                assert_eq!(frames.len(), 3);
+                state.stop_all_previews();
+                return;
+            }
+        }
+        state.stop_all_previews();
+        panic!("a previewable webcam");
+    }
+}
+
+#[cfg(test)]
 mod share_source_tests {
     use super::*;
 
@@ -2020,6 +2447,34 @@ mod share_source_tests {
             ShareSource::parse("window:42").unwrap(),
             ShareSource::Window(_)
         ));
+        assert!(matches!(
+            ShareSource::parse("camera:0").unwrap(),
+            ShareSource::Camera(_)
+        ));
+    }
+
+    #[test]
+    fn parses_combo_screen_plus_camera() {
+        match ShareSource::parse("combo:display:1+camera:0").unwrap() {
+            ShareSource::Combo { screen, camera } => {
+                assert!(matches!(*screen, ShareSource::Display(_)));
+                assert_eq!(camera, "0");
+            }
+            other => panic!("expected combo, got {other:?}"),
+        }
+        match ShareSource::parse("combo:window:42+camera:1").unwrap() {
+            ShareSource::Combo { screen, camera } => {
+                assert!(matches!(*screen, ShareSource::Window(_)));
+                assert_eq!(camera, "1");
+            }
+            other => panic!("expected combo, got {other:?}"),
+        }
+        // Screen half must be display/window; camera id must exist.
+        assert!(ShareSource::parse("combo:camera:0+camera:1").is_err());
+        assert!(ShareSource::parse("combo:synthetic+camera:0").is_err());
+        assert!(ShareSource::parse("combo:display:1+camera:").is_err());
+        assert!(ShareSource::parse("combo:display:1").is_err());
+        assert!(ShareSource::parse("combo:").is_err());
     }
 
     #[test]
@@ -2027,6 +2482,8 @@ mod share_source_tests {
         assert!(ShareSource::parse("display:").is_err());
         assert!(ShareSource::parse("display:   ").is_err());
         assert!(ShareSource::parse("window:").is_err());
+        assert!(ShareSource::parse("camera:").is_err());
+        assert!(ShareSource::parse("camera:   ").is_err());
         assert!(ShareSource::parse("movie:").is_err());
         assert!(ShareSource::parse("screen").is_err());
         assert!(ShareSource::parse("").is_err());
@@ -2036,8 +2493,15 @@ mod share_source_tests {
     fn window_share_uses_window_audio_display_does_not() {
         let window = ShareSource::parse("window:42").unwrap();
         let display = ShareSource::parse("display:\\\\.\\DISPLAY1").unwrap();
+        let camera = ShareSource::parse("camera:0").unwrap();
+        let combo_window = ShareSource::parse("combo:window:42+camera:0").unwrap();
+        let combo_display = ShareSource::parse("combo:display:1+camera:0").unwrap();
         assert_eq!(window_audio_id(&window), Some("42"));
         assert_eq!(window_audio_id(&display), None);
+        assert_eq!(window_audio_id(&camera), None);
+        // Combo inherits the screen half's audio: window taps, display ducks.
+        assert_eq!(window_audio_id(&combo_window), Some("42"));
+        assert_eq!(window_audio_id(&combo_display), None);
         assert_eq!(window_audio_id(&ShareSource::Synthetic), None);
     }
 
