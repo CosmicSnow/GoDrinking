@@ -9,7 +9,7 @@
 import { useEffect, useRef, useState } from "react";
 import { version as APP_VERSION } from "../package.json";
 import { StreamPlayer } from "./StreamPlayer";
-import { PreviewPlayer, useAppFocus } from "./PreviewPlayer";
+import { PreviewPlayer, SelfViewPlayer, useAppFocus } from "./PreviewPlayer";
 import { isTauri, playerMuteAll, previewStop } from "./api";
 import type { UpdateInfo } from "./update";
 import type {
@@ -70,6 +70,18 @@ export function visibleAudioApps(
 export const NICKNAME_STORAGE_KEY = "golive.nickname";
 /** Chave do "Servidor" no localStorage (ausente = DEFAULT_SERVER do App). */
 export const SERVER_STORAGE_KEY = "golive.server";
+/** Chave do tile "Você" no palco ("1" visível / "0" oculto; ausente = visível). */
+export const SELFVIEW_STORAGE_KEY = "golive.selfview";
+
+/** Pref do self-view: visível por padrão; só "0" explícito oculta. */
+export function readSelfviewPref(): boolean {
+  return readStoredSetting(SELFVIEW_STORAGE_KEY) !== "0";
+}
+
+/** Persiste o pref do self-view (silencioso sem storage). */
+export function writeSelfviewPref(visible: boolean): void {
+  writeStoredSetting(SELFVIEW_STORAGE_KEY, visible ? "1" : "0");
+}
 
 /** Leitura segura: SSR/testes sem window e modo privado nunca quebram. */
 export function readStoredSetting(key: string): string | null {
@@ -1215,7 +1227,7 @@ function Tile(props: TileProps) {
 
 export function RoomScreen(props: RoomProps) {
   const {
-    roomCode, snapshot, roster, selfId, selfNickname, watching,
+    roomCode, nickname, snapshot, roster, selfId, selfNickname, watching,
     source, onSource, sources, sourcesError, sourcesDenied = false, caps, onListSources,
     previews, onPreviewsVisible,
     busy, error, lastSignal, lastMedia, quality, linkStats,
@@ -1253,6 +1265,20 @@ export function RoomScreen(props: RoomProps) {
   // Preview ao vivo: token opaco do backend + último erro (o thumb segue).
   const [previewToken, setPreviewToken] = useState<string | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
+  // Tile "Você" no palco: visível por padrão, removível com ícone e
+  // reativável no topo (pref persiste). Espelha o feed do share.
+  const [selfViewPref, setSelfViewPref] = useState(() => readSelfviewPref());
+  const [selfViewError, setSelfViewError] = useState<string | null>(null);
+  const hideSelfView = (): void => {
+    setSelfViewPref(false);
+    writeSelfviewPref(false);
+    say("Seu preview oculto — ative de volta no topo.");
+  };
+  const showSelfView = (): void => {
+    setSelfViewPref(true);
+    writeSelfviewPref(true);
+    say("Seu preview de volta no palco.");
+  };
   // O preview só roda com a janela do app em foco (pausa fora dela).
   const appFocused = useAppFocus();
   const [audioQuery, setAudioQuery] = useState("");
@@ -1426,6 +1452,16 @@ export function RoomScreen(props: RoomProps) {
               <div className="stage-hint">
                 Roda = zoom · Arrastar = mover · Duplo-clique = tela cheia · 0 = restaurar
               </div>
+              {sharing && !selfViewPref ? (
+                <button
+                  type="button"
+                  className="btn ghost small"
+                  onClick={showSelfView}
+                  title="Mostra seu vídeo de novo no palco"
+                >
+                  Mostrar meu vídeo
+                </button>
+              ) : null}
               <button
                 type="button"
                 className="btn ghost small"
@@ -1446,11 +1482,49 @@ export function RoomScreen(props: RoomProps) {
           ) : null}
 
           <section className="stage" aria-label="Transmissões da sala">
-            {othersSharing.length === 0 ? (
+            {(othersSharing.length === 0 && !(sharing && selfViewPref)) ? (
               <div className="empty-stage">Sem transmissões</div>
             ) : (
               <>
                 <div className={roomTilesClassName(!!pinned)} data-hook="tile-grid">
+                  {sharing && selfViewPref ? (
+                    <div key="self" className={stageCellClassName("self", pinnedId)}>
+                      <article
+                        className="tile"
+                        data-hook="tile-self"
+                        tabIndex={0}
+                        aria-label="Sua transmissão (prévia local)"
+                      >
+                        <div className="viewport">
+                          <SelfViewPlayer
+                            active={appFocused}
+                            nickname={nickname}
+                            onError={setSelfViewError}
+                          />
+                        </div>
+                        <div className="badge-live"><i />PRÉVIA</div>
+                        <div className="tile-top">
+                          <span className="name-tag">
+                            {nickname}
+                            <span className="leader">VOCÊ</span>
+                          </span>
+                        </div>
+                        <div className="tile-controls">
+                          <button
+                            type="button"
+                            className="tbtn"
+                            onClick={hideSelfView}
+                            title="Ocultar meu preview do palco"
+                          >
+                            Ocultar
+                          </button>
+                        </div>
+                        {selfViewError ? (
+                          <p className="error" role="alert">{selfViewError}</p>
+                        ) : null}
+                      </article>
+                    </div>
+                  ) : null}
                   {othersSharing.map((member) => <div key={member.id} className={stageCellClassName(member.id, pinnedId)}>
                     <Tile
                       native={!mock}

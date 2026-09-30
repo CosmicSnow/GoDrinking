@@ -52,6 +52,52 @@ pub struct BridgeHandle {
     /// Set when this bridge composites screen + webcam (PiP): `info` is the
     /// screen, this is the camera. `reconfigure` restarts both, stop-first.
     combo_camera: Option<SourceInfo>,
+    /// Stage self-view tap: mirrors forwarded CPU frames to the local tile.
+    /// Shared with pump threads; survives `reconfigure` (same handle).
+    tap: FrameTap,
+}
+
+/// Local self-view tap: mirrors forwarded CPU frames to zero or one
+/// attached viewer (the stage self tile). Latest-only (cap 2, skip on
+/// full); attaching replaces any previous tap; a dead receiver clears
+/// itself on the next send. `Clone` shares one tap across the handle and
+/// every pump thread that feeds it.
+#[derive(Clone, Default)]
+pub struct FrameTap {
+    inner: Arc<Mutex<Option<mpsc::SyncSender<I420Frame>>>>,
+}
+
+impl FrameTap {
+    /// Attaches a receiver, replacing any previous one (its side then
+    /// observes disconnect). Returns the tap feed.
+    pub fn attach(&self) -> mpsc::Receiver<I420Frame> {
+        let (tx, rx) = mpsc::sync_channel::<I420Frame>(CHANNEL_DEPTH);
+        if let Ok(mut guard) = self.inner.lock() {
+            *guard = Some(tx);
+        }
+        rx
+    }
+
+    /// Best-effort mirror of one forwarded frame. Never blocks, never
+    /// fails the share: full drops, dead clears.
+    pub fn send(&self, frame: &I420Frame) {
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        if let Some(tx) = guard.as_ref() {
+            if matches!(
+                tx.try_send(frame.clone()),
+                Err(mpsc::TrySendError::Disconnected(_))
+            ) {
+                *guard = None;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn is_attached(&self) -> bool {
+        self.inner.lock().map(|guard| guard.is_some()).unwrap_or(false)
+    }
 }
 
 impl BridgeHandle {
@@ -60,6 +106,12 @@ impl BridgeHandle {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+
+    /// Attaches the stage self-view tap to this bridge's live feed (zero or
+    /// one attached viewer; re-attaching orphans the previous receiver).
+    pub fn attach_tap(&self) -> mpsc::Receiver<I420Frame> {
+        self.tap.attach()
     }
 
     /// Stream restart at `profile` on the same core channel (latest-only —
@@ -88,6 +140,7 @@ impl BridgeHandle {
                 camera_config,
                 self.core_tx.clone(),
                 Arc::clone(&self.live),
+                self.tap.clone(),
             )?;
             self.thread = Some(thread);
             self.stop = stop;
@@ -112,6 +165,7 @@ impl BridgeHandle {
                     config,
                     self.core_tx.clone(),
                     Arc::clone(&self.live),
+                    self.tap.clone(),
                 )
             },
         )?;
@@ -176,6 +230,7 @@ fn spawn_stream(
     config: CaptureConfig,
     core_tx: mpsc::SyncSender<ExternalFrame>,
     live: Arc<Mutex<QualityProfile>>,
+    tap: FrameTap,
 ) -> Result<(std::thread::JoinHandle<()>, Arc<AtomicBool>, RestartOrder), PlatformError> {
     let (mut stream, order) = open_stream(&info, &config)?;
     let stop = Arc::new(AtomicBool::new(false));
@@ -183,7 +238,7 @@ fn spawn_stream(
     let thread = std::thread::Builder::new()
         .name("golive-screen-bridge".into())
         .spawn(move || {
-            pump_bridge(&mut stream, &core_tx, &stop_, &live, Instant::now);
+            pump_bridge(&mut stream, &core_tx, &stop_, &live, Instant::now, &tap);
         })
         .map_err(|e| PlatformError::Internal(format!("thread da ponte: {e}")))?;
     Ok((thread, stop, order))
@@ -200,11 +255,12 @@ pub fn start_capture(
     live: Arc<Mutex<QualityProfile>>,
 ) -> Result<(mpsc::Receiver<ExternalFrame>, BridgeHandle), PlatformError> {
     let (core_tx, core_rx) = mpsc::sync_channel::<ExternalFrame>(CHANNEL_DEPTH);
+    let tap = FrameTap::default();
     let (thread, stop, order) =
-        spawn_stream(info.clone(), config, core_tx.clone(), Arc::clone(&live))?;
+        spawn_stream(info.clone(), config, core_tx.clone(), Arc::clone(&live), tap.clone())?;
     Ok((
         core_rx,
-        BridgeHandle { stop, thread: Some(thread), info: info.clone(), core_tx, live, order, combo_camera: None },
+        BridgeHandle { stop, thread: Some(thread), info: info.clone(), core_tx, live, order, combo_camera: None, tap },
     ))
 }
 
@@ -268,6 +324,7 @@ pub fn start_capture_combo(
     };
     let label = format!("combo:{screen_tag}:{screen_id}+camera:{camera_id}");
     let (core_tx, core_rx) = mpsc::sync_channel::<ExternalFrame>(CHANNEL_DEPTH);
+    let tap = FrameTap::default();
     let screen_config = profile_config(&screen, &profile);
     let camera_config = profile_config(&camera, &profile);
     let (thread, stop) = spawn_composite_stream(
@@ -277,6 +334,7 @@ pub fn start_capture_combo(
         camera_config,
         core_tx.clone(),
         Arc::clone(&live),
+        tap.clone(),
     )?;
     Ok((
         core_rx,
@@ -288,6 +346,7 @@ pub fn start_capture_combo(
             live,
             order: RestartOrder::StopFirst,
             combo_camera: Some(camera),
+            tap,
         },
         label,
     ))
@@ -303,6 +362,7 @@ fn spawn_composite_stream(
     camera_config: CaptureConfig,
     core_tx: mpsc::SyncSender<ExternalFrame>,
     live: Arc<Mutex<QualityProfile>>,
+    tap: FrameTap,
 ) -> Result<(std::thread::JoinHandle<()>, Arc<AtomicBool>), PlatformError> {
     let (mut screen_stream, _) = open_stream(&screen, &screen_config)?;
     let (mut camera_stream, _) = match open_stream(&camera, &camera_config) {
@@ -317,7 +377,7 @@ fn spawn_composite_stream(
     let thread = std::thread::Builder::new()
         .name("golive-screen-camera-combo".into())
         .spawn(move || {
-            pump_composite(&mut screen_stream, &mut camera_stream, &core_tx, &stop_, &live);
+            pump_composite(&mut screen_stream, &mut camera_stream, &core_tx, &stop_, &live, &tap);
             screen_stream.stop(Duration::from_secs(2)).ok();
             camera_stream.stop(Duration::from_secs(2)).ok();
         })
@@ -336,6 +396,7 @@ fn pump_composite(
     core_tx: &mpsc::SyncSender<ExternalFrame>,
     stop: &AtomicBool,
     live: &Arc<Mutex<QualityProfile>>,
+    tap: &FrameTap,
 ) {
     let mut last_forwarded: Option<Instant> = None;
     let mut camera_dead = false;
@@ -388,6 +449,8 @@ fn pump_composite(
                         data.extend_from_slice(&planar.v);
                         let frame = I420Frame { w: planar.w as usize, h: planar.h as usize, data };
                         last_forwarded = Some(advance_forwarded(last_forwarded, now, interval));
+                        // Self-view tap, independent of core backpressure.
+                        tap.send(&frame);
                         let _ = core_tx.try_send(ExternalFrame::Cpu(frame));
                     }
                     Err(e) => {
@@ -830,6 +893,7 @@ fn pump_bridge(
     stop: &AtomicBool,
     live: &Arc<Mutex<QualityProfile>>,
     mut clock: impl FnMut() -> Instant,
+    tap: &FrameTap,
 ) {
     let mut last_forwarded: Option<Instant> = None;
     let mut trace = Trace::new(Stage::Capture);
@@ -894,6 +958,10 @@ fn pump_bridge(
                         data.extend_from_slice(&planar.v);
                         let frame = I420Frame { w: planar.w as usize, h: planar.h as usize, data };
                         last_forwarded = Some(advance_forwarded(last_forwarded, now, interval));
+                        // Stage self-view tap: mirrors every converted frame,
+                        // independent of core backpressure (a slow encoder
+                        // must not stall the local tile).
+                        tap.send(&frame);
                         // Latest-only: a full channel means the core is
                         // behind; drop this one rather than queue stale.
                         let sent = core_tx.try_send(ExternalFrame::Cpu(frame)).is_ok();
@@ -1163,7 +1231,7 @@ mod tests {
             let at = start + interval * n + Duration::from_millis((n % 2) as u64);
             n += 1;
             at
-        });
+        }, &FrameTap::default());
         let forwarded = core_rx.try_iter().count();
         assert_eq!(forwarded, 300, "30fps capture lost frames to 1ms jitter");
     }
@@ -1380,6 +1448,74 @@ mod tests {
     }
 
     #[test]
+    fn tap_mirrors_full_skips_dead_clears() {
+        let tap = FrameTap::default();
+        assert!(!tap.is_attached());
+        let frame = |v: u8| I420Frame { w: 2, h: 2, data: vec![v; 6] };
+        // Unattached send is a no-op (share without self-view costs nothing).
+        tap.send(&frame(1));
+        let rx = tap.attach();
+        assert!(tap.is_attached());
+        tap.send(&frame(2));
+        let got = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(got.data, vec![2u8; 6]);
+        // Full channel (cap 2) drops newest instead of blocking the pump.
+        tap.send(&frame(3));
+        tap.send(&frame(4));
+        tap.send(&frame(5));
+        let _ = rx.try_iter().count();
+        // Dead receiver clears the tap on next send.
+        drop(rx);
+        tap.send(&frame(6));
+        assert!(!tap.is_attached());
+        // Re-attach replaces cleanly.
+        let rx2 = tap.attach();
+        assert!(tap.is_attached());
+        tap.send(&frame(7));
+        assert_eq!(rx2.recv_timeout(Duration::from_secs(2)).unwrap().data, vec![7u8; 6]);
+    }
+
+    #[test]
+    #[ignore]
+    fn hw_bridge_tap_mirrors_shared_camera_frames() {
+        // Real webcam through a live share bridge (the exact mechanism the
+        // stage self-view uses). Run explicitly, serially (single-open):
+        // cargo test -p golive-app --lib hw_bridge_tap -- --ignored --nocapture --test-threads=1
+        // Virtual devices with no fulfillable mode are skipped honestly.
+        let listed = enumerate_sources().expect("real enumerate");
+        let live = Arc::new(Mutex::new(QualityProfile::medium()));
+        for cam in listed.iter().filter(|s| s.kind == SourceKind::Camera) {
+            let (core_rx, handle, _) = match start_capture_for(
+                SourceKind::Camera,
+                &cam.id,
+                QualityProfile::medium(),
+                Arc::clone(&live),
+            ) {
+                Ok(opened) => opened,
+                Err(e) => {
+                    eprintln!("tap skipping camera: {e}");
+                    continue;
+                }
+            };
+            let tap_rx = handle.attach_tap();
+            // The core side is intentionally undrained (cap-2 latest-only):
+            // the tap must flow independently of core backpressure.
+            drop(core_rx);
+            match tap_rx.recv_timeout(Duration::from_secs(15)) {
+                Ok(frame) => {
+                    assert!(frame.w >= 2 && frame.h >= 2);
+                    assert_eq!(frame.data.len(), frame.w * frame.h * 3 / 2);
+                    let second = tap_rx.recv_timeout(Duration::from_secs(15)).expect("tap frame");
+                    assert_eq!((second.w, second.h), (frame.w, frame.h));
+                    return;
+                }
+                Err(e) => eprintln!("tap camera without frames: {e:?}"),
+            }
+        }
+        panic!("no tap-proven webcam");
+    }
+
+    #[test]
     #[ignore]
     fn hw_camera_preview_streams_small_packets() {
         // Needs a physical webcam; never runs in CI:
@@ -1534,7 +1670,7 @@ mod tests {
         let (core_tx, core_rx) = mpsc::sync_channel::<ExternalFrame>(2);
         let stop = AtomicBool::new(false);
         let live = Arc::new(Mutex::new(profile));
-        pump_bridge(&mut stream, &core_tx, &stop, &live, Instant::now);
+        pump_bridge(&mut stream, &core_tx, &stop, &live, Instant::now, &FrameTap::default());
         let mut out = Vec::new();
         while let Ok(packet) = core_rx.recv_timeout(Duration::from_millis(200)) {
             match packet {
@@ -1596,7 +1732,7 @@ mod tests {
         let (core_tx, core_rx) = mpsc::sync_channel::<ExternalFrame>(2);
         let stop = AtomicBool::new(false);
         let live = Arc::new(Mutex::new(QualityProfile::medium()));
-        pump_bridge(&mut stream, &core_tx, &stop, &live, Instant::now);
+        pump_bridge(&mut stream, &core_tx, &stop, &live, Instant::now, &FrameTap::default());
         match core_rx.recv_timeout(Duration::from_secs(2)).expect("gpu forwarded") {
             ExternalFrame::Gpu(forwarded) => {
                 // Untouched: same dims/stride, still owned (no convert ran —

@@ -27,7 +27,7 @@ use golive_core::owner::{Fence, Owner, OwnerSnapshot};
 use golive_core::signal::SignalClient;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tokio::sync::mpsc;
@@ -436,6 +436,26 @@ struct Inner {
     /// independent from share bridges; stopped explicitly (modal close,
     /// blur, share confirm) and swept on stop_share/leave. Kind + id only.
     previews: HashMap<String, screen::PreviewHandle>,
+    /// Stage self-view sessions by token (see `selfview_start`). Each owns
+    /// its tap-forwarder stop flag; stopped explicitly (tile hide, share
+    /// stop) and swept on stop_share/leave.
+    selfviews: HashMap<String, SelfviewSession>,
+}
+
+/// One stage self-view session: owns the tap-forwarder stop flag so
+/// `selfview_stop` joins promptly instead of stranding a thread in `recv`.
+struct SelfviewSession {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SelfviewSession {
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 /// Decode-side observation for one watched member.
@@ -474,6 +494,7 @@ impl AppState {
                 census_logged: false,
                 share_source: None,
                 previews: HashMap::new(),
+                selfviews: HashMap::new(),
             }),
             session_log: Mutex::new(session_log::SessionLog::disabled()),
             operations: tokio::sync::Mutex::new(()),
@@ -642,6 +663,7 @@ impl AppState {
     pub async fn leave(self: &Arc<Self>) -> Result<(), String> {
         let _operation = self.operations.lock().await;
         self.stop_all_previews();
+        self.stop_all_selfviews();
         let (signal, publishers, viewers, audio) = {
             let mut inner = self
                 .inner
@@ -1101,6 +1123,7 @@ impl AppState {
     pub async fn stop_share(self: &Arc<Self>) -> Result<(), String> {
         let _operation = self.operations.lock().await;
         self.stop_all_previews();
+        self.stop_all_selfviews();
         let (publishers, audio) = {
             let mut inner = self
                 .inner
@@ -1617,6 +1640,95 @@ impl AppState {
         }
     }
 
+    /// Starts the stage self-view: mirrors the LIVE share bridge feed into
+    /// `channel` as GLP2/format-1 (contiguous I420, player-compatible) until
+    /// `selfview_stop`, share stop, or leave. No second OS open — the local
+    /// tile reuses the exact frames the encoder gets. Fails honestly when
+    /// nothing is shared (no bridge to tap).
+    pub fn selfview_start(&self, channel: Channel) -> Result<String, String> {
+        let tap_rx = {
+            let inner = self.inner.lock().map_err(|_| "state lock poisoned".to_string())?;
+            let mut found: Option<std::sync::mpsc::Receiver<golive_core::media::I420Frame>> = None;
+            for session in inner.publishers.values() {
+                if let Some(bridge) = session.bridge.as_ref() {
+                    found = Some(bridge.attach_tap());
+                    break;
+                }
+            }
+            found.ok_or_else(|| "inicie o compartilhamento para ver seu vídeo".to_string())?
+        };
+        let token = {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            format!("sv-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_ = Arc::clone(&stop);
+        let mut seq = 0u32;
+        let thread = std::thread::Builder::new()
+            .name("golive-selfview-send".into())
+            .spawn(move || {
+                loop {
+                    if stop_.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let frame = match tap_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                        Ok(frame) => frame,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
+                    // Frontend parsePlayerFrame rejects odd dims — skip the
+                    // frame instead of breaking the tile.
+                    if frame.w < 2 || frame.h < 2 || frame.w % 2 != 0 || frame.h % 2 != 0 {
+                        continue;
+                    }
+                    if frame.data.len() != frame.w * frame.h * 3 / 2 {
+                        continue;
+                    }
+                    let mut bytes = Vec::with_capacity(20 + frame.data.len());
+                    bytes.extend_from_slice(b"GLP2");
+                    bytes.extend_from_slice(&seq.to_le_bytes());
+                    bytes.extend_from_slice(&(frame.w as u32).to_le_bytes());
+                    bytes.extend_from_slice(&(frame.h as u32).to_le_bytes());
+                    bytes.extend_from_slice(&1u32.to_le_bytes());
+                    bytes.extend_from_slice(&frame.data);
+                    seq = seq.wrapping_add(1);
+                    if channel.send(InvokeResponseBody::Raw(bytes)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(|_| "prévia local: sem thread de envio".to_string())?;
+        self.session_log("selfview start".to_string());
+        self.inner
+            .lock()
+            .map_err(|_| "state lock poisoned".to_string())?
+            .selfviews
+            .insert(token.clone(), SelfviewSession { stop, thread: Some(thread) });
+        Ok(token)
+    }
+
+    /// Stops one stage self-view. Idempotent; unknown tokens are Ok.
+    pub fn selfview_stop(&self, token: &str) {
+        let session = match self.inner.lock() {
+            Ok(mut inner) => inner.selfviews.remove(token),
+            Err(_) => None,
+        };
+        if let Some(mut session) = session {
+            session.stop();
+        }
+    }
+
+    /// Stops every stage self-view (stop_share/leave sweep).
+    pub fn stop_all_selfviews(&self) {
+        let sessions: Vec<SelfviewSession> = match self.inner.lock() {
+            Ok(mut inner) => inner.selfviews.drain().map(|(_, s)| s).collect(),
+            Err(_) => Vec::new(),
+        };
+        for mut session in sessions {
+            session.stop();
+        }
+    }
+
     /// Backend-observed media counters (observational, redacted). Pollable
     /// fallback next to push events. `presented` is summed live from the
     /// native windows (acks), the rest is bumped by forward tasks.
@@ -2006,6 +2118,24 @@ fn preview_stop(state: State<'_, Arc<AppState>>, token: String) {
 }
 
 #[tauri::command]
+async fn selfview_start(
+    state: State<'_, Arc<AppState>>,
+    channel: Channel,
+) -> Result<String, String> {
+    // Attaching the tap is instant (no device open), but keep the async
+    // shape for forward-compatibility with the preview commands.
+    let owned = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || owned.selfview_start(channel))
+        .await
+        .map_err(|e| format!("prévia local: {e}"))?
+}
+
+#[tauri::command]
+fn selfview_stop(state: State<'_, Arc<AppState>>, token: String) {
+    state.selfview_stop(&token);
+}
+
+#[tauri::command]
 fn get_media_counters(state: State<'_, Arc<AppState>>) -> Result<MediaCounters, String> {
     state.get_media_counters()
 }
@@ -2071,6 +2201,8 @@ pub fn run_with(state: Arc<AppState>) {
             preview_source,
             preview_start,
             preview_stop,
+            selfview_start,
+            selfview_stop,
             get_media_counters,
             set_server,
             get_e2e_plan,

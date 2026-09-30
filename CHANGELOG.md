@@ -1,5 +1,9 @@
 # changelog
 
+## v0.7.18
+
+- feat: tile "Você" no palco espelha o share ativo (prévia local, sem reabrir dispositivo); ícone Ocultar + "Mostrar meu vídeo" com pref persistido; comandos `selfview_start`/`selfview_stop`, mesmo fio GLP2 do player
+
 ## v0.7.17
 
 - feat: preview ao vivo no modal Compartilhar (webcam contínua ~8fps, tela em stills ~1.4fps, só com o app em foco); comandos `preview_start`/`preview_stop`, mesmo fio GLP2 do player, para antes de compartilhar

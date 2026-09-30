@@ -66,3 +66,15 @@ test('uso 4 (segunda instância vê): viewer em outra aba enxerga quem compartil
   await host.close();
   await viewer.close();
 });
+
+test('self-view: meu tile no palco oculta com ícone e volta no topo', async ({ page }) => {
+  await lobbyToRoom(page);
+  // Mock entra compartilhando: meu tile abre visível com Ocultar.
+  await expect(page.locator('[data-hook="tile-self"]')).toBeVisible({ timeout: 8000 });
+  await expect(page.getByTestId('selfview-mock')).toBeVisible();
+  await page.getByRole('button', { name: 'Ocultar', exact: true }).click();
+  await expect(page.locator('[data-hook="tile-self"]')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Mostrar meu vídeo', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Mostrar meu vídeo', exact: true }).click();
+  await expect(page.locator('[data-hook="tile-self"]')).toBeVisible({ timeout: 8000 });
+});

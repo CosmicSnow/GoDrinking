@@ -2,7 +2,7 @@
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createElement } from "react";
-import { PreviewPlayer, appFocusNow } from "./PreviewPlayer";
+import { PreviewPlayer, SelfViewPlayer, appFocusNow } from "./PreviewPlayer";
 
 describe("appFocusNow (puro: janela E documento)", () => {
   it("só focado + visível roda o preview", () => {
@@ -29,5 +29,16 @@ describe("PreviewPlayer (mock: sem Tauri, sem invoke)", () => {
       createElement(PreviewPlayer, { kind: "display", id: "1", active: false }),
     );
     expect(html).toContain("preview-mock");
+  });
+});
+
+describe("SelfViewPlayer (mock: sem Tauri, sem invoke)", () => {
+  it("sem Tauri mostra o placeholder honesto, nunca o canvas", () => {
+    const html = renderToStaticMarkup(
+      createElement(SelfViewPlayer, { active: true, nickname: "Ana" }),
+    );
+    expect(html).toContain("selfview-mock");
+    expect(html).toContain("só no app");
+    expect(html).not.toContain("<canvas");
   });
 });

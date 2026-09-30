@@ -18,6 +18,8 @@ import {
   isTauri,
   previewStart,
   previewStop,
+  selfviewStart,
+  selfviewStop,
   type PreviewKind,
 } from "./api";
 import { createPlayerRenderer, parsePlayerFrame } from "./playerRenderer";
@@ -169,6 +171,120 @@ export function PreviewPlayer({ kind, id, active, onToken, onError }: PreviewPla
     <div className="preview-live" data-testid="preview-live">
       <canvas ref={canvas} aria-label={`Pré-visualização de ${kind}`} />
       {frames === 0 ? <span className="watch-note">Aguardando preview…</span> : null}
+    </div>
+  );
+}
+
+/**
+ * Renderer do player reaproveitado para os previews locais.
+ */
+export type PreviewRenderer = ReturnType<typeof createPlayerRenderer>;
+
+/**
+ * Desenha UM frame GLP2 no canvas (renderer reaproveitado entre frames).
+ * Puro o bastante para teste: o canvas entra pronto, o renderer sai junto.
+ */
+export function drawPreviewFrame(
+  canvas: HTMLCanvasElement,
+  renderer: PreviewRenderer | undefined,
+  buffer: ArrayBuffer,
+  onFirstFrame: () => void,
+): { renderer: PreviewRenderer; drew: boolean } {
+  const frame = parsePlayerFrame(buffer);
+  let active = renderer;
+  let drew = false;
+  deliverPlayerFrame(
+    () => {
+      active ??= createPlayerRenderer(canvas);
+      active.draw(frame);
+      drew = true;
+      onFirstFrame();
+    },
+    () => undefined,
+  );
+  if (!active) throw new Error("canvas unavailable");
+  return { renderer: active, drew };
+}
+
+export interface SelfViewPlayerProps {
+  /** Share no ar + pref visível + app em foco (o dono decide). */
+  active: boolean;
+  nickname: string;
+  onToken?: (token: string | null) => void;
+  onError?: (message: string | null) => void;
+}
+
+/**
+ * Tile "Você": espelha o feed do share ativo (sem reabrir dispositivo).
+ * Mock: placeholder honesto. Sem share no backend: nota verbatim.
+ */
+export function SelfViewPlayer({ active, nickname, onToken, onError }: SelfViewPlayerProps) {
+  const canvas = useRef<HTMLCanvasElement>(null);
+  const [frames, setFrames] = useState(0);
+  const tokenCb = useRef(onToken);
+  tokenCb.current = onToken;
+  const errorCb = useRef(onError);
+  errorCb.current = onError;
+
+  useEffect(() => {
+    if (!active || !isTauri()) return;
+    let disposed = false;
+    let token: string | null = null;
+    let renderer: PreviewRenderer | undefined;
+    const channel = new Channel<ArrayBuffer>();
+    channel.onmessage = (buffer) => {
+      if (disposed) return;
+      try {
+        const out = drawPreviewFrame(
+          canvas.current ?? (() => { throw new Error("canvas unavailable"); })(),
+          renderer,
+          buffer,
+          () => {
+            if (!disposed) setFrames((n) => n + 1);
+          },
+        );
+        renderer = out.renderer;
+      } catch {
+        // Frame inválido ou canvas sumiu: o próximo tenta de novo.
+      }
+    };
+    void (async () => {
+      try {
+        token = await selfviewStart(channel);
+        if (disposed) {
+          await selfviewStop(token).catch(() => undefined);
+          return;
+        }
+        tokenCb.current?.(token);
+        errorCb.current?.(null);
+      } catch (failure) {
+        if (!disposed) {
+          errorCb.current?.(
+            failure instanceof Error ? failure.message : "Prévia local indisponível.",
+          );
+        }
+      }
+    })();
+    return () => {
+      disposed = true;
+      renderer?.dispose();
+      tokenCb.current?.(null);
+      if (token) void selfviewStop(token).catch(() => undefined);
+    };
+  }, [active]);
+
+  if (!isTauri()) {
+    return (
+      <p className="hint" data-testid="selfview-mock">
+        Prévia local só no app (aqui vale o palco dos outros).
+      </p>
+    );
+  }
+  if (!active) return null;
+  return (
+    <div className="preview-live selfview" data-testid="selfview-live">
+      <canvas ref={canvas} aria-label={`Seu vídeo (${nickname})`} />
+      {frames === 0 ? <span className="watch-note">Aguardando seu vídeo…</span> : null}
     </div>
   );
 }

@@ -2335,7 +2335,7 @@ dependencies = [
 
 [[package]]
 name = "golive-app"
-version = "0.7.17"
+version = "0.7.18"
 dependencies = [
  "base64 0.22.1",
  "cpal",

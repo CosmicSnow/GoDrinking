@@ -28,6 +28,8 @@ import {
   previewSource,
   previewStart,
   previewStop,
+  selfviewStart,
+  selfviewStop,
   setAudioExclusions,
   setQuality,
   setServer,
@@ -182,6 +184,16 @@ describe("intents (comando certo, args certos)", () => {
     mockInvoke.mockResolvedValueOnce(undefined);
     await previewStop("pv-1-2");
     expect(mockInvoke).toHaveBeenCalledWith("preview_stop", { token: "pv-1-2" });
+  });
+
+  it("selfview_start leva só o channel e devolve o token; selfview_stop leva o token", async () => {
+    const channel = { onmessage: null };
+    mockInvoke.mockResolvedValueOnce("sv-1-2");
+    await expect(selfviewStart(channel as never)).resolves.toBe("sv-1-2");
+    expect(mockInvoke).toHaveBeenCalledWith("selfview_start", { channel });
+    mockInvoke.mockResolvedValueOnce(undefined);
+    await selfviewStop("sv-1-2");
+    expect(mockInvoke).toHaveBeenCalledWith("selfview_stop", { token: "sv-1-2" });
   });
 });
 

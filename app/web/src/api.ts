@@ -355,6 +355,23 @@ export function previewStop(token: string): Promise<void> {
   return invoke<void>("preview_stop", { token });
 }
 
+/**
+ * Inicia a prévia local do share ATIVO (tile "Você" no palco). Espelha o
+ * feed do bridge — sem segunda abertura de dispositivo. Devolve token;
+ * frames GLP2/format-1 chegam no `channel` até `selfviewStop(token)`.
+ * Erra honesto sem share ("inicie o compartilhamento…").
+ */
+export function selfviewStart(
+  channel: import("@tauri-apps/api/core").Channel<ArrayBuffer>,
+): Promise<string> {
+  return invoke<string>("selfview_start", { channel });
+}
+
+/** Para a prévia local. Idempotente; token desconhecido é Ok. */
+export function selfviewStop(token: string): Promise<void> {
+  return invoke<void>("selfview_stop", { token });
+}
+
 /** Capacidades sem tocar no SO (nunca pede permissão). */
 export function sourceCapabilities(): Promise<CapabilitySet> {
   return invoke<CapabilitySet>("source_capabilities");

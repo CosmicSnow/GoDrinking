@@ -9,6 +9,7 @@ import {
   QUALITY_PRESETS,
   QualityPanel,
   RoomScreen,
+  SELFVIEW_STORAGE_KEY,
   WINDOW_HINT,
   DEFAULT_AUDIO_EXCLUSION_TOKENS,
   NICKNAME_STORAGE_KEY,
@@ -20,6 +21,7 @@ import {
   formatFps,
   frameRefreshDue,
   linkLabel,
+  readSelfviewPref,
   readStoredSetting,
   resolveDesired,
   salaLabel,
@@ -28,6 +30,7 @@ import {
   sourceKindOf,
   watchingStillLive,
   visibleAudioApps,
+  writeSelfviewPref,
   writeStoredSetting,
   isSelf,
   roomTilesClassName,
@@ -778,6 +781,34 @@ describe("fontes de captura (select + capacidades)", () => {
       createElement(RoomScreen, roomProps({ source: "synthetic" })),
     );
     expect(html).not.toContain("Pré-visualização ao vivo");
+  });
+
+  it("pref do self-view: visível por padrão, escrita sem window não quebra", () => {
+    expect(typeof window).toBe("undefined");
+    expect(readSelfviewPref()).toBe(true);
+    expect(SELFVIEW_STORAGE_KEY).toBe("golive.selfview");
+    expect(() => writeSelfviewPref(false)).not.toThrow();
+    expect(readSelfviewPref()).toBe(true);
+  });
+
+  it("share no ar mostra o tile próprio com Ocultar; parado esconde", () => {
+    const live = renderToStaticMarkup(
+      createElement(
+        RoomScreen,
+        roomProps({
+          snapshot: snapshotFixture({ share: { id: "s1", state: "live" } }),
+        }),
+      ),
+    );
+    expect(live).toContain('data-hook="tile-self"');
+    expect(live).toContain("Sua transmissão (prévia local)");
+    expect(live).toContain("Ocultar");
+    expect(live).toContain("PRÉVIA");
+    expect(live).not.toContain("Sem transmissões");
+
+    const idle = renderToStaticMarkup(createElement(RoomScreen, roomProps()));
+    expect(idle).not.toContain('data-hook="tile-self"');
+    expect(idle).toContain("Sem transmissões");
   });
 });
 
